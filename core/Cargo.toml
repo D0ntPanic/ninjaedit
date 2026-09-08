@@ -1,0 +1,11 @@
+[package]
+name = "ninjaedit-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+git2 = { version = "0.21.0", features = ["ssh", "https", "vendored-libgit2", "vendored-openssl"] }
+regex = "1.13.1"
+ignore = "0.4"
+notify = "8"
+tempfile = "3"
