@@ -158,11 +158,9 @@ impl EditorView {
 
         let selection = self.editor.selection();
         // A theme can force one text color over the selection for contrast;
-        // otherwise the text keeps its own color (only `view-text`, until
-        // there is syntax highlighting).
-        let selected = Style::default()
-            .fg(theme.selection_text.unwrap_or(theme.view_text))
-            .bg(theme.selection_background);
+        // otherwise the text keeps its syntax color. Bold and italic stay
+        // either way.
+        let selected = Style::default().bg(theme.selection_background);
         for (row, cells) in lines.iter().enumerate() {
             let line = self.scroll_line + row;
             let y = area.y + row as u16;
@@ -184,9 +182,16 @@ impl EditorView {
                 if cell.column >= visible.end {
                     break;
                 }
+                let syntax = theme.syntax(cell.kind);
                 let style = match &selection {
-                    Some(range) if range.contains(&cell.range.start) => selected,
-                    _ => text_style,
+                    Some(range) if range.contains(&cell.range.start) => {
+                        let style = syntax.apply(selected);
+                        match theme.selection_text {
+                            Some(color) => style.fg(color),
+                            None => style,
+                        }
+                    }
+                    _ => syntax.apply(text_style),
                 };
                 let fits = cell.column >= visible.start && cell.column + cell.width <= visible.end;
                 let start = cell.column.max(visible.start);

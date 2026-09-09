@@ -39,6 +39,9 @@ struct Tab {
     /// When the tab was last active, as a tick of [`App::view_clock`].
     /// Higher is more recent.
     last_viewed: u64,
+    /// The editor's highlight generation as of the last redraw, to notice
+    /// when background highlighting has changed what's on screen.
+    highlight_generation: u64,
 }
 
 impl Tab {
@@ -114,8 +117,10 @@ impl App {
         }
         match self.project.open_file(&path) {
             Ok(buffer) => {
+                let editor = Editor::new(buffer);
                 self.tabs.push(Tab {
-                    view: EditorView::new(Editor::new(buffer)),
+                    highlight_generation: editor.highlight_generation(),
+                    view: EditorView::new(editor),
                     last_viewed: 0,
                 });
                 self.activate(self.tabs.len() - 1);
@@ -281,9 +286,17 @@ impl App {
     /// Periodic housekeeping while idle. Returns whether the screen needs
     /// redrawing.
     pub fn tick(&mut self) -> bool {
+        let mut redraw = false;
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            let generation = tab.view.editor().highlight_generation();
+            if generation != tab.highlight_generation {
+                tab.highlight_generation = generation;
+                redraw = true;
+            }
+        }
         let generation = self.project.index().generation();
         if generation == self.index_generation {
-            return false;
+            return redraw;
         }
         self.index_generation = generation;
         if self.palette_is_files {
@@ -294,7 +307,7 @@ impl App {
             }
             return true;
         }
-        false
+        redraw
     }
 
     // ----- Events ---------------------------------------------------------
@@ -793,6 +806,45 @@ mod tests {
         let selected = cell(&mut app, 4);
         assert_eq!(selected.fg, Color::Rgb(1, 2, 3));
         assert_eq!(selected.bg, theme.selection_background);
+    }
+
+    #[test]
+    fn syntax_highlighting_reaches_the_screen() {
+        let (_dir, mut app) = app_with_files(&[("a.rs", "fn main() {} // hi\n")]);
+        app.set_theme(
+            Theme::parse(
+                "syntax-keyword = \"*#010203\"\nsyntax-function-definition = \"#040506\"\n\
+                 syntax-comment = \"/#070809\"\n",
+            )
+            .unwrap(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(30, 4)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        // Gutter is 3 wide.
+        let keyword = &buffer[(3, 1)];
+        assert_eq!(keyword.symbol(), "f");
+        assert_eq!(keyword.fg, Color::Rgb(1, 2, 3));
+        assert!(keyword.modifier.contains(Modifier::BOLD));
+        let name = &buffer[(6, 1)];
+        assert_eq!(name.symbol(), "m");
+        assert_eq!(name.fg, Color::Rgb(4, 5, 6));
+        assert!(!name.modifier.contains(Modifier::BOLD));
+        let comment = &buffer[(16, 1)];
+        assert_eq!(comment.symbol(), "/");
+        assert_eq!(comment.fg, Color::Rgb(7, 8, 9));
+        assert!(comment.modifier.contains(Modifier::ITALIC));
+        let space = &buffer[(5, 1)];
+        assert_eq!(space.fg, Theme::default().view_text);
+
+        // Selected text keeps its syntax color and modifiers unless the
+        // theme forces a selection text color.
+        app.handle_event(key(KeyCode::Right, KeyModifiers::SHIFT));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let selected = &terminal.backend().buffer()[(3, 1)];
+        assert_eq!(selected.fg, Color::Rgb(1, 2, 3));
+        assert!(selected.modifier.contains(Modifier::BOLD));
+        assert_eq!(selected.bg, Theme::default().selection_background);
     }
 
     #[test]

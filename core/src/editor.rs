@@ -33,8 +33,15 @@
 //! where in the history the buffer was last saved (or loaded), and reports
 //! itself unmodified whenever it is back at that point, whether by undo,
 //! redo, or save.
+//!
+//! Syntax highlighting: when the buffer's file has a recognized
+//! [`Language`], the editor keeps a [`Highlighter`] in step with every
+//! edit, and [`Editor::line_cells`] reports each character's
+//! [`TokenKind`] for the frontend to style. See the
+//! [`syntax`](crate::syntax) module.
 
 use crate::buffer::FileBuffer;
+use crate::syntax::{Highlighter, Language, Token, TokenKind};
 use crate::text::{self, Grapheme};
 use std::io;
 use std::ops::Range;
@@ -98,6 +105,9 @@ pub struct Cell {
     pub column: usize,
     /// The number of cells the character occupies (may be zero).
     pub width: usize,
+    /// What the character is part of, for styling. [`TokenKind::Text`]
+    /// when the buffer's language is unknown.
+    pub kind: TokenKind,
 }
 
 /// The cursor and selection anchor, as saved in undo entries.
@@ -262,6 +272,8 @@ pub struct Editor {
     /// `None` if that state is no longer in the history.
     save_point: Option<usize>,
     tab_width: usize,
+    /// Syntax highlighting, when the buffer's language is known.
+    highlighter: Option<Highlighter>,
 }
 
 impl Editor {
@@ -269,6 +281,8 @@ impl Editor {
     /// selection.
     pub fn new(buffer: FileBuffer) -> Editor {
         let save_point = if buffer.is_modified() { None } else { Some(0) };
+        let language = buffer.path().and_then(Language::from_path);
+        let highlighter = language.map(|language| Highlighter::new(language, buffer.line_count()));
         Editor {
             buffer,
             cursor: 0,
@@ -279,6 +293,7 @@ impl Editor {
             grouping: false,
             save_point,
             tab_width: DEFAULT_TAB_WIDTH,
+            highlighter,
         }
     }
 
@@ -286,6 +301,40 @@ impl Editor {
     /// through the editor so the undo history stays consistent.
     pub fn buffer(&self) -> &FileBuffer {
         &self.buffer
+    }
+
+    // ----- Syntax highlighting --------------------------------------------
+
+    /// The language the buffer is highlighted as, if any. Chosen from the
+    /// file's name when the editor is created or the buffer is saved under
+    /// a new name; see [`set_language`](Self::set_language) to override.
+    pub fn language(&self) -> Option<Language> {
+        self.highlighter.as_ref().map(Highlighter::language)
+    }
+
+    /// Highlight the buffer as `language`, or not at all with `None`.
+    pub fn set_language(&mut self, language: Option<Language>) {
+        if language == self.language() {
+            return;
+        }
+        self.highlighter =
+            language.map(|language| Highlighter::new(language, self.buffer.line_count()));
+    }
+
+    /// The syntax tokens of a line, with ranges relative to the start of
+    /// the line's content. Empty when the language is unknown.
+    pub fn line_tokens(&self, line: usize) -> Vec<Token> {
+        match &self.highlighter {
+            Some(highlighter) => highlighter.tokens(&self.buffer, line),
+            None => Vec::new(),
+        }
+    }
+
+    /// A counter that changes when background highlighting has updated
+    /// lines, so a frontend knows to redraw. See
+    /// [`Highlighter::generation`].
+    pub fn highlight_generation(&self) -> u64 {
+        self.highlighter.as_ref().map_or(0, Highlighter::generation)
     }
 
     /// The number of cells between tab stops, used for display columns.
@@ -305,15 +354,34 @@ impl Editor {
         let bytes = self
             .buffer
             .bytes_in_range(layout.start..layout.start + layout.len());
+        let tokens = match &self.highlighter {
+            Some(highlighter) => highlighter.tokens_of(&self.buffer, line, &bytes),
+            None => Vec::new(),
+        };
+        let mut next_token = 0;
         layout
             .cells
             .iter()
             .zip(text::graphemes(&bytes))
-            .map(|(cell, grapheme)| Cell {
-                range: layout.start + cell.range.start..layout.start + cell.range.end,
-                text: grapheme.text.to_owned(),
-                column: cell.column,
-                width: cell.width,
+            .map(|(cell, grapheme)| {
+                // Tokens are ordered and disjoint, as are cells, so one
+                // forward pass matches them up. A character is styled by
+                // the token containing its first byte.
+                while next_token < tokens.len() && tokens[next_token].range.end <= cell.range.start
+                {
+                    next_token += 1;
+                }
+                let kind = match tokens.get(next_token) {
+                    Some(token) if token.range.start <= cell.range.start => token.kind,
+                    _ => TokenKind::Text,
+                };
+                Cell {
+                    range: layout.start + cell.range.start..layout.start + cell.range.end,
+                    text: grapheme.text.to_owned(),
+                    column: cell.column,
+                    width: cell.width,
+                    kind,
+                }
             })
             .collect()
     }
@@ -726,16 +794,30 @@ impl Editor {
 
     /// Apply an edit's replacement to the buffer.
     fn apply(&mut self, edit: &Edit) {
-        self.buffer
-            .delete(edit.offset..edit.offset + edit.removed.len());
-        self.buffer.insert_bytes(edit.offset, &edit.inserted);
+        self.replace_bytes(edit.offset, edit.removed.len(), &edit.inserted);
     }
 
     /// Reverse an edit's replacement in the buffer.
     fn revert(&mut self, edit: &Edit) {
-        self.buffer
-            .delete(edit.offset..edit.offset + edit.inserted.len());
-        self.buffer.insert_bytes(edit.offset, &edit.removed);
+        self.replace_bytes(edit.offset, edit.inserted.len(), &edit.removed);
+    }
+
+    /// Replace `len` bytes at `offset` with `bytes`, keeping the
+    /// highlighter in step. Every change to the buffer comes through here.
+    fn replace_bytes(&mut self, offset: usize, len: usize, bytes: &[u8]) {
+        let start = self.buffer.line_of_offset(offset);
+        let old_end = self.buffer.line_of_offset(offset + len);
+        self.buffer.delete(offset..offset + len);
+        self.buffer.insert_bytes(offset, bytes);
+        if let Some(highlighter) = &self.highlighter {
+            let new_end = self.buffer.line_of_offset(offset + bytes.len());
+            highlighter.lines_changed(
+                start,
+                old_end - start + 1,
+                new_end - start + 1,
+                self.buffer.line_count(),
+            );
+        }
     }
 
     fn state(&self) -> CursorState {
@@ -813,10 +895,12 @@ impl Editor {
         Ok(())
     }
 
-    /// Save to a file, which becomes the buffer's associated file.
+    /// Save to a file, which becomes the buffer's associated file. The
+    /// language is chosen afresh from the new name.
     pub fn save_as(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
         self.buffer.save_as(path)?;
         self.mark_saved();
+        self.set_language(self.buffer.path().and_then(Language::from_path));
         Ok(())
     }
 }
@@ -886,6 +970,56 @@ mod tests {
         for c in s.chars() {
             editor.insert_char(c);
         }
+    }
+
+    #[test]
+    fn highlighting_follows_edits() {
+        let mut ed = editor("fn main() {\n    let x = 1;\n}\n");
+        assert_eq!(ed.language(), None);
+        assert!(ed.line_cells(0).iter().all(|c| c.kind == TokenKind::Text));
+        ed.set_language(Some(Language::Rust));
+        let kinds = |ed: &Editor, line: usize| -> Vec<TokenKind> {
+            ed.line_cells(line).iter().map(|c| c.kind).collect()
+        };
+        assert_eq!(kinds(&ed, 0)[..2], [TokenKind::Keyword, TokenKind::Keyword]);
+        assert_eq!(kinds(&ed, 0)[3], TokenKind::FunctionDefinition);
+        assert_eq!(kinds(&ed, 1)[8], TokenKind::VariableDefinition);
+        assert_eq!(kinds(&ed, 1)[12], TokenKind::Number);
+
+        // Opening a comment at the top recolors the lines below, in step
+        // with the edit; closing it with undo restores them.
+        ed.set_cursor(0);
+        type_str(&mut ed, "/* ");
+        assert!(kinds(&ed, 1).iter().all(|&k| k == TokenKind::Comment));
+        assert_eq!(
+            ed.line_tokens(2),
+            vec![Token {
+                range: 0..1,
+                kind: TokenKind::Comment
+            }]
+        );
+        ed.undo();
+        assert_eq!(kinds(&ed, 1)[12], TokenKind::Number);
+        ed.redo();
+        assert!(kinds(&ed, 2).iter().all(|&k| k == TokenKind::Comment));
+
+        // Pasting and cutting lines keeps the line bookkeeping in step.
+        ed.set_cursor(0);
+        ed.paste("a\nb\nc\n");
+        ed.set_selection(0, 4);
+        ed.cut();
+        ed.select_all();
+        ed.insert_text("x = \"s\n");
+        assert_eq!(
+            ed.line_tokens(0)[2],
+            Token {
+                range: 4..6,
+                kind: TokenKind::String
+            }
+        );
+        assert!(ed.line_tokens(1).is_empty(), "empty line inside the string");
+        ed.set_language(None);
+        assert!(ed.line_tokens(0).is_empty());
     }
 
     #[test]

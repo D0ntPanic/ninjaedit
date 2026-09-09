@@ -21,12 +21,59 @@
 //! A few colors are optional, such as `selection-text`: leaving one out
 //! (or setting it to `""`, to undo the default) means the interface falls
 //! back to a related color instead.
+//!
+//! Syntax highlighting colors are the `syntax-` keys, one per
+//! [`TokenKind`] (`syntax-keyword`, `syntax-doc-comment`, ...). They may
+//! be bold or italic: a `*` before the color makes it bold and a `/`
+//! makes it italic, in either order, on a name or an RGB value alike:
+//!
+//! ```toml
+//! syntax-comment = "/dimmed"
+//! syntax-function-definition = "*#e0e0e0"
+//! syntax-type-definition = "*/cyan"
+//! ```
+//!
+//! Every syntax key is optional. A kind that isn't styled borrows the
+//! style of its parent kind (a doc comment is a comment, a primitive type
+//! is a type; see [`TokenKind::parent`]), and at the root falls back to
+//! `view-text`.
 
-use ratatui::style::Color;
+use ninjaedit_core::TokenKind;
+use ratatui::style::{Color, Modifier, Style};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::LazyLock;
+
+/// A color with optional bold and italic, for text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextStyle {
+    pub color: Color,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl TextStyle {
+    pub const fn plain(color: Color) -> TextStyle {
+        TextStyle {
+            color,
+            bold: false,
+            italic: false,
+        }
+    }
+
+    /// Apply this style's foreground color and modifiers to `base`.
+    pub fn apply(self, base: Style) -> Style {
+        let mut style = base.fg(self.color);
+        if self.bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if self.italic {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        style
+    }
+}
 
 const DEFAULT_THEME: &str = include_str!("../../theme/default.theme");
 
@@ -42,6 +89,9 @@ macro_rules! theme_colors {
         pub struct Theme {
             $($(#[$doc])* pub $field: Color,)*
             $($(#[$odoc])* pub $ofield: Option<Color>,)*
+            /// Syntax styles by [`TokenKind::index`]; `None` where the
+            /// theme leaves a kind to its parent.
+            syntax: [Option<TextStyle>; TokenKind::COUNT],
         }
 
         impl Theme {
@@ -55,11 +105,20 @@ macro_rules! theme_colors {
                 Theme {
                     $($field: color,)*
                     $($ofield: None,)*
+                    syntax: [None; TokenKind::COUNT],
                 }
             }
 
-            /// Set (or, with `None`, unset) the color for a theme file key.
-            fn set(&mut self, key: &str, color: Option<Color>) -> Set {
+            /// Set (or, with `None`, unset) the style for a theme file key.
+            fn set(&mut self, key: &str, style: Option<TextStyle>) -> Set {
+                if let Some(kind) = syntax_kind(key) {
+                    self.syntax[kind.index()] = style;
+                    return Set::Ok;
+                }
+                if style.is_some_and(|s| s.bold || s.italic) {
+                    return Set::NotText;
+                }
+                let color = style.map(|s| s.color);
                 match key {
                     $($key => match color {
                         Some(color) => self.$field = color,
@@ -80,6 +139,29 @@ enum Set {
     UnknownKey,
     /// The key can't be unset.
     Required,
+    /// The key is an interface color, which can't be bold or italic.
+    NotText,
+}
+
+/// The token kind a `syntax-` key styles.
+fn syntax_kind(key: &str) -> Option<TokenKind> {
+    let name = key.strip_prefix("syntax-")?;
+    TokenKind::ALL.into_iter().find(|kind| kind.name() == name)
+}
+
+impl Theme {
+    /// The style for a kind of token, following parents for kinds the
+    /// theme doesn't style and ending at `view-text`.
+    pub fn syntax(&self, kind: TokenKind) -> TextStyle {
+        let mut current = Some(kind);
+        while let Some(kind) = current {
+            if let Some(style) = self.syntax[kind.index()] {
+                return style;
+            }
+            current = kind.parent();
+        }
+        TextStyle::plain(self.view_text)
+    }
 }
 
 theme_colors! {
@@ -196,11 +278,16 @@ impl Theme {
             let text = value
                 .as_str()
                 .ok_or_else(|| ThemeError(format!("`{key}` must be a color string")))?;
-            let color = if text.is_empty() {
+            let style = if text.is_empty() {
                 None
             } else {
-                match parse_rgb(text).or_else(|| names.get(text).copied()) {
-                    Some(color) => Some(color),
+                let (bold, italic, color_text) = split_modifiers(text);
+                match parse_rgb(color_text).or_else(|| names.get(color_text).copied()) {
+                    Some(color) => Some(TextStyle {
+                        color,
+                        bold,
+                        italic,
+                    }),
                     None => {
                         return Err(ThemeError(format!(
                             "`{key}` is `{text}`, which is neither an RGB color like #1a2b3c nor a named color"
@@ -208,7 +295,7 @@ impl Theme {
                     }
                 }
             };
-            match theme.set(key, color) {
+            match theme.set(key, style) {
                 Set::Ok => {}
                 Set::UnknownKey => {
                     return Err(ThemeError(format!("`{key}` is not a theme color")));
@@ -218,9 +305,32 @@ impl Theme {
                         "`{key}` is not optional and can't be empty"
                     )));
                 }
+                Set::NotText => {
+                    return Err(ThemeError(format!(
+                        "`{key}` is an interface color and can't be bold or italic; only `syntax-` colors can"
+                    )));
+                }
             }
         }
         Ok(theme)
+    }
+}
+
+/// Split the `*` (bold) and `/` (italic) prefixes off a color.
+fn split_modifiers(text: &str) -> (bool, bool, &str) {
+    let mut bold = false;
+    let mut italic = false;
+    let mut rest = text;
+    loop {
+        if let Some(r) = rest.strip_prefix('*') {
+            bold = true;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix('/') {
+            italic = true;
+            rest = r;
+        } else {
+            return (bold, italic, rest);
+        }
     }
 }
 
@@ -299,6 +409,84 @@ mod tests {
         assert!(error("[names]\nbad = \"red\"").contains("must be an RGB color"));
         assert!(error("names = 3").contains("must be a table"));
         assert!(error("view-text = ").contains("invalid theme"));
+    }
+
+    #[test]
+    fn syntax_styles_and_modifiers() {
+        // Over a blank base, so the default theme's own syntax colors
+        // don't get in the way of checking fallbacks.
+        let theme = Theme::parse_over(
+            "syntax-comment = \"/#010203\"\nsyntax-keyword = \"*/blue\"\nsyntax-type = \"/*#040506\"\n\n[names]\nblue = \"#0000ff\"\n",
+            Theme::uniform(Color::Rgb(9, 9, 9)),
+        )
+        .unwrap();
+        assert_eq!(
+            theme.syntax(TokenKind::Comment),
+            TextStyle {
+                color: Color::Rgb(1, 2, 3),
+                bold: false,
+                italic: true
+            }
+        );
+        assert_eq!(
+            theme.syntax(TokenKind::Keyword),
+            TextStyle {
+                color: Color::Rgb(0, 0, 0xff),
+                bold: true,
+                italic: true
+            }
+        );
+        assert!(theme.syntax(TokenKind::Type).bold && theme.syntax(TokenKind::Type).italic);
+        // Unstyled kinds follow their parents; doc comments are comments.
+        assert_eq!(
+            theme.syntax(TokenKind::DocComment),
+            theme.syntax(TokenKind::Comment)
+        );
+        // Unsetting a kind in a derived theme returns it to its parent.
+        let derived = Theme::parse_over("syntax-doc-comment = \"\"\n", theme).unwrap();
+        assert_eq!(
+            derived.syntax(TokenKind::DocComment),
+            theme.syntax(TokenKind::Comment)
+        );
+        // Root kinds fall back to the view text color.
+        assert_eq!(
+            theme.syntax(TokenKind::Text),
+            TextStyle::plain(Color::Rgb(9, 9, 9))
+        );
+        assert_eq!(
+            theme.syntax(TokenKind::Function),
+            TextStyle::plain(Color::Rgb(9, 9, 9))
+        );
+
+        let style = TextStyle {
+            color: Color::Rgb(1, 2, 3),
+            bold: true,
+            italic: false,
+        }
+        .apply(Style::default().bg(Color::Black));
+        assert_eq!(style.fg, Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(style.bg, Some(Color::Black));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert!(!style.add_modifier.contains(Modifier::ITALIC));
+
+        let error = |text: &str| Theme::parse(text).unwrap_err().to_string();
+        assert!(error("view-text = \"*#000000\"").contains("can't be bold or italic"));
+        assert!(error("syntax-nope = \"#000000\"").contains("not a theme color"));
+        assert!(error("syntax-comment = \"*\"").contains("nor a named color"));
+    }
+
+    #[test]
+    fn default_theme_styles_every_root_kind() {
+        let theme = Theme::default();
+        for kind in TokenKind::ALL {
+            if kind.parent().is_none() && kind != TokenKind::Text && kind != TokenKind::Identifier {
+                assert!(
+                    theme.syntax[kind.index()].is_some(),
+                    "default theme lacks syntax-{}",
+                    kind.name()
+                );
+            }
+        }
     }
 
     #[test]

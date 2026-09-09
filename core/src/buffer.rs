@@ -21,6 +21,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Target chunk size. Chunks are split when they grow past twice this.
 const CHUNK_TARGET: usize = 16 * 1024;
@@ -61,21 +62,53 @@ impl LineEnding {
 /// may equal `data.len()`). A CRLF pair is a single terminator and is never
 /// split across a chunk boundary (see `fix_crlf_boundaries`), so each chunk
 /// can be scanned without looking at its neighbors.
-struct Chunk {
+///
+/// Chunks are shared with [`BufferSnapshot`]s through an `Arc`, and are
+/// copied on write: an edit clones the one chunk it touches if (and only
+/// if) a snapshot still refers to it. See [`Chunk::make_mut`].
+#[derive(Clone)]
+struct Chunk(Arc<ChunkData>);
+
+struct ChunkData {
     data: Vec<u8>,
     breaks: Vec<u32>,
 }
 
+impl std::ops::Deref for Chunk {
+    type Target = ChunkData;
+
+    fn deref(&self) -> &ChunkData {
+        &self.0
+    }
+}
+
 impl Chunk {
     fn new(data: Vec<u8>) -> Chunk {
-        let mut chunk = Chunk {
+        let mut chunk = ChunkData {
             data,
             breaks: Vec::new(),
         };
         chunk.rescan();
-        chunk
+        Chunk(Arc::new(chunk))
     }
 
+    /// Mutable access to the chunk, cloning its contents first if a
+    /// snapshot shares them.
+    fn make_mut(&mut self) -> &mut ChunkData {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl Clone for ChunkData {
+    fn clone(&self) -> ChunkData {
+        ChunkData {
+            data: self.data.clone(),
+            breaks: self.breaks.clone(),
+        }
+    }
+}
+
+impl ChunkData {
     fn len(&self) -> usize {
         self.data.len()
     }
@@ -226,7 +259,7 @@ impl FileBuffer {
 
     /// Total length in bytes.
     pub fn len(&self) -> usize {
-        self.chunks.iter().map(Chunk::len).sum()
+        self.chunks.iter().map(|c| c.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -241,6 +274,15 @@ impl FileBuffer {
     /// ending with a line terminator has a final empty line after it.
     pub fn line_count(&self) -> usize {
         self.break_count() + 1
+    }
+
+    /// A cheap, immutable copy of the current contents, for work on other
+    /// threads. Taking one costs a clone of the chunk list (a few bytes per
+    /// chunk); the chunk contents are shared until an edit touches them.
+    pub fn snapshot(&self) -> BufferSnapshot {
+        BufferSnapshot {
+            chunks: self.chunks.clone(),
+        }
     }
 
     /// Whether the buffer ends with a line terminator.
@@ -282,13 +324,14 @@ impl FileBuffer {
             let split_pair = self.chunks[i - 1].data.last() == Some(&b'\r')
                 && self.chunks[i].data.first() == Some(&b'\n');
             if split_pair {
-                self.chunks[i].data.remove(0);
-                self.chunks[i - 1].data.push(b'\n');
-                self.chunks[i - 1].rescan();
+                self.chunks[i].make_mut().data.remove(0);
+                let prev = self.chunks[i - 1].make_mut();
+                prev.data.push(b'\n');
+                prev.rescan();
                 if self.chunks[i].data.is_empty() {
                     self.chunks.remove(i);
                 } else {
-                    self.chunks[i].rescan();
+                    self.chunks[i].make_mut().rescan();
                     i += 1;
                 }
             } else {
@@ -305,8 +348,9 @@ impl FileBuffer {
         while i + 1 < self.chunks.len() {
             if self.chunks[i].len() + self.chunks[i + 1].len() <= CHUNK_TARGET {
                 let next = self.chunks.remove(i + 1);
-                self.chunks[i].data.extend_from_slice(&next.data);
-                self.chunks[i].rescan();
+                let chunk = self.chunks[i].make_mut();
+                chunk.data.extend_from_slice(&next.data);
+                chunk.rescan();
             } else {
                 i += 1;
             }
@@ -332,6 +376,7 @@ impl FileBuffer {
             let (index, rel) = self.locate(offset);
             let chunk = &mut self.chunks[index];
             if chunk.len() + bytes.len() <= CHUNK_MAX {
+                let chunk = chunk.make_mut();
                 chunk.data.splice(rel..rel, bytes.iter().copied());
                 chunk.rescan();
             } else {
@@ -366,6 +411,7 @@ impl FileBuffer {
             if rel == 0 && take == chunk.len() {
                 self.chunks.remove(index);
             } else {
+                let chunk = chunk.make_mut();
                 chunk.data.drain(rel..rel + take);
                 chunk.rescan();
                 index += 1;
@@ -575,6 +621,136 @@ impl Default for FileBuffer {
     }
 }
 
+/// An immutable view of a [`FileBuffer`]'s contents at the moment
+/// [`FileBuffer::snapshot`] was called. Snapshots are cheap to take and to
+/// clone, and can be sent to other threads.
+#[derive(Clone)]
+pub struct BufferSnapshot {
+    chunks: Vec<Chunk>,
+}
+
+impl BufferSnapshot {
+    /// Total length in bytes.
+    pub fn len(&self) -> usize {
+        self.chunks.iter().map(|c| c.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chunks.iter().all(|c| c.data.is_empty())
+    }
+
+    /// Number of lines, counted as [`FileBuffer::line_count`] does.
+    pub fn line_count(&self) -> usize {
+        self.chunks.iter().map(|c| c.breaks.len()).sum::<usize>() + 1
+    }
+
+    /// Iterate over line contents (without terminators) starting at `line`.
+    /// Walking lines in order this way is much cheaper than looking each
+    /// one up by number.
+    pub fn lines_from(&self, line: usize) -> Lines<'_> {
+        let mut remaining = line;
+        let mut index = 0;
+        let mut rel = 0;
+        let mut brk = 0;
+        while index < self.chunks.len() {
+            let chunk = &self.chunks[index];
+            if remaining <= chunk.breaks.len() {
+                if remaining > 0 {
+                    rel = chunk.breaks[remaining - 1] as usize;
+                }
+                brk = remaining;
+                break;
+            }
+            remaining -= chunk.breaks.len();
+            index += 1;
+        }
+        Lines {
+            snapshot: self,
+            index,
+            rel,
+            brk,
+            done: line >= self.line_count(),
+            scratch: Vec::new(),
+        }
+    }
+
+    /// The entire contents as bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len());
+        for chunk in &self.chunks {
+            out.extend_from_slice(&chunk.data);
+        }
+        out
+    }
+}
+
+/// A forward walk over the lines of a [`BufferSnapshot`]; see
+/// [`BufferSnapshot::lines_from`]. Not an `Iterator` because a line that
+/// spans chunks is assembled in a scratch buffer that the next call reuses.
+pub struct Lines<'a> {
+    snapshot: &'a BufferSnapshot,
+    /// The chunk the next line starts in.
+    index: usize,
+    /// The offset of the next line within that chunk.
+    rel: usize,
+    /// The index into that chunk's `breaks` of the next line's terminator.
+    brk: usize,
+    done: bool,
+    scratch: Vec<u8>,
+}
+
+impl Lines<'_> {
+    /// The content of the next line, or `None` after the last line.
+    pub fn next_line(&mut self) -> Option<&[u8]> {
+        if self.done {
+            return None;
+        }
+        let chunks = &self.snapshot.chunks;
+        // Fast path: the line ends inside the chunk it starts in.
+        if let Some(chunk) = chunks.get(self.index)
+            && let Some(&end) = chunk.breaks.get(self.brk)
+        {
+            let end = end as usize;
+            let content = &chunk.data[self.rel..end - terminator_len(&chunk.data[..end])];
+            self.rel = end;
+            self.brk += 1;
+            return Some(content);
+        }
+        // The line runs to the end of this chunk and on into the next ones
+        // (or to the end of the buffer).
+        self.scratch.clear();
+        loop {
+            let Some(chunk) = chunks.get(self.index) else {
+                self.done = true;
+                return Some(&self.scratch);
+            };
+            match chunk.breaks.get(self.brk) {
+                Some(&end) => {
+                    let end = end as usize;
+                    self.scratch.extend_from_slice(
+                        &chunk.data[self.rel..end - terminator_len(&chunk.data[..end])],
+                    );
+                    self.rel = end;
+                    self.brk += 1;
+                    return Some(&self.scratch);
+                }
+                None => {
+                    self.scratch.extend_from_slice(&chunk.data[self.rel..]);
+                    self.index += 1;
+                    self.rel = 0;
+                    self.brk = 0;
+                }
+            }
+        }
+    }
+}
+
+/// The length of the line terminator that `bytes` ends with (which it
+/// must, and which never straddles a chunk boundary).
+fn terminator_len(bytes: &[u8]) -> usize {
+    if bytes.ends_with(b"\r\n") { 2 } else { 1 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +795,65 @@ mod tests {
             let expected_line = starts.iter().filter(|&&s| s <= offset).count() - 1;
             assert_eq!(line, expected_line, "line of offset {offset}");
         }
+    }
+
+    #[test]
+    fn snapshot_lines_and_copy_on_write() {
+        // A file big enough to span several chunks, with lines that cross
+        // chunk boundaries and every kind of terminator.
+        let mut text = String::new();
+        for i in 0..3000 {
+            let eol = match i % 3 {
+                0 => "\n",
+                1 => "\r\n",
+                _ => "\r",
+            };
+            text.push_str(&format!("line {i} {}{eol}", "x".repeat(i % 40)));
+        }
+        text.push_str("last line without terminator");
+        let mut buffer = FileBuffer::from_text(&text);
+        assert!(buffer.chunks.len() > 3);
+        let snapshot = buffer.snapshot();
+        assert_eq!(snapshot.line_count(), buffer.line_count());
+        assert_eq!(snapshot.len(), buffer.len());
+
+        for start in [0, 1, 1234, 2999, 3000] {
+            let mut lines = snapshot.lines_from(start);
+            for line in start..buffer.line_count() {
+                let expected = buffer.line_text(line);
+                let got = lines.next_line().expect("line present");
+                assert_eq!(std::str::from_utf8(got).unwrap(), expected, "line {line}");
+            }
+            assert!(lines.next_line().is_none());
+        }
+        assert!(
+            snapshot
+                .lines_from(buffer.line_count())
+                .next_line()
+                .is_none()
+        );
+
+        // Editing the buffer leaves the snapshot untouched.
+        buffer.insert(0, "/* ");
+        buffer.delete(buffer.len() - 5..buffer.len());
+        buffer.insert(buffer.len() / 2, &"y".repeat(CHUNK_MAX));
+        assert_eq!(snapshot.to_bytes(), text.as_bytes());
+        assert_ne!(buffer.to_text(), text);
+        check_consistency(&buffer, &buffer.to_text());
+    }
+
+    #[test]
+    fn empty_snapshot_has_one_empty_line() {
+        let snapshot = FileBuffer::new().snapshot();
+        assert_eq!(snapshot.line_count(), 1);
+        let mut lines = snapshot.lines_from(0);
+        assert_eq!(lines.next_line(), Some(&b""[..]));
+        assert!(lines.next_line().is_none());
+        let snapshot = FileBuffer::from_text("a\n").snapshot();
+        let mut lines = snapshot.lines_from(0);
+        assert_eq!(lines.next_line(), Some(&b"a"[..]));
+        assert_eq!(lines.next_line(), Some(&b""[..]));
+        assert!(lines.next_line().is_none());
     }
 
     #[test]
