@@ -7,11 +7,12 @@
 //! core crate. Enter activates the selected result, which starts out as the
 //! best match; the arrow keys and the mouse choose another.
 
+use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::fuzzy;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::Span;
 use ratatui::widgets::{Block, BorderType, Clear, Widget};
 use std::path::PathBuf;
@@ -187,7 +188,12 @@ impl Palette {
 
     /// Draw the palette over the top center of `screen`. Returns where the
     /// terminal cursor belongs.
-    pub fn render(&mut self, screen: Rect, buf: &mut Buffer) -> Option<ScreenPosition> {
+    pub fn render(
+        &mut self,
+        screen: Rect,
+        buf: &mut Buffer,
+        theme: &Theme,
+    ) -> Option<ScreenPosition> {
         let width = MAX_WIDTH.min(screen.width.saturating_sub(2));
         if width < 10 || screen.height < 3 {
             return None;
@@ -200,13 +206,17 @@ impl Palette {
         self.area = Rect::new(x, y, width, height);
 
         Clear.render(self.area, buf);
+        let background = Style::default()
+            .fg(theme.command_palette_result_text)
+            .bg(theme.command_palette_background);
         let mut block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .style(background)
+            .border_style(background.fg(theme.command_palette_box_color));
         if let Some(hint) = &self.hint {
             block = block.title_bottom(Span::styled(
                 format!(" {hint} "),
-                Style::default().fg(Color::DarkGray),
+                background.fg(theme.command_palette_placeholder_text),
             ));
         }
         let inner = block.inner(self.area);
@@ -216,12 +226,16 @@ impl Palette {
         }
 
         // Search box.
+        let input = Style::default()
+            .fg(theme.command_palette_input_text)
+            .bg(theme.command_palette_input_background);
+        buf.set_style(Rect::new(inner.x, inner.y, inner.width, 1), input);
         let prompt = "> ";
         buf.set_string(
             inner.x,
             inner.y,
             prompt,
-            Style::default().fg(Color::DarkGray),
+            input.fg(theme.command_palette_box_color),
         );
         let input_x = inner.x + prompt.len() as u16;
         let input_width = inner.width.saturating_sub(prompt.len() as u16) as usize;
@@ -231,7 +245,7 @@ impl Palette {
                 inner.y,
                 self.placeholder,
                 input_width,
-                Style::default().add_modifier(Modifier::DIM),
+                input.fg(theme.command_palette_placeholder_text),
             );
             ScreenPosition::new(input_x, inner.y)
         } else {
@@ -242,7 +256,7 @@ impl Palette {
                 chars.next();
                 shown = chars.as_str();
             }
-            buf.set_string(input_x, inner.y, shown, Style::default());
+            buf.set_string(input_x, inner.y, shown, input);
             ScreenPosition::new(input_x + Span::raw(shown).width() as u16, inner.y)
         };
 
@@ -259,7 +273,7 @@ impl Palette {
                 self.rows.y,
                 message,
                 self.rows.width.saturating_sub(1) as usize,
-                Style::default().add_modifier(Modifier::DIM),
+                background.fg(theme.command_palette_result_context_text),
             );
             return Some(cursor);
         }
@@ -277,16 +291,18 @@ impl Palette {
             let item = &self.items[index];
             let y = self.rows.y + (row - self.first_visible) as u16;
             let highlighted = row == self.selected;
-            let base = if highlighted {
-                Style::default().add_modifier(Modifier::REVERSED)
+            let (base, context) = if highlighted {
+                let base = Style::default()
+                    .fg(theme.command_palette_selection_text)
+                    .bg(theme.command_palette_selection_background);
+                buf.set_style(Rect::new(self.rows.x, y, self.rows.width, 1), base);
+                (base, base)
             } else {
-                Style::default()
+                (
+                    background,
+                    background.fg(theme.command_palette_result_context_text),
+                )
             };
-            if highlighted {
-                for x in self.rows.x..self.rows.right() {
-                    buf[(x, y)].set_symbol(" ").set_style(base);
-                }
-            }
             let width = self.rows.width as usize;
             let label_width = Span::raw(&item.label).width().min(width.saturating_sub(1));
             buf.set_stringn(self.rows.x + 1, y, &item.label, label_width, base);
@@ -297,7 +313,7 @@ impl Palette {
                     y,
                     &item.detail,
                     width - used,
-                    base.fg(Color::DarkGray),
+                    context,
                 );
             }
         }

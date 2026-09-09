@@ -9,8 +9,10 @@ mod app;
 mod editor_view;
 mod palette;
 mod tabs;
+mod theme;
 
 use crate::app::App;
+use crate::theme::Theme;
 use clap::Parser;
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 use crossterm::execute;
@@ -29,16 +31,31 @@ const TICK: Duration = Duration::from_millis(100);
 struct Args {
     /// Files to open for editing.
     files: Vec<PathBuf>,
+
+    /// A theme file to use instead of the built-in default.
+    #[arg(long, value_name = "FILE")]
+    theme: Option<PathBuf>,
 }
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
+
+    // Read the theme before touching the terminal so a bad file is
+    // reported plainly rather than flashed through the alternate screen.
+    let theme = match &args.theme {
+        Some(path) => Theme::load(path).unwrap_or_else(|err| {
+            eprintln!("ninjaedit: {err}");
+            std::process::exit(1);
+        }),
+        None => Theme::default(),
+    };
 
     // The project is the git repository the current directory belongs to,
     // or the current directory itself if it isn't inside one.
     let cwd = std::env::current_dir()?;
     let project = Project::discover(&cwd)?;
     let mut app = App::new(project);
+    app.set_theme(theme);
     for file in args.files {
         app.open_file(std::path::absolute(&file)?);
     }

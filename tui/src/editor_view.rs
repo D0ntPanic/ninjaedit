@@ -13,11 +13,12 @@
 //! or the view is scrolled horizontally. Only the visible lines are measured
 //! for that decision, so it stays cheap on files with huge lines.
 
+use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::{Cell, Editor, Movement, Position};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget};
 
 /// Lines scrolled per mouse wheel notch.
@@ -85,7 +86,16 @@ impl EditorView {
     /// terminal cursor if it should be shown: when the model's cursor is in
     /// view and nothing is selected. With a selection, the highlight alone
     /// marks the cursor's end; a blinking cursor there only obscures it.
-    pub fn render(&mut self, area: Rect, buf: &mut Buffer) -> Option<ScreenPosition> {
+    pub fn render(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        theme: &Theme,
+    ) -> Option<ScreenPosition> {
+        let text_style = Style::default()
+            .fg(theme.view_text)
+            .bg(theme.view_background);
+        buf.set_style(area, text_style);
         let line_count = self.editor.buffer().line_count();
         let gutter_width = digits(line_count) as u16 + 2;
         // Gutter, at least one text column, and the vertical scrollbar.
@@ -147,7 +157,12 @@ impl EditorView {
         };
 
         let selection = self.editor.selection();
-        let selected = Style::default().add_modifier(Modifier::REVERSED);
+        // A theme can force one text color over the selection for contrast;
+        // otherwise the text keeps its own color (only `view-text`, until
+        // there is syntax highlighting).
+        let selected = Style::default()
+            .fg(theme.selection_text.unwrap_or(theme.view_text))
+            .bg(theme.selection_background);
         for (row, cells) in lines.iter().enumerate() {
             let line = self.scroll_line + row;
             let y = area.y + row as u16;
@@ -155,11 +170,11 @@ impl EditorView {
             // Line number, right-aligned, with a space either side.
             let number = format!("{:>width$} ", line + 1, width = gutter_width as usize - 1);
             let color = if line == cursor.line {
-                Color::Gray
+                theme.active_line_number
             } else {
-                Color::DarkGray
+                theme.inactive_line_number
             };
-            buf.set_string(area.x, y, &number, Style::default().fg(color));
+            buf.set_string(area.x, y, &number, text_style.fg(color));
 
             let visible = self.scroll_col..self.scroll_col + text_width;
             for cell in cells {
@@ -171,7 +186,7 @@ impl EditorView {
                 }
                 let style = match &selection {
                     Some(range) if range.contains(&cell.range.start) => selected,
-                    _ => Style::default(),
+                    _ => text_style,
                 };
                 let fits = cell.column >= visible.start && cell.column + cell.width <= visible.end;
                 let start = cell.column.max(visible.start);
@@ -202,8 +217,8 @@ impl EditorView {
             }
         }
 
-        let track = Style::default().fg(Color::DarkGray);
-        let thumb = Style::default().fg(Color::Gray);
+        let track = text_style.fg(theme.scroll_bar_track);
+        let thumb = text_style.fg(theme.scroll_bar_color);
         let mut state = ScrollbarState::new(self.max_scroll_line() + 1)
             .position(self.scroll_line)
             .viewport_content_length(height as usize);

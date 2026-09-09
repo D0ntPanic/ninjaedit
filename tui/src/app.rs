@@ -12,6 +12,7 @@
 use crate::editor_view::EditorView;
 use crate::palette::{Palette, PaletteAction, PaletteItem, PaletteOutcome};
 use crate::tabs::{TabBar, TabHit, TabLabel};
+use crate::theme::Theme;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -55,6 +56,7 @@ impl Tab {
 
 pub struct App {
     project: Project,
+    theme: Theme,
     tabs: Vec<Tab>,
     active: usize,
     /// Counts tab activations, to order tabs by most recently viewed.
@@ -78,6 +80,7 @@ impl App {
         App {
             index_generation: project.index().generation(),
             project,
+            theme: Theme::default(),
             tabs: Vec::new(),
             active: 0,
             view_clock: 0,
@@ -94,6 +97,10 @@ impl App {
 
     pub fn should_quit(&self) -> bool {
         self.quit
+    }
+
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
     /// Open a file in a new tab, or switch to its tab if it is already
@@ -414,6 +421,7 @@ impl App {
         let status_area = Rect::new(screen.x, screen.bottom() - 1, screen.width, 1);
         self.editor_area = Rect::new(screen.x, screen.y + 1, screen.width, screen.height - 2);
         let buf = frame.buffer_mut();
+        let theme = &self.theme;
 
         let labels: Vec<TabLabel> = self
             .tabs
@@ -423,18 +431,19 @@ impl App {
                 modified: tab.view.editor().is_modified(),
             })
             .collect();
-        self.tab_bar.render(tab_area, buf, &labels, self.active);
+        self.tab_bar
+            .render(tab_area, buf, theme, &labels, self.active);
 
         let mut cursor = None;
         match self.tabs.get_mut(self.active) {
-            Some(tab) => cursor = tab.view.render(self.editor_area, buf),
-            None => render_empty(self.editor_area, buf),
+            Some(tab) => cursor = tab.view.render(self.editor_area, buf, theme),
+            None => render_empty(self.editor_area, buf, theme),
         }
 
         self.render_status(status_area, buf);
 
         if let Some(palette) = &mut self.palette {
-            cursor = palette.render(screen, buf);
+            cursor = palette.render(screen, buf, theme);
         }
         if let Some(cursor) = cursor {
             frame.set_cursor_position(cursor);
@@ -442,23 +451,27 @@ impl App {
     }
 
     fn render_status(&self, area: Rect, buf: &mut Buffer) {
-        let style = Style::default().add_modifier(Modifier::REVERSED);
-        for x in area.x..area.right() {
-            buf[(x, area.y)].set_symbol(" ").set_style(style);
-        }
+        let theme = &self.theme;
+        let base = Style::default().bg(theme.status_bar_background);
+        buf.set_style(area, base);
         let tab = self.tabs.get(self.active);
         let position = tab.map(|tab| {
             let position = tab.view.editor().cursor_position();
-            format!("Ln {}, Col {}", position.line + 1, position.column + 1)
+            format!(" Ln {}, Col {} ", position.line + 1, position.column + 1)
         });
-        let mut right = format!(" {} ", self.project.name());
-        if let Some(position) = position {
-            right = format!(" {position} {right}");
+        let mut project = format!(" {} ", self.project.name());
+        if let Some(position) = &position {
             // Drop the project name when there's no room for it.
-            if Span::raw(&right).width() as u16 + 20 > area.width {
-                right = format!(" {position} ");
+            if Span::raw(position).width() as u16 + Span::raw(&project).width() as u16 + 20
+                > area.width
+            {
+                project.clear();
             }
         }
+        let right = [
+            (position.unwrap_or_default(), theme.status_bar_position_text),
+            (project, theme.status_bar_project_text),
+        ];
         let left = match &self.status {
             Some(message) => message.clone(),
             None => match tab.and_then(Tab::path) {
@@ -466,16 +479,30 @@ impl App {
                 None => "Ctrl+O to open a file, Ctrl+Q to quit".to_owned(),
             },
         };
-        let right_width = Span::raw(&right).width() as u16;
+        let right_width: u16 = right
+            .iter()
+            .map(|(text, _)| Span::raw(text).width() as u16)
+            .sum();
         let left_width = area.width.saturating_sub(right_width + 1) as usize;
-        buf.set_stringn(area.x + 1, area.y, &left, left_width, style);
+        buf.set_stringn(
+            area.x + 1,
+            area.y,
+            &left,
+            left_width,
+            base.fg(theme.status_bar_filename_text),
+        );
         if right_width <= area.width {
-            buf.set_string(area.right() - right_width, area.y, &right, style);
+            let mut x = area.right() - right_width;
+            for (text, color) in &right {
+                buf.set_string(x, area.y, text, base.fg(*color));
+                x += Span::raw(text).width() as u16;
+            }
         }
     }
 }
 
-fn render_empty(area: Rect, buf: &mut Buffer) {
+fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme) {
+    buf.set_style(area, Style::default().bg(theme.view_background));
     if area.height == 0 {
         return;
     }
@@ -499,7 +526,10 @@ fn render_empty(area: Rect, buf: &mut Buffer) {
             y,
             line,
             area.width as usize,
-            Style::default().add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(theme.view_text)
+                .bg(theme.view_background)
+                .add_modifier(Modifier::DIM),
         );
     }
 }
@@ -519,6 +549,7 @@ mod tests {
     use crossterm::event::KeyEventState;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
 
     fn app_with_files(files: &[(&str, &str)]) -> (tempfile::TempDir, App) {
         let dir = tempfile::tempdir().unwrap();
@@ -543,6 +574,32 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn theme_colors_reach_the_screen() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hello\n")]);
+        let theme = Theme::parse(
+            "view-background = \"#010203\"\nstatus-bar-background = \"#040506\"\n\
+             active-tab-text = \"#070809\"\nstatus-bar-position-text = \"#0a0b0c\"\n",
+        )
+        .unwrap();
+        app.set_theme(theme);
+        let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        // Tab bar: the active tab's title.
+        assert_eq!(buffer[(1, 0)].symbol(), "a");
+        assert_eq!(buffer[(1, 0)].fg, Color::Rgb(7, 8, 9));
+        // Editor text and the blank area past it share the background.
+        assert_eq!(buffer[(3, 1)].bg, Color::Rgb(1, 2, 3));
+        assert_eq!(buffer[(20, 3)].bg, Color::Rgb(1, 2, 3));
+        // Status bar: the row and the cursor position on its right.
+        assert_eq!(buffer[(0, 4)].bg, Color::Rgb(4, 5, 6));
+        let row: String = (0..40).map(|x| buffer[(x, 4)].symbol()).collect();
+        let ln = row.find("Ln 1").unwrap() as u16;
+        assert_eq!(buffer[(ln, 4)].fg, Color::Rgb(10, 11, 12));
+        assert_eq!(buffer[(ln, 4)].bg, Color::Rgb(4, 5, 6));
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
@@ -575,7 +632,7 @@ mod tests {
     fn renders_tabs_gutter_scrollbar_and_status() {
         let (_dir, mut app) = app_with_files(&[("a.txt", "one\ntwo\nthree\n")]);
         let screen = draw(&mut app, 30, 6);
-        assert_eq!(screen[0].trim_end(), " a.txt ×");
+        assert_eq!(screen[0].trim_end(), "◢a.txt ×◣");
         assert_eq!(screen[1], " 1 one                       █");
         assert_eq!(screen[2], " 2 two                       █");
         assert_eq!(screen[3], " 3 three                     █");
@@ -698,7 +755,7 @@ mod tests {
         let (_dir, mut app) = app_with_files(&[("a.txt", "abc\ndef\n"), ("b.txt", "x\n")]);
         assert_eq!(app.active, 1);
         draw(&mut app, 30, 6);
-        // Tab bar: " a.txt × │ b.txt ×"
+        // Tab bar: " a.txt ×  ◢b.txt ×◣"
         click(&mut app, 1, 0);
         assert_eq!(app.active, 0);
         draw(&mut app, 30, 6);
@@ -709,6 +766,61 @@ mod tests {
         // The close button on the second tab.
         click(&mut app, 17, 0);
         assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn selection_uses_theme_colors() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hello\n")]);
+        app.handle_event(key(KeyCode::Right, KeyModifiers::SHIFT));
+        app.handle_event(key(KeyCode::Right, KeyModifiers::SHIFT));
+        let cell = |app: &mut App, x: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(30, 4)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            terminal.backend().buffer()[(x, 1)].clone()
+        };
+        // Gutter is 3 wide, so "he" is selected at columns 3 and 4.
+        let theme = Theme::default();
+        let selected = cell(&mut app, 4);
+        assert_eq!(selected.symbol(), "e");
+        assert_eq!(selected.bg, theme.selection_background);
+        assert_eq!(selected.fg, theme.view_text);
+        let plain = cell(&mut app, 5);
+        assert_eq!(plain.symbol(), "l");
+        assert_eq!(plain.bg, theme.view_background);
+
+        // An explicit selection text color takes over.
+        app.set_theme(Theme::parse("selection-text = \"#010203\"").unwrap());
+        let selected = cell(&mut app, 4);
+        assert_eq!(selected.fg, Color::Rgb(1, 2, 3));
+        assert_eq!(selected.bg, theme.selection_background);
+    }
+
+    #[test]
+    fn active_tab_has_sloped_edges() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", ""), ("b.txt", ""), ("c.txt", "")]);
+        app.activate(1);
+        let screen = draw(&mut app, 40, 4);
+        // Separators only stand between two inactive tabs.
+        assert_eq!(screen[0].trim_end(), " a.txt ×  ◢b.txt ×◣  c.txt ×");
+        app.activate(2);
+        let screen = draw(&mut app, 40, 4);
+        assert_eq!(screen[0].trim_end(), " a.txt × │ b.txt ×  ◢c.txt ×◣");
+
+        // The edges are the tab's background drawn over the bar's.
+        let theme = Theme::default();
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..40).map(|x| buffer[(x, 0)].symbol()).collect();
+        // Every glyph in the bar is one column wide.
+        let left = row.chars().position(|c| c == '◢').unwrap() as u16;
+        let right = row.chars().position(|c| c == '◣').unwrap() as u16;
+        for x in [left, right] {
+            assert_eq!(buffer[(x, 0)].fg, theme.active_tab_background);
+            assert_eq!(buffer[(x, 0)].bg, theme.inactive_tab_background);
+        }
+        assert_eq!(buffer[(left + 1, 0)].bg, theme.active_tab_background);
+        assert_eq!(buffer[(left + 1, 0)].fg, theme.active_tab_text);
     }
 
     #[test]
