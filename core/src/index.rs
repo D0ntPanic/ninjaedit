@@ -64,7 +64,13 @@ struct DirNode {
 
 impl DirNode {
     fn new(name: OsString, ignored: bool) -> DirNode {
-        DirNode { name, ignored, scanned: false, dirs: Vec::new(), files: Vec::new() }
+        DirNode {
+            name,
+            ignored,
+            scanned: false,
+            dirs: Vec::new(),
+            files: Vec::new(),
+        }
     }
 }
 
@@ -149,7 +155,12 @@ impl FileIndex {
             .spawn(move || Worker::new(worker_shared, rx).run())
             .ok();
 
-        FileIndex { shared, tx, watcher, worker }
+        FileIndex {
+            shared,
+            tx,
+            watcher,
+            worker,
+        }
     }
 
     /// The project root being indexed (canonicalized).
@@ -191,7 +202,11 @@ impl FileIndex {
             if now >= deadline {
                 return false;
             }
-            let (guard, _) = self.shared.cond.wait_timeout(state, deadline - now).unwrap();
+            let (guard, _) = self
+                .shared
+                .cond
+                .wait_timeout(state, deadline - now)
+                .unwrap();
             state = guard;
         }
     }
@@ -256,7 +271,12 @@ impl FileIndex {
         }
         let state = self.shared.state.lock().unwrap();
         let mut out = Vec::new();
-        walk(&state.root, &self.shared.root_path, include_ignored, &mut out);
+        walk(
+            &state.root,
+            &self.shared.root_path,
+            include_ignored,
+            &mut out,
+        );
         out
     }
 }
@@ -304,7 +324,10 @@ impl Worker {
                     return;
                 }
             }
-            let next = self.priority.pop_front().or_else(|| self.deferred.pop_front());
+            let next = self
+                .priority
+                .pop_front()
+                .or_else(|| self.deferred.pop_front());
             match next {
                 Some(dir) => {
                     self.queued.remove(&dir);
@@ -342,7 +365,9 @@ impl Worker {
             _ => {}
         }
         for path in &event.paths {
-            let Ok(rel) = path.strip_prefix(&self.shared.root_path) else { continue };
+            let Ok(rel) = path.strip_prefix(&self.shared.root_path) else {
+                continue;
+            };
             // Activity inside .git (constant during git operations) doesn't
             // change the indexed tree, which never descends into it.
             if rel.components().any(|c| c.as_os_str() == GIT_DIR) {
@@ -387,7 +412,9 @@ impl Worker {
     fn enqueue_nearest(&mut self, dir: &Path) {
         let mut current = dir;
         loop {
-            let Ok(rel) = current.strip_prefix(&self.shared.root_path) else { return };
+            let Ok(rel) = current.strip_prefix(&self.shared.root_path) else {
+                return;
+            };
             let ignored = {
                 let state = self.shared.state.lock().unwrap();
                 find_node(&state.root, rel).map(|node| node.ignored)
@@ -405,7 +432,9 @@ impl Worker {
 
     /// Enqueue a rescan of `dir` and every already-scanned directory below it.
     fn enqueue_subtree(&mut self, dir: &Path) {
-        let Ok(rel) = dir.strip_prefix(&self.shared.root_path) else { return };
+        let Ok(rel) = dir.strip_prefix(&self.shared.root_path) else {
+            return;
+        };
         let mut to_scan = Vec::new();
         {
             let state = self.shared.state.lock().unwrap();
@@ -483,7 +512,9 @@ impl Worker {
     }
 
     fn scan_dir(&mut self, dir: &Path) {
-        let Ok(rel) = dir.strip_prefix(&self.shared.root_path) else { return };
+        let Ok(rel) = dir.strip_prefix(&self.shared.root_path) else {
+            return;
+        };
         let rel = rel.to_path_buf();
 
         // A directory ignored by its parent stays ignored throughout (matching
@@ -508,7 +539,9 @@ impl Worker {
         let mut dirs: Vec<(OsString, bool)> = Vec::new();
         let mut files: Vec<(OsString, bool)> = Vec::new();
         for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else { continue };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             let name = entry.file_name();
             let child_path = dir.join(&name);
             // Symlinks are listed as files and never followed, so a symlink
@@ -528,7 +561,9 @@ impl Worker {
         let mut to_enqueue: Vec<(PathBuf, bool)> = Vec::new();
         {
             let mut state = self.shared.state.lock().unwrap();
-            let Some(node) = find_node_mut(&mut state.root, &rel) else { return };
+            let Some(node) = find_node_mut(&mut state.root, &rel) else {
+                return;
+            };
             node.scanned = true;
             node.files = files
                 .into_iter()
@@ -572,7 +607,9 @@ impl Worker {
     }
 
     fn remove_node(&self, rel: &Path) {
-        let Some(parent_rel) = rel.parent() else { return };
+        let Some(parent_rel) = rel.parent() else {
+            return;
+        };
         let Some(name) = rel.file_name() else { return };
         let mut state = self.shared.state.lock().unwrap();
         if let Some(parent) = find_node_mut(&mut state.root, parent_rel) {
@@ -639,7 +676,13 @@ mod tests {
 
         assert_eq!(
             relative(index.files(false), &root),
-            vec![".gitignore", "README.md", "src/main.rs", "sub/.gitignore", "sub/lib.rs"]
+            vec![
+                ".gitignore",
+                "README.md",
+                "src/main.rs",
+                "sub/.gitignore",
+                "sub/lib.rs"
+            ]
         );
         assert_eq!(
             relative(index.files(true), &root),
@@ -672,13 +715,20 @@ mod tests {
             entry.ignored
         };
         assert!(flag(".git"), ".git must be marked ignored");
-        assert!(flag("target"), "gitignored directory must be marked ignored");
+        assert!(
+            flag("target"),
+            "gitignored directory must be marked ignored"
+        );
         assert!(flag("notes.log"), "gitignored file must be marked ignored");
         assert!(!flag("src"));
         assert!(!flag("README.md"));
 
         // Directories come first, and everything is sorted by name.
-        let dirs: Vec<_> = entries.iter().take_while(|e| e.is_dir).map(|e| e.name.clone()).collect();
+        let dirs: Vec<_> = entries
+            .iter()
+            .take_while(|e| e.is_dir)
+            .map(|e| e.name.clone())
+            .collect();
         assert_eq!(dirs, vec![".git", "src", "sub", "target"]);
 
         // .git is present in the tree but its contents are not.
@@ -687,7 +737,12 @@ mod tests {
 
         // Nested .gitignore applies to its own directory.
         let sub = index.children("sub").unwrap();
-        assert!(sub.iter().find(|e| e.name == "generated.rs").unwrap().ignored);
+        assert!(
+            sub.iter()
+                .find(|e| e.name == "generated.rs")
+                .unwrap()
+                .ignored
+        );
         assert!(!sub.iter().find(|e| e.name == "lib.rs").unwrap().ignored);
 
         // Files inside an ignored directory are ignored by inheritance.
@@ -705,8 +760,9 @@ mod tests {
 
         write(&root.join("src/new_file.rs"), "new");
         assert!(
-            eventually(|| relative(index.files(false), &root)
-                .contains(&"src/new_file.rs".to_string())),
+            eventually(
+                || relative(index.files(false), &root).contains(&"src/new_file.rs".to_string())
+            ),
             "new file was not picked up by the watcher"
         );
 
@@ -719,8 +775,9 @@ mod tests {
 
         fs::remove_file(root.join("src/new_file.rs")).unwrap();
         assert!(
-            eventually(|| !relative(index.files(false), &root)
-                .contains(&"src/new_file.rs".to_string())),
+            eventually(
+                || !relative(index.files(false), &root).contains(&"src/new_file.rs".to_string())
+            ),
             "deleted file was not removed from the index"
         );
     }
@@ -745,8 +802,7 @@ mod tests {
         // Start ignoring src: its files should drop out of the project set.
         write(&root.join(".gitignore"), "target/\nsrc/\n");
         assert!(
-            eventually(|| !relative(index.files(false), &root)
-                .contains(&"src/main.rs".to_string())),
+            eventually(|| !relative(index.files(false), &root).contains(&"src/main.rs".to_string())),
             "newly ignored directory still appears in project files"
         );
         // But they remain in the full index, flagged as ignored.

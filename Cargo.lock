@@ -1000,6 +1000,8 @@ dependencies = [
  "notify",
  "regex",
  "tempfile",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

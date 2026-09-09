@@ -1,13 +1,5 @@
-[package]
-name = "ninjaedit"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-ninjaedit-core = { path = "core" }
-crossterm = "0.29.0"
-ratatui = "0.30.2"
-
 [workspace]
-members = ["core"]
+resolver = "3"
+members = ["core", "tui"]
+default-members = ["tui"]
 

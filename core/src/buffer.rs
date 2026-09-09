@@ -46,7 +46,11 @@ impl LineEnding {
 
     /// The native line ending for the platform this was compiled for.
     pub fn native() -> LineEnding {
-        if cfg!(windows) { LineEnding::CrLf } else { LineEnding::Lf }
+        if cfg!(windows) {
+            LineEnding::CrLf
+        } else {
+            LineEnding::Lf
+        }
     }
 }
 
@@ -64,7 +68,10 @@ struct Chunk {
 
 impl Chunk {
     fn new(data: Vec<u8>) -> Chunk {
-        let mut chunk = Chunk { data, breaks: Vec::new() };
+        let mut chunk = Chunk {
+            data,
+            breaks: Vec::new(),
+        };
         chunk.rescan();
         chunk
     }
@@ -201,6 +208,13 @@ impl FileBuffer {
         self.modified
     }
 
+    /// Override the modified flag. Used by the editor model, which tracks
+    /// modification against its undo history so that undoing back to the
+    /// saved state reports the buffer as unmodified again.
+    pub(crate) fn set_modified(&mut self, modified: bool) {
+        self.modified = modified;
+    }
+
     /// The line ending used when edits create new line breaks.
     pub fn eol(&self) -> LineEnding {
         self.eol
@@ -304,7 +318,10 @@ impl FileBuffer {
         self.insert_bytes(offset, text.as_bytes());
     }
 
-    fn insert_bytes(&mut self, offset: usize, bytes: &[u8]) {
+    /// Insert raw bytes at a byte offset. Unlike [`insert`](Self::insert)
+    /// this does not require valid UTF-8, so bytes copied out of the buffer
+    /// can be put back exactly.
+    pub fn insert_bytes(&mut self, offset: usize, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
@@ -425,7 +442,8 @@ impl FileBuffer {
         range.start..range.end - terminator
     }
 
-    fn byte_at(&self, offset: usize) -> u8 {
+    /// The byte at an offset. Panics if `offset >= len()`.
+    pub fn byte_at(&self, offset: usize) -> u8 {
         let (index, rel) = self.locate(offset);
         self.chunks[index].data[rel]
     }
@@ -606,14 +624,20 @@ mod tests {
     #[test]
     fn eol_detection() {
         assert_eq!(FileBuffer::from_text("a\nb\nc\n").eol(), LineEnding::Lf);
-        assert_eq!(FileBuffer::from_text("a\r\nb\r\nc\r\n").eol(), LineEnding::CrLf);
+        assert_eq!(
+            FileBuffer::from_text("a\r\nb\r\nc\r\n").eol(),
+            LineEnding::CrLf
+        );
         assert_eq!(FileBuffer::from_text("a\rb\rc\r").eol(), LineEnding::Cr);
         assert_eq!(
             FileBuffer::from_text("a\r\nb\r\nc\n").eol(),
             LineEnding::CrLf,
             "most common ending wins"
         );
-        assert_eq!(FileBuffer::from_text("no line breaks").eol(), LineEnding::native());
+        assert_eq!(
+            FileBuffer::from_text("no line breaks").eol(),
+            LineEnding::native()
+        );
         assert_eq!(FileBuffer::new().eol(), LineEnding::native());
     }
 
@@ -646,8 +670,16 @@ mod tests {
         assert_eq!(buffer.line_text(2), "three");
         assert_eq!(buffer.line_text(3), "four");
         assert_eq!(buffer.line_of_offset(0), 0);
-        assert_eq!(buffer.line_of_offset(3), 0, "offset of the terminator itself");
-        assert_eq!(buffer.line_of_offset(4), 1, "offset just past the terminator");
+        assert_eq!(
+            buffer.line_of_offset(3),
+            0,
+            "offset of the terminator itself"
+        );
+        assert_eq!(
+            buffer.line_of_offset(4),
+            1,
+            "offset just past the terminator"
+        );
         assert_eq!(buffer.line_of_offset(buffer.len()), 3);
     }
 
@@ -746,7 +778,11 @@ mod tests {
         buffer.insert(boundary, "\n");
         let line_count = buffer.line_count();
         buffer.insert(boundary, "\r");
-        assert_eq!(buffer.line_count(), line_count, "CR+LF must merge into one break");
+        assert_eq!(
+            buffer.line_count(),
+            line_count,
+            "CR+LF must merge into one break"
+        );
     }
 
     struct Rng(u64);
@@ -760,14 +796,26 @@ mod tests {
         }
 
         fn below(&mut self, bound: usize) -> usize {
-            if bound == 0 { 0 } else { (self.next() % bound as u64) as usize }
+            if bound == 0 {
+                0
+            } else {
+                (self.next() % bound as u64) as usize
+            }
         }
     }
 
     #[test]
     fn randomized_edits_match_reference() {
         let mut rng = Rng(0x1234_5678_9abc_def1);
-        let pieces = ["alpha", "b", "\n", "\r\n", "\r", "some longer text ", "\n\r\n\r"];
+        let pieces = [
+            "alpha",
+            "b",
+            "\n",
+            "\r\n",
+            "\r",
+            "some longer text ",
+            "\n\r\n\r",
+        ];
 
         let mut expected = String::new();
         for _ in 0..20000 {
@@ -806,7 +854,11 @@ mod tests {
         assert_eq!(buffer.path(), Some(path.as_path()));
 
         let reloaded = FileBuffer::open(&path).unwrap();
-        assert_eq!(reloaded.to_text(), contents, "endings must be preserved exactly");
+        assert_eq!(
+            reloaded.to_text(),
+            contents,
+            "endings must be preserved exactly"
+        );
     }
 
     #[test]

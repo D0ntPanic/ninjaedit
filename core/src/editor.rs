@@ -1,0 +1,1482 @@
+//! Editor model: the UI-agnostic state of a text editor.
+//!
+//! An [`Editor`] owns a [`FileBuffer`] and layers on top of it everything
+//! that makes the buffer editable: a cursor, an optional selection, and an
+//! undo history. Every change to the buffer goes through the editor so the
+//! history always matches the contents; readers get the buffer through
+//! [`Editor::buffer`] for display and searching, but never mutably.
+//!
+//! Positions are byte offsets into the buffer, which is what the buffer's own
+//! line and range queries use. A "character" for movement is a grapheme
+//! cluster (see the [`text`](crate::text) module), so the cursor is always
+//! kept on a cluster boundary: never inside a multi-byte sequence, between a
+//! base character and its combining marks, or inside a CRLF pair.
+//! [`Position`] converts to and from line/column pairs for display, where a
+//! column is a terminal cell: wide characters take two, tabs extend to the
+//! next tab stop. Vertical movement remembers the column it started from, so
+//! moving across a short line and back returns to the original column.
+//!
+//! Undo: cursor and selection changes are not undoable on their own, but each
+//! undo entry records the cursor and selection from before and after its
+//! edit, and undo/redo restore them. Runs of typing, of backspaces, and of
+//! forward deletes are merged into a single entry so that undo works in
+//! natural units; a run is broken by any cursor movement, by a newline, by a
+//! save, and when a new word starts after whitespace.
+//!
+//! The clipboard belongs to the UI. [`Editor::copy`] and [`Editor::cut`]
+//! return the text for the caller to place on the clipboard, and
+//! [`Editor::paste`] takes the text to insert. Undo entries carry the bytes
+//! they removed or inserted, so undoing a cut or paste is independent of
+//! whatever the clipboard holds by then.
+//!
+//! Modified state is tracked against the undo history: the editor remembers
+//! where in the history the buffer was last saved (or loaded), and reports
+//! itself unmodified whenever it is back at that point, whether by undo,
+//! redo, or save.
+
+use crate::buffer::FileBuffer;
+use crate::text::{self, Grapheme};
+use std::io;
+use std::ops::Range;
+use std::path::Path;
+
+/// The default number of cells between tab stops.
+pub const DEFAULT_TAB_WIDTH: usize = 4;
+
+/// A cursor movement, used both to move the cursor and to extend a selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Movement {
+    /// One character left; at the start of a line, to the end of the previous
+    /// line.
+    Left,
+    /// One character right; at the end of a line, to the start of the next.
+    Right,
+    /// One line up, keeping the column. On the first line, to the start of
+    /// the buffer.
+    Up,
+    /// One line down, keeping the column. On the last line, to the end of the
+    /// buffer.
+    Down,
+    /// To the start of the previous word (skipping whitespace first); at the
+    /// start of a line, to the end of the previous line.
+    WordLeft,
+    /// To the end of the next word (skipping whitespace first); at the end of
+    /// a line, to the start of the next line.
+    WordRight,
+    /// To the first byte of the current line.
+    LineStart,
+    /// To the end of the current line's content, before its terminator.
+    LineEnd,
+    /// Up by the given number of lines (the height of the view), keeping the
+    /// column. On the first line, to the start of the buffer.
+    PageUp(usize),
+    /// Down by the given number of lines (the height of the view), keeping
+    /// the column. On the last line, to the end of the buffer.
+    PageDown(usize),
+    DocumentStart,
+    DocumentEnd,
+}
+
+/// A location in the buffer as a zero-based line and column. The column is
+/// a display column in terminal cells (see [`text::width`]), not a byte or
+/// code point index.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Position {
+    pub line: usize,
+    pub column: usize,
+}
+
+/// One character of a line laid out for display: where it lives in the
+/// buffer and which cells it occupies. See [`Editor::line_cells`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cell {
+    /// The character's byte range in the buffer.
+    pub range: Range<usize>,
+    /// The character's text; U+FFFD for a byte of invalid UTF-8.
+    pub text: String,
+    /// The display column the character starts at.
+    pub column: usize,
+    /// The number of cells the character occupies (may be zero).
+    pub width: usize,
+}
+
+/// The cursor and selection anchor, as saved in undo entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CursorState {
+    cursor: usize,
+    anchor: Option<usize>,
+}
+
+/// One replacement of bytes at an offset: `removed` was replaced with
+/// `inserted`. Either may be empty.
+struct Edit {
+    offset: usize,
+    removed: Vec<u8>,
+    inserted: Vec<u8>,
+}
+
+/// The kind of edit an undo entry holds, used to decide whether consecutive
+/// edits merge into one entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditKind {
+    /// Characters typed one at a time.
+    Typing,
+    /// Backspace over single characters.
+    Backspace,
+    /// Forward deletion of single characters.
+    Delete,
+    /// Anything else; never merged.
+    Other,
+}
+
+struct UndoEntry {
+    before: CursorState,
+    after: CursorState,
+    edit: Edit,
+    kind: EditKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharClass {
+    Word,
+    Space,
+    Punctuation,
+}
+
+/// Classify a grapheme by its first code point.
+fn classify(grapheme: &str) -> CharClass {
+    let c = grapheme.chars().next().unwrap_or('\u{FFFD}');
+    if c.is_alphanumeric() || c == '_' {
+        CharClass::Word
+    } else if c.is_whitespace() {
+        CharClass::Space
+    } else {
+        CharClass::Punctuation
+    }
+}
+
+/// The layout of one line's content: its characters with their byte ranges
+/// (relative to the start of the line) and display columns.
+struct Layout {
+    /// Byte offset of the line's content in the buffer.
+    start: usize,
+    cells: Vec<LayoutCell>,
+    /// The display column after the last character.
+    end_column: usize,
+}
+
+struct LayoutCell {
+    range: Range<usize>,
+    column: usize,
+    width: usize,
+    class: CharClass,
+}
+
+impl Layout {
+    fn new(start: usize, bytes: &[u8], tab_width: usize) -> Layout {
+        let mut column = 0;
+        let cells = text::graphemes(bytes)
+            .map(|Grapheme { range, text }| {
+                let width = text::width(text, column, tab_width);
+                let cell = LayoutCell {
+                    range,
+                    column,
+                    width,
+                    class: classify(text),
+                };
+                column += width;
+                cell
+            })
+            .collect();
+        Layout {
+            start,
+            cells,
+            end_column: column,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.cells.last().map_or(0, |c| c.range.end)
+    }
+
+    /// Index of the character containing the relative offset `rel`.
+    fn cell_at(&self, rel: usize) -> Option<usize> {
+        let i = self.cells.partition_point(|c| c.range.end <= rel);
+        (i < self.cells.len()).then_some(i)
+    }
+
+    /// The display column of a relative offset, which is snapped back to
+    /// the start of the character containing it.
+    fn column_of(&self, rel: usize) -> usize {
+        match self.cell_at(rel) {
+            Some(i) => self.cells[i].column,
+            None => self.end_column,
+        }
+    }
+
+    /// The relative offset of the character covering a display column, or
+    /// the end of the line if the column is past its content. A column in
+    /// the middle of a wide character maps to that character's start.
+    fn offset_at_column(&self, column: usize) -> usize {
+        let i = self.cells.partition_point(|c| c.column + c.width <= column);
+        self.cells.get(i).map_or(self.len(), |c| c.range.start)
+    }
+}
+
+/// Rewrite every line break in `text` (LF, CRLF, or lone CR) as `eol`.
+fn normalize_line_endings(text: &str, eol: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' => out.push_str(eol),
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push_str(eol);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// A text editor over a single [`FileBuffer`]: cursor, selection, and undo
+/// history. See the [module documentation](self) for an overview.
+pub struct Editor {
+    buffer: FileBuffer,
+    cursor: usize,
+    /// The fixed end of the selection; the cursor is the moving end. `None`
+    /// when nothing is selected.
+    anchor: Option<usize>,
+    /// The column vertical movement aims for, remembered across lines that
+    /// are too short to reach it. Cleared by anything that isn't a vertical
+    /// movement.
+    desired_column: Option<usize>,
+    undo: Vec<UndoEntry>,
+    redo: Vec<UndoEntry>,
+    /// Whether the newest undo entry may absorb another edit of its kind.
+    grouping: bool,
+    /// The undo stack depth at which the buffer matched the file on disk, or
+    /// `None` if that state is no longer in the history.
+    save_point: Option<usize>,
+    tab_width: usize,
+}
+
+impl Editor {
+    /// Create an editor over a buffer, with the cursor at the start and no
+    /// selection.
+    pub fn new(buffer: FileBuffer) -> Editor {
+        let save_point = if buffer.is_modified() { None } else { Some(0) };
+        Editor {
+            buffer,
+            cursor: 0,
+            anchor: None,
+            desired_column: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            grouping: false,
+            save_point,
+            tab_width: DEFAULT_TAB_WIDTH,
+        }
+    }
+
+    /// The buffer being edited, for reading and display. All edits go
+    /// through the editor so the undo history stays consistent.
+    pub fn buffer(&self) -> &FileBuffer {
+        &self.buffer
+    }
+
+    /// The number of cells between tab stops, used for display columns.
+    pub fn tab_width(&self) -> usize {
+        self.tab_width
+    }
+
+    pub fn set_tab_width(&mut self, tab_width: usize) {
+        self.tab_width = tab_width.max(1);
+    }
+
+    /// Lay out a line's content for display: each character with its byte
+    /// range and the cells it occupies, using the editor's tab width. The
+    /// line's terminator is not included.
+    pub fn line_cells(&self, line: usize) -> Vec<Cell> {
+        let layout = self.layout(line);
+        let bytes = self
+            .buffer
+            .bytes_in_range(layout.start..layout.start + layout.len());
+        layout
+            .cells
+            .iter()
+            .zip(text::graphemes(&bytes))
+            .map(|(cell, grapheme)| Cell {
+                range: layout.start + cell.range.start..layout.start + cell.range.end,
+                text: grapheme.text.to_owned(),
+                column: cell.column,
+                width: cell.width,
+            })
+            .collect()
+    }
+
+    // ----- Cursor and selection -------------------------------------------
+
+    /// The cursor's byte offset.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// The cursor as a line and column.
+    pub fn cursor_position(&self) -> Position {
+        self.position_of_offset(self.cursor)
+    }
+
+    /// The selection anchor: the end of the selection that doesn't move.
+    /// `None` when nothing is selected.
+    pub fn anchor(&self) -> Option<usize> {
+        self.anchor
+    }
+
+    /// The selected byte range, or `None` if the selection is empty.
+    pub fn selection(&self) -> Option<Range<usize>> {
+        let anchor = self.anchor?;
+        if anchor == self.cursor {
+            return None;
+        }
+        Some(anchor.min(self.cursor)..anchor.max(self.cursor))
+    }
+
+    /// The selected text, or `None` if the selection is empty. Invalid UTF-8
+    /// is replaced.
+    pub fn selected_text(&self) -> Option<String> {
+        let range = self.selection()?;
+        Some(String::from_utf8_lossy(&self.buffer.bytes_in_range(range)).into_owned())
+    }
+
+    /// The line and column of a byte offset.
+    pub fn position_of_offset(&self, offset: usize) -> Position {
+        let offset = offset.min(self.buffer.len());
+        let line = self.buffer.line_of_offset(offset);
+        Position {
+            line,
+            column: self.column_of(line, offset),
+        }
+    }
+
+    /// The byte offset of a line and column. Lines past the end map to the
+    /// last line, and columns past the end of a line to the end of that
+    /// line's content.
+    pub fn offset_of_position(&self, position: Position) -> usize {
+        let line = position.line.min(self.buffer.line_count() - 1);
+        self.offset_at_column(line, position.column)
+    }
+
+    /// Place the cursor at a byte offset and clear the selection. The offset
+    /// is clamped to the buffer and snapped back to a character boundary.
+    pub fn set_cursor(&mut self, offset: usize) {
+        self.cursor = self.snap(offset);
+        self.anchor = None;
+        self.end_movement();
+    }
+
+    /// Select from `anchor` to `cursor`, leaving the cursor at `cursor`. Both
+    /// are clamped and snapped like [`set_cursor`](Self::set_cursor).
+    pub fn set_selection(&mut self, anchor: usize, cursor: usize) {
+        self.anchor = Some(self.snap(anchor));
+        self.cursor = self.snap(cursor);
+        self.end_movement();
+    }
+
+    /// Select the whole buffer, leaving the cursor at the end.
+    pub fn select_all(&mut self) {
+        self.anchor = Some(0);
+        self.cursor = self.buffer.len();
+        self.end_movement();
+    }
+
+    /// Clear the selection, leaving the cursor where it is.
+    pub fn clear_selection(&mut self) {
+        self.anchor = None;
+        self.end_movement();
+    }
+
+    /// Move the cursor, clearing any selection. Moving left or right out of
+    /// a selection collapses it to its start or end.
+    pub fn move_cursor(&mut self, movement: Movement) {
+        if let Some(range) = self.selection() {
+            let collapsed = match movement {
+                Movement::Left => Some(range.start),
+                Movement::Right => Some(range.end),
+                _ => None,
+            };
+            if let Some(offset) = collapsed {
+                self.cursor = offset;
+                self.anchor = None;
+                self.end_movement();
+                return;
+            }
+        }
+        self.apply_movement(movement, false);
+    }
+
+    /// Move the cursor while keeping (or starting) a selection from where
+    /// the cursor was.
+    pub fn extend_selection(&mut self, movement: Movement) {
+        self.apply_movement(movement, true);
+    }
+
+    fn apply_movement(&mut self, movement: Movement, extend: bool) {
+        let vertical = matches!(
+            movement,
+            Movement::Up | Movement::Down | Movement::PageUp(_) | Movement::PageDown(_)
+        );
+        let line = self.buffer.line_of_offset(self.cursor);
+        let mut column = if vertical {
+            Some(
+                self.desired_column
+                    .unwrap_or_else(|| self.column_of(line, self.cursor)),
+            )
+        } else {
+            None
+        };
+        let mut vertical_target =
+            |delta: isize| match self.vertical_target(line, column.unwrap(), delta) {
+                Some(offset) => offset,
+                // Ran off the first or last line: jump to that end of the buffer,
+                // which is a horizontal move, so forget the column.
+                None => {
+                    column = None;
+                    if delta < 0 { 0 } else { self.buffer.len() }
+                }
+            };
+        let target = match movement {
+            Movement::Left => self.prev_char(self.cursor),
+            Movement::Right => self.next_char(self.cursor),
+            Movement::Up => vertical_target(-1),
+            Movement::Down => vertical_target(1),
+            Movement::PageUp(height) => vertical_target(-(height.max(1) as isize)),
+            Movement::PageDown(height) => vertical_target(height.max(1) as isize),
+            Movement::WordLeft => self.word_left(self.cursor),
+            Movement::WordRight => self.word_right(self.cursor),
+            Movement::LineStart => self.buffer.offset_of_line(line),
+            Movement::LineEnd => self.buffer.line_content_range(line).end,
+            Movement::DocumentStart => 0,
+            Movement::DocumentEnd => self.buffer.len(),
+        };
+        if extend {
+            if self.anchor.is_none() {
+                self.anchor = Some(self.cursor);
+            }
+        } else {
+            self.anchor = None;
+        }
+        self.cursor = target;
+        self.grouping = false;
+        self.desired_column = column;
+    }
+
+    /// Bookkeeping shared by all explicit cursor changes: they break undo
+    /// grouping and forget the remembered vertical column.
+    fn end_movement(&mut self) {
+        self.grouping = false;
+        self.desired_column = None;
+    }
+
+    // ----- Position arithmetic -------------------------------------------
+
+    fn layout(&self, line: usize) -> Layout {
+        let content = self.buffer.line_content_range(line);
+        let bytes = self.buffer.bytes_in_range(content.clone());
+        Layout::new(content.start, &bytes, self.tab_width)
+    }
+
+    /// Clamp an offset to the buffer and move it back to the nearest
+    /// character boundary (out of a grapheme cluster or a CRLF pair).
+    fn snap(&self, offset: usize) -> usize {
+        let offset = offset.min(self.buffer.len());
+        let layout = self.layout(self.buffer.line_of_offset(offset));
+        let rel = offset - layout.start;
+        match layout.cell_at(rel) {
+            Some(i) => layout.start + layout.cells[i].range.start,
+            None => layout.start + layout.len(), // at the end, or inside a CRLF pair
+        }
+    }
+
+    /// The display column of an offset that lies on `line`.
+    fn column_of(&self, line: usize, offset: usize) -> usize {
+        let layout = self.layout(line);
+        layout.column_of(offset.saturating_sub(layout.start))
+    }
+
+    /// The offset of a display column on a line, clamped to the end of the
+    /// line's content.
+    fn offset_at_column(&self, line: usize, column: usize) -> usize {
+        let layout = self.layout(line);
+        layout.start + layout.offset_at_column(column)
+    }
+
+    /// The offset one character to the right, crossing to the next line at
+    /// the end of a line. Returns `offset` itself at the end of the buffer.
+    fn next_char(&self, offset: usize) -> usize {
+        let line = self.buffer.line_of_offset(offset);
+        let layout = self.layout(line);
+        match layout.cell_at(offset - layout.start) {
+            Some(i) => layout.start + layout.cells[i].range.end,
+            None if line + 1 < self.buffer.line_count() => self.buffer.offset_of_line(line + 1),
+            None => offset,
+        }
+    }
+
+    /// The offset one character to the left, crossing to the previous line
+    /// at the start of a line. Returns 0 at the start of the buffer.
+    fn prev_char(&self, offset: usize) -> usize {
+        let line = self.buffer.line_of_offset(offset);
+        let layout = self.layout(line);
+        let rel = offset - layout.start;
+        if rel == 0 {
+            return if line > 0 {
+                self.buffer.line_content_range(line - 1).end
+            } else {
+                0
+            };
+        }
+        // The character ending at (or containing) rel.
+        let i = layout.cells.partition_point(|c| c.range.end < rel);
+        layout.start + layout.cells[i.min(layout.cells.len() - 1)].range.start
+    }
+
+    fn word_right(&self, offset: usize) -> usize {
+        let line = self.buffer.line_of_offset(offset);
+        let layout = self.layout(line);
+        let Some(mut i) = layout.cell_at(offset - layout.start) else {
+            return self.next_char(offset);
+        };
+        let cells = &layout.cells;
+        while i < cells.len() && cells[i].class == CharClass::Space {
+            i += 1;
+        }
+        if i < cells.len() {
+            let run = cells[i].class;
+            while i < cells.len() && cells[i].class == run {
+                i += 1;
+            }
+        }
+        layout.start + cells.get(i).map_or(layout.len(), |c| c.range.start)
+    }
+
+    fn word_left(&self, offset: usize) -> usize {
+        let line = self.buffer.line_of_offset(offset);
+        let layout = self.layout(line);
+        let rel = offset - layout.start;
+        if rel == 0 {
+            return self.prev_char(offset);
+        }
+        let cells = &layout.cells;
+        // Number of characters strictly before the cursor.
+        let mut i = cells.partition_point(|c| c.range.start < rel);
+        while i > 0 && cells[i - 1].class == CharClass::Space {
+            i -= 1;
+        }
+        if i > 0 {
+            let run = cells[i - 1].class;
+            while i > 0 && cells[i - 1].class == run {
+                i -= 1;
+            }
+        }
+        layout.start + cells.get(i).map_or(layout.len(), |c| c.range.start)
+    }
+
+    /// The target of moving `delta` lines from `line` aiming for `column`,
+    /// or `None` if `line` is already the first (or last) line.
+    fn vertical_target(&self, line: usize, column: usize, delta: isize) -> Option<usize> {
+        let last = self.buffer.line_count() - 1;
+        let target = if delta < 0 {
+            line.saturating_sub(delta.unsigned_abs())
+        } else {
+            (line + delta as usize).min(last)
+        };
+        if target == line {
+            return None;
+        }
+        Some(self.offset_at_column(target, column))
+    }
+
+    // ----- Editing --------------------------------------------------------
+
+    /// Insert a typed character at the cursor, replacing the selection if
+    /// there is one. `'\n'` and `'\r'` insert the buffer's line ending.
+    pub fn insert_char(&mut self, c: char) {
+        if c == '\n' || c == '\r' {
+            let eol = self.buffer.eol().as_str().as_bytes().to_vec();
+            self.replace_selection_with(eol, EditKind::Other);
+            return;
+        }
+        let mut bytes = [0u8; 4];
+        let inserted = c.encode_utf8(&mut bytes).as_bytes().to_vec();
+        self.replace_selection_with(inserted, EditKind::Typing);
+    }
+
+    /// Insert text at the cursor, replacing the selection if there is one.
+    /// Line breaks in the text are rewritten as the buffer's line ending.
+    pub fn insert_text(&mut self, text: &str) {
+        let text = normalize_line_endings(text, self.buffer.eol().as_str());
+        if text.is_empty() {
+            return;
+        }
+        self.replace_selection_with(text.into_bytes(), EditKind::Other);
+    }
+
+    /// Delete the selection, or the character before the cursor if nothing
+    /// is selected.
+    pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        let start = self.prev_char(self.cursor);
+        if start < self.cursor {
+            self.commit(start..self.cursor, Vec::new(), EditKind::Backspace);
+        }
+    }
+
+    /// Delete the selection, or the character after the cursor if nothing is
+    /// selected.
+    pub fn delete_forward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        let end = self.next_char(self.cursor);
+        if end > self.cursor {
+            self.commit(self.cursor..end, Vec::new(), EditKind::Delete);
+        }
+    }
+
+    /// Delete the selected text. Returns whether anything was selected.
+    pub fn delete_selection(&mut self) -> bool {
+        match self.selection() {
+            Some(range) => {
+                self.commit(range, Vec::new(), EditKind::Other);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The selected text, for the caller to place on the clipboard. Does
+    /// not change the buffer. `None` if nothing is selected.
+    pub fn copy(&self) -> Option<String> {
+        self.selected_text()
+    }
+
+    /// Delete the selected text and return it, for the caller to place on
+    /// the clipboard. `None` (and no change) if nothing is selected.
+    pub fn cut(&mut self) -> Option<String> {
+        let text = self.selected_text()?;
+        self.delete_selection();
+        Some(text)
+    }
+
+    /// Insert clipboard text at the cursor, replacing the selection if there
+    /// is one. Line breaks are rewritten as the buffer's line ending.
+    pub fn paste(&mut self, text: &str) {
+        self.insert_text(text);
+    }
+
+    /// Replace the selection (or insert at the cursor) with `inserted`.
+    fn replace_selection_with(&mut self, inserted: Vec<u8>, kind: EditKind) {
+        let range = self.selection().unwrap_or(self.cursor..self.cursor);
+        self.commit(range, inserted, kind);
+    }
+
+    /// Replace `range` with `inserted`, leaving the cursor after the inserted
+    /// bytes with no selection, and record the change for undo.
+    fn commit(&mut self, range: Range<usize>, inserted: Vec<u8>, kind: EditKind) {
+        let before = self.state();
+        let edit = Edit {
+            offset: range.start,
+            removed: self.buffer.bytes_in_range(range),
+            inserted,
+        };
+        self.apply(&edit);
+        self.cursor = edit.offset + edit.inserted.len();
+        self.anchor = None;
+        self.desired_column = None;
+
+        self.redo.clear();
+        if self.save_point.is_some_and(|depth| depth > self.undo.len()) {
+            // The saved state lived in the redo history we just discarded.
+            self.save_point = None;
+        }
+        let after = self.state();
+        let merged = self.grouping
+            && kind != EditKind::Other
+            && self
+                .undo
+                .last_mut()
+                .is_some_and(|last| last.try_merge(&edit, kind, after));
+        if !merged {
+            self.undo.push(UndoEntry {
+                before,
+                after,
+                edit,
+                kind,
+            });
+        }
+        self.grouping = kind != EditKind::Other;
+        self.sync_modified();
+    }
+
+    /// Apply an edit's replacement to the buffer.
+    fn apply(&mut self, edit: &Edit) {
+        self.buffer
+            .delete(edit.offset..edit.offset + edit.removed.len());
+        self.buffer.insert_bytes(edit.offset, &edit.inserted);
+    }
+
+    /// Reverse an edit's replacement in the buffer.
+    fn revert(&mut self, edit: &Edit) {
+        self.buffer
+            .delete(edit.offset..edit.offset + edit.inserted.len());
+        self.buffer.insert_bytes(edit.offset, &edit.removed);
+    }
+
+    fn state(&self) -> CursorState {
+        CursorState {
+            cursor: self.cursor,
+            anchor: self.anchor,
+        }
+    }
+
+    fn restore(&mut self, state: CursorState) {
+        self.cursor = state.cursor;
+        self.anchor = state.anchor;
+        self.end_movement();
+    }
+
+    // ----- Undo -----------------------------------------------------------
+
+    /// Undo the most recent edit, restoring the cursor and selection from
+    /// before it. Returns whether there was anything to undo.
+    pub fn undo(&mut self) -> bool {
+        let Some(entry) = self.undo.pop() else {
+            return false;
+        };
+        self.revert(&entry.edit);
+        self.restore(entry.before);
+        self.redo.push(entry);
+        self.sync_modified();
+        true
+    }
+
+    /// Redo the most recently undone edit, restoring the cursor and
+    /// selection from after it. Returns whether there was anything to redo.
+    pub fn redo(&mut self) -> bool {
+        let Some(entry) = self.redo.pop() else {
+            return false;
+        };
+        self.apply(&entry.edit);
+        self.restore(entry.after);
+        self.undo.push(entry);
+        self.sync_modified();
+        true
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    // ----- Files ----------------------------------------------------------
+
+    /// Whether the buffer differs from the file it was loaded from or last
+    /// saved to. Undoing back to the saved state clears this.
+    pub fn is_modified(&self) -> bool {
+        self.save_point != Some(self.undo.len())
+    }
+
+    fn sync_modified(&mut self) {
+        let modified = self.is_modified();
+        self.buffer.set_modified(modified);
+    }
+
+    fn mark_saved(&mut self) {
+        self.save_point = Some(self.undo.len());
+        self.grouping = false;
+        self.sync_modified();
+    }
+
+    /// Save to the buffer's associated file. Fails if it has none.
+    pub fn save(&mut self) -> io::Result<()> {
+        self.buffer.save()?;
+        self.mark_saved();
+        Ok(())
+    }
+
+    /// Save to a file, which becomes the buffer's associated file.
+    pub fn save_as(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.buffer.save_as(path)?;
+        self.mark_saved();
+        Ok(())
+    }
+}
+
+impl UndoEntry {
+    /// Try to absorb `edit` into this entry, which is possible when both are
+    /// the same kind of single-character edit and `edit` continues where
+    /// this entry left off. On success the entry's `after` state is updated.
+    fn try_merge(&mut self, edit: &Edit, kind: EditKind, after: CursorState) -> bool {
+        if self.kind != kind {
+            return false;
+        }
+        let last = &mut self.edit;
+        let mergeable = match kind {
+            EditKind::Typing => {
+                let contiguous =
+                    edit.removed.is_empty() && edit.offset == last.offset + last.inserted.len();
+                // Start a new entry when a word begins after whitespace, so
+                // undo removes one word at a time.
+                let starts_word = last
+                    .inserted
+                    .last()
+                    .is_some_and(|b| b.is_ascii_whitespace())
+                    && edit
+                        .inserted
+                        .first()
+                        .is_some_and(|b| !b.is_ascii_whitespace());
+                contiguous && !starts_word
+            }
+            EditKind::Backspace => {
+                edit.inserted.is_empty() && edit.offset + edit.removed.len() == last.offset
+            }
+            EditKind::Delete => edit.inserted.is_empty() && edit.offset == last.offset,
+            EditKind::Other => false,
+        };
+        if !mergeable {
+            return false;
+        }
+        match kind {
+            EditKind::Typing => last.inserted.extend_from_slice(&edit.inserted),
+            EditKind::Backspace => {
+                last.removed.splice(0..0, edit.removed.iter().copied());
+                last.offset = edit.offset;
+            }
+            EditKind::Delete => last.removed.extend_from_slice(&edit.removed),
+            EditKind::Other => unreachable!(),
+        }
+        self.after = after;
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use Movement::*;
+
+    fn editor(text: &str) -> Editor {
+        Editor::new(FileBuffer::from_text(text))
+    }
+
+    fn text(editor: &Editor) -> String {
+        editor.buffer().to_text()
+    }
+
+    fn type_str(editor: &mut Editor, s: &str) {
+        for c in s.chars() {
+            editor.insert_char(c);
+        }
+    }
+
+    #[test]
+    fn character_movement_handles_utf8_and_crlf() {
+        let mut ed = editor("aé\r\nb");
+        let expected_right = [1, 3, 5, 6, 6];
+        for &offset in &expected_right {
+            ed.move_cursor(Right);
+            assert_eq!(ed.cursor(), offset);
+        }
+        let expected_left = [5, 3, 1, 0, 0];
+        for &offset in &expected_left {
+            ed.move_cursor(Left);
+            assert_eq!(ed.cursor(), offset);
+        }
+    }
+
+    #[test]
+    fn combining_marks_move_as_one_character() {
+        // "e" + combining acute accent, then "x".
+        let mut ed = editor("e\u{301}x");
+        ed.move_cursor(Right);
+        assert_eq!(ed.cursor(), 3, "past the whole cluster");
+        assert_eq!(ed.cursor_position(), Position { line: 0, column: 1 });
+        ed.move_cursor(Right);
+        assert_eq!(ed.cursor(), 4);
+        ed.move_cursor(Left);
+        ed.move_cursor(Left);
+        assert_eq!(ed.cursor(), 0);
+        ed.set_cursor(1);
+        assert_eq!(
+            ed.cursor(),
+            0,
+            "between base and mark snaps to the cluster start"
+        );
+        ed.set_cursor(3);
+        ed.backspace();
+        assert_eq!(text(&ed), "x", "backspace removes the whole cluster");
+        ed.undo();
+        ed.set_cursor(0);
+        ed.delete_forward();
+        assert_eq!(text(&ed), "x", "delete removes the whole cluster");
+        ed.undo();
+        ed.extend_selection(WordRight);
+        assert_eq!(
+            ed.selected_text().as_deref(),
+            Some("e\u{301}x"),
+            "clusters join words"
+        );
+    }
+
+    #[test]
+    fn emoji_sequences_are_one_character() {
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let flag = "🇺🇸";
+        let mut ed = editor(&format!("{family}{flag}!"));
+        ed.move_cursor(Right);
+        assert_eq!(ed.cursor(), family.len());
+        assert_eq!(ed.cursor_position().column, 2);
+        ed.move_cursor(Right);
+        assert_eq!(ed.cursor(), family.len() + flag.len());
+        assert_eq!(ed.cursor_position().column, 4);
+        ed.move_cursor(Left);
+        assert_eq!(ed.cursor(), family.len());
+    }
+
+    #[test]
+    fn wide_characters_take_two_columns() {
+        let mut ed = editor("한글ab\nabcdef");
+        ed.set_cursor(9 + 3);
+        assert_eq!(ed.cursor_position(), Position { line: 1, column: 3 });
+        ed.move_cursor(Up);
+        // Column 3 is the middle of "글" (columns 2..4): land at its start.
+        assert_eq!(ed.cursor(), 3);
+        assert_eq!(ed.cursor_position(), Position { line: 0, column: 2 });
+        ed.move_cursor(Down);
+        assert_eq!(
+            ed.cursor_position(),
+            Position { line: 1, column: 3 },
+            "desired column kept"
+        );
+        assert_eq!(ed.offset_of_position(Position { line: 0, column: 4 }), 6);
+        assert_eq!(ed.offset_of_position(Position { line: 0, column: 5 }), 7);
+        assert_eq!(ed.position_of_offset(6), Position { line: 0, column: 4 });
+    }
+
+    #[test]
+    fn tabs_advance_to_the_next_tab_stop() {
+        let mut ed = editor("\tx\n123456789\na\tb");
+        assert_eq!(ed.tab_width(), DEFAULT_TAB_WIDTH);
+        ed.move_cursor(Right);
+        assert_eq!(ed.cursor_position(), Position { line: 0, column: 4 });
+        ed.move_cursor(Down);
+        assert_eq!(ed.cursor(), 3 + 4);
+        ed.move_cursor(Down);
+        assert_eq!(ed.cursor_position(), Position { line: 2, column: 4 });
+        assert_eq!(
+            ed.cursor(),
+            3 + 10 + 2,
+            "column 4 is past the tab ending at column 4"
+        );
+
+        ed.set_tab_width(8);
+        assert_eq!(ed.position_of_offset(1), Position { line: 0, column: 8 });
+        assert_eq!(
+            ed.position_of_offset(3 + 10 + 2),
+            Position { line: 2, column: 8 }
+        );
+        ed.set_tab_width(0);
+        assert_eq!(ed.tab_width(), 1, "tab width is at least one");
+    }
+
+    #[test]
+    fn invalid_utf8_bytes_are_single_characters() {
+        let mut ed = Editor::new(FileBuffer::from_bytes(b"a\xff\xfeb"));
+        for expected in [1, 2, 3, 4, 4] {
+            ed.move_cursor(Right);
+            assert_eq!(ed.cursor(), expected);
+        }
+        assert_eq!(ed.cursor_position().column, 4);
+        ed.backspace();
+        ed.backspace();
+        assert_eq!(ed.buffer().to_bytes(), b"a\xff");
+    }
+
+    #[test]
+    fn line_cells_lay_out_a_line() {
+        let mut ed = editor("a\t한\r\n");
+        let cells = ed.line_cells(0);
+        let summary: Vec<_> = cells
+            .iter()
+            .map(|c| (c.range.clone(), c.text.as_str(), c.column, c.width))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![(0..1, "a", 0, 1), (1..2, "\t", 1, 3), (2..5, "한", 4, 2)]
+        );
+        assert!(ed.line_cells(1).is_empty());
+
+        ed.set_tab_width(2);
+        assert_eq!(ed.line_cells(0)[1].width, 1);
+
+        let invalid = Editor::new(FileBuffer::from_bytes(b"\xff"));
+        assert_eq!(invalid.line_cells(0)[0].text, "\u{FFFD}");
+    }
+
+    #[test]
+    fn positions_round_trip() {
+        let ed = editor("aé\r\nb\nlast");
+        assert_eq!(ed.position_of_offset(3), Position { line: 0, column: 2 });
+        assert_eq!(ed.position_of_offset(5), Position { line: 1, column: 0 });
+        assert_eq!(ed.offset_of_position(Position { line: 0, column: 2 }), 3);
+        assert_eq!(
+            ed.offset_of_position(Position {
+                line: 0,
+                column: 99
+            }),
+            3,
+            "clamps column"
+        );
+        assert_eq!(
+            ed.offset_of_position(Position {
+                line: 99,
+                column: 1
+            }),
+            8,
+            "clamps line"
+        );
+        assert_eq!(ed.cursor_position(), Position::default());
+    }
+
+    #[test]
+    fn set_cursor_snaps_to_character_boundaries() {
+        let mut ed = editor("aé\r\nb");
+        ed.set_cursor(2);
+        assert_eq!(ed.cursor(), 1, "inside a multi-byte character");
+        ed.set_cursor(4);
+        assert_eq!(ed.cursor(), 3, "inside a CRLF pair");
+        ed.set_cursor(100);
+        assert_eq!(ed.cursor(), 6, "past the end");
+        ed.set_selection(100, 2);
+        assert_eq!(ed.selection(), Some(1..6));
+    }
+
+    #[test]
+    fn word_movement() {
+        let mut ed = editor("foo bar_baz  (qux)\nnext");
+        for &offset in &[3, 11, 14, 17, 18, 19, 23, 23] {
+            ed.move_cursor(WordRight);
+            assert_eq!(ed.cursor(), offset);
+        }
+        for &offset in &[19, 18, 17, 14, 13, 4, 0, 0] {
+            ed.move_cursor(WordLeft);
+            assert_eq!(ed.cursor(), offset);
+        }
+    }
+
+    #[test]
+    fn line_and_document_movement() {
+        let mut ed = editor("first\r\nsecond");
+        ed.set_cursor(2);
+        ed.move_cursor(LineEnd);
+        assert_eq!(ed.cursor(), 5, "before the terminator");
+        ed.move_cursor(LineStart);
+        assert_eq!(ed.cursor(), 0);
+        ed.move_cursor(DocumentEnd);
+        assert_eq!(ed.cursor(), 13);
+        ed.move_cursor(DocumentStart);
+        assert_eq!(ed.cursor(), 0);
+    }
+
+    #[test]
+    fn vertical_movement_keeps_desired_column() {
+        let mut ed = editor("long line here\nab\nlonger line\n");
+        ed.set_cursor(10);
+        ed.move_cursor(Down);
+        assert_eq!(ed.cursor_position(), Position { line: 1, column: 2 });
+        ed.move_cursor(Down);
+        assert_eq!(
+            ed.cursor_position(),
+            Position {
+                line: 2,
+                column: 10
+            }
+        );
+        ed.move_cursor(Down);
+        assert_eq!(ed.cursor_position(), Position { line: 3, column: 0 });
+        ed.move_cursor(Up);
+        assert_eq!(
+            ed.cursor_position(),
+            Position {
+                line: 2,
+                column: 10
+            }
+        );
+        ed.move_cursor(Up);
+        ed.move_cursor(Up);
+        assert_eq!(
+            ed.cursor_position(),
+            Position {
+                line: 0,
+                column: 10
+            }
+        );
+        ed.move_cursor(Up);
+        assert_eq!(ed.cursor(), 0, "up on the first line goes to the start");
+        ed.move_cursor(DocumentEnd);
+        ed.move_cursor(Down);
+        assert_eq!(
+            ed.cursor(),
+            ed.buffer().len(),
+            "down on the last line goes to the end"
+        );
+
+        // Horizontal movement resets the remembered column.
+        ed.set_cursor(10);
+        ed.move_cursor(Down);
+        ed.move_cursor(Left);
+        ed.move_cursor(Down);
+        assert_eq!(ed.cursor_position(), Position { line: 2, column: 1 });
+    }
+
+    #[test]
+    fn page_movement() {
+        let lines: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
+        let mut ed = editor(&lines.join("\n"));
+        ed.set_cursor(3);
+        ed.move_cursor(PageDown(4));
+        assert_eq!(ed.cursor_position(), Position { line: 4, column: 3 });
+        ed.move_cursor(PageDown(4));
+        assert_eq!(ed.cursor_position(), Position { line: 8, column: 3 });
+        ed.move_cursor(PageDown(4));
+        assert_eq!(ed.cursor_position(), Position { line: 9, column: 3 });
+        ed.move_cursor(PageDown(4));
+        assert_eq!(ed.cursor(), ed.buffer().len());
+        ed.move_cursor(PageUp(3));
+        assert_eq!(ed.cursor_position(), Position { line: 6, column: 6 });
+        ed.move_cursor(PageUp(100));
+        assert_eq!(ed.cursor_position(), Position { line: 0, column: 6 });
+    }
+
+    #[test]
+    fn selection_extends_and_collapses() {
+        let mut ed = editor("hello world");
+        for _ in 0..5 {
+            ed.extend_selection(Right);
+        }
+        assert_eq!(ed.selection(), Some(0..5));
+        assert_eq!(ed.selected_text().as_deref(), Some("hello"));
+        assert_eq!(ed.anchor(), Some(0));
+        assert_eq!(ed.cursor(), 5);
+
+        ed.move_cursor(Left);
+        assert_eq!(ed.cursor(), 0, "left collapses to the selection start");
+        assert_eq!(ed.selection(), None);
+
+        ed.extend_selection(WordRight);
+        ed.move_cursor(Right);
+        assert_eq!(ed.cursor(), 5, "right collapses to the selection end");
+        assert_eq!(ed.selection(), None);
+
+        ed.extend_selection(WordLeft);
+        assert_eq!(ed.selection(), Some(0..5));
+        ed.extend_selection(WordRight);
+        assert_eq!(ed.selection(), None, "selection shrunk back to empty");
+        assert_eq!(ed.anchor(), Some(5));
+        ed.move_cursor(Up);
+        assert_eq!(ed.anchor(), None, "plain movement clears the selection");
+
+        ed.select_all();
+        assert_eq!(ed.selection(), Some(0..11));
+        ed.clear_selection();
+        assert_eq!(ed.selection(), None);
+        assert_eq!(ed.cursor(), 11);
+    }
+
+    #[test]
+    fn typing_replaces_selection_and_undo_restores_it() {
+        let mut ed = editor("hello world");
+        ed.set_selection(0, 5);
+        type_str(&mut ed, "Jay");
+        assert_eq!(text(&ed), "Jay world");
+        assert_eq!(ed.cursor(), 3);
+
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "hello world");
+        assert_eq!(ed.cursor(), 5);
+        assert_eq!(ed.selection(), Some(0..5), "selection restored");
+        assert!(!ed.undo(), "nothing left to undo");
+
+        assert!(ed.redo());
+        assert_eq!(text(&ed), "Jay world");
+        assert_eq!(ed.cursor(), 3);
+        assert_eq!(ed.selection(), None);
+        assert!(!ed.redo());
+    }
+
+    #[test]
+    fn typing_groups_by_word() {
+        let mut ed = editor("");
+        type_str(&mut ed, "ab cd");
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "ab ");
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "");
+        assert!(ed.redo());
+        assert_eq!(text(&ed), "ab ");
+        assert_eq!(ed.cursor(), 3);
+    }
+
+    #[test]
+    fn movement_and_newlines_break_typing_groups() {
+        let mut ed = editor("");
+        type_str(&mut ed, "ab");
+        ed.move_cursor(Left);
+        ed.move_cursor(Right);
+        type_str(&mut ed, "cd");
+        ed.insert_char('\n');
+        type_str(&mut ed, "ef");
+        assert_eq!(text(&ed), "abcd\nef");
+        ed.undo();
+        assert_eq!(text(&ed), "abcd\n");
+        ed.undo();
+        assert_eq!(text(&ed), "abcd");
+        ed.undo();
+        assert_eq!(text(&ed), "ab");
+        ed.undo();
+        assert_eq!(text(&ed), "");
+    }
+
+    #[test]
+    fn newline_uses_buffer_line_ending() {
+        let mut ed = editor("a\r\nb");
+        ed.move_cursor(Right);
+        ed.insert_char('\n');
+        assert_eq!(text(&ed), "a\r\n\r\nb");
+        assert_eq!(ed.cursor(), 3);
+        ed.backspace();
+        assert_eq!(
+            text(&ed),
+            "a\r\nb",
+            "backspace removes the whole terminator"
+        );
+        assert_eq!(ed.cursor(), 1);
+        ed.delete_forward();
+        assert_eq!(text(&ed), "ab", "delete removes the whole terminator");
+        ed.undo();
+        assert_eq!(text(&ed), "a\r\nb");
+    }
+
+    #[test]
+    fn backspace_and_delete_group_and_stop_at_edges() {
+        let mut ed = editor("héllo");
+        ed.move_cursor(DocumentEnd);
+        ed.backspace();
+        ed.backspace();
+        ed.backspace();
+        assert_eq!(text(&ed), "hé");
+        ed.backspace();
+        assert_eq!(
+            text(&ed),
+            "h",
+            "backspace removes a whole multi-byte character"
+        );
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "héllo", "one undo restores the whole run");
+        assert_eq!(ed.cursor(), 6);
+
+        ed.move_cursor(DocumentStart);
+        ed.backspace();
+        assert_eq!(text(&ed), "héllo", "backspace at the start does nothing");
+        assert!(!ed.can_undo());
+
+        ed.delete_forward();
+        ed.delete_forward();
+        assert_eq!(text(&ed), "llo");
+        assert_eq!(ed.cursor(), 0);
+        ed.move_cursor(DocumentEnd);
+        ed.delete_forward();
+        assert_eq!(text(&ed), "llo", "delete at the end does nothing");
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "héllo");
+        assert!(!ed.can_undo());
+    }
+
+    #[test]
+    fn selection_deletion_is_one_undo_step() {
+        let mut ed = editor("hello world");
+        ed.set_selection(6, 11);
+        ed.backspace();
+        assert_eq!(text(&ed), "hello ");
+        ed.set_selection(0, 5);
+        ed.delete_forward();
+        assert_eq!(text(&ed), " ");
+        assert!(!ed.delete_selection());
+        ed.undo();
+        assert_eq!(text(&ed), "hello ");
+        assert_eq!(ed.selection(), Some(0..5));
+        ed.undo();
+        assert_eq!(text(&ed), "hello world");
+        assert_eq!(ed.selection(), Some(6..11));
+        assert_eq!(ed.cursor(), 11);
+    }
+
+    #[test]
+    fn clipboard_operations() {
+        let mut ed = editor("hello world");
+        assert_eq!(ed.copy(), None);
+        assert_eq!(ed.cut(), None);
+        assert!(!ed.can_undo());
+
+        ed.set_selection(6, 11);
+        assert_eq!(ed.copy().as_deref(), Some("world"));
+        assert_eq!(text(&ed), "hello world", "copy doesn't change the buffer");
+        assert!(!ed.can_undo(), "copy isn't an undoable edit");
+
+        assert_eq!(ed.cut().as_deref(), Some("world"));
+        assert_eq!(text(&ed), "hello ");
+        assert_eq!(ed.cursor(), 6);
+
+        ed.move_cursor(DocumentStart);
+        ed.paste("world ");
+        assert_eq!(text(&ed), "world hello ");
+        assert_eq!(ed.cursor(), 6);
+
+        // Undo is independent of the clipboard: the cut text comes back even
+        // though the caller's clipboard would now hold something else.
+        ed.undo();
+        assert_eq!(text(&ed), "hello ");
+        assert_eq!(ed.cursor(), 0);
+        ed.undo();
+        assert_eq!(text(&ed), "hello world");
+        assert_eq!(ed.selection(), Some(6..11));
+        ed.redo();
+        ed.redo();
+        assert_eq!(text(&ed), "world hello ");
+    }
+
+    #[test]
+    fn paste_normalizes_line_endings() {
+        let mut ed = editor("a\r\nb");
+        ed.move_cursor(DocumentEnd);
+        ed.paste("x\ny\r\nz\r");
+        assert_eq!(text(&ed), "a\r\nbx\r\ny\r\nz\r\n");
+        ed.paste("");
+        assert!(ed.can_undo());
+        ed.undo();
+        assert_eq!(text(&ed), "a\r\nb", "an empty paste is not an undo step");
+    }
+
+    #[test]
+    fn paste_replaces_selection() {
+        let mut ed = editor("hello world");
+        ed.select_all();
+        ed.paste("bye");
+        assert_eq!(text(&ed), "bye");
+        ed.undo();
+        assert_eq!(text(&ed), "hello world");
+        assert_eq!(ed.selection(), Some(0..11));
+    }
+
+    #[test]
+    fn undo_preserves_invalid_utf8_exactly() {
+        let mut ed = Editor::new(FileBuffer::from_bytes(b"ab\xffcd"));
+        ed.set_selection(1, 4);
+        assert_eq!(ed.cut().as_deref(), Some("b\u{FFFD}c"));
+        assert_eq!(ed.buffer().to_bytes(), b"ad");
+        ed.undo();
+        assert_eq!(ed.buffer().to_bytes(), b"ab\xffcd");
+    }
+
+    #[test]
+    fn modified_tracks_the_save_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        let mut ed = editor("");
+        assert!(!ed.is_modified());
+
+        type_str(&mut ed, "one");
+        assert!(ed.is_modified());
+        assert!(ed.buffer().is_modified());
+        ed.undo();
+        assert!(!ed.is_modified(), "undone back to the loaded state");
+        assert!(!ed.buffer().is_modified());
+        ed.redo();
+        assert!(ed.is_modified());
+
+        ed.save_as(&path).unwrap();
+        assert!(!ed.is_modified());
+        assert_eq!(ed.buffer().path(), Some(path.as_path()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one");
+
+        ed.undo();
+        assert!(ed.is_modified(), "undone past the save");
+        ed.redo();
+        assert!(!ed.is_modified(), "redone back to the saved state");
+
+        // Typing right after a save must not merge into the saved entry.
+        type_str(&mut ed, "s");
+        assert!(ed.is_modified());
+        ed.undo();
+        assert!(!ed.is_modified());
+        assert_eq!(text(&ed), "one");
+
+        // Editing after undoing past the save point discards the saved
+        // state from the history, so no amount of undo reaches it.
+        ed.undo();
+        type_str(&mut ed, "x");
+        assert!(ed.is_modified());
+        ed.undo();
+        assert!(ed.is_modified());
+        assert_eq!(text(&ed), "");
+
+        ed.save().unwrap();
+        assert!(!ed.is_modified());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn save_without_path_fails_and_stays_modified() {
+        let mut ed = editor("x");
+        type_str(&mut ed, "y");
+        assert!(ed.save().is_err());
+        assert!(ed.is_modified());
+    }
+
+    #[test]
+    fn already_modified_buffer_starts_modified() {
+        let mut buffer = FileBuffer::from_text("a");
+        buffer.insert(1, "b");
+        let mut ed = Editor::new(buffer);
+        assert!(ed.is_modified());
+        ed.undo();
+        assert!(ed.is_modified(), "there is no saved state in the history");
+    }
+
+    #[test]
+    fn undo_history_is_linear() {
+        let mut ed = editor("");
+        type_str(&mut ed, "a");
+        ed.move_cursor(LineEnd);
+        type_str(&mut ed, "b");
+        ed.undo();
+        assert!(ed.can_redo());
+        ed.move_cursor(LineEnd);
+        type_str(&mut ed, "c");
+        assert!(!ed.can_redo(), "a new edit discards the redo history");
+        assert_eq!(text(&ed), "ac");
+        ed.undo();
+        ed.undo();
+        assert_eq!(text(&ed), "");
+        assert!(!ed.can_undo());
+    }
+}
