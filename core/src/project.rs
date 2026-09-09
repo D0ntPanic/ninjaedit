@@ -35,6 +35,18 @@ impl Project {
         Ok(Project { root, index })
     }
 
+    /// Open the project that contains `path`: the working tree of the git
+    /// repository `path` belongs to, or `path` itself if it is not inside a
+    /// repository (or the repository is bare). `path` must be a directory.
+    pub fn discover(path: impl AsRef<Path>) -> io::Result<Project> {
+        let path = path.as_ref();
+        let root = git2::Repository::discover(path)
+            .ok()
+            .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+            .unwrap_or_else(|| path.to_path_buf());
+        Project::open(root)
+    }
+
     /// The project's root directory (canonicalized).
     pub fn root(&self) -> &Path {
         &self.root
@@ -114,6 +126,21 @@ mod tests {
         let c = Project::open(other.path()).unwrap();
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn discover_finds_git_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let nested = root.join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+
+        // Not a repository: the directory itself is the project.
+        assert_eq!(Project::discover(&nested).unwrap().root(), nested);
+
+        git2::Repository::init(&root).unwrap();
+        assert_eq!(Project::discover(&nested).unwrap().root(), root);
+        assert_eq!(Project::discover(&root).unwrap().root(), root);
     }
 
     #[test]

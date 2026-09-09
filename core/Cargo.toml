@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+code-fuzzy-match = "0.2.2"
 git2 = { version = "0.21.0", features = ["ssh", "https", "vendored-libgit2", "vendored-openssl"] }
 regex = "1.13.1"
 ignore = "0.4"
