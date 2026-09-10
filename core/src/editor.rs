@@ -55,9 +55,19 @@
 //! when text is typed after it. Another newline leaves the line blank, with
 //! no trailing whitespace, and carries the same pending indentation on.
 //! Moving the cursor, or any other edit, discards it.
+//!
+//! Search: [`Editor::start_search`] begins a [`Search`] of the buffer from
+//! the cursor, and [`Editor::set_search_query`] updates it as the query is
+//! typed; the frontend reads the matches back through [`Editor::search`]
+//! to highlight them. The search is a *preview* until
+//! [`Editor::accept_search`] selects its current match, and
+//! [`Editor::next_match`] steps through the rest. In either state, moving
+//! the cursor or editing the text drops the search and its highlights;
+//! selecting a match through the search itself does not.
 
 use crate::buffer::FileBuffer;
 use crate::indent::{self, Indentation};
+use crate::search::{Search, SearchStep};
 use crate::syntax::{Highlighter, Language, Token, TokenKind};
 use crate::text::{self, Grapheme};
 use std::io;
@@ -297,6 +307,10 @@ pub struct Editor {
     pending: Option<String>,
     /// Syntax highlighting, when the buffer's language is known.
     highlighter: Option<Highlighter>,
+    /// The search in progress or accepted, if any. Its offsets are only
+    /// valid for the buffer as it was when it began, so every edit drops
+    /// it.
+    search: Option<Search>,
 }
 
 impl Editor {
@@ -320,6 +334,7 @@ impl Editor {
             indentation,
             pending: None,
             highlighter,
+            search: None,
         }
     }
 
@@ -580,12 +595,91 @@ impl Editor {
         self.grouping = false;
         self.desired_column = column;
         self.pending = None;
+        self.search = None;
     }
 
     /// Bookkeeping shared by all explicit cursor changes: they break undo
-    /// grouping, forget the remembered vertical column, and discard
-    /// pending indentation.
+    /// grouping, forget the remembered vertical column, discard pending
+    /// indentation, and drop any search.
     fn end_movement(&mut self) {
+        self.grouping = false;
+        self.desired_column = None;
+        self.pending = None;
+        self.search = None;
+    }
+
+    // ----- Search ---------------------------------------------------------
+
+    /// Begin a search from the cursor (or from the start of the selection,
+    /// so that a selected occurrence is the first match) with an empty
+    /// query. Any earlier search is dropped.
+    pub fn start_search(&mut self) {
+        let origin = self.selection().map_or(self.cursor, |range| range.start);
+        self.search = Some(Search::new(&self.buffer, origin));
+    }
+
+    /// Change the query of the search in progress. Does nothing without
+    /// one; see [`start_search`](Self::start_search).
+    pub fn set_search_query(&mut self, query: &str) {
+        if let Some(search) = &mut self.search {
+            search.set_query(query);
+        }
+    }
+
+    /// The search in progress or accepted, for the frontend to show its
+    /// matches. `None` when there is none.
+    pub fn search(&self) -> Option<&Search> {
+        self.search.as_ref()
+    }
+
+    /// Select the search's current match, turning the preview into an
+    /// accepted search whose other matches stay highlighted until the
+    /// cursor moves or the text changes. Waits for the search to finish if
+    /// the first match isn't known yet. Returns whether there was a match
+    /// to select; with none the search stays as it was.
+    pub fn accept_search(&mut self) -> bool {
+        let Some(search) = &mut self.search else {
+            return false;
+        };
+        if search.current().is_none() {
+            search.wait();
+        }
+        let Some(range) = search.current() else {
+            return false;
+        };
+        search.set_accepted();
+        self.select_match(range);
+        true
+    }
+
+    /// Step the search to its next match, wrapping around the end of the
+    /// buffer; see [`Search::advance`] for how arriving back at the start
+    /// is reported. With an accepted search the match is selected; while
+    /// previewing only the current match changes.
+    pub fn next_match(&mut self) -> SearchStep {
+        let Some(search) = &mut self.search else {
+            return SearchStep::NoMatches;
+        };
+        let step = search.advance();
+        if let SearchStep::Moved(range) = &step
+            && search.is_accepted()
+        {
+            self.select_match(range.clone());
+        }
+        step
+    }
+
+    /// Drop the search and its highlights, leaving the cursor and
+    /// selection alone.
+    pub fn clear_search(&mut self) {
+        self.search = None;
+    }
+
+    /// Select a match without dropping the search, as
+    /// [`set_selection`](Self::set_selection) otherwise would.
+    fn select_match(&mut self, range: Range<usize>) {
+        self.anchor = Some(self.snap(range.start));
+        self.cursor = self.snap(range.end);
         self.grouping = false;
         self.desired_column = None;
         self.pending = None;
@@ -866,6 +960,7 @@ impl Editor {
         anchor: Option<usize>,
     ) {
         self.pending = None;
+        self.search = None;
         let before = self.state();
         let edit = Edit {
             offset: range.start,
@@ -1265,6 +1360,7 @@ impl UndoEntry {
 mod tests {
     use super::*;
     use Movement::*;
+    use SearchStep::*;
 
     fn editor(text: &str) -> Editor {
         Editor::new(FileBuffer::from_text(text))
@@ -1278,6 +1374,87 @@ mod tests {
         for c in s.chars() {
             editor.insert_char(c);
         }
+    }
+
+    #[test]
+    fn search_previews_then_selects_and_steps() {
+        let mut ed = editor("foo bar\nfoo baz\nfoo\n");
+        ed.set_cursor(5);
+        ed.start_search();
+        ed.set_search_query("foo");
+        let search = ed.search().unwrap();
+        search.wait();
+        // Previewing: the first match after the cursor is current, but
+        // nothing is selected yet.
+        assert_eq!(search.current(), Some(8..11));
+        assert_eq!(search.match_count(), 3);
+        assert!(!search.is_accepted());
+        assert_eq!(ed.cursor(), 5);
+        assert!(ed.selection().is_none());
+        // Stepping while previewing moves only the current match.
+        assert_eq!(ed.next_match(), Moved(16..19));
+        assert!(ed.selection().is_none());
+
+        assert!(ed.accept_search());
+        assert_eq!(ed.selection(), Some(16..19));
+        assert!(ed.search().unwrap().is_accepted());
+        assert_eq!(ed.next_match(), Moved(0..3));
+        assert_eq!(ed.selection(), Some(0..3));
+        assert_eq!(ed.next_match(), ReachedStart);
+        assert_eq!(ed.selection(), Some(0..3));
+        assert!(
+            ed.search().is_some(),
+            "arriving at the start keeps the search"
+        );
+        assert_eq!(ed.next_match(), Moved(8..11));
+        assert_eq!(ed.selection(), Some(8..11));
+
+        // Any other cursor movement or edit drops the search.
+        ed.move_cursor(Right);
+        assert!(ed.search().is_none());
+        assert_eq!(ed.next_match(), NoMatches);
+        ed.start_search();
+        ed.set_search_query("bar");
+        assert!(ed.accept_search());
+        assert_eq!(ed.selected_text().as_deref(), Some("bar"));
+        type_str(&mut ed, "x");
+        assert!(ed.search().is_none());
+        assert_eq!(text(&ed), "foo x\nfoo baz\nfoo\n");
+        ed.start_search();
+        ed.set_search_query("baz");
+        assert!(ed.accept_search());
+        ed.undo();
+        assert!(ed.search().is_none());
+        ed.start_search();
+        ed.set_search_query("baz");
+        assert!(ed.accept_search());
+        ed.clear_selection();
+        assert!(ed.search().is_none());
+    }
+
+    #[test]
+    fn search_without_matches_or_query() {
+        let mut ed = editor("abc\n");
+        assert!(!ed.accept_search());
+        ed.set_search_query("a");
+        assert!(ed.search().is_none(), "no search to set a query on");
+        ed.start_search();
+        assert!(!ed.accept_search(), "empty query");
+        ed.set_search_query("zzz");
+        assert!(!ed.accept_search());
+        assert!(ed.search().is_some(), "a failed accept keeps the search");
+        assert_eq!(ed.next_match(), NoMatches);
+        ed.clear_search();
+        assert!(ed.search().is_none());
+        // A selection makes its start the origin, so a selected occurrence
+        // is itself the first match.
+        let mut ed = editor("ab ab ab");
+        ed.set_selection(3, 5);
+        ed.start_search();
+        ed.set_search_query("ab");
+        assert!(ed.accept_search());
+        assert_eq!(ed.selection(), Some(3..5));
+        assert_eq!(ed.search().unwrap().origin(), 3);
     }
 
     #[test]

@@ -664,11 +664,13 @@ impl BufferSnapshot {
             remaining -= chunk.breaks.len();
             index += 1;
         }
+        let offset = self.chunks[..index].iter().map(|c| c.len()).sum::<usize>() + rel;
         Lines {
             snapshot: self,
             index,
             rel,
             brk,
+            offset,
             done: line >= self.line_count(),
             scratch: Vec::new(),
         }
@@ -695,11 +697,20 @@ pub struct Lines<'a> {
     rel: usize,
     /// The index into that chunk's `breaks` of the next line's terminator.
     brk: usize,
+    /// The buffer offset of the next line's start.
+    offset: usize,
     done: bool,
     scratch: Vec<u8>,
 }
 
 impl Lines<'_> {
+    /// The buffer offset where the line [`next_line`](Self::next_line)
+    /// will return starts. Read it before the call to know where a line's
+    /// content lives in the buffer.
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
     /// The content of the next line, or `None` after the last line.
     pub fn next_line(&mut self) -> Option<&[u8]> {
         if self.done {
@@ -712,6 +723,7 @@ impl Lines<'_> {
         {
             let end = end as usize;
             let content = &chunk.data[self.rel..end - terminator_len(&chunk.data[..end])];
+            self.offset += end - self.rel;
             self.rel = end;
             self.brk += 1;
             return Some(content);
@@ -730,12 +742,14 @@ impl Lines<'_> {
                     self.scratch.extend_from_slice(
                         &chunk.data[self.rel..end - terminator_len(&chunk.data[..end])],
                     );
+                    self.offset += end - self.rel;
                     self.rel = end;
                     self.brk += 1;
                     return Some(&self.scratch);
                 }
                 None => {
                     self.scratch.extend_from_slice(&chunk.data[self.rel..]);
+                    self.offset += chunk.len() - self.rel;
                     self.index += 1;
                     self.rel = 0;
                     self.brk = 0;
@@ -821,6 +835,7 @@ mod tests {
             let mut lines = snapshot.lines_from(start);
             for line in start..buffer.line_count() {
                 let expected = buffer.line_text(line);
+                assert_eq!(lines.offset(), buffer.offset_of_line(line), "line {line}");
                 let got = lines.next_line().expect("line present");
                 assert_eq!(std::str::from_utf8(got).unwrap(), expected, "line {line}");
             }

@@ -9,6 +9,7 @@ mod app;
 mod clipboard;
 mod editor_view;
 mod palette;
+mod search_box;
 mod tabs;
 mod theme;
 

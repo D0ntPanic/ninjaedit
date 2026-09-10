@@ -8,6 +8,7 @@ pub mod fuzzy;
 pub mod indent;
 pub mod index;
 pub mod project;
+pub mod search;
 pub mod syntax;
 pub mod text;
 
@@ -16,4 +17,5 @@ pub use editor::{Cell, Editor, Movement, Position};
 pub use indent::Indentation;
 pub use index::{FileIndex, IndexEntry};
 pub use project::Project;
+pub use search::{Search, SearchStep};
 pub use syntax::{Highlighter, Language, Token, TokenKind};

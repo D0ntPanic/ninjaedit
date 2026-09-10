@@ -21,7 +21,81 @@ use std::path::PathBuf;
 const MAX_RESULTS: usize = 200;
 /// The most result rows shown at once.
 const MAX_VISIBLE: usize = 12;
-const MAX_WIDTH: u16 = 80;
+/// The widest the palette (and the search box, which shares its look)
+/// gets.
+pub const MAX_WIDTH: u16 = 80;
+
+/// The palette's text over its background.
+pub fn palette_background(theme: &Theme) -> Style {
+    Style::default()
+        .fg(theme.command_palette_result_text)
+        .bg(theme.command_palette_background)
+}
+
+/// Draw the palette's rounded frame over `area`, clearing what's under
+/// it, with `hint` in the bottom border. Returns the area inside the
+/// frame.
+pub fn render_frame(area: Rect, hint: Option<&str>, buf: &mut Buffer, theme: &Theme) -> Rect {
+    Clear.render(area, buf);
+    let background = palette_background(theme);
+    let mut block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .style(background)
+        .border_style(background.fg(theme.command_palette_box_color));
+    if let Some(hint) = hint {
+        block = block.title_bottom(Span::styled(
+            format!(" {hint} "),
+            background.fg(theme.command_palette_placeholder_text),
+        ));
+    }
+    let inner = block.inner(area);
+    block.render(area, buf);
+    inner
+}
+
+/// Draw a one-row query input into `row`: a prompt, then the query or,
+/// while it is empty, the dimmed placeholder. Returns where the terminal
+/// cursor belongs.
+pub fn render_input(
+    row: Rect,
+    query: &str,
+    placeholder: &str,
+    buf: &mut Buffer,
+    theme: &Theme,
+) -> ScreenPosition {
+    let input = Style::default()
+        .fg(theme.command_palette_input_text)
+        .bg(theme.command_palette_input_background);
+    buf.set_style(row, input);
+    let prompt = "> ";
+    buf.set_string(
+        row.x,
+        row.y,
+        prompt,
+        input.fg(theme.command_palette_box_color),
+    );
+    let input_x = row.x + prompt.len() as u16;
+    let input_width = row.width.saturating_sub(prompt.len() as u16) as usize;
+    if query.is_empty() {
+        buf.set_stringn(
+            input_x,
+            row.y,
+            placeholder,
+            input_width,
+            input.fg(theme.command_palette_placeholder_text),
+        );
+        return ScreenPosition::new(input_x, row.y);
+    }
+    // Show the tail of a query wider than the box.
+    let mut shown = query;
+    while Span::raw(shown).width() >= input_width && !shown.is_empty() {
+        let mut chars = shown.chars();
+        chars.next();
+        shown = chars.as_str();
+    }
+    buf.set_string(input_x, row.y, shown, input);
+    ScreenPosition::new(input_x + Span::raw(shown).width() as u16, row.y)
+}
 
 /// What activating a result does.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,60 +279,18 @@ impl Palette {
         let y = screen.y + 1.min(screen.height.saturating_sub(height));
         self.area = Rect::new(x, y, width, height);
 
-        Clear.render(self.area, buf);
-        let background = Style::default()
-            .fg(theme.command_palette_result_text)
-            .bg(theme.command_palette_background);
-        let mut block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .style(background)
-            .border_style(background.fg(theme.command_palette_box_color));
-        if let Some(hint) = &self.hint {
-            block = block.title_bottom(Span::styled(
-                format!(" {hint} "),
-                background.fg(theme.command_palette_placeholder_text),
-            ));
-        }
-        let inner = block.inner(self.area);
-        block.render(self.area, buf);
+        let background = palette_background(theme);
+        let inner = render_frame(self.area, self.hint.as_deref(), buf, theme);
         if inner.height == 0 {
             return None;
         }
-
-        // Search box.
-        let input = Style::default()
-            .fg(theme.command_palette_input_text)
-            .bg(theme.command_palette_input_background);
-        buf.set_style(Rect::new(inner.x, inner.y, inner.width, 1), input);
-        let prompt = "> ";
-        buf.set_string(
-            inner.x,
-            inner.y,
-            prompt,
-            input.fg(theme.command_palette_box_color),
+        let cursor = render_input(
+            Rect::new(inner.x, inner.y, inner.width, 1),
+            &self.query,
+            self.placeholder,
+            buf,
+            theme,
         );
-        let input_x = inner.x + prompt.len() as u16;
-        let input_width = inner.width.saturating_sub(prompt.len() as u16) as usize;
-        let cursor = if self.query.is_empty() {
-            buf.set_stringn(
-                input_x,
-                inner.y,
-                self.placeholder,
-                input_width,
-                input.fg(theme.command_palette_placeholder_text),
-            );
-            ScreenPosition::new(input_x, inner.y)
-        } else {
-            // Show the tail of a query wider than the box.
-            let mut shown = self.query.as_str();
-            while Span::raw(shown).width() >= input_width && !shown.is_empty() {
-                let mut chars = shown.chars();
-                chars.next();
-                shown = chars.as_str();
-            }
-            buf.set_string(input_x, inner.y, shown, input);
-            ScreenPosition::new(input_x + Span::raw(shown).width() as u16, inner.y)
-        };
 
         // Results.
         self.rows = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);

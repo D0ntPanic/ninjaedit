@@ -170,6 +170,11 @@ required {
     view_text => "view-text",
     /// The background of selected text in the editor.
     selection_background => "selection-background",
+    /// The background of a search match.
+    find_result_background => "find-result-background",
+    /// The background of the search match the search is at: the one
+    /// Enter selects, or the last one stepped to.
+    highlighted_find_result_background => "highlighted-find-result-background",
     inactive_line_number => "inactive-line-number",
     /// The number of the line the cursor is on.
     active_line_number => "active-line-number",

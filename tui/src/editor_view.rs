@@ -8,7 +8,11 @@
 //!
 //! Scrolling follows the cursor after any action that moves it, but not
 //! after plain scrolling (mouse wheel, scrollbar), so the user can look
-//! around without losing their place. The vertical scrollbar is always
+//! around without losing their place. While a search is being previewed
+//! the cursor stays put, so the view instead scrolls to the search's
+//! current match whenever that changes, centering it (clear of the search
+//! box, which covers the top rows) if it isn't already in view, so the
+//! match comes with some context around it. The vertical scrollbar is always
 //! shown; the horizontal one appears only when a visible line doesn't fit,
 //! or the view is scrolled horizontally. Only the visible lines are measured
 //! for that decision, so it stays cheap on files with huge lines.
@@ -34,6 +38,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget};
+use std::ops::Range;
 
 /// Lines scrolled per mouse wheel notch.
 const WHEEL_LINES: usize = 3;
@@ -42,6 +47,18 @@ const WHEEL_COLUMNS: usize = 4;
 /// Columns the view may scroll past the longest visible line: one for the
 /// cursor at the end of the line, one for padding.
 const HSCROLL_SLACK: usize = 2;
+
+/// What a render scrolls to bring into view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reveal {
+    /// The cursor, after an action moved it: scrolled just into view.
+    Cursor(Position),
+    /// A search match that has just become current, as the position of its
+    /// start and the column of its end. Centered vertically if it was out
+    /// of view; horizontally, scrolled as little as possible while showing
+    /// its start and as much of the rest as fits.
+    Match(Position, usize),
+}
 
 /// What the mouse is dragging, from a button press until its release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +78,12 @@ pub struct EditorView {
     scroll_col: usize,
     /// Whether the next render should scroll to bring the cursor into view.
     follow_cursor: bool,
+    /// The search match the view last scrolled to show, so that it only
+    /// scrolls when the match changes and not on every redraw.
+    revealed_match: Option<Range<usize>>,
+    /// Rows at the top of the view hidden under an overlay such as the
+    /// search box, which a revealed match is kept clear of.
+    covered_rows: u16,
     drag: Drag,
     // Screen regions from the last render.
     gutter: Rect,
@@ -85,6 +108,8 @@ impl EditorView {
             scroll_line: 0,
             scroll_col: 0,
             follow_cursor: true,
+            revealed_match: None,
+            covered_rows: 0,
             drag: Drag::None,
             gutter: Rect::default(),
             text: Rect::default(),
@@ -98,9 +123,23 @@ impl EditorView {
         &self.editor
     }
 
+    /// The editor, for an action that may move the cursor: the view
+    /// scrolls to show it at the next render.
     pub fn editor_mut(&mut self) -> &mut Editor {
         self.follow_cursor = true;
         &mut self.editor
+    }
+
+    /// The editor, for an action that leaves the cursor where it is, such
+    /// as a search preview, so the view doesn't scroll back to it.
+    pub fn editor_mut_in_place(&mut self) -> &mut Editor {
+        &mut self.editor
+    }
+
+    /// Tell the view how many of its top rows an overlay hides, so that a
+    /// search match it scrolls to isn't put under the overlay.
+    pub fn set_covered_rows(&mut self, rows: u16) {
+        self.covered_rows = rows;
     }
 
     /// First visible display column.
@@ -134,6 +173,21 @@ impl EditorView {
         }
         let text_width = (area.width - gutter_width - 1) as usize;
         let cursor = self.editor.cursor_position();
+        // Where to scroll to, if anywhere: a search match that has become
+        // current since the last render (whether previewed or selected,
+        // since a selection's cursor at the match's end says nothing
+        // about where its start is), or else the cursor after it moved.
+        let current_match = self.editor.search().and_then(|search| search.current());
+        let reveal = match &current_match {
+            Some(range) if current_match != self.revealed_match => {
+                let start = self.editor.position_of_offset(range.start);
+                let end = self.editor.position_of_offset(range.end);
+                Some(Reveal::Match(start, end.column))
+            }
+            _ if self.follow_cursor => Some(Reveal::Cursor(cursor)),
+            _ => None,
+        };
+        self.revealed_match = current_match.clone();
 
         // Settle the vertical scroll position and decide whether the
         // horizontal scrollbar is needed. Showing it costs a row, which can
@@ -148,8 +202,12 @@ impl EditorView {
         let mut max_width;
         loop {
             height = full_height - usize::from(show_hscroll);
-            if self.follow_cursor {
-                self.scroll_to_line(cursor.line, height);
+            match reveal {
+                Some(Reveal::Cursor(target)) => self.scroll_to_line(target.line, height),
+                Some(Reveal::Match(target, _)) => {
+                    self.center_line_if_hidden(target.line, height);
+                }
+                None => {}
             }
             self.scroll_line = self.scroll_line.min(line_count.saturating_sub(height));
             lines = (self.scroll_line..(self.scroll_line + height).min(line_count))
@@ -167,12 +225,18 @@ impl EditorView {
             }
             break;
         }
-        if self.follow_cursor {
-            if cursor.column < self.scroll_col {
-                self.scroll_col = cursor.column;
-            } else if cursor.column >= self.scroll_col + text_width {
-                self.scroll_col = cursor.column + 1 - text_width;
+        match reveal {
+            Some(Reveal::Cursor(target)) => {
+                if target.column < self.scroll_col {
+                    self.scroll_col = target.column;
+                } else if target.column >= self.scroll_col + text_width {
+                    self.scroll_col = target.column + 1 - text_width;
+                }
             }
+            Some(Reveal::Match(start, end)) => {
+                self.scroll_to_columns(start.column, end, text_width);
+            }
+            None => {}
         }
         self.follow_cursor = false;
 
@@ -199,6 +263,23 @@ impl EditorView {
         // otherwise the text keeps its syntax color. Bold and italic stay
         // either way.
         let selected = Style::default().bg(theme.selection_background);
+        // Search matches on the visible lines, ascending. Cells are walked
+        // in the same order, so one index keeps up with them.
+        let matches = match self.editor.search() {
+            Some(search) if !lines.is_empty() => {
+                let first = self.editor.buffer().offset_of_line(self.scroll_line);
+                let last = self
+                    .editor
+                    .buffer()
+                    .line_range(self.scroll_line + lines.len() - 1)
+                    .end;
+                search.matches_in(first..last)
+            }
+            _ => Vec::new(),
+        };
+        let mut next_match = 0;
+        let found = Style::default().bg(theme.find_result_background);
+        let found_current = Style::default().bg(theme.highlighted_find_result_background);
         for (row, cells) in lines.iter().enumerate() {
             let line = self.scroll_line + row;
             let y = area.y + row as u16;
@@ -221,6 +302,17 @@ impl EditorView {
                     break;
                 }
                 let syntax = theme.syntax(cell.kind);
+                while next_match < matches.len() && matches[next_match].end <= cell.range.start {
+                    next_match += 1;
+                }
+                let in_match = matches
+                    .get(next_match)
+                    .is_some_and(|m| m.start <= cell.range.start);
+                let in_current = current_match
+                    .as_ref()
+                    .is_some_and(|m| m.contains(&cell.range.start));
+                // The selection wins over a match, and the current match
+                // over the others.
                 let style = match &selection {
                     Some(range) if range.contains(&cell.range.start) => {
                         let style = syntax.apply(selected);
@@ -229,6 +321,8 @@ impl EditorView {
                             None => style,
                         }
                     }
+                    _ if in_current => syntax.apply(found_current),
+                    _ if in_match => syntax.apply(found),
                     _ => syntax.apply(text_style),
                 };
                 let fits = cell.column >= visible.start && cell.column + cell.width <= visible.end;
@@ -312,6 +406,35 @@ impl EditorView {
         } else if line >= self.scroll_line + height {
             self.scroll_line = line + 1 - height;
         }
+    }
+
+    /// Scroll vertically so that `line` is in the middle of the part of a
+    /// view `height` rows tall that isn't covered by an overlay, unless it
+    /// is already visible there.
+    fn center_line_if_hidden(&mut self, line: usize, height: usize) {
+        let covered = (self.covered_rows as usize).min(height.saturating_sub(1));
+        let visible = self.scroll_line + covered..self.scroll_line + height.max(1);
+        if !visible.contains(&line) {
+            self.scroll_line = line.saturating_sub(covered + (height - covered) / 2);
+        }
+    }
+
+    /// Scroll horizontally so that the columns `start..end` are visible in
+    /// a view `text_width` columns wide, scrolling as little to the right
+    /// as will do: a range already in view stays put, one that fits is
+    /// brought in with its end at the right edge (or not scrolled at all
+    /// if it fits from the left margin), and one wider than the view has
+    /// its start at the left edge and shows as much as fits.
+    fn scroll_to_columns(&mut self, start: usize, end: usize, text_width: usize) {
+        let text_width = text_width.max(1);
+        if start >= self.scroll_col && end <= self.scroll_col + text_width {
+            return;
+        }
+        self.scroll_col = if end - start > text_width {
+            start
+        } else {
+            end.saturating_sub(text_width)
+        };
     }
 
     /// The furthest the view can scroll down: the last line at the bottom.

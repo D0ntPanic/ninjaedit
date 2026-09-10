@@ -4,7 +4,13 @@
 //! Layout, top to bottom: the tab bar, the editor for the active tab (or a
 //! hint when nothing is open), and the status bar. The command palette,
 //! when open, floats over the top of the editor and takes all keyboard
-//! input until it is closed.
+//! input until it is closed. The search box (Ctrl+F) floats there too,
+//! and never at the same time as the palette; it drives a search in the
+//! active tab's editor, which highlights what it finds as the query is
+//! typed. Enter selects the current match and closes the box, leaving the
+//! other matches highlighted; Ctrl+G, with the box open or closed, steps
+//! to the next match, and with no search going repeats the last query
+//! from the cursor. Escape closes the box and clears the search.
 //!
 //! Closing a modified tab or quitting with unsaved changes asks for the key
 //! to be pressed a second time rather than popping up a dialog.
@@ -12,21 +18,29 @@
 use crate::clipboard::Clipboard;
 use crate::editor_view::EditorView;
 use crate::palette::{Palette, PaletteAction, PaletteItem, PaletteOutcome};
+use crate::search_box::{self, SearchBox, SearchOutcome};
 use crate::tabs::{TabBar, TabHit, TabLabel};
 use crate::theme::Theme;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ninjaedit_core::{Editor, Project};
+use ninjaedit_core::{Editor, Project, SearchStep};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use std::path::Path;
+use std::time::Duration;
 
 const TABS_PLACEHOLDER: &str = "Search open tabs";
 const FILES_PLACEHOLDER: &str = "Search files in project";
+/// How long a change to the search query waits for the search to finish,
+/// so that in all but the largest files the matches show up in the same
+/// frame as the keystroke rather than a tick later.
+const SEARCH_GRACE: Duration = Duration::from_millis(15);
+const SEARCH_WRAPPED: &str =
+    "Search wrapped around to where it started; press Ctrl+G to go around again";
 
 /// An action that discards unsaved changes and so needs confirming.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +57,9 @@ struct Tab {
     /// The editor's highlight generation as of the last redraw, to notice
     /// when background highlighting has changed what's on screen.
     highlight_generation: u64,
+    /// Likewise for the editor's search, which finds matches in the
+    /// background.
+    search_generation: u64,
 }
 
 impl Tab {
@@ -70,6 +87,11 @@ pub struct App {
     /// Whether the open palette searches project files, and so needs
     /// refreshing as the index fills in.
     palette_is_files: bool,
+    /// The search box, driving a search in the active tab. Never open at
+    /// the same time as the palette.
+    search_box: Option<SearchBox>,
+    /// The last query searched for with Enter, for Ctrl+G to repeat.
+    last_search: String,
     index_generation: u64,
     /// A message shown in the status bar until the next key press.
     status: Option<String>,
@@ -92,6 +114,8 @@ impl App {
             tab_bar: TabBar::default(),
             palette: None,
             palette_is_files: false,
+            search_box: None,
+            last_search: String::new(),
             status: None,
             confirm: None,
             clipboard: Clipboard::new(),
@@ -122,6 +146,7 @@ impl App {
                 let editor = Editor::new(buffer);
                 self.tabs.push(Tab {
                     highlight_generation: editor.highlight_generation(),
+                    search_generation: 0,
                     view: EditorView::new(editor),
                     last_viewed: 0,
                 });
@@ -224,6 +249,7 @@ impl App {
     /// active tab is always at the top, so the previously viewed one is
     /// preselected: Enter alone flips back to it.
     fn open_tabs_palette(&mut self) {
+        self.close_search_box(true);
         let mut order: Vec<usize> = (0..self.tabs.len()).collect();
         order.sort_by_key(|&index| std::cmp::Reverse(self.tabs[index].last_viewed));
         let items = order
@@ -246,6 +272,7 @@ impl App {
     }
 
     fn open_files_palette(&mut self) {
+        self.close_search_box(true);
         let mut palette = Palette::new(FILES_PLACEHOLDER, self.file_items());
         self.refresh_index_hint(&mut palette);
         self.palette = Some(palette);
@@ -285,6 +312,127 @@ impl App {
         }
     }
 
+    // ----- Search ---------------------------------------------------------
+
+    /// Open the search box over the active tab, starting a search from its
+    /// cursor. Does nothing with the box already open, or with no tab.
+    fn open_search_box(&mut self) {
+        if self.search_box.is_some() {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        self.palette = None;
+        tab.view.editor_mut_in_place().start_search();
+        self.search_box = Some(SearchBox::new());
+    }
+
+    /// Close the search box, and with `clear` drop the search along with
+    /// its highlights; otherwise the accepted search stays.
+    fn close_search_box(&mut self, clear: bool) {
+        if self.search_box.take().is_some()
+            && clear
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            tab.view.editor_mut_in_place().clear_search();
+        }
+    }
+
+    /// Search for what the box now holds, giving a quick search a moment
+    /// to finish so its matches are drawn right away.
+    fn update_search_query(&mut self) {
+        let (Some(search_box), Some(tab)) = (&self.search_box, self.tabs.get_mut(self.active))
+        else {
+            return;
+        };
+        let editor = tab.view.editor_mut_in_place();
+        editor.set_search_query(search_box.query());
+        if let Some(search) = editor.search() {
+            search.wait_for(SEARCH_GRACE);
+        }
+    }
+
+    fn handle_search_outcome(&mut self, outcome: SearchOutcome) {
+        match outcome {
+            SearchOutcome::Continue => {}
+            SearchOutcome::Changed => self.update_search_query(),
+            SearchOutcome::Close => self.close_search_box(true),
+            SearchOutcome::Accept => {
+                let Some(tab) = self.tabs.get_mut(self.active) else {
+                    return;
+                };
+                // With nothing to select the box stays open, its hint
+                // saying why.
+                if tab.view.editor_mut().accept_search() {
+                    if let Some(search_box) = &self.search_box {
+                        self.last_search = search_box.query().to_owned();
+                    }
+                    self.close_search_box(false);
+                }
+            }
+            SearchOutcome::Next => self.step_search(),
+        }
+    }
+
+    /// Ctrl+G: move the active tab's search on to its next match, or with
+    /// no search going, search again for the last query from the cursor.
+    fn find_next(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if tab.view.editor().search().is_some() {
+            self.step_search();
+        } else if self.last_search.is_empty() {
+            self.open_search_box();
+        } else {
+            let editor = tab.view.editor_mut();
+            editor.start_search();
+            editor.set_search_query(&self.last_search);
+            if !editor.accept_search() {
+                editor.clear_search();
+                self.status = Some(format!("No matches for {}", self.last_search));
+            }
+        }
+    }
+
+    fn step_search(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let step = if self.search_box.is_some() {
+            tab.view.editor_mut_in_place().next_match()
+        } else {
+            tab.view.editor_mut().next_match()
+        };
+        if step == SearchStep::ReachedStart {
+            self.status = Some(SEARCH_WRAPPED.to_owned());
+        }
+    }
+
+    /// What the search box's bottom border says about the search.
+    fn search_hint(&self) -> Option<String> {
+        let search = self.tabs.get(self.active)?.view.editor().search()?;
+        if search.query().is_empty() {
+            return None;
+        }
+        if let Some(error) = search.error() {
+            return Some(format!("invalid regex: {error}"));
+        }
+        let kind = if search.is_regex() { "regex, " } else { "" };
+        let count = search.match_count();
+        let found = if !search.is_done() {
+            format!("searching… {count} so far")
+        } else {
+            match count {
+                0 => "no matches".to_owned(),
+                1 => "1 match".to_owned(),
+                n => format!("{n} matches"),
+            }
+        };
+        Some(format!("{kind}{found}"))
+    }
+
     /// Periodic housekeeping while idle. Returns whether the screen needs
     /// redrawing.
     pub fn tick(&mut self) -> bool {
@@ -293,6 +441,11 @@ impl App {
             let generation = tab.view.editor().highlight_generation();
             if generation != tab.highlight_generation {
                 tab.highlight_generation = generation;
+                redraw = true;
+            }
+            let generation = tab.view.editor().search().map_or(0, |s| s.generation());
+            if generation != tab.search_generation {
+                tab.search_generation = generation;
                 redraw = true;
             }
         }
@@ -319,7 +472,11 @@ impl App {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::Paste(text) if self.palette.is_none() => {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
+                if let Some(search_box) = &mut self.search_box {
+                    if search_box.paste(&text) {
+                        self.update_search_query();
+                    }
+                } else if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.view.editor_mut().paste(&text);
                 }
             }
@@ -348,6 +505,10 @@ impl App {
                     self.open_files_palette();
                     return;
                 }
+                KeyCode::Char('f') => {
+                    self.open_search_box();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -360,6 +521,11 @@ impl App {
             }
             return;
         }
+        if let Some(search_box) = &mut self.search_box {
+            let outcome = search_box.handle_key(key);
+            self.handle_search_outcome(outcome);
+            return;
+        }
 
         if ctrl {
             match key.code {
@@ -370,6 +536,10 @@ impl App {
                 }
                 KeyCode::Char('s') => {
                     self.save_active();
+                    return;
+                }
+                KeyCode::Char('g') => {
+                    self.find_next();
                     return;
                 }
                 _ => {}
@@ -395,6 +565,18 @@ impl App {
                 self.palette = None;
             }
             return;
+        }
+        // A click outside the search box closes it, like the palette, but
+        // the wheel still scrolls the editor under it so the matches can
+        // be looked over.
+        if let Some(search_box) = &self.search_box {
+            if search_box.contains(x, y) {
+                return;
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.close_search_box(true);
+                return;
+            }
         }
 
         // A drag that started in the editor stays with it wherever the
@@ -451,7 +633,17 @@ impl App {
 
         let mut cursor = None;
         match self.tabs.get_mut(self.active) {
-            Some(tab) => cursor = tab.view.render(self.editor_area, buf, theme),
+            Some(tab) => {
+                // The search box, drawn later, sits over the top of the
+                // editor, and the editor is showing search matches.
+                let covered = if self.search_box.is_some() {
+                    search_box::HEIGHT
+                } else {
+                    0
+                };
+                tab.view.set_covered_rows(covered);
+                cursor = tab.view.render(self.editor_area, buf, theme);
+            }
             None => render_empty(self.editor_area, buf, theme),
         }
 
@@ -459,6 +651,11 @@ impl App {
 
         if let Some(palette) = &mut self.palette {
             cursor = palette.render(screen, buf, theme);
+        }
+        let hint = self.search_hint();
+        if let Some(search_box) = &mut self.search_box {
+            search_box.set_hint(hint);
+            cursor = search_box.render(screen, buf, theme);
         }
         if let Some(cursor) = cursor {
             frame.set_cursor_position(cursor);
@@ -1053,6 +1250,296 @@ mod tests {
         assert_eq!(app.tabs[0].title(), "gamma.rs");
         press(&mut app, KeyCode::Esc);
         assert!(app.palette.is_none());
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    /// Wait for the active tab's search to finish, since it runs in the
+    /// background.
+    fn wait_for_search(app: &App) {
+        if let Some(search) = app.tabs[app.active].view.editor().search() {
+            search.wait();
+        }
+    }
+
+    fn cell_bg(app: &mut App, width: u16, height: u16, x: u16, y: u16) -> Color {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.backend().buffer()[(x, y)].bg
+    }
+
+    #[test]
+    fn search_previews_selects_and_steps_through_matches() {
+        // Three blank lines keep the text clear of the search box, which
+        // covers rows 1 to 3. The gutter is 4 wide.
+        let (_dir, mut app) = app_with_files(&[("a.txt", "\n\n\nfoo bar\nbaz foo\nfoo\n")]);
+        let theme = Theme::default();
+        ctrl(&mut app, 'f');
+        let screen = draw(&mut app, 60, 10);
+        assert!(screen[2].contains("Search in file"), "{screen:#?}");
+        type_str(&mut app, "foo");
+        wait_for_search(&app);
+        let screen = draw(&mut app, 60, 10);
+        assert!(screen[3].contains("3 matches"), "{screen:#?}");
+        // Previewing: the first match from the cursor is highlighted, the
+        // others marked, and the cursor hasn't moved.
+        assert_eq!(
+            cell_bg(&mut app, 60, 10, 4, 4),
+            theme.highlighted_find_result_background
+        );
+        assert_eq!(
+            cell_bg(&mut app, 60, 10, 6, 4),
+            theme.highlighted_find_result_background
+        );
+        assert_eq!(cell_bg(&mut app, 60, 10, 7, 4), theme.view_background);
+        assert_eq!(
+            cell_bg(&mut app, 60, 10, 8, 5),
+            theme.find_result_background
+        );
+        assert_eq!(
+            cell_bg(&mut app, 60, 10, 4, 6),
+            theme.find_result_background
+        );
+        assert!(screen[9].contains("Ln 1, Col 1"), "{screen:#?}");
+        assert!(app.tabs[0].view.editor().selection().is_none());
+
+        // Enter selects it and closes the box; the rest stay marked.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.search_box.is_none());
+        let editor = app.tabs[0].view.editor();
+        assert_eq!(editor.selection(), Some(3..6));
+        assert!(editor.search().is_some());
+        assert_eq!(cell_bg(&mut app, 60, 10, 4, 4), theme.selection_background);
+        assert_eq!(
+            cell_bg(&mut app, 60, 10, 8, 5),
+            theme.find_result_background
+        );
+        assert_eq!(
+            cell_bg(&mut app, 60, 10, 4, 6),
+            theme.find_result_background
+        );
+
+        // Ctrl+G steps on, wrapping with a message before going around.
+        ctrl(&mut app, 'g');
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(15..18));
+        ctrl(&mut app, 'g');
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(19..22));
+        assert!(app.status.is_none());
+        ctrl(&mut app, 'g');
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(19..22));
+        assert!(app.status.as_deref().unwrap().contains("wrapped"));
+        ctrl(&mut app, 'g');
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(3..6));
+        assert!(app.status.is_none());
+
+        // Any other movement drops the highlights.
+        press(&mut app, KeyCode::Right);
+        assert!(app.tabs[0].view.editor().search().is_none());
+        assert_eq!(cell_bg(&mut app, 60, 10, 8, 5), theme.view_background);
+
+        // Ctrl+G with no search going repeats the last query from the
+        // cursor, which is now at the end of the first match.
+        ctrl(&mut app, 'g');
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(15..18));
+        assert_eq!(
+            cell_bg(&mut app, 60, 10, 4, 6),
+            theme.find_result_background
+        );
+    }
+
+    #[test]
+    fn search_starts_at_the_cursor_and_reveals_the_match() {
+        let text: String = (1..=60)
+            .map(|i| {
+                if i % 20 == 10 {
+                    format!("needle {i}\n")
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect();
+        let (_dir, mut app) = app_with_files(&[("a.txt", &text)]);
+        draw(&mut app, 30, 12);
+        // Cursor onto line 12, past the first needle.
+        for _ in 0..11 {
+            press(&mut app, KeyCode::Down);
+        }
+        draw(&mut app, 30, 12);
+        ctrl(&mut app, 'f');
+        type_str(&mut app, "needle");
+        wait_for_search(&app);
+        let screen = draw(&mut app, 30, 12);
+        // The view scrolled to the first match after the cursor, on line
+        // 30, centered in the rows the box leaves clear, while the cursor
+        // stayed on line 12.
+        assert_eq!(screen[7], " 30 │needle 30               │", "{screen:#?}");
+        assert!(screen[11].contains("Ln 12"), "{screen:#?}");
+        assert!(screen[3].contains("3 matches"), "{screen:#?}");
+        // Ctrl+G in the box previews the next one.
+        ctrl(&mut app, 'g');
+        let screen = draw(&mut app, 30, 12);
+        assert!(
+            screen[1..11].iter().any(|r| r.contains("needle 50")),
+            "{screen:#?}"
+        );
+        assert!(screen[11].contains("Ln 12"), "{screen:#?}");
+        ctrl(&mut app, 'g');
+        let screen = draw(&mut app, 30, 12);
+        assert_eq!(screen[7], " 10 │needle 10               │", "{screen:#?}");
+        // Enter selects the previewed match.
+        press(&mut app, KeyCode::Enter);
+        let editor = app.tabs[0].view.editor();
+        assert_eq!(editor.selected_text().as_deref(), Some("needle"));
+        assert_eq!(editor.cursor_position().line, 9);
+    }
+
+    #[test]
+    fn stepping_between_matches_scrolls_sideways_as_little_as_possible() {
+        // The view is 30 wide with a 4-column gutter and a scrollbar: 25
+        // text columns. Three blank lines keep the text clear of the
+        // search box.
+        let x = "x".repeat(50);
+        let z = "z".repeat(10);
+        let w = "w".repeat(40);
+        let text = format!("\n\n\n{x}needle\nneedle {x}\n{z}{w}\n");
+        let (_dir, mut app) = app_with_files(&[("a.txt", &text)]);
+        draw(&mut app, 30, 10);
+        ctrl(&mut app, 'f');
+        type_str(&mut app, "needle");
+        wait_for_search(&app);
+        // The first match ends at column 56: scrolled just enough to fit.
+        let screen = draw(&mut app, 30, 10);
+        assert_eq!(app.tabs[0].view.scroll_col(), 31);
+        assert_eq!(screen[4], " 4 │xxxxxxxxxxxxxxxxxxxneedle█", "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(53..59));
+        // The next match is at the start of its line, so the view scrolls
+        // all the way back rather than leaving its start off the left.
+        ctrl(&mut app, 'g');
+        let screen = draw(&mut app, 30, 10);
+        assert_eq!(app.tabs[0].view.scroll_col(), 0);
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(60..66));
+        assert!(screen[5].starts_with(" 5 │needle xxx"), "{screen:#?}");
+        // Back to the first: it doesn't fit from the margin, so the view
+        // scrolls right again.
+        ctrl(&mut app, 'g');
+        ctrl(&mut app, 'g');
+        draw(&mut app, 30, 10);
+        assert_eq!(app.tabs[0].view.scroll_col(), 31);
+        // A match already in view leaves the scroll alone.
+        press(&mut app, KeyCode::Esc);
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Left);
+        }
+        draw(&mut app, 30, 10);
+        assert_eq!(app.tabs[0].view.editor().cursor(), 53);
+        ctrl(&mut app, 'f');
+        type_str(&mut app, "eedle");
+        wait_for_search(&app);
+        draw(&mut app, 30, 10);
+        assert_eq!(
+            app.tabs[0].view.editor().search().unwrap().current(),
+            Some(54..59)
+        );
+        assert_eq!(app.tabs[0].view.scroll_col(), 31);
+        // A match wider than the view starts at the left edge.
+        press(&mut app, KeyCode::Esc);
+        ctrl(&mut app, 'f');
+        type_str(&mut app, "/w+");
+        wait_for_search(&app);
+        let screen = draw(&mut app, 30, 10);
+        assert_eq!(app.tabs[0].view.scroll_col(), 10);
+        assert_eq!(screen[6], " 6 │wwwwwwwwwwwwwwwwwwwwwwwww█", "{screen:#?}");
+    }
+
+    #[test]
+    fn escape_clears_the_search() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "foo foo\n")]);
+        let theme = Theme::default();
+        ctrl(&mut app, 'f');
+        type_str(&mut app, "foo");
+        wait_for_search(&app);
+        assert!(app.tabs[0].view.editor().search().is_some());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.search_box.is_none());
+        assert!(app.tabs[0].view.editor().search().is_none());
+        assert_eq!(cell_bg(&mut app, 30, 4, 4, 1), theme.view_background);
+
+        // After Enter too: Escape drops both the selection and the marks.
+        ctrl(&mut app, 'f');
+        type_str(&mut app, "foo");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.tabs[0].view.editor().selection().is_some());
+        press(&mut app, KeyCode::Esc);
+        let editor = app.tabs[0].view.editor();
+        assert!(editor.selection().is_none());
+        assert!(editor.search().is_none());
+
+        // Typing after Enter drops the marks as well.
+        ctrl(&mut app, 'f');
+        type_str(&mut app, "foo");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.tabs[0].view.editor().search().is_none());
+        assert_eq!(app.tabs[0].view.editor().buffer().to_text(), "foo x\n");
+
+        // A click outside the box closes it and clears the search; the
+        // palette replaces it.
+        ctrl(&mut app, 'f');
+        type_str(&mut app, "foo");
+        click(&mut app, 5, 6);
+        assert!(app.search_box.is_none());
+        assert!(app.tabs[0].view.editor().search().is_none());
+        ctrl(&mut app, 'f');
+        ctrl(&mut app, 't');
+        assert!(app.search_box.is_none() && app.palette.is_some());
+        assert!(app.tabs[0].view.editor().search().is_none());
+        ctrl(&mut app, 'f');
+        assert!(app.search_box.is_some() && app.palette.is_none());
+    }
+
+    #[test]
+    fn regex_search_and_hints() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "\n\n\nfoo fooo f\n")]);
+        ctrl(&mut app, 'f');
+        type_str(&mut app, "/fo+");
+        wait_for_search(&app);
+        let screen = draw(&mut app, 60, 8);
+        assert!(screen[3].contains("regex, 2 matches"), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(3..6));
+        ctrl(&mut app, 'g');
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(7..11));
+
+        press(&mut app, KeyCode::Right);
+        ctrl(&mut app, 'f');
+        type_str(&mut app, "/(");
+        let screen = draw(&mut app, 60, 8);
+        assert!(
+            screen[3].contains("invalid regex: unclosed group"),
+            "{screen:#?}"
+        );
+        // Enter with nothing to select keeps the box open.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.search_box.is_some());
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        type_str(&mut app, "zzz");
+        wait_for_search(&app);
+        let screen = draw(&mut app, 60, 8);
+        assert!(screen[3].contains("no matches"), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.search_box.is_some());
+        // The plain text form of a pattern is literal.
+        ctrl(&mut app, 'u');
+        type_str(&mut app, "fo+");
+        wait_for_search(&app);
+        let screen = draw(&mut app, 60, 8);
+        assert!(screen[3].contains("no matches"), "{screen:#?}");
     }
 
     #[test]
