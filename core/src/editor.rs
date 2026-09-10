@@ -375,6 +375,13 @@ impl Editor {
     /// Lay out a line's content for display: each character with its byte
     /// range and the cells it occupies, using the editor's tab width. The
     /// line's terminator is not included.
+    /// The display width of a line in columns, without laying out its
+    /// syntax highlighting. Cheaper than [`line_cells`](Self::line_cells)
+    /// when only the width matters.
+    pub fn line_width(&self, line: usize) -> usize {
+        self.layout(line).end_column
+    }
+
     pub fn line_cells(&self, line: usize) -> Vec<Cell> {
         let layout = self.layout(line);
         let bytes = self
@@ -1740,9 +1747,12 @@ mod tests {
             vec![(0..1, "a", 0, 1), (1..2, "\t", 1, 3), (2..5, "한", 4, 2)]
         );
         assert!(ed.line_cells(1).is_empty());
+        assert_eq!(ed.line_width(0), 6);
+        assert_eq!(ed.line_width(1), 0);
 
         ed.set_tab_width(2);
         assert_eq!(ed.line_cells(0)[1].width, 1);
+        assert_eq!(ed.line_width(0), 4);
 
         let invalid = Editor::new(FileBuffer::from_bytes(b"\xff"));
         assert_eq!(invalid.line_cells(0)[0].text, "\u{FFFD}");

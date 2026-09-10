@@ -740,6 +740,74 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_scrolling_stops_past_the_longest_visible_line() {
+        // A long line among short ones; the view is 14 text columns wide.
+        let long = "x".repeat(50);
+        let short: String = "short\n".repeat(30);
+        let (_dir, mut app) = app_with_files(&[("a.txt", &format!("short\n{long}\n{short}"))]);
+        draw(&mut app, 20, 6);
+        let wheel = |app: &mut App, kind| {
+            app.handle_event(Event::Mouse(MouseEvent {
+                kind,
+                column: 8,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            }));
+        };
+        // Scrolling far right stops with the end of the long line and two
+        // spare columns in view: 50 + 2 - 14.
+        for _ in 0..20 {
+            wheel(&mut app, MouseEventKind::ScrollRight);
+        }
+        let screen = draw(&mut app, 20, 6);
+        assert_eq!(app.tabs[0].view.scroll_col(), 38);
+        assert_eq!(screen[2], "  2 │xxxxxxxxxxxx  │");
+        // Scrolling down to where only short lines are visible keeps the
+        // horizontal position rather than snapping back...
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        draw(&mut app, 20, 6);
+        assert_eq!(app.tabs[0].view.scroll_col(), 38);
+        // ...but it can't go any further right, only left.
+        wheel(&mut app, MouseEventKind::ScrollRight);
+        assert_eq!(app.tabs[0].view.scroll_col(), 38);
+        wheel(&mut app, MouseEventKind::ScrollLeft);
+        assert_eq!(app.tabs[0].view.scroll_col(), 34);
+        wheel(&mut app, MouseEventKind::ScrollRight);
+        assert_eq!(app.tabs[0].view.scroll_col(), 34);
+        // Back at the top, the short first line doesn't limit anything
+        // until the long line scrolls out of view, and even a burst of
+        // vertical and horizontal motion between redraws respects the
+        // lines visible at the time.
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        wheel(&mut app, MouseEventKind::ScrollRight);
+        wheel(&mut app, MouseEventKind::ScrollRight);
+        assert_eq!(app.tabs[0].view.scroll_col(), 38);
+        // Clicking the far end of the scrollbar track can't get past the
+        // limit either; the bar's range ends at the limit.
+        wheel(&mut app, MouseEventKind::ScrollLeft);
+        wheel(&mut app, MouseEventKind::ScrollLeft);
+        let screen = draw(&mut app, 20, 6);
+        assert!(screen[4].contains('─'), "{screen:#?}");
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 18,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        }));
+        let col = app.tabs[0].view.scroll_col();
+        assert!(col > 30 && col <= 38, "scroll_col {col}");
+        // Short lines only: no limit to scroll into from the left edge.
+        for _ in 0..10 {
+            wheel(&mut app, MouseEventKind::ScrollLeft);
+        }
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        draw(&mut app, 20, 6);
+        assert_eq!(app.tabs[0].view.scroll_col(), 0);
+        wheel(&mut app, MouseEventKind::ScrollRight);
+        assert_eq!(app.tabs[0].view.scroll_col(), 0);
+    }
+
+    #[test]
     fn paging_through_long_lines_keeps_the_full_height() {
         // Every line overflows a 30-column view, so the horizontal scrollbar
         // is always needed. Paging down must not shrink the editor.

@@ -13,6 +13,12 @@
 //! or the view is scrolled horizontally. Only the visible lines are measured
 //! for that decision, so it stays cheap on files with huge lines.
 //!
+//! Horizontal scrolling stops at the longest visible line plus a couple of
+//! columns, so a trackpad's stray sideways motion can't push the text out
+//! of view. Scrolling vertically can lower that limit, and then the view
+//! keeps its horizontal position rather than snapping back; the limit only
+//! ever blocks further scrolling to the right.
+//!
 //! The gutter to the left of the text is laid out as
 //! `[breakpoint][line number][space][guide]`. The breakpoint column is
 //! blank for now; a debugger can later mark it with a red circle. The
@@ -32,6 +38,9 @@ use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, Stateful
 const WHEEL_LINES: usize = 3;
 /// Columns scrolled per horizontal wheel notch.
 const WHEEL_COLUMNS: usize = 4;
+/// Columns the view may scroll past the longest visible line: one for the
+/// cursor at the end of the line, one for padding.
+const HSCROLL_SLACK: usize = 2;
 
 /// What the mouse is dragging, from a button press until its release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +100,12 @@ impl EditorView {
     pub fn editor_mut(&mut self) -> &mut Editor {
         self.follow_cursor = true;
         &mut self.editor
+    }
+
+    /// First visible display column.
+    #[cfg(test)]
+    pub fn scroll_col(&self) -> usize {
+        self.scroll_col
     }
 
     // ----- Rendering ------------------------------------------------------
@@ -259,7 +274,9 @@ impl EditorView {
             .render(self.vscroll, buf, &mut state);
 
         if show_hscroll {
-            self.hscroll_total = max_width.max(self.scroll_col + text_width);
+            // The bar covers the reachable range, whichever is larger: the
+            // longest line and its slack, or what is already scrolled to.
+            self.hscroll_total = (max_width + HSCROLL_SLACK).max(self.scroll_col + text_width);
             let mut state = ScrollbarState::new(self.hscroll_total - text_width + 1)
                 .position(self.scroll_col)
                 .viewport_content_length(text_width);
@@ -311,8 +328,30 @@ impl EditorView {
             .min(self.max_scroll_line());
     }
 
+    /// Scroll sideways. Scrolling right stops at the limit, but a position
+    /// already past it, left there by a vertical scroll, stays where it is.
     fn scroll_horizontally_by(&mut self, columns: isize) {
-        self.scroll_col = self.scroll_col.saturating_add_signed(columns);
+        let target = self.scroll_col.saturating_add_signed(columns);
+        self.scroll_col = if columns > 0 {
+            target.min(self.max_scroll_col().max(self.scroll_col))
+        } else {
+            target
+        };
+    }
+
+    /// The furthest the view can scroll right: the longest visible line
+    /// plus its slack at the right edge. Measured from the lines visible
+    /// now, not at the last render, since a burst of wheel events can mix
+    /// vertical and horizontal motion between redraws.
+    fn max_scroll_col(&self) -> usize {
+        let text_width = self.text.width as usize;
+        let last = (self.scroll_line + self.text.height.max(1) as usize)
+            .min(self.editor.buffer().line_count());
+        let max_width = (self.scroll_line..last)
+            .map(|line| self.editor.line_width(line))
+            .max()
+            .unwrap_or(0);
+        (max_width + HSCROLL_SLACK).saturating_sub(text_width)
     }
 
     // ----- Keyboard -------------------------------------------------------
@@ -509,12 +548,20 @@ impl EditorView {
         self.scroll_line = (row * (max + 1) / track).min(max);
     }
 
-    /// Scroll so the horizontal scrollbar's thumb is around column `x`.
+    /// Scroll so the horizontal scrollbar's thumb is around column `x`. The
+    /// bar's range is the reachable one, so dragging can't go past the
+    /// limit either, and dragging right from a position beyond the limit
+    /// stays put.
     fn scroll_horizontally_to(&mut self, x: u16) {
         let track = self.hscroll.width.max(1) as usize;
         let column = x.saturating_sub(self.hscroll.x) as usize;
         let max = self.hscroll_total.saturating_sub(self.text.width as usize);
-        self.scroll_col = (column * (max + 1) / track).min(max);
+        let target = (column * (max + 1) / track).min(max);
+        if target > self.scroll_col {
+            self.scroll_col = target.min(self.max_scroll_col().max(self.scroll_col));
+        } else {
+            self.scroll_col = target;
+        }
     }
 }
 
