@@ -27,7 +27,7 @@ command-palette-selection-text = "black"
 
 # Syntax highlighting. A `*` prefix is bold, a `/` prefix is italic.
 # Kinds left unset use their parent kind's style (see the theme docs).
-syntax-comment = "/inactive"
+syntax-comment = "alt"
 syntax-doc-comment = "/alt"
 syntax-keyword = "yellow"
 syntax-control-keyword = "*yellow"
