@@ -686,6 +686,44 @@ mod tests {
     }
 
     #[test]
+    fn paging_scrolls_the_view_with_one_line_of_overlap() {
+        let text: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        let (_dir, mut app) = app_with_files(&[("a.txt", &text)]);
+        // Ten text rows, so a page is nine lines.
+        draw(&mut app, 20, 12);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::PageDown);
+        let screen = draw(&mut app, 20, 12);
+        // The old bottom line (10) is now at the top, and the cursor stayed
+        // on its row: line 3 was on row 3, line 12 is on row 3.
+        assert!(screen[1].starts_with(" 10 "), "{screen:#?}");
+        assert!(screen[11].contains("Ln 12"), "{screen:#?}");
+        press(&mut app, KeyCode::PageDown);
+        let screen = draw(&mut app, 20, 12);
+        assert!(screen[1].starts_with(" 19 "), "{screen:#?}");
+        assert!(screen[11].contains("Ln 21"), "{screen:#?}");
+        // Near the end the view stops at the last page while the cursor
+        // keeps moving a full page.
+        press(&mut app, KeyCode::PageDown);
+        press(&mut app, KeyCode::PageDown);
+        let screen = draw(&mut app, 20, 12);
+        assert!(screen[1].starts_with(" 32 "), "{screen:#?}");
+        assert!(screen[11].contains("Ln 39"), "{screen:#?}");
+        // Paging back up scrolls the old top line to the bottom, cursor row
+        // unchanged again.
+        press(&mut app, KeyCode::PageUp);
+        let screen = draw(&mut app, 20, 12);
+        assert!(screen[1].starts_with(" 23 "), "{screen:#?}");
+        assert!(screen[10].starts_with(" 32 "), "{screen:#?}");
+        assert!(screen[11].contains("Ln 30"), "{screen:#?}");
+        // Shift+PageUp extends the selection while scrolling.
+        app.handle_event(key(KeyCode::PageUp, KeyModifiers::SHIFT));
+        draw(&mut app, 20, 12);
+        assert!(app.tabs[0].view.editor().selection().is_some());
+    }
+
+    #[test]
     fn horizontal_scrollbar_appears_only_when_needed() {
         let long = "x".repeat(50);
         let (_dir, mut app) = app_with_files(&[("a.txt", &format!("short\n{long}\nshort\n"))]);

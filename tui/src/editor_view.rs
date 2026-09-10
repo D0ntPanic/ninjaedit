@@ -302,7 +302,29 @@ impl EditorView {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let page = self.text.height.max(1) as usize;
+        // Page up and down scroll the view by a page and move the cursor
+        // by the same amount, so the cursor stays on its screen row. The
+        // page is one line short of the view, so the line at the edge of
+        // the old page is still visible at the opposite edge of the new
+        // one, as vim does, to keep some context across the jump.
+        let page = self.text.height.saturating_sub(1).max(1) as usize;
+        let paging = match key.code {
+            KeyCode::PageUp => Some((-(page as isize), Movement::PageUp(page))),
+            KeyCode::PageDown => Some((page as isize, Movement::PageDown(page))),
+            _ => None,
+        };
+        if let Some((lines, movement)) = paging {
+            self.scroll_by(lines);
+            if shift {
+                self.editor.extend_selection(movement);
+            } else {
+                self.editor.move_cursor(movement);
+            }
+            // The scroll may have been clamped at either end of the buffer,
+            // so still make sure the cursor ends up in view.
+            self.follow_cursor = true;
+            return true;
+        }
 
         let movement = match key.code {
             KeyCode::Left if ctrl => Some(Movement::WordLeft),
@@ -315,8 +337,6 @@ impl EditorView {
             KeyCode::End if ctrl => Some(Movement::DocumentEnd),
             KeyCode::Home => Some(Movement::LineStart),
             KeyCode::End => Some(Movement::LineEnd),
-            KeyCode::PageUp => Some(Movement::PageUp(page)),
-            KeyCode::PageDown => Some(Movement::PageDown(page)),
             _ => None,
         };
         if let Some(movement) = movement {
