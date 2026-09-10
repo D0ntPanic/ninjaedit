@@ -39,8 +39,25 @@
 //! edit, and [`Editor::line_cells`] reports each character's
 //! [`TokenKind`] for the frontend to style. See the
 //! [`syntax`](crate::syntax) module.
+//!
+//! Indentation: the editor guesses the buffer's [`Indentation`] style when
+//! it is created (see the [`indent`](crate::indent) module) and uses it for
+//! [`Editor::indent`] and [`Editor::outdent`], which the frontend binds to
+//! Tab and Shift+Tab. With a selection they shift whole lines; without one,
+//! Tab inserts one level at the cursor and Shift+Tab shifts the cursor's
+//! line. In a space-indented buffer, backspace within a line's leading
+//! spaces removes a whole level.
+//!
+//! A newline at the end of an indented line does not copy the indentation
+//! into the buffer right away. Instead the editor holds it as *pending*
+//! indentation: the cursor is shown at the indented column, Tab and
+//! backspace adjust the pending amount, and the whitespace is only written
+//! when text is typed after it. Another newline leaves the line blank, with
+//! no trailing whitespace, and carries the same pending indentation on.
+//! Moving the cursor, or any other edit, discards it.
 
 use crate::buffer::FileBuffer;
+use crate::indent::{self, Indentation};
 use crate::syntax::{Highlighter, Language, Token, TokenKind};
 use crate::text::{self, Grapheme};
 use std::io;
@@ -272,17 +289,24 @@ pub struct Editor {
     /// `None` if that state is no longer in the history.
     save_point: Option<usize>,
     tab_width: usize,
+    /// How lines are indented; see [`indentation`](Self::indentation).
+    indentation: Indentation,
+    /// Indentation the cursor is shown at but that isn't in the buffer
+    /// yet; see the [module documentation](self). Only ever spaces and
+    /// tabs. When set, the cursor is at the start of an empty line.
+    pending: Option<String>,
     /// Syntax highlighting, when the buffer's language is known.
     highlighter: Option<Highlighter>,
 }
 
 impl Editor {
     /// Create an editor over a buffer, with the cursor at the start and no
-    /// selection.
+    /// selection. The indentation style is guessed from the contents.
     pub fn new(buffer: FileBuffer) -> Editor {
         let save_point = if buffer.is_modified() { None } else { Some(0) };
         let language = buffer.path().and_then(Language::from_path);
         let highlighter = language.map(|language| Highlighter::new(language, buffer.line_count()));
+        let indentation = indent::detect(&buffer.snapshot()).unwrap_or_default();
         Editor {
             buffer,
             cursor: 0,
@@ -293,6 +317,8 @@ impl Editor {
             grouping: false,
             save_point,
             tab_width: DEFAULT_TAB_WIDTH,
+            indentation,
+            pending: None,
             highlighter,
         }
     }
@@ -393,9 +419,15 @@ impl Editor {
         self.cursor
     }
 
-    /// The cursor as a line and column.
+    /// The cursor as a line and column. With pending indentation, the
+    /// column is where the cursor is shown, past the indentation, not the
+    /// column of its byte offset.
     pub fn cursor_position(&self) -> Position {
-        self.position_of_offset(self.cursor)
+        let mut position = self.position_of_offset(self.cursor);
+        if let Some(pending) = &self.pending {
+            position.column += self.indent_columns(pending);
+        }
+        position
     }
 
     /// The selection anchor: the end of the selection that doesn't move.
@@ -501,7 +533,7 @@ impl Editor {
         let mut column = if vertical {
             Some(
                 self.desired_column
-                    .unwrap_or_else(|| self.column_of(line, self.cursor)),
+                    .unwrap_or_else(|| self.cursor_position().column),
             )
         } else {
             None
@@ -540,13 +572,16 @@ impl Editor {
         self.cursor = target;
         self.grouping = false;
         self.desired_column = column;
+        self.pending = None;
     }
 
     /// Bookkeeping shared by all explicit cursor changes: they break undo
-    /// grouping and forget the remembered vertical column.
+    /// grouping, forget the remembered vertical column, and discard
+    /// pending indentation.
     fn end_movement(&mut self) {
         self.grouping = false;
         self.desired_column = None;
+        self.pending = None;
     }
 
     // ----- Position arithmetic -------------------------------------------
@@ -671,43 +706,93 @@ impl Editor {
     // ----- Editing --------------------------------------------------------
 
     /// Insert a typed character at the cursor, replacing the selection if
-    /// there is one. `'\n'` and `'\r'` insert the buffer's line ending.
+    /// there is one. `'\n'` and `'\r'` insert the buffer's line ending and
+    /// carry the line's indentation on as pending indentation (see the
+    /// [module documentation](self)); any other character first commits
+    /// pending indentation to the buffer.
     pub fn insert_char(&mut self, c: char) {
         if c == '\n' || c == '\r' {
-            let eol = self.buffer.eol().as_str().as_bytes().to_vec();
-            self.replace_selection_with(eol, EditKind::Other);
+            self.insert_newline();
             return;
         }
+        let mut inserted = self.pending.take().unwrap_or_default().into_bytes();
         let mut bytes = [0u8; 4];
-        let inserted = c.encode_utf8(&mut bytes).as_bytes().to_vec();
+        inserted.extend_from_slice(c.encode_utf8(&mut bytes).as_bytes());
         self.replace_selection_with(inserted, EditKind::Typing);
+    }
+
+    /// Insert a line break at the cursor (replacing the selection). When
+    /// nothing follows the cursor on its line, the line's indentation
+    /// becomes pending on the new line; otherwise the text moving to the
+    /// new line is indented right away. With indentation already pending,
+    /// the current line is left blank and the pending indentation moves on.
+    fn insert_newline(&mut self) {
+        let eol = self.buffer.eol().as_str().as_bytes();
+        if let Some(pending) = self.pending.take() {
+            self.replace_selection_with(eol.to_vec(), EditKind::Other);
+            self.pending = Some(pending);
+            return;
+        }
+        let range = self.selection().unwrap_or(self.cursor..self.cursor);
+        let leading = self.leading_whitespace(self.buffer.line_of_offset(range.start));
+        let indent = self
+            .buffer
+            .bytes_in_range(leading.start..leading.end.min(range.start));
+        let end_line = self.buffer.line_of_offset(range.end);
+        let at_end = range.end == self.buffer.line_content_range(end_line).end;
+        let mut inserted = eol.to_vec();
+        if at_end {
+            self.commit(range, inserted, EditKind::Other);
+            if !indent.is_empty() {
+                // Leading whitespace is only ever spaces and tabs.
+                self.pending = String::from_utf8(indent).ok();
+            }
+        } else {
+            inserted.extend_from_slice(&indent);
+            self.commit(range, inserted, EditKind::Other);
+        }
     }
 
     /// Insert text at the cursor, replacing the selection if there is one.
     /// Line breaks in the text are rewritten as the buffer's line ending.
+    /// Pending indentation is committed first.
     pub fn insert_text(&mut self, text: &str) {
         let text = normalize_line_endings(text, self.buffer.eol().as_str());
         if text.is_empty() {
             return;
         }
-        self.replace_selection_with(text.into_bytes(), EditKind::Other);
+        let mut inserted = self.pending.take().unwrap_or_default().into_bytes();
+        inserted.extend_from_slice(text.as_bytes());
+        self.replace_selection_with(inserted, EditKind::Other);
     }
 
     /// Delete the selection, or the character before the cursor if nothing
-    /// is selected.
+    /// is selected. With pending indentation, removes one level of it
+    /// instead. In a space-indented buffer, when only spaces precede the
+    /// cursor on its line, removes back to the previous indentation stop.
     pub fn backspace(&mut self) {
+        if let Some(mut pending) = self.pending.take() {
+            self.shrink_indent(&mut pending);
+            if !pending.is_empty() {
+                self.pending = Some(pending);
+            }
+            return;
+        }
         if self.delete_selection() {
             return;
         }
-        let start = self.prev_char(self.cursor);
+        let start = self
+            .indentation_stop_before_cursor()
+            .unwrap_or_else(|| self.prev_char(self.cursor));
         if start < self.cursor {
             self.commit(start..self.cursor, Vec::new(), EditKind::Backspace);
         }
     }
 
     /// Delete the selection, or the character after the cursor if nothing is
-    /// selected.
+    /// selected. Pending indentation is discarded.
     pub fn delete_forward(&mut self) {
+        self.pending = None;
         if self.delete_selection() {
             return;
         }
@@ -757,6 +842,23 @@ impl Editor {
     /// Replace `range` with `inserted`, leaving the cursor after the inserted
     /// bytes with no selection, and record the change for undo.
     fn commit(&mut self, range: Range<usize>, inserted: Vec<u8>, kind: EditKind) {
+        let cursor = range.start + inserted.len();
+        self.commit_with_cursor(range, inserted, kind, cursor, None);
+    }
+
+    /// Replace `range` with `inserted`, leaving the cursor and selection
+    /// anchor where the caller says, and record the change for undo. Any
+    /// pending indentation is discarded; a caller that wants to keep it
+    /// must set it again afterwards.
+    fn commit_with_cursor(
+        &mut self,
+        range: Range<usize>,
+        inserted: Vec<u8>,
+        kind: EditKind,
+        cursor: usize,
+        anchor: Option<usize>,
+    ) {
+        self.pending = None;
         let before = self.state();
         let edit = Edit {
             offset: range.start,
@@ -764,8 +866,8 @@ impl Editor {
             inserted,
         };
         self.apply(&edit);
-        self.cursor = edit.offset + edit.inserted.len();
-        self.anchor = None;
+        self.cursor = cursor;
+        self.anchor = anchor;
         self.desired_column = None;
 
         self.redo.clear();
@@ -825,6 +927,205 @@ impl Editor {
             cursor: self.cursor,
             anchor: self.anchor,
         }
+    }
+
+    // ----- Indentation ----------------------------------------------------
+
+    /// How lines are indented: guessed from the buffer's contents when the
+    /// editor was created, or four spaces if they didn't say. Used by
+    /// [`indent`](Self::indent), [`outdent`](Self::outdent), and
+    /// [`backspace`](Self::backspace).
+    pub fn indentation(&self) -> Indentation {
+        self.indentation
+    }
+
+    pub fn set_indentation(&mut self, indentation: Indentation) {
+        self.indentation = match indentation {
+            Indentation::Spaces(n) => Indentation::Spaces(n.max(1)),
+            Indentation::Tabs => Indentation::Tabs,
+        };
+    }
+
+    /// Indentation the cursor is shown at but that hasn't been written to
+    /// the buffer; see the [module documentation](self). `None` when there
+    /// is none.
+    pub fn pending_indentation(&self) -> Option<&str> {
+        self.pending.as_deref()
+    }
+
+    /// Indent by one level. With pending indentation, adds a level to it.
+    /// With a selection, indents every line it touches, keeping the
+    /// selection. Otherwise inserts, at the cursor, whatever reaches the
+    /// next indentation stop: a tab, or spaces up to the next multiple of
+    /// the indentation width.
+    pub fn indent(&mut self) {
+        if let Some(mut pending) = self.pending.take() {
+            let step = self.indent_step(self.indent_columns(&pending));
+            pending.push_str(&step);
+            self.pending = Some(pending);
+            return;
+        }
+        match self.selection() {
+            Some(range) => self.shift_lines(range, true),
+            None => {
+                let step = self.indent_step(self.cursor_position().column);
+                self.commit(
+                    self.cursor..self.cursor,
+                    step.into_bytes(),
+                    EditKind::Typing,
+                );
+            }
+        }
+    }
+
+    /// Remove one level of indentation. With pending indentation, takes a
+    /// level off it. Otherwise shifts every line the selection touches (or
+    /// the cursor's line) back to the previous indentation stop, keeping
+    /// the selection. Lines that aren't indented are left alone.
+    pub fn outdent(&mut self) {
+        if let Some(mut pending) = self.pending.take() {
+            self.shrink_indent(&mut pending);
+            if !pending.is_empty() {
+                self.pending = Some(pending);
+            }
+            return;
+        }
+        let range = self.selection().unwrap_or(self.cursor..self.cursor);
+        self.shift_lines(range, false);
+    }
+
+    /// The width of one indentation level in columns.
+    fn indent_width(&self) -> usize {
+        self.indentation.width(self.tab_width)
+    }
+
+    /// The display width of a run of spaces and tabs starting at column 0.
+    fn indent_columns(&self, indent: &str) -> usize {
+        indent.chars().fold(0, |column, c| match c {
+            '\t' => column + self.tab_width - column % self.tab_width,
+            _ => column + 1,
+        })
+    }
+
+    /// The text that takes indentation from `column` to the next stop.
+    fn indent_step(&self, column: usize) -> String {
+        match self.indentation {
+            Indentation::Tabs => "\t".to_owned(),
+            Indentation::Spaces(n) => " ".repeat(n - column % n),
+        }
+    }
+
+    /// The number of bytes to drop from the end of `indent` (spaces and
+    /// tabs) to reach the previous indentation stop: a trailing tab, or the
+    /// spaces past the previous multiple of the indentation width.
+    fn outdent_len(&self, indent: &[u8]) -> usize {
+        if indent.last() == Some(&b'\t') {
+            return 1;
+        }
+        let spaces = indent.iter().rev().take_while(|&&b| b == b' ').count();
+        if spaces == 0 {
+            return 0;
+        }
+        let width = self.indent_width();
+        let columns = self.indent_columns(&String::from_utf8_lossy(indent));
+        ((columns - 1) % width + 1).min(spaces)
+    }
+
+    /// Take one level off a run of spaces and tabs.
+    fn shrink_indent(&self, indent: &mut String) {
+        let len = indent.len() - self.outdent_len(indent.as_bytes());
+        indent.truncate(len);
+    }
+
+    /// The range of spaces and tabs at the start of a line's content.
+    fn leading_whitespace(&self, line: usize) -> Range<usize> {
+        let content = self.buffer.line_content_range(line);
+        let len = self
+            .buffer
+            .bytes_in_range(content.clone())
+            .iter()
+            .take_while(|&&b| b == b' ' || b == b'\t')
+            .count();
+        content.start..content.start + len
+    }
+
+    /// In a space-indented buffer, when only spaces precede the cursor on
+    /// its line, the offset of the previous indentation stop.
+    fn indentation_stop_before_cursor(&self) -> Option<usize> {
+        let Indentation::Spaces(width) = self.indentation else {
+            return None;
+        };
+        let start = self
+            .buffer
+            .offset_of_line(self.buffer.line_of_offset(self.cursor));
+        let spaces = self.cursor - start;
+        if spaces == 0
+            || !self
+                .buffer
+                .bytes_in_range(start..self.cursor)
+                .iter()
+                .all(|&b| b == b' ')
+        {
+            return None;
+        }
+        Some(self.cursor - ((spaces - 1) % width + 1))
+    }
+
+    /// Indent or outdent every line `range` touches, as one undoable edit,
+    /// moving the cursor and anchor with the text they sit on. A range
+    /// ending at the very start of a line doesn't touch that line. Blank
+    /// lines are never indented, so they never gain trailing whitespace.
+    fn shift_lines(&mut self, range: Range<usize>, indent: bool) {
+        let first = self.buffer.line_of_offset(range.start);
+        let mut last = self.buffer.line_of_offset(range.end);
+        if last > first && range.end == self.buffer.offset_of_line(last) {
+            last -= 1;
+        }
+        let start = self.buffer.offset_of_line(first);
+        let end = self.buffer.line_content_range(last).end;
+        let old = self.buffer.bytes_in_range(start..end);
+        let unit = self.indentation.unit();
+        let mut new = Vec::with_capacity(old.len() + (last - first + 1) * unit.len());
+        // Each line's start and how many bytes were added (or, negative,
+        // removed) there, for moving offsets to match.
+        let mut changes: Vec<(usize, isize)> = Vec::new();
+        for line in first..=last {
+            let line_start = self.buffer.offset_of_line(line);
+            let line_end = self.buffer.line_range(line).end.min(end);
+            let content = &old[line_start - start..line_end - start];
+            if indent {
+                if !content.iter().all(u8::is_ascii_whitespace) {
+                    new.extend_from_slice(unit.as_bytes());
+                    changes.push((line_start, unit.len() as isize));
+                }
+                new.extend_from_slice(content);
+            } else {
+                let leading = content
+                    .iter()
+                    .take_while(|&&b| b == b' ' || b == b'\t')
+                    .count();
+                let removed = self.outdent_len(&content[..leading]);
+                new.extend_from_slice(&content[removed..]);
+                changes.push((line_start, -(removed as isize)));
+            }
+        }
+        if new == old {
+            return;
+        }
+        let moved = |offset: usize| -> usize {
+            changes.iter().fold(offset, |moved, &(line_start, delta)| {
+                if offset <= line_start {
+                    moved
+                } else if delta >= 0 {
+                    moved + delta as usize
+                } else {
+                    moved - delta.unsigned_abs().min(offset - line_start)
+                }
+            })
+        };
+        let cursor = moved(self.cursor);
+        let anchor = self.anchor.map(moved);
+        self.commit_with_cursor(start..end, new, EditKind::Other, cursor, anchor);
     }
 
     fn restore(&mut self, state: CursorState) {
@@ -970,6 +1271,287 @@ mod tests {
         for c in s.chars() {
             editor.insert_char(c);
         }
+    }
+
+    #[test]
+    fn indentation_is_detected_or_defaults() {
+        assert_eq!(editor("").indentation(), Indentation::Spaces(4));
+        assert_eq!(editor("a\n\tb\n").indentation(), Indentation::Tabs);
+        assert_eq!(editor("a\n  b\n").indentation(), Indentation::Spaces(2));
+        let mut ed = editor("");
+        ed.set_indentation(Indentation::Spaces(0));
+        assert_eq!(ed.indentation(), Indentation::Spaces(1));
+    }
+
+    #[test]
+    fn tab_inserts_to_the_next_indentation_stop() {
+        let mut ed = editor("");
+        ed.indent();
+        assert_eq!(text(&ed), "    ");
+        type_str(&mut ed, "ab");
+        ed.indent();
+        assert_eq!(text(&ed), "    ab  ", "spaces up to the next stop");
+
+        let mut ed = editor("a\n  b\n");
+        ed.indent();
+        assert_eq!(text(&ed), "  a\n  b\n");
+
+        let mut ed = editor("a\n\tb\n");
+        ed.indent();
+        assert_eq!(text(&ed), "\ta\n\tb\n");
+        assert_eq!(ed.cursor(), 1);
+    }
+
+    #[test]
+    fn backspace_removes_a_level_of_space_indentation() {
+        let mut ed = editor("a\n    b\n      c\n\td");
+        ed.set_indentation(Indentation::Spaces(4));
+        ed.set_cursor(6);
+        ed.backspace();
+        assert_eq!(text(&ed), "a\nb\n      c\n\td");
+        assert_eq!(ed.cursor(), 2);
+        ed.set_cursor(10);
+        ed.backspace();
+        assert_eq!(
+            text(&ed),
+            "a\nb\n    c\n\td",
+            "back to the previous stop, not a whole level"
+        );
+        ed.backspace();
+        assert_eq!(text(&ed), "a\nb\nc\n\td");
+        ed.undo();
+        assert_eq!(
+            text(&ed),
+            "a\nb\n      c\n\td",
+            "a run of backspaces is one undo step"
+        );
+        ed.set_cursor(14);
+        ed.backspace();
+        assert_eq!(
+            text(&ed),
+            "a\nb\n      c\n\t",
+            "text before the cursor: one character"
+        );
+        ed.set_cursor(1);
+        ed.backspace();
+        assert_eq!(text(&ed), "\nb\n      c\n\t");
+
+        let mut ed = editor("\ta\n    b");
+        ed.set_indentation(Indentation::Tabs);
+        ed.set_cursor(7);
+        ed.backspace();
+        assert_eq!(
+            text(&ed),
+            "\ta\n   b",
+            "one space at a time in a tab-indented buffer"
+        );
+    }
+
+    #[test]
+    fn tab_with_a_selection_indents_lines() {
+        let mut ed = editor("a\n  b\n\nc\nd\n");
+        ed.set_selection(3, 8);
+        ed.indent();
+        assert_eq!(
+            text(&ed),
+            "a\n    b\n\n  c\nd\n",
+            "the blank line stays blank; the line after the selection is untouched"
+        );
+        assert_eq!(ed.selection(), Some(5..12));
+        assert_eq!(ed.anchor(), Some(5));
+        assert_eq!(ed.selected_text().as_deref(), Some(" b\n\n  c"));
+        ed.undo();
+        assert_eq!(text(&ed), "a\n  b\n\nc\nd\n");
+        assert_eq!(ed.selection(), Some(3..8));
+
+        // A selection starting at column 0 keeps the new indentation
+        // selected, and one ending at column 0 doesn't touch that line.
+        ed.set_selection(2, 7);
+        ed.indent();
+        assert_eq!(text(&ed), "a\n    b\n\nc\nd\n");
+        assert_eq!(ed.selection(), Some(2..9));
+        assert_eq!(ed.selected_text().as_deref(), Some("    b\n\n"));
+    }
+
+    #[test]
+    fn shift_tab_outdents_lines() {
+        let mut ed = editor("a\n    b\n   c\nd\n\te\n");
+        ed.set_indentation(Indentation::Spaces(2));
+        ed.set_selection(4, 13);
+        ed.outdent();
+        assert_eq!(text(&ed), "a\n  b\n  c\nd\n\te\n");
+        assert_eq!(ed.selection(), Some(2..10), "offsets move with their text");
+        ed.outdent();
+        assert_eq!(text(&ed), "a\nb\nc\nd\n\te\n");
+        assert_eq!(ed.selection(), Some(2..6), "clamped to the line start");
+        assert!(ed.can_undo());
+        let depth = {
+            let mut n = 0;
+            while ed.undo() {
+                n += 1;
+            }
+            n
+        };
+        assert_eq!(depth, 2);
+        while ed.redo() {}
+
+        ed.set_cursor(9);
+        ed.outdent();
+        assert_eq!(
+            text(&ed),
+            "a\nb\nc\nd\ne\n",
+            "the cursor's line, without a selection"
+        );
+        assert_eq!(ed.cursor(), 8);
+        ed.outdent();
+        assert_eq!(text(&ed), "a\nb\nc\nd\ne\n");
+        ed.undo();
+        assert_eq!(
+            text(&ed),
+            "a\nb\nc\nd\n\te\n",
+            "an outdent that changes nothing isn't an undo step"
+        );
+    }
+
+    #[test]
+    fn newline_carries_indentation_as_pending() {
+        let mut ed = editor("    foo");
+        ed.move_cursor(LineEnd);
+        ed.insert_char('\n');
+        assert_eq!(text(&ed), "    foo\n", "nothing written yet");
+        assert_eq!(ed.pending_indentation(), Some("    "));
+        assert_eq!(ed.cursor(), 8);
+        assert_eq!(ed.cursor_position(), Position { line: 1, column: 4 });
+        assert_eq!(ed.position_of_offset(8), Position { line: 1, column: 0 });
+
+        ed.indent();
+        assert_eq!(ed.pending_indentation(), Some("        "));
+        assert_eq!(ed.cursor_position().column, 8);
+        ed.outdent();
+        ed.backspace();
+        assert_eq!(ed.pending_indentation(), None);
+        assert_eq!(
+            text(&ed),
+            "    foo\n",
+            "adjusting pending indentation doesn't edit"
+        );
+        assert_eq!(ed.cursor_position().column, 0);
+        ed.backspace();
+        assert_eq!(text(&ed), "    foo", "then backspace joins the lines");
+
+        ed.insert_char('\n');
+        type_str(&mut ed, "b");
+        assert_eq!(
+            text(&ed),
+            "    foo\n    b",
+            "typing commits the indentation"
+        );
+        assert_eq!(ed.pending_indentation(), None);
+        ed.undo();
+        assert_eq!(
+            text(&ed),
+            "    foo\n",
+            "committed indentation undoes with the text"
+        );
+        assert_eq!(ed.pending_indentation(), None);
+    }
+
+    #[test]
+    fn newline_with_pending_indentation_leaves_a_blank_line() {
+        let mut ed = editor("\tfoo");
+        ed.move_cursor(LineEnd);
+        ed.insert_char('\n');
+        ed.insert_char('\n');
+        assert_eq!(text(&ed), "\tfoo\n\n");
+        assert_eq!(ed.pending_indentation(), Some("\t"));
+        ed.indent();
+        ed.insert_char('\n');
+        assert_eq!(
+            ed.pending_indentation(),
+            Some("\t\t"),
+            "carried on, with the extra level"
+        );
+        ed.paste("x");
+        assert_eq!(text(&ed), "\tfoo\n\n\n\t\tx", "paste commits too");
+    }
+
+    #[test]
+    fn pending_indentation_is_discarded_by_movement_and_edits() {
+        let mut ed = editor("  foo\nbar");
+        ed.set_cursor(5);
+        ed.insert_char('\n');
+        assert_eq!(ed.pending_indentation(), Some("  "));
+        ed.move_cursor(Left);
+        assert_eq!(ed.pending_indentation(), None);
+        assert_eq!(ed.cursor(), 5);
+
+        ed.insert_char('\n');
+        ed.insert_char('\n');
+        assert_eq!(text(&ed), "  foo\n\n\n\nbar");
+        assert_eq!(ed.cursor_position(), Position { line: 2, column: 2 });
+        ed.move_cursor(Down);
+        assert_eq!(ed.pending_indentation(), None);
+        assert_eq!(ed.cursor_position(), Position { line: 3, column: 0 });
+        ed.move_cursor(Down);
+        assert_eq!(
+            ed.cursor_position(),
+            Position { line: 4, column: 2 },
+            "vertical movement aims for the shown column"
+        );
+        ed.move_cursor(Up);
+        assert_eq!(ed.cursor_position(), Position { line: 3, column: 0 });
+
+        ed.insert_char('\n');
+        assert_eq!(
+            ed.pending_indentation(),
+            None,
+            "an unindented line has none to carry"
+        );
+        ed.set_cursor(5);
+        ed.insert_char('\n');
+        ed.delete_forward();
+        assert_eq!(ed.pending_indentation(), None);
+        assert_eq!(ed.cursor_position().column, 0);
+        ed.set_cursor(5);
+        ed.insert_char('\n');
+        ed.undo();
+        assert_eq!(ed.pending_indentation(), None);
+        ed.redo();
+        assert_eq!(ed.pending_indentation(), None);
+    }
+
+    #[test]
+    fn newline_in_the_middle_of_a_line_indents_immediately() {
+        let mut ed = editor("    foo bar");
+        ed.set_cursor(8);
+        ed.insert_char('\n');
+        assert_eq!(text(&ed), "    foo \n    bar");
+        assert_eq!(ed.cursor(), 13);
+        assert_eq!(ed.pending_indentation(), None);
+        ed.undo();
+        assert_eq!(text(&ed), "    foo bar");
+
+        // Inside the leading whitespace, only the part before the cursor
+        // is carried.
+        ed.set_cursor(2);
+        ed.insert_char('\n');
+        assert_eq!(text(&ed), "  \n    foo bar");
+
+        // The selection is replaced, and the indentation comes from the
+        // line the selection starts on.
+        let mut ed = editor("  a\n      b");
+        ed.set_selection(2, 9);
+        ed.insert_char('\n');
+        assert_eq!(
+            text(&ed),
+            "  \n   b",
+            "the rest of the line keeps its own spaces"
+        );
+        ed.undo();
+        ed.set_selection(11, 2);
+        ed.insert_char('\n');
+        assert_eq!(text(&ed), "  \n");
+        assert_eq!(ed.pending_indentation(), Some("  "));
     }
 
     #[test]

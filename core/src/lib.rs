@@ -5,6 +5,7 @@
 pub mod buffer;
 pub mod editor;
 pub mod fuzzy;
+pub mod indent;
 pub mod index;
 pub mod project;
 pub mod syntax;
@@ -12,6 +13,7 @@ pub mod text;
 
 pub use buffer::{FileBuffer, LineEnding};
 pub use editor::{Cell, Editor, Movement, Position};
+pub use indent::Indentation;
 pub use index::{FileIndex, IndexEntry};
 pub use project::Project;
 pub use syntax::{Highlighter, Language, Token, TokenKind};

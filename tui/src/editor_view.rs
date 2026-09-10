@@ -363,7 +363,11 @@ impl EditorView {
             },
             KeyCode::Char(c) if !alt => self.editor.insert_char(c),
             KeyCode::Enter => self.editor.insert_char('\n'),
-            KeyCode::Tab => self.editor.insert_char('\t'),
+            // Shift+Tab arrives as BackTab from most terminals, or as Tab
+            // with the shift modifier under enhanced keyboard protocols.
+            KeyCode::BackTab => self.editor.outdent(),
+            KeyCode::Tab if shift => self.editor.outdent(),
+            KeyCode::Tab => self.editor.indent(),
             KeyCode::Backspace => self.editor.backspace(),
             KeyCode::Delete => self.editor.delete_forward(),
             KeyCode::Esc => self.editor.clear_selection(),
