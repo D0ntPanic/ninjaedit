@@ -648,10 +648,11 @@ mod tests {
         let (_dir, mut app) = app_with_files(&[("a.txt", "one\ntwo\nthree\n")]);
         let screen = draw(&mut app, 30, 6);
         assert_eq!(screen[0].trim_end(), "◢a.txt ×◣");
-        assert_eq!(screen[1], " 1 one                       █");
-        assert_eq!(screen[2], " 2 two                       █");
-        assert_eq!(screen[3], " 3 three                     █");
-        assert_eq!(screen[4], " 4                           █");
+        // Gutter: breakpoint column, line number, space, guide.
+        assert_eq!(screen[1], " 1 │one                      █");
+        assert_eq!(screen[2], " 2 │two                      █");
+        assert_eq!(screen[3], " 3 │three                    █");
+        assert_eq!(screen[4], " 4 │                         █");
         assert_eq!(screen[5], " a.txt            Ln 1, Col 1 ");
     }
 
@@ -812,8 +813,8 @@ mod tests {
         click(&mut app, 1, 0);
         assert_eq!(app.active, 0);
         draw(&mut app, 30, 6);
-        // Gutter is 3 wide: text starts at column 3. Row 2 is line 2.
-        click(&mut app, 5, 2);
+        // Gutter is 4 wide: text starts at column 4. Row 2 is line 2.
+        click(&mut app, 6, 2);
         let position = app.tabs[0].view.editor().cursor_position();
         assert_eq!((position.line, position.column), (1, 2));
         // The close button on the second tab.
@@ -831,19 +832,19 @@ mod tests {
             terminal.draw(|frame| app.render(frame)).unwrap();
             terminal.backend().buffer()[(x, 1)].clone()
         };
-        // Gutter is 3 wide, so "he" is selected at columns 3 and 4.
+        // Gutter is 4 wide, so "he" is selected at columns 4 and 5.
         let theme = Theme::default();
-        let selected = cell(&mut app, 4);
+        let selected = cell(&mut app, 5);
         assert_eq!(selected.symbol(), "e");
         assert_eq!(selected.bg, theme.selection_background);
         assert_eq!(selected.fg, theme.view_text);
-        let plain = cell(&mut app, 5);
+        let plain = cell(&mut app, 6);
         assert_eq!(plain.symbol(), "l");
         assert_eq!(plain.bg, theme.view_background);
 
         // An explicit selection text color takes over.
         app.set_theme(Theme::parse("selection-text = \"#010203\"").unwrap());
-        let selected = cell(&mut app, 4);
+        let selected = cell(&mut app, 5);
         assert_eq!(selected.fg, Color::Rgb(1, 2, 3));
         assert_eq!(selected.bg, theme.selection_background);
     }
@@ -861,27 +862,30 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(30, 4)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let buffer = terminal.backend().buffer();
-        // Gutter is 3 wide.
-        let keyword = &buffer[(3, 1)];
+        // Gutter is 4 wide, ending in the guide.
+        let guide = &buffer[(3, 1)];
+        assert_eq!(guide.symbol(), "│");
+        assert_eq!(guide.fg, Theme::default().gutter_guide);
+        let keyword = &buffer[(4, 1)];
         assert_eq!(keyword.symbol(), "f");
         assert_eq!(keyword.fg, Color::Rgb(1, 2, 3));
         assert!(keyword.modifier.contains(Modifier::BOLD));
-        let name = &buffer[(6, 1)];
+        let name = &buffer[(7, 1)];
         assert_eq!(name.symbol(), "m");
         assert_eq!(name.fg, Color::Rgb(4, 5, 6));
         assert!(!name.modifier.contains(Modifier::BOLD));
-        let comment = &buffer[(16, 1)];
+        let comment = &buffer[(17, 1)];
         assert_eq!(comment.symbol(), "/");
         assert_eq!(comment.fg, Color::Rgb(7, 8, 9));
         assert!(comment.modifier.contains(Modifier::ITALIC));
-        let space = &buffer[(5, 1)];
+        let space = &buffer[(6, 1)];
         assert_eq!(space.fg, Theme::default().view_text);
 
         // Selected text keeps its syntax color and modifiers unless the
         // theme forces a selection text color.
         app.handle_event(key(KeyCode::Right, KeyModifiers::SHIFT));
         terminal.draw(|frame| app.render(frame)).unwrap();
-        let selected = &terminal.backend().buffer()[(3, 1)];
+        let selected = &terminal.backend().buffer()[(4, 1)];
         assert_eq!(selected.fg, Color::Rgb(1, 2, 3));
         assert!(selected.modifier.contains(Modifier::BOLD));
         assert_eq!(selected.bg, Theme::default().selection_background);

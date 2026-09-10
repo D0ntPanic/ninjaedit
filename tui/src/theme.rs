@@ -173,6 +173,8 @@ required {
     inactive_line_number => "inactive-line-number",
     /// The number of the line the cursor is on.
     active_line_number => "active-line-number",
+    /// The vertical guide between the gutter and the text.
+    gutter_guide => "gutter-guide",
     inactive_tab_background => "inactive-tab-background",
     active_tab_background => "active-tab-background",
     inactive_tab_text => "inactive-tab-text",

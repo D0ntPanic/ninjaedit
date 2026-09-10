@@ -12,6 +12,13 @@
 //! shown; the horizontal one appears only when a visible line doesn't fit,
 //! or the view is scrolled horizontally. Only the visible lines are measured
 //! for that decision, so it stays cheap on files with huge lines.
+//!
+//! The gutter to the left of the text is laid out as
+//! `[breakpoint][line number][space][guide]`. The breakpoint column is
+//! blank for now; a debugger can later mark it with a red circle. The
+//! guide is a vertical line right against the text, showing where the
+//! text's left edge is; git line status can later replace the guide glyph
+//! on a line with a thin colored block.
 
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -55,6 +62,12 @@ pub struct EditorView {
     hscroll_total: usize,
 }
 
+/// The guide glyph drawn between the gutter and the text.
+const GUIDE: &str = "│";
+/// Gutter columns besides the line number: the breakpoint column before
+/// it, and the space and guide after it.
+const GUTTER_EXTRA: u16 = 3;
+
 impl EditorView {
     pub fn new(editor: Editor) -> EditorView {
         EditorView {
@@ -97,7 +110,8 @@ impl EditorView {
             .bg(theme.view_background);
         buf.set_style(area, text_style);
         let line_count = self.editor.buffer().line_count();
-        let gutter_width = digits(line_count) as u16 + 2;
+        let number_width = digits(line_count) as u16;
+        let gutter_width = number_width + GUTTER_EXTRA;
         // Gutter, at least one text column, and the vertical scrollbar.
         if area.width < gutter_width + 2 || area.height == 0 {
             return None;
@@ -156,6 +170,14 @@ impl EditorView {
             Rect::default()
         };
 
+        // The guide runs the full height of the view, past the end of the
+        // file, since it marks the edge of the text area rather than a line.
+        let guide_x = self.text.x - 1;
+        let guide_style = text_style.fg(theme.gutter_guide);
+        for y in area.y..area.y + height {
+            buf.set_string(guide_x, y, GUIDE, guide_style);
+        }
+
         let selection = self.editor.selection();
         // A theme can force one text color over the selection for contrast;
         // otherwise the text keeps its syntax color. Bold and italic stay
@@ -165,14 +187,14 @@ impl EditorView {
             let line = self.scroll_line + row;
             let y = area.y + row as u16;
 
-            // Line number, right-aligned, with a space either side.
-            let number = format!("{:>width$} ", line + 1, width = gutter_width as usize - 1);
+            // Line number, right-aligned after the breakpoint column.
+            let number = format!("{:>width$}", line + 1, width = number_width as usize);
             let color = if line == cursor.line {
                 theme.active_line_number
             } else {
                 theme.inactive_line_number
             };
-            buf.set_string(area.x, y, &number, text_style.fg(color));
+            buf.set_string(area.x + 1, y, &number, text_style.fg(color));
 
             let visible = self.scroll_col..self.scroll_col + text_width;
             for cell in cells {
