@@ -6,6 +6,7 @@
 //! palette, and the status bar.
 
 mod app;
+mod clipboard;
 mod editor_view;
 mod palette;
 mod tabs;

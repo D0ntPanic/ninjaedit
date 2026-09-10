@@ -26,6 +26,7 @@
 //! text's left edge is; git line status can later replace the guide glyph
 //! on a line with a thin colored block.
 
+use crate::clipboard::Clipboard;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::{Cell, Editor, Movement, Position};
@@ -359,7 +360,7 @@ impl EditorView {
     /// Handle a key press. Returns whether the key meant something to the
     /// editor. `clipboard` is the application's clipboard, read by paste and
     /// replaced by copy and cut.
-    pub fn handle_key(&mut self, key: KeyEvent, clipboard: &mut Option<String>) -> bool {
+    pub fn handle_key(&mut self, key: KeyEvent, clipboard: &mut Clipboard) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -427,17 +428,17 @@ impl EditorView {
                 }
                 'c' => {
                     if let Some(text) = self.editor.copy() {
-                        *clipboard = Some(text);
+                        clipboard.set(text);
                     }
                 }
                 'x' => {
                     if let Some(text) = self.editor.cut() {
-                        *clipboard = Some(text);
+                        clipboard.set(text);
                     }
                 }
                 'v' => {
-                    if let Some(text) = clipboard {
-                        self.editor.paste(text);
+                    if let Some(text) = clipboard.get() {
+                        self.editor.paste(&text);
                     }
                 }
                 _ => return false,

@@ -9,6 +9,7 @@
 //! Closing a modified tab or quitting with unsaved changes asks for the key
 //! to be pressed a second time rather than popping up a dialog.
 
+use crate::clipboard::Clipboard;
 use crate::editor_view::EditorView;
 use crate::palette::{Palette, PaletteAction, PaletteItem, PaletteOutcome};
 use crate::tabs::{TabBar, TabHit, TabLabel};
@@ -73,7 +74,8 @@ pub struct App {
     /// A message shown in the status bar until the next key press.
     status: Option<String>,
     confirm: Option<Confirm>,
-    clipboard: Option<String>,
+    /// Lives as long as the app: see the `clipboard` module for why.
+    clipboard: Clipboard,
     quit: bool,
     editor_area: Rect,
 }
@@ -92,7 +94,7 @@ impl App {
             palette_is_files: false,
             status: None,
             confirm: None,
-            clipboard: None,
+            clipboard: Clipboard::new(),
             quit: false,
             editor_area: Rect::default(),
         }
