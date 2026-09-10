@@ -74,7 +74,11 @@ pub fn rank_labeled<S: AsRef<str>>(
             Some((Ranked { index, score }, text.len()))
         })
         .collect();
-    results.sort_by_key(|(r, len)| (Reverse(r.score), *len));
+    // An empty query is a plain listing: every candidate scores the same,
+    // and the length tiebreak must not disturb the caller's order.
+    if !query.is_empty() {
+        results.sort_by_key(|(r, len)| (Reverse(r.score), *len));
+    }
     results.into_iter().map(|(r, _)| r).collect()
 }
 
@@ -141,6 +145,7 @@ mod tests {
             labeled(&files, "core/undo"),
             vec!["core/function/undoactions.cpp"]
         );
-        assert_eq!(labeled(&files, "").len(), files.len());
+        // An empty query keeps the original order, even for longer paths.
+        assert_eq!(labeled(&files, ""), files);
     }
 }

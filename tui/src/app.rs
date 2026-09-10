@@ -567,7 +567,9 @@ mod tests {
     fn app_with_files(files: &[(&str, &str)]) -> (tempfile::TempDir, App) {
         let dir = tempfile::tempdir().unwrap();
         for (name, contents) in files {
-            std::fs::write(dir.path().join(name), contents).unwrap();
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
         }
         let mut app = App::new(Project::open(dir.path()).unwrap());
         for (name, _) in files {
@@ -877,7 +879,10 @@ mod tests {
 
     #[test]
     fn tab_palette_lists_most_recently_viewed_first() {
-        let (_dir, mut app) = app_with_files(&[("a.rs", ""), ("b.rs", ""), ("c.rs", "")]);
+        // Paths of different lengths, so ranking by length rather than by
+        // recency would show.
+        let (_dir, mut app) =
+            app_with_files(&[("a.rs", ""), ("bb/b.rs", ""), ("longer/name/c.rs", "")]);
         // Viewed in order a, b, c on open; now view a again.
         app.activate(0);
         ctrl(&mut app, 't');
