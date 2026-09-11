@@ -7,7 +7,11 @@
 //! input until it is closed. The search box (Ctrl+F) floats there too,
 //! and never at the same time as the palette; it drives a search in the
 //! active tab's editor, which highlights what it finds as the query is
-//! typed. Enter selects the current match and closes the box, leaving the
+//! typed. Opened while text within one line is selected, the box starts
+//! with that text as its query (selected, so typing replaces it) and the
+//! search already run, which with a double-click to select a word makes
+//! looking for the other uses of a name a two-step affair. Enter selects
+//! the current match and closes the box, leaving the
 //! other matches highlighted; Ctrl+G, with the box open or closed, steps
 //! to the next match, and with no search going repeats the last query
 //! from the cursor. Escape closes the box and clears the search.
@@ -24,6 +28,7 @@ use crate::theme::Theme;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ninjaedit_core::search::literal_query;
 use ninjaedit_core::{Editor, Project, SearchStep};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -315,7 +320,9 @@ impl App {
     // ----- Search ---------------------------------------------------------
 
     /// Open the search box over the active tab, starting a search from its
-    /// cursor. Does nothing with the box already open, or with no tab.
+    /// cursor, or with the selected text as the query when the selection
+    /// lies within one line. Does nothing with the box already open, or
+    /// with no tab.
     fn open_search_box(&mut self) {
         if self.search_box.is_some() {
             return;
@@ -324,8 +331,20 @@ impl App {
             return;
         };
         self.palette = None;
-        tab.view.editor_mut_in_place().start_search();
-        self.search_box = Some(SearchBox::new());
+        let editor = tab.view.editor_mut_in_place();
+        let seed = editor
+            .selected_text()
+            .filter(|text| !text.contains(['\n', '\r']));
+        editor.start_search();
+        let mut search_box = SearchBox::new();
+        let seeded = seed.is_some();
+        if let Some(seed) = seed {
+            search_box.set_query_selected(&literal_query(&seed));
+        }
+        self.search_box = Some(search_box);
+        if seeded {
+            self.update_search_query();
+        }
     }
 
     /// Close the search box, and with `clear` drop the search along with
@@ -471,8 +490,10 @@ impl App {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
-            Event::Paste(text) if self.palette.is_none() => {
-                if let Some(search_box) = &mut self.search_box {
+            Event::Paste(text) => {
+                if let Some(palette) = &mut self.palette {
+                    palette.paste(&text);
+                } else if let Some(search_box) = &mut self.search_box {
                     if search_box.paste(&text) {
                         self.update_search_query();
                     }
@@ -514,7 +535,7 @@ impl App {
         }
 
         if let Some(palette) = &mut self.palette {
-            match palette.handle_key(key) {
+            match palette.handle_key(key, &mut self.clipboard) {
                 PaletteOutcome::Continue => {}
                 PaletteOutcome::Close => self.palette = None,
                 PaletteOutcome::Activate(action) => self.run_palette_action(action),
@@ -522,7 +543,7 @@ impl App {
             return;
         }
         if let Some(search_box) = &mut self.search_box {
-            let outcome = search_box.handle_key(key);
+            let outcome = search_box.handle_key(key, &mut self.clipboard);
             self.handle_search_outcome(outcome);
             return;
         }
@@ -554,8 +575,10 @@ impl App {
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         let (x, y) = (mouse.column, mouse.row);
 
+        // A drag that started in the palette's or the search box's query
+        // stays with it wherever the pointer goes.
         if let Some(palette) = &mut self.palette {
-            if palette.contains(x, y) {
+            if palette.contains(x, y) || palette.is_dragging() {
                 match palette.handle_mouse(mouse) {
                     PaletteOutcome::Continue => {}
                     PaletteOutcome::Close => self.palette = None,
@@ -569,8 +592,9 @@ impl App {
         // A click outside the search box closes it, like the palette, but
         // the wheel still scrolls the editor under it so the matches can
         // be looked over.
-        if let Some(search_box) = &self.search_box {
-            if search_box.contains(x, y) {
+        if let Some(search_box) = &mut self.search_box {
+            if search_box.contains(x, y) || search_box.is_dragging() {
+                search_box.handle_mouse(mouse);
                 return;
             }
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
@@ -1540,6 +1564,155 @@ mod tests {
         wait_for_search(&app);
         let screen = draw(&mut app, 60, 8);
         assert!(screen[3].contains("no matches"), "{screen:#?}");
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+
+    #[test]
+    fn search_starts_with_a_single_line_selection() {
+        // Three blank lines keep the text clear of the search box. The
+        // gutter is 4 wide.
+        let (_dir, mut app) = app_with_files(&[("a.txt", "\n\n\nfoo bar\nbaz foo\nfoo\n")]);
+        let theme = Theme::default();
+        draw(&mut app, 60, 10);
+        // Double-click "foo" on line 5 (row 5, columns 8 to 10).
+        click(&mut app, 9, 5);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 9, 5);
+        click(&mut app, 9, 5);
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(15..18));
+        // Ctrl+F searches for it right away, with the query selected.
+        ctrl(&mut app, 'f');
+        let search_box = app.search_box.as_ref().unwrap();
+        assert_eq!(search_box.query(), "foo");
+        assert_eq!(search_box.input().edit().selection(), Some(0..3));
+        wait_for_search(&app);
+        let screen = draw(&mut app, 60, 10);
+        assert!(screen[3].contains("3 matches"), "{screen:#?}");
+        // The selected occurrence is the current match (still drawn as
+        // the selection, which wins over a match), so Enter keeps it and
+        // Ctrl+G goes on from there.
+        let editor = app.tabs[0].view.editor();
+        assert_eq!(editor.search().unwrap().current(), Some(15..18));
+        assert_eq!(editor.selection(), Some(15..18));
+        assert_eq!(cell_bg(&mut app, 60, 10, 8, 5), theme.selection_background);
+        assert_eq!(
+            cell_bg(&mut app, 60, 10, 4, 6),
+            theme.find_result_background
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(app.search_box.is_none());
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(15..18));
+        ctrl(&mut app, 'g');
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(19..22));
+
+        // Typing replaces the seeded query rather than adding to it.
+        ctrl(&mut app, 'f');
+        assert_eq!(app.search_box.as_ref().unwrap().query(), "foo");
+        type_str(&mut app, "ba");
+        assert_eq!(app.search_box.as_ref().unwrap().query(), "ba");
+        wait_for_search(&app);
+        let screen = draw(&mut app, 60, 10);
+        assert!(screen[3].contains("2 matches"), "{screen:#?}");
+        press(&mut app, KeyCode::Esc);
+
+        // A selection spanning lines doesn't seed the box.
+        app.tabs[0].view.editor_mut().set_selection(4, 12);
+        ctrl(&mut app, 'f');
+        assert_eq!(app.search_box.as_ref().unwrap().query(), "");
+        press(&mut app, KeyCode::Esc);
+        // Nor does no selection.
+        ctrl(&mut app, 'f');
+        assert_eq!(app.search_box.as_ref().unwrap().query(), "");
+        press(&mut app, KeyCode::Esc);
+    }
+
+    #[test]
+    fn search_seeded_with_a_leading_slash_stays_literal() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "\n\n\n/a.b /axb /a.b\n")]);
+        app.tabs[0].view.editor_mut().set_selection(3, 7);
+        ctrl(&mut app, 'f');
+        assert_eq!(app.search_box.as_ref().unwrap().query(), "//a\\.b");
+        wait_for_search(&app);
+        let screen = draw(&mut app, 60, 10);
+        assert!(screen[3].contains("regex, 2 matches"), "{screen:#?}");
+    }
+
+    #[test]
+    fn search_query_edits_like_a_text_field() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "\n\n\nfoo bar\n")]);
+        ctrl(&mut app, 'f');
+        type_str(&mut app, "bar");
+        press(&mut app, KeyCode::Home);
+        type_str(&mut app, "foo ");
+        assert_eq!(app.search_box.as_ref().unwrap().query(), "foo bar");
+        wait_for_search(&app);
+        let screen = draw(&mut app, 60, 10);
+        assert!(screen[3].contains("1 match"), "{screen:#?}");
+        // Select "foo " with Shift+Home and cut it; paste it back at the
+        // end.
+        press(&mut app, KeyCode::End);
+        app.handle_event(key(KeyCode::Left, KeyModifiers::CONTROL));
+        app.handle_event(key(KeyCode::Home, KeyModifiers::SHIFT));
+        ctrl(&mut app, 'x');
+        assert_eq!(app.search_box.as_ref().unwrap().query(), "bar");
+        press(&mut app, KeyCode::End);
+        ctrl(&mut app, 'v');
+        assert_eq!(app.search_box.as_ref().unwrap().query(), "barfoo ");
+        wait_for_search(&app);
+        let screen = draw(&mut app, 60, 10);
+        assert!(screen[3].contains("no matches"), "{screen:#?}");
+
+        // The mouse places the cursor and drags a selection in the query,
+        // even when the drag leaves the box; a click outside closes it.
+        // The box spans columns 1 to 58 on rows 1 to 3; the query starts
+        // at column 4.
+        click(&mut app, 5, 2);
+        assert_eq!(app.search_box.as_ref().unwrap().input().edit().cursor(), 1);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 7, 2);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 7, 6);
+        assert_eq!(
+            app.search_box.as_ref().unwrap().input().edit().selection(),
+            Some(1..3)
+        );
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 7, 6);
+        assert!(app.search_box.is_some());
+        type_str(&mut app, "o");
+        assert_eq!(app.search_box.as_ref().unwrap().query(), "bofoo ");
+        click(&mut app, 7, 6);
+        assert!(app.search_box.is_none());
+    }
+
+    #[test]
+    fn palette_query_edits_and_pastes() {
+        let (_dir, mut app) = app_with_files(&[("alpha.rs", ""), ("beta.rs", "")]);
+        ctrl(&mut app, 't');
+        app.handle_event(Event::Paste("et\n".to_owned()));
+        press(&mut app, KeyCode::Home);
+        type_str(&mut app, "b");
+        let screen = draw(&mut app, 40, 12);
+        assert!(screen[2].contains("> bet"), "{screen:#?}");
+        assert!(screen[3].contains("beta.rs"), "{screen:#?}");
+        assert!(
+            !screen[1..].iter().any(|r| r.contains("alpha.rs")),
+            "{screen:#?}"
+        );
+        // Ctrl+Home still picks the first result; Ctrl+A selects the query
+        // and typing replaces it.
+        app.handle_event(key(KeyCode::Home, KeyModifiers::CONTROL));
+        ctrl(&mut app, 'a');
+        type_str(&mut app, "alp");
+        let screen = draw(&mut app, 40, 12);
+        assert!(screen[2].contains("> alp"), "{screen:#?}");
+        assert!(screen[3].contains("alpha.rs"), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.active, 0);
     }
 
     #[test]

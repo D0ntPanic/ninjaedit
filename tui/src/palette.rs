@@ -5,8 +5,13 @@
 //! list of [`PaletteItem`]s (open tabs, project files, ...) and the palette
 //! ranks them against whatever is typed with the fuzzy matcher from the
 //! core crate. Enter activates the selected result, which starts out as the
-//! best match; the arrow keys and the mouse choose another.
+//! best match; the arrow keys and the mouse choose another. The query is
+//! an [`Input`], so it edits like a text field: Home and End and the
+//! arrow keys work on it, and Ctrl+Home and Ctrl+End pick the first and
+//! last result instead.
 
+use crate::clipboard::Clipboard;
+use crate::input::{Input, InputKey};
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::fuzzy;
@@ -53,50 +58,6 @@ pub fn render_frame(area: Rect, hint: Option<&str>, buf: &mut Buffer, theme: &Th
     inner
 }
 
-/// Draw a one-row query input into `row`: a prompt, then the query or,
-/// while it is empty, the dimmed placeholder. Returns where the terminal
-/// cursor belongs.
-pub fn render_input(
-    row: Rect,
-    query: &str,
-    placeholder: &str,
-    buf: &mut Buffer,
-    theme: &Theme,
-) -> ScreenPosition {
-    let input = Style::default()
-        .fg(theme.command_palette_input_text)
-        .bg(theme.command_palette_input_background);
-    buf.set_style(row, input);
-    let prompt = "> ";
-    buf.set_string(
-        row.x,
-        row.y,
-        prompt,
-        input.fg(theme.command_palette_box_color),
-    );
-    let input_x = row.x + prompt.len() as u16;
-    let input_width = row.width.saturating_sub(prompt.len() as u16) as usize;
-    if query.is_empty() {
-        buf.set_stringn(
-            input_x,
-            row.y,
-            placeholder,
-            input_width,
-            input.fg(theme.command_palette_placeholder_text),
-        );
-        return ScreenPosition::new(input_x, row.y);
-    }
-    // Show the tail of a query wider than the box.
-    let mut shown = query;
-    while Span::raw(shown).width() >= input_width && !shown.is_empty() {
-        let mut chars = shown.chars();
-        chars.next();
-        shown = chars.as_str();
-    }
-    buf.set_string(input_x, row.y, shown, input);
-    ScreenPosition::new(input_x + Span::raw(shown).width() as u16, row.y)
-}
-
 /// What activating a result does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
@@ -130,7 +91,7 @@ pub struct Palette {
     placeholder: &'static str,
     /// A note shown in the bottom border, such as indexing progress.
     hint: Option<String>,
-    query: String,
+    query: Input,
     items: Vec<PaletteItem>,
     /// Indices into `items`, best match first.
     results: Vec<usize>,
@@ -149,7 +110,7 @@ impl Palette {
         let mut palette = Palette {
             placeholder,
             hint: None,
-            query: String::new(),
+            query: Input::new(),
             items,
             results: Vec::new(),
             selected: 0,
@@ -173,7 +134,7 @@ impl Palette {
 
     fn search(&mut self) {
         let candidates = self.items.iter().map(|item| (&item.label, &item.search));
-        self.results = fuzzy::rank_labeled(candidates, &self.query)
+        self.results = fuzzy::rank_labeled(candidates, self.query.text())
             .into_iter()
             .take(MAX_RESULTS)
             .map(|ranked| ranked.index)
@@ -209,7 +170,9 @@ impl Palette {
         }
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) -> PaletteOutcome {
+    /// Handle a key press. `clipboard` is the application's clipboard, for
+    /// copy, cut, and paste in the query.
+    pub fn handle_key(&mut self, key: KeyEvent, clipboard: &mut Clipboard) -> PaletteOutcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => return PaletteOutcome::Close,
@@ -220,22 +183,22 @@ impl Palette {
             KeyCode::PageDown => self.select(self.selected + self.visible_rows()),
             KeyCode::Home if ctrl => self.select(0),
             KeyCode::End if ctrl => self.select(usize::MAX),
-            KeyCode::Backspace => {
-                if self.query.pop().is_some() {
+            _ => {
+                if self.query.handle_key(key, clipboard) == InputKey::Changed {
                     self.search();
                 }
             }
-            KeyCode::Char('u') if ctrl => {
-                self.query.clear();
-                self.search();
-            }
-            KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                self.query.push(c);
-                self.search();
-            }
-            _ => {}
         }
         PaletteOutcome::Continue
+    }
+
+    /// Add pasted text to the query. Returns whether the query changed.
+    pub fn paste(&mut self, text: &str) -> bool {
+        let changed = self.query.paste(text);
+        if changed {
+            self.search();
+        }
+        changed
     }
 
     /// Whether the mouse position is over the palette.
@@ -243,8 +206,19 @@ impl Palette {
         self.area.contains(ScreenPosition::new(x, y))
     }
 
+    /// Whether a drag that started in the query is going on, in which
+    /// case the palette wants drag and release events wherever they
+    /// happen.
+    pub fn is_dragging(&self) -> bool {
+        self.query.is_dragging()
+    }
+
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> PaletteOutcome {
         let at = ScreenPosition::new(mouse.column, mouse.row);
+        if self.query.is_dragging() || self.query.contains(mouse.column, mouse.row) {
+            self.query.handle_mouse(mouse);
+            return PaletteOutcome::Continue;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => self.select(self.selected.saturating_sub(1)),
             MouseEventKind::ScrollDown => self.select(self.selected + 1),
@@ -284,9 +258,8 @@ impl Palette {
         if inner.height == 0 {
             return None;
         }
-        let cursor = render_input(
+        let cursor = self.query.render(
             Rect::new(inner.x, inner.y, inner.width, 1),
-            &self.query,
             self.placeholder,
             buf,
             theme,
@@ -307,7 +280,7 @@ impl Palette {
                 self.rows.width.saturating_sub(1) as usize,
                 background.fg(theme.command_palette_result_context_text),
             );
-            return Some(cursor);
+            return cursor;
         }
         let rows = self.rows.height as usize;
         if self.selected >= self.first_visible + rows {
@@ -349,6 +322,6 @@ impl Palette {
                 );
             }
         }
-        Some(cursor)
+        cursor
     }
 }

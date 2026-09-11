@@ -7,9 +7,11 @@
 //! border (the match count, an error in a regular expression) is set by
 //! the application for the same reason.
 
-use crate::palette::{MAX_WIDTH, render_frame, render_input};
+use crate::clipboard::Clipboard;
+use crate::input::{Input, InputKey};
+use crate::palette::{MAX_WIDTH, render_frame};
 use crate::theme::Theme;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
 
@@ -34,7 +36,7 @@ pub enum SearchOutcome {
 
 #[derive(Default)]
 pub struct SearchBox {
-    query: String,
+    input: Input,
     hint: Option<String>,
     /// The whole box, including its border, from the last render.
     area: Rect,
@@ -46,51 +48,56 @@ impl SearchBox {
     }
 
     pub fn query(&self) -> &str {
-        &self.query
+        self.input.text()
+    }
+
+    /// Start with a query, left selected so that typing replaces it.
+    pub fn set_query_selected(&mut self, query: &str) {
+        self.input.set_text_selected(query);
     }
 
     pub fn set_hint(&mut self, hint: Option<String>) {
         self.hint = hint;
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) -> SearchOutcome {
+    /// The query's text, cursor, and selection.
+    #[cfg(test)]
+    pub fn input(&self) -> &Input {
+        &self.input
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent, clipboard: &mut Clipboard) -> SearchOutcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => SearchOutcome::Close,
             KeyCode::Enter => SearchOutcome::Accept,
             KeyCode::Char('g') if ctrl => SearchOutcome::Next,
-            KeyCode::Backspace => match self.query.pop() {
-                Some(_) => SearchOutcome::Changed,
-                None => SearchOutcome::Continue,
+            _ => match self.input.handle_key(key, clipboard) {
+                InputKey::Changed => SearchOutcome::Changed,
+                InputKey::Unchanged | InputKey::Ignored => SearchOutcome::Continue,
             },
-            KeyCode::Char('u') if ctrl => {
-                if self.query.is_empty() {
-                    SearchOutcome::Continue
-                } else {
-                    self.query.clear();
-                    SearchOutcome::Changed
-                }
-            }
-            KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                self.query.push(c);
-                SearchOutcome::Changed
-            }
-            _ => SearchOutcome::Continue,
         }
     }
 
     /// Add pasted text to the query. A match can't span lines, so line
     /// breaks are dropped. Returns whether the query changed.
     pub fn paste(&mut self, text: &str) -> bool {
-        let before = self.query.len();
-        self.query
-            .extend(text.chars().filter(|c| *c != '\n' && *c != '\r'));
-        self.query.len() != before
+        self.input.paste(text)
     }
 
     /// Whether the mouse position is over the box.
     pub fn contains(&self, x: u16, y: u16) -> bool {
         self.area.contains(ScreenPosition::new(x, y))
+    }
+
+    /// Whether a drag that started in the query is going on, in which
+    /// case the box wants drag and release events wherever they happen.
+    pub fn is_dragging(&self) -> bool {
+        self.input.is_dragging()
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        self.input.handle_mouse(mouse);
     }
 
     /// Draw the box over the top center of `screen`. Returns where the
@@ -111,12 +118,11 @@ impl SearchBox {
         if inner.height == 0 {
             return None;
         }
-        Some(render_input(
+        self.input.render(
             Rect::new(inner.x, inner.y, inner.width, 1),
-            &self.query,
             PLACEHOLDER,
             buf,
             theme,
-        ))
+        )
     }
 }

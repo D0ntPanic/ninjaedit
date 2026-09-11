@@ -277,6 +277,17 @@ impl Drop for Search {
 }
 
 /// Compile a query: a literal, or a regular expression after a `/`.
+/// A query that finds `text` literally. Queries starting with `/` are
+/// regular expressions, so text that starts that way is escaped into
+/// one; anything else is already searched for literally.
+pub fn literal_query(text: &str) -> String {
+    if text.starts_with('/') {
+        format!("/{}", regex::escape(text))
+    } else {
+        text.to_owned()
+    }
+}
+
 fn compile(query: &str) -> Result<Option<Regex>, String> {
     let pattern = match query.strip_prefix('/') {
         Some("") => return Ok(None),
@@ -405,6 +416,15 @@ mod tests {
         search.set_query(query);
         search.wait();
         search
+    }
+
+    #[test]
+    fn literal_query_escapes_a_leading_slash() {
+        assert_eq!(literal_query("foo"), "foo");
+        assert_eq!(literal_query("a.b"), "a.b");
+        assert_eq!(literal_query("/a.b"), "//a\\.b");
+        let search = search("x /a.b /axb\n", 0, &literal_query("/a.b"));
+        assert_eq!(all(&search), vec![2..6]);
     }
 
     fn all(search: &Search) -> Vec<Range<usize>> {

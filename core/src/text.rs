@@ -10,6 +10,10 @@
 //! most characters are one cell wide, East Asian wide characters and emoji
 //! are two, and combining marks on their own are zero. A tab advances to the
 //! next tab stop, so its width depends on the column it starts at.
+//!
+//! Words, for word-wise movement and double-click selection, are runs of
+//! characters of one [`CharClass`]: letters, digits, and underscores make
+//! a word, and so, separately, do stretches of spaces and of punctuation.
 
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -42,6 +46,99 @@ pub fn width(text: &str, column: usize, tab_width: usize) -> usize {
     } else {
         text.width()
     }
+}
+
+/// How a character takes part in words, for word-wise movement and
+/// selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharClass {
+    /// Letters, digits, and underscores.
+    Word,
+    Space,
+    /// Anything else.
+    Punctuation,
+}
+
+/// Classify a grapheme by its first code point.
+pub fn classify(grapheme: &str) -> CharClass {
+    let c = grapheme.chars().next().unwrap_or('\u{FFFD}');
+    if c.is_alphanumeric() || c == '_' {
+        CharClass::Word
+    } else if c.is_whitespace() {
+        CharClass::Space
+    } else {
+        CharClass::Punctuation
+    }
+}
+
+/// The word at a byte offset within one line of text: the run of
+/// characters of one class (a word, a stretch of spaces, a run of
+/// punctuation) containing the character at `offset`, or, at the end of
+/// the text, the run ending there. Empty text gives an empty range. This
+/// is what a double-click selects.
+pub fn word_at(bytes: &[u8], offset: usize) -> Range<usize> {
+    let cells: Vec<(Range<usize>, CharClass)> = graphemes(bytes)
+        .map(|g| (g.range, classify(g.text)))
+        .collect();
+    if cells.is_empty() {
+        return 0..0;
+    }
+    let offset = offset.min(bytes.len());
+    let i = cells
+        .partition_point(|(range, _)| range.end <= offset)
+        .min(cells.len() - 1);
+    let class = cells[i].1;
+    let mut start = i;
+    while start > 0 && cells[start - 1].1 == class {
+        start -= 1;
+    }
+    let mut end = i;
+    while end + 1 < cells.len() && cells[end + 1].1 == class {
+        end += 1;
+    }
+    cells[start].0.start..cells[end].0.end
+}
+
+/// The offset of the next word boundary after `offset` within one line
+/// of text: past any spaces, then past the run of characters of one
+/// class that follows. Returns the end of the text from its last word.
+pub fn next_word_boundary(bytes: &[u8], offset: usize) -> usize {
+    let cells: Vec<(Range<usize>, CharClass)> = graphemes(bytes)
+        .map(|g| (g.range, classify(g.text)))
+        .collect();
+    // The character containing (or starting at) the offset.
+    let mut i = cells.partition_point(|(range, _)| range.end <= offset);
+    while i < cells.len() && cells[i].1 == CharClass::Space {
+        i += 1;
+    }
+    if i < cells.len() {
+        let run = cells[i].1;
+        while i < cells.len() && cells[i].1 == run {
+            i += 1;
+        }
+    }
+    cells.get(i).map_or(bytes.len(), |(range, _)| range.start)
+}
+
+/// The offset of the previous word boundary before `offset` within one
+/// line of text: back over any spaces, then back over the run of
+/// characters of one class before them. Returns 0 from the first word.
+pub fn prev_word_boundary(bytes: &[u8], offset: usize) -> usize {
+    let cells: Vec<(Range<usize>, CharClass)> = graphemes(bytes)
+        .map(|g| (g.range, classify(g.text)))
+        .collect();
+    // Number of characters strictly before the offset.
+    let mut i = cells.partition_point(|(range, _)| range.start < offset);
+    while i > 0 && cells[i - 1].1 == CharClass::Space {
+        i -= 1;
+    }
+    if i > 0 {
+        let run = cells[i - 1].1;
+        while i > 0 && cells[i - 1].1 == run {
+            i -= 1;
+        }
+    }
+    cells.get(i).map_or(bytes.len(), |(range, _)| range.start)
 }
 
 /// Split bytes into graphemes, tolerating invalid UTF-8.
@@ -128,6 +225,31 @@ mod tests {
         assert_eq!(split(b"\xff"), vec![(0..1, "\u{FFFD}")]);
         let family = "👨\u{200d}👩\u{200d}👧";
         assert_eq!(split(family.as_bytes()), vec![(0..family.len(), family)]);
+    }
+
+    #[test]
+    fn words() {
+        let line = b"foo_bar  ++baz";
+        assert_eq!(word_at(line, 0), 0..7);
+        assert_eq!(word_at(line, 6), 0..7);
+        assert_eq!(word_at(line, 7), 7..9, "a run of spaces is a word");
+        assert_eq!(word_at(line, 9), 9..11);
+        assert_eq!(word_at(line, 12), 11..14);
+        assert_eq!(word_at(line, 14), 11..14, "at the end: the last word");
+        assert_eq!(word_at(line, 99), 11..14);
+        assert_eq!(word_at(b"", 0), 0..0);
+        assert_eq!(word_at("e\u{301}a b".as_bytes(), 1), 0..4);
+
+        assert_eq!(next_word_boundary(line, 0), 7);
+        assert_eq!(next_word_boundary(line, 3), 7);
+        assert_eq!(next_word_boundary(line, 7), 11);
+        assert_eq!(next_word_boundary(line, 11), 14);
+        assert_eq!(next_word_boundary(line, 14), 14);
+        assert_eq!(prev_word_boundary(line, 14), 11);
+        assert_eq!(prev_word_boundary(line, 11), 9);
+        assert_eq!(prev_word_boundary(line, 9), 0);
+        assert_eq!(prev_word_boundary(line, 3), 0);
+        assert_eq!(prev_word_boundary(line, 0), 0);
     }
 
     #[test]

@@ -30,6 +30,16 @@ impl Clipboard {
         }
     }
 
+    /// A clipboard with no system backing, for tests, so that they don't
+    /// touch (or depend on) the real clipboard.
+    #[cfg(test)]
+    pub fn local_only() -> Clipboard {
+        Clipboard {
+            system: None,
+            local: None,
+        }
+    }
+
     /// Place `text` on the clipboard.
     pub fn set(&mut self, text: String) {
         if let Some(system) = &mut self.system
@@ -58,18 +68,9 @@ impl Clipboard {
 mod tests {
     use super::*;
 
-    /// A clipboard with no system backing, so tests don't touch (or depend
-    /// on) the real clipboard.
-    fn local_only() -> Clipboard {
-        Clipboard {
-            system: None,
-            local: None,
-        }
-    }
-
     #[test]
     fn local_fallback_round_trips() {
-        let mut clipboard = local_only();
+        let mut clipboard = Clipboard::local_only();
         assert_eq!(clipboard.get(), None);
         clipboard.set("hello".to_string());
         assert_eq!(clipboard.get().as_deref(), Some("hello"));

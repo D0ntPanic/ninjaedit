@@ -23,6 +23,9 @@
 //! keeps its horizontal position rather than snapping back; the limit only
 //! ever blocks further scrolling to the right.
 //!
+//! A click puts the cursor under the pointer and a drag selects; two
+//! clicks in quick succession on one cell select the word there.
+//!
 //! The gutter to the left of the text is laid out as
 //! `[breakpoint][line number][space][guide]`. The breakpoint column is
 //! blank for now; a debugger can later mark it with a red circle. The
@@ -30,6 +33,7 @@
 //! text's left edge is; git line status can later replace the guide glyph
 //! on a line with a thin colored block.
 
+use crate::clicks::ClickTracker;
 use crate::clipboard::Clipboard;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -85,6 +89,8 @@ pub struct EditorView {
     /// search box, which a revealed match is kept clear of.
     covered_rows: u16,
     drag: Drag,
+    /// Presses in the text, to notice a double-click.
+    clicks: ClickTracker,
     // Screen regions from the last render.
     gutter: Rect,
     text: Rect,
@@ -111,6 +117,7 @@ impl EditorView {
             revealed_match: None,
             covered_rows: 0,
             drag: Drag::None,
+            clicks: ClickTracker::default(),
             gutter: Rect::default(),
             text: Rect::default(),
             vscroll: Rect::default(),
@@ -619,7 +626,9 @@ impl EditorView {
                 } else if self.text.contains(at) || self.gutter.contains(at) {
                     self.drag = Drag::Selection;
                     let offset = self.offset_at(x, y);
-                    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                    if self.clicks.press(x, y) == 2 {
+                        self.editor.select_word_at(offset);
+                    } else if mouse.modifiers.contains(KeyModifiers::SHIFT) {
                         let anchor = self.editor.anchor().unwrap_or(self.editor.cursor());
                         self.editor.set_selection(anchor, offset);
                     } else {

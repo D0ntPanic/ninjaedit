@@ -173,25 +173,6 @@ struct UndoEntry {
     kind: EditKind,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CharClass {
-    Word,
-    Space,
-    Punctuation,
-}
-
-/// Classify a grapheme by its first code point.
-fn classify(grapheme: &str) -> CharClass {
-    let c = grapheme.chars().next().unwrap_or('\u{FFFD}');
-    if c.is_alphanumeric() || c == '_' {
-        CharClass::Word
-    } else if c.is_whitespace() {
-        CharClass::Space
-    } else {
-        CharClass::Punctuation
-    }
-}
-
 /// The layout of one line's content: its characters with their byte ranges
 /// (relative to the start of the line) and display columns.
 struct Layout {
@@ -206,7 +187,6 @@ struct LayoutCell {
     range: Range<usize>,
     column: usize,
     width: usize,
-    class: CharClass,
 }
 
 impl Layout {
@@ -219,7 +199,6 @@ impl Layout {
                     range,
                     column,
                     width,
-                    class: classify(text),
                 };
                 column += width;
                 cell
@@ -521,6 +500,18 @@ impl Editor {
         self.end_movement();
     }
 
+    /// Select the word at a byte offset, as a double-click does: the run
+    /// of word characters (or of spaces, or of punctuation) containing
+    /// it, or at the end of a line the run ending there; see
+    /// [`text::word_at`]. The cursor ends up at the end of the word. On
+    /// an empty line nothing is selected and the cursor moves there.
+    pub fn select_word_at(&mut self, offset: usize) {
+        let offset = self.snap(offset);
+        let (start, bytes) = self.line_bytes_at(offset);
+        let word = text::word_at(&bytes, offset - start);
+        self.set_selection(start + word.start, start + word.end);
+    }
+
     /// Move the cursor, clearing any selection. Moving left or right out of
     /// a selection collapses it to its start or end.
     pub fn move_cursor(&mut self, movement: Movement) {
@@ -748,45 +739,33 @@ impl Editor {
         layout.start + layout.cells[i.min(layout.cells.len() - 1)].range.start
     }
 
-    fn word_right(&self, offset: usize) -> usize {
-        let line = self.buffer.line_of_offset(offset);
-        let layout = self.layout(line);
-        let Some(mut i) = layout.cell_at(offset - layout.start) else {
-            return self.next_char(offset);
-        };
-        let cells = &layout.cells;
-        while i < cells.len() && cells[i].class == CharClass::Space {
-            i += 1;
-        }
-        if i < cells.len() {
-            let run = cells[i].class;
-            while i < cells.len() && cells[i].class == run {
-                i += 1;
-            }
-        }
-        layout.start + cells.get(i).map_or(layout.len(), |c| c.range.start)
+    /// The bytes of the line containing `offset`, with the offset of the
+    /// line's start.
+    fn line_bytes_at(&self, offset: usize) -> (usize, Vec<u8>) {
+        let content = self
+            .buffer
+            .line_content_range(self.buffer.line_of_offset(offset));
+        (content.start, self.buffer.bytes_in_range(content))
     }
 
+    /// The next word boundary, crossing to the next line from the end of
+    /// a line.
+    fn word_right(&self, offset: usize) -> usize {
+        let (start, bytes) = self.line_bytes_at(offset);
+        if offset >= start + bytes.len() {
+            return self.next_char(offset);
+        }
+        start + text::next_word_boundary(&bytes, offset - start)
+    }
+
+    /// The previous word boundary, crossing to the previous line from
+    /// the start of a line.
     fn word_left(&self, offset: usize) -> usize {
-        let line = self.buffer.line_of_offset(offset);
-        let layout = self.layout(line);
-        let rel = offset - layout.start;
-        if rel == 0 {
+        let (start, bytes) = self.line_bytes_at(offset);
+        if offset <= start {
             return self.prev_char(offset);
         }
-        let cells = &layout.cells;
-        // Number of characters strictly before the cursor.
-        let mut i = cells.partition_point(|c| c.range.start < rel);
-        while i > 0 && cells[i - 1].class == CharClass::Space {
-            i -= 1;
-        }
-        if i > 0 {
-            let run = cells[i - 1].class;
-            while i > 0 && cells[i - 1].class == run {
-                i -= 1;
-            }
-        }
-        layout.start + cells.get(i).map_or(layout.len(), |c| c.range.start)
+        start + text::prev_word_boundary(&bytes, offset - start)
     }
 
     /// The target of moving `delta` lines from `line` aiming for `column`,
@@ -1984,6 +1963,33 @@ mod tests {
             ed.move_cursor(WordLeft);
             assert_eq!(ed.cursor(), offset);
         }
+    }
+
+    #[test]
+    fn select_word_at_picks_the_run_under_the_offset() {
+        let mut ed = editor("foo bar_baz  (qux)\r\n\nend");
+        ed.select_word_at(5);
+        assert_eq!(ed.selection(), Some(4..11));
+        assert_eq!(ed.cursor(), 11);
+        ed.select_word_at(12);
+        assert_eq!(ed.selection(), Some(11..13), "a run of spaces");
+        ed.select_word_at(13);
+        assert_eq!(ed.selection(), Some(13..14), "punctuation");
+        ed.select_word_at(18);
+        assert_eq!(
+            ed.selection(),
+            Some(17..18),
+            "the end of a line: the last word"
+        );
+        ed.select_word_at(19);
+        assert_eq!(ed.selection(), Some(17..18), "inside the line ending");
+        ed.select_word_at(20);
+        assert_eq!(ed.selection(), None, "an empty line");
+        assert_eq!(ed.cursor(), 20);
+        ed.select_word_at(22);
+        assert_eq!(ed.selection(), Some(21..24));
+        ed.select_word_at(99);
+        assert_eq!(ed.selection(), Some(21..24));
     }
 
     #[test]
