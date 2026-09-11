@@ -192,23 +192,7 @@ impl FileIndex {
     }
 
     fn wait(&self, timeout: Duration, done: impl Fn(&State) -> bool) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut state = self.shared.state.lock().unwrap();
-        loop {
-            if done(&state) {
-                return true;
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let (guard, _) = self
-                .shared
-                .cond
-                .wait_timeout(state, deadline - now)
-                .unwrap();
-            state = guard;
-        }
+        self.shared.wait(timeout, done)
     }
 
     /// A counter that increases every time the indexed tree changes. The UI
@@ -257,6 +241,57 @@ impl FileIndex {
     /// covered by gitignore rules are included as well (though never the
     /// contents of `.git`, which is not descended into).
     pub fn files(&self, include_ignored: bool) -> Vec<PathBuf> {
+        self.shared.files(include_ignored)
+    }
+
+    /// A handle to the index's file list that can be sent to another
+    /// thread, for work that waits on the index in the background.
+    pub fn file_list(&self) -> FileList {
+        FileList {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+/// A handle to a [`FileIndex`]'s file list, cheap to clone and to send to
+/// another thread. It lives independently of the index (a background job
+/// holding one keeps the indexed tree alive, though not the watcher or
+/// the indexing thread).
+#[derive(Clone)]
+pub struct FileList {
+    shared: Arc<Shared>,
+}
+
+impl FileList {
+    /// See [`FileIndex::wait_for_primary`].
+    pub fn wait_for_primary(&self, timeout: Duration) -> bool {
+        self.shared.wait(timeout, |state| state.primary_done)
+    }
+
+    /// See [`FileIndex::files`].
+    pub fn files(&self, include_ignored: bool) -> Vec<PathBuf> {
+        self.shared.files(include_ignored)
+    }
+}
+
+impl Shared {
+    fn wait(&self, timeout: Duration, done: impl Fn(&State) -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if done(&state) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (guard, _) = self.cond.wait_timeout(state, deadline - now).unwrap();
+            state = guard;
+        }
+    }
+
+    fn files(&self, include_ignored: bool) -> Vec<PathBuf> {
         fn walk(node: &DirNode, path: &Path, include_ignored: bool, out: &mut Vec<PathBuf>) {
             for file in &node.files {
                 if include_ignored || !file.ignored {
@@ -269,14 +304,9 @@ impl FileIndex {
                 }
             }
         }
-        let state = self.shared.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
         let mut out = Vec::new();
-        walk(
-            &state.root,
-            &self.shared.root_path,
-            include_ignored,
-            &mut out,
-        );
+        walk(&state.root, &self.root_path, include_ignored, &mut out);
         out
     }
 }

@@ -276,7 +276,6 @@ impl Drop for Search {
     }
 }
 
-/// Compile a query: a literal, or a regular expression after a `/`.
 /// A query that finds `text` literally. Queries starting with `/` are
 /// regular expressions, so text that starts that way is escaped into
 /// one; anything else is already searched for literally.
@@ -288,7 +287,9 @@ pub fn literal_query(text: &str) -> String {
     }
 }
 
-fn compile(query: &str) -> Result<Option<Regex>, String> {
+/// Compile a query: a literal, or a regular expression after a `/`.
+/// `Ok(None)` is the empty query, which matches nothing.
+pub(crate) fn compile(query: &str) -> Result<Option<Regex>, String> {
     let pattern = match query.strip_prefix('/') {
         Some("") => return Ok(None),
         Some(pattern) => pattern.to_owned(),

@@ -16,12 +16,22 @@
 //! to the next match, and with no search going repeats the last query
 //! from the cursor. Escape closes the box and clears the search.
 //!
+//! The project search dialog (Ctrl+Shift+F) searches every file in the
+//! project; see the `project_search` module. It is seeded from a
+//! single-line selection like the search box, but only when that text
+//! isn't what it is already searching for: otherwise it comes back just
+//! as it was closed, so that Enter (go to the match, closing the dialog)
+//! and Ctrl+Shift+F, Down, Enter work through the matches one by one.
+//! Either way the query is selected, so typing starts a new search.
+//! Going to a match selects it in its file, opening the file if need be.
+//!
 //! Closing a modified tab or quitting with unsaved changes asks for the key
 //! to be pressed a second time rather than popping up a dialog.
 
 use crate::clipboard::Clipboard;
 use crate::editor_view::EditorView;
 use crate::palette::{Palette, PaletteAction, PaletteItem, PaletteOutcome};
+use crate::project_search::{ProjectSearchDialog, ProjectSearchOutcome};
 use crate::search_box::{self, SearchBox, SearchOutcome};
 use crate::tabs::{TabBar, TabHit, TabLabel};
 use crate::theme::Theme;
@@ -29,7 +39,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ninjaedit_core::search::literal_query;
-use ninjaedit_core::{Editor, Project, SearchStep};
+use ninjaedit_core::{Editor, Project, ProjectMatch, SearchStep};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -97,6 +107,11 @@ pub struct App {
     search_box: Option<SearchBox>,
     /// The last query searched for with Enter, for Ctrl+G to repeat.
     last_search: String,
+    /// The project search dialog, kept (with its results) once opened so
+    /// that it comes back as it was. Shown while `project_search_open`,
+    /// never at the same time as the palette or the search box.
+    project_search: Option<ProjectSearchDialog>,
+    project_search_open: bool,
     index_generation: u64,
     /// A message shown in the status bar until the next key press.
     status: Option<String>,
@@ -121,6 +136,8 @@ impl App {
             palette_is_files: false,
             search_box: None,
             last_search: String::new(),
+            project_search: None,
+            project_search_open: false,
             status: None,
             confirm: None,
             clipboard: Clipboard::new(),
@@ -255,6 +272,7 @@ impl App {
     /// preselected: Enter alone flips back to it.
     fn open_tabs_palette(&mut self) {
         self.close_search_box(true);
+        self.hide_project_search();
         let mut order: Vec<usize> = (0..self.tabs.len()).collect();
         order.sort_by_key(|&index| std::cmp::Reverse(self.tabs[index].last_viewed));
         let items = order
@@ -278,6 +296,7 @@ impl App {
 
     fn open_files_palette(&mut self) {
         self.close_search_box(true);
+        self.hide_project_search();
         let mut palette = Palette::new(FILES_PLACEHOLDER, self.file_items());
         self.refresh_index_hint(&mut palette);
         self.palette = Some(palette);
@@ -327,10 +346,14 @@ impl App {
         if self.search_box.is_some() {
             return;
         }
+        if self.tabs.get(self.active).is_none() {
+            return;
+        }
+        self.palette = None;
+        self.hide_project_search();
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
-        self.palette = None;
         let editor = tab.view.editor_mut_in_place();
         let seed = editor
             .selected_text()
@@ -452,10 +475,87 @@ impl App {
         Some(format!("{kind}{found}"))
     }
 
+    // ----- Project search -------------------------------------------------
+
+    /// Show the project search dialog, seeded with the active tab's
+    /// selection when that lies within one line and isn't what the dialog
+    /// is already searching for; otherwise the dialog comes back as it
+    /// was, its query selected so that typing replaces it.
+    fn open_project_search(&mut self) {
+        self.palette = None;
+        self.close_search_box(true);
+        let seed = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.view.editor().selected_text())
+            .filter(|text| !text.contains(['\n', '\r']));
+        let dialog = self.project_search.get_or_insert_with(|| {
+            ProjectSearchDialog::new(
+                self.project.root().to_path_buf(),
+                self.project.index().file_list(),
+            )
+        });
+        match seed {
+            Some(seed) if !dialog.is_searching_for(&seed) => {
+                dialog.set_query_selected(&literal_query(&seed));
+            }
+            _ => dialog.select_query(),
+        }
+        self.project_search_open = true;
+    }
+
+    /// Hide the project search dialog, keeping it (and its results) for
+    /// next time, less what it can make again.
+    fn hide_project_search(&mut self) {
+        if self.project_search_open
+            && let Some(dialog) = &mut self.project_search
+        {
+            dialog.hide();
+        }
+        self.project_search_open = false;
+    }
+
+    fn handle_project_search_outcome(&mut self, outcome: ProjectSearchOutcome) {
+        match outcome {
+            ProjectSearchOutcome::Continue => {}
+            ProjectSearchOutcome::Close => self.hide_project_search(),
+            ProjectSearchOutcome::Navigate(found) => {
+                self.hide_project_search();
+                self.go_to_match(&found);
+            }
+        }
+    }
+
+    /// Select a project search match in its file, opening the file if it
+    /// isn't open. The match is placed by line and column, so if the file
+    /// has changed since the search the selection lands where the match
+    /// was rather than on it.
+    fn go_to_match(&mut self, found: &ProjectMatch) {
+        self.open_file(&found.path);
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if tab.path() != Some(&*found.path) {
+            return; // it couldn't be opened; the status bar says why
+        }
+        let buffer = tab.view.editor().buffer();
+        let line = found.line.min(buffer.line_count().saturating_sub(1));
+        let content = buffer.line_content_range(line);
+        let start = (content.start + found.column).min(content.end);
+        let end = (start + found.len).min(content.end);
+        tab.view.select_and_center(start, end);
+    }
+
     /// Periodic housekeeping while idle. Returns whether the screen needs
     /// redrawing.
     pub fn tick(&mut self) -> bool {
         let mut redraw = false;
+        if self.project_search_open
+            && let Some(dialog) = &mut self.project_search
+            && dialog.poll()
+        {
+            redraw = true;
+        }
         if let Some(tab) = self.tabs.get_mut(self.active) {
             let generation = tab.view.editor().highlight_generation();
             if generation != tab.highlight_generation {
@@ -497,6 +597,10 @@ impl App {
                     if search_box.paste(&text) {
                         self.update_search_query();
                     }
+                } else if self.project_search_open
+                    && let Some(dialog) = &mut self.project_search
+                {
+                    dialog.paste(&text);
                 } else if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.view.editor_mut().paste(&text);
                 }
@@ -526,6 +630,17 @@ impl App {
                     self.open_files_palette();
                     return;
                 }
+                // With the kitty keyboard protocol Ctrl+Shift+F arrives as
+                // a shifted 'F' (or as 'f' with the shift modifier); a
+                // plain terminal can't tell it from Ctrl+F.
+                KeyCode::Char('F') => {
+                    self.open_project_search();
+                    return;
+                }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.open_project_search();
+                    return;
+                }
                 KeyCode::Char('f') => {
                     self.open_search_box();
                     return;
@@ -545,6 +660,13 @@ impl App {
         if let Some(search_box) = &mut self.search_box {
             let outcome = search_box.handle_key(key, &mut self.clipboard);
             self.handle_search_outcome(outcome);
+            return;
+        }
+        if self.project_search_open
+            && let Some(dialog) = &mut self.project_search
+        {
+            let outcome = dialog.handle_key(key, &mut self.clipboard);
+            self.handle_project_search_outcome(outcome);
             return;
         }
 
@@ -586,6 +708,18 @@ impl App {
                 }
             } else if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.palette = None;
+            }
+            return;
+        }
+        // The project search dialog works like the palette.
+        if self.project_search_open
+            && let Some(dialog) = &mut self.project_search
+        {
+            if dialog.contains(x, y) || dialog.is_dragging() {
+                let outcome = dialog.handle_mouse(mouse);
+                self.handle_project_search_outcome(outcome);
+            } else if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.hide_project_search();
             }
             return;
         }
@@ -681,6 +815,11 @@ impl App {
             search_box.set_hint(hint);
             cursor = search_box.render(screen, buf, theme);
         }
+        if self.project_search_open
+            && let Some(dialog) = &mut self.project_search
+        {
+            cursor = dialog.render(screen, buf, theme);
+        }
         if let Some(cursor) = cursor {
             frame.set_cursor_position(cursor);
         }
@@ -745,9 +884,10 @@ fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme) {
     let lines = [
         "No files open",
         "",
-        "Ctrl+O   open a project file",
-        "Ctrl+T   switch between open tabs",
-        "Ctrl+Q   quit",
+        "Ctrl+O         open a project file",
+        "Ctrl+Shift+F   search in project files",
+        "Ctrl+T         switch between open tabs",
+        "Ctrl+Q         quit",
     ];
     let top = area.y + area.height.saturating_sub(lines.len() as u16) / 2;
     for (i, line) in lines.iter().enumerate() {
@@ -1713,6 +1853,427 @@ mod tests {
         assert!(screen[3].contains("alpha.rs"), "{screen:#?}");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.active, 0);
+    }
+
+    /// An app on a project with these files, none of them open.
+    fn project_with_files(files: &[(&str, &str)]) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, contents) in files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let app = App::new(Project::open(dir.path()).unwrap());
+        (dir, app)
+    }
+
+    fn ctrl_shift_f(app: &mut App) {
+        app.handle_event(key(
+            KeyCode::Char('F'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+    }
+
+    /// Wait for the project search to finish, since it runs in the
+    /// background.
+    fn wait_for_project_search(app: &App) {
+        app.project_search.as_ref().unwrap().wait();
+    }
+
+    /// The screen column `needle` starts at in a drawn row.
+    fn column_of(row: &str, needle: &str) -> u16 {
+        let index = row.find(needle).unwrap();
+        row[..index].chars().count() as u16
+    }
+
+    fn cell(app: &mut App, width: u16, height: u16, x: u16, y: u16) -> ratatui::buffer::Cell {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal.backend().buffer()[(x, y)].clone()
+    }
+
+    #[test]
+    fn project_search_lists_matches_and_walks_through_them() {
+        let (_dir, mut app) = project_with_files(&[
+            ("a.rs", "fn alpha() {}\nlet needle = 1;\n"),
+            ("b/c.rs", "needle\nx\nneedle again\n"),
+        ]);
+        let theme = Theme::default();
+        assert!(app.tabs.is_empty());
+        ctrl_shift_f(&mut app);
+        assert!(app.project_search_open);
+        // On a 60x20 screen the dialog spans rows 1 to 18: the query on
+        // row 2, seven result rows from row 3, a rule on row 10, and
+        // seven context rows from row 11.
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[2].contains("Search in project"), "{screen:#?}");
+        assert!(screen[3].contains("Type to search"), "{screen:#?}");
+        type_str(&mut app, "needle");
+        wait_for_project_search(&app);
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[3].contains("let needle = 1;"), "{screen:#?}");
+        assert!(screen[3].trim_end().ends_with("a.rs:2│"), "{screen:#?}");
+        assert!(screen[4].contains("needle"), "{screen:#?}");
+        assert!(screen[4].trim_end().ends_with("b/c.rs:1│"), "{screen:#?}");
+        assert!(screen[5].contains("needle again"), "{screen:#?}");
+        assert!(screen[5].trim_end().ends_with("b/c.rs:3│"), "{screen:#?}");
+        assert!(screen[10].starts_with("  ├"), "{screen:#?}");
+        assert!(screen[11].contains("1 │fn alpha() {}"), "{screen:#?}");
+        assert!(screen[12].contains("2 │let needle = 1;"), "{screen:#?}");
+        assert!(screen[18].contains("3 matches in 2 files"), "{screen:#?}");
+        // The first row is highlighted; the location of the second is in
+        // its own color.
+        assert_eq!(
+            cell(&mut app, 60, 20, 10, 3).bg,
+            theme.command_palette_selection_background
+        );
+        let location = column_of(&screen[4], "b/c.rs");
+        assert_eq!(
+            cell(&mut app, 60, 20, location, 4).fg,
+            theme.project_search_location_text
+        );
+        // The match itself is bold, in the find result color.
+        let x = column_of(&screen[4], "needle");
+        let found = cell(&mut app, 60, 20, x, 4);
+        assert!(found.modifier.contains(Modifier::BOLD));
+        assert_eq!(found.bg, theme.find_result_background);
+
+        // Enter opens the file and selects the match.
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.project_search_open);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[app.active].title(), "a.rs");
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(18..24));
+        assert_eq!(
+            app.tabs[0].view.editor().selected_text().as_deref(),
+            Some("needle")
+        );
+
+        // Reopened, the dialog is as it was: the match just visited is
+        // still the highlighted one, so Down and Enter go to the next.
+        ctrl_shift_f(&mut app);
+        assert_eq!(app.project_search.as_ref().unwrap().query(), "needle");
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[3].contains("let needle = 1;"), "{screen:#?}");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            cell(&mut app, 60, 20, 10, 4).bg,
+            theme.command_palette_selection_background
+        );
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[11].contains("1 │needle"), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs[app.active].title(), "c.rs");
+        assert_eq!(app.tabs[app.active].view.editor().selection(), Some(0..6));
+        ctrl_shift_f(&mut app);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs[app.active].title(), "c.rs");
+        assert_eq!(app.tabs[app.active].view.editor().selection(), Some(9..15));
+        // Past the last match, Down stays put.
+        ctrl_shift_f(&mut app);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs[app.active].view.editor().selection(), Some(9..15));
+
+        // A different selection seeds a new search, with the query
+        // selected so typing replaces it.
+        app.tabs[app.active].view.editor_mut().set_selection(16, 21);
+        ctrl_shift_f(&mut app);
+        let dialog = app.project_search.as_ref().unwrap();
+        assert_eq!(dialog.query(), "again");
+        assert_eq!(dialog.input().edit().selection(), Some(0..5));
+        wait_for_project_search(&app);
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[18].contains("1 match"), "{screen:#?}");
+        assert!(!screen[4].contains("needle"), "{screen:#?}");
+        type_str(&mut app, "zzz");
+        assert_eq!(app.project_search.as_ref().unwrap().query(), "zzz");
+        wait_for_project_search(&app);
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[3].contains("No matches"), "{screen:#?}");
+        assert!(screen[18].contains("no matches"), "{screen:#?}");
+
+        // Escape hides the dialog; Ctrl+F replaces it with the search
+        // box; a click outside hides it too.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.project_search_open);
+        ctrl_shift_f(&mut app);
+        ctrl(&mut app, 'f');
+        assert!(!app.project_search_open && app.search_box.is_some());
+        ctrl_shift_f(&mut app);
+        assert!(app.project_search_open && app.search_box.is_none());
+        draw(&mut app, 60, 20);
+        click(&mut app, 0, 5);
+        assert!(!app.project_search_open);
+    }
+
+    #[test]
+    fn reopened_project_search_has_its_query_selected() {
+        let (_dir, mut app) =
+            project_with_files(&[("a.rs", "needle\n"), ("b.rs", "needle\nother\n")]);
+        ctrl_shift_f(&mut app);
+        type_str(&mut app, "needle");
+        wait_for_project_search(&app);
+        assert_eq!(
+            app.project_search
+                .as_ref()
+                .unwrap()
+                .input()
+                .edit()
+                .selection(),
+            None
+        );
+        press(&mut app, KeyCode::Enter);
+        // Reopened after a jump: the state is kept, the query selected,
+        // and the results untouched until something is typed.
+        ctrl_shift_f(&mut app);
+        let dialog = app.project_search.as_ref().unwrap();
+        assert_eq!(dialog.query(), "needle");
+        assert_eq!(dialog.input().edit().selection(), Some(0..6));
+        assert_eq!(dialog.selected().unwrap().line, 0);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs[app.active].title(), "b.rs");
+        // Typing over the selected query starts a new search.
+        ctrl_shift_f(&mut app);
+        type_str(&mut app, "other");
+        assert_eq!(app.project_search.as_ref().unwrap().query(), "other");
+        wait_for_project_search(&app);
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[18].contains("1 match"), "{screen:#?}");
+        // Reopened with nothing selected in the editor, and after Escape,
+        // the query is selected too.
+        press(&mut app, KeyCode::Esc);
+        app.tabs[app.active].view.editor_mut().clear_selection();
+        ctrl_shift_f(&mut app);
+        assert_eq!(
+            app.project_search
+                .as_ref()
+                .unwrap()
+                .input()
+                .edit()
+                .selection(),
+            Some(0..5)
+        );
+    }
+
+    #[test]
+    fn project_search_context_pane_scrolls_through_the_file() {
+        let text: String = (1..=30)
+            .map(|i| {
+                if i == 20 {
+                    "needle here\n".to_owned()
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect();
+        let (_dir, mut app) = project_with_files(&[("long.txt", &text)]);
+        ctrl_shift_f(&mut app);
+        type_str(&mut app, "needle");
+        wait_for_project_search(&app);
+        // Seven context rows, the match centered: lines 17 to 23.
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[11].contains("17 │line 17"), "{screen:#?}");
+        assert!(screen[14].contains("20 │needle here"), "{screen:#?}");
+        assert!(screen[17].contains("23 │line 23"), "{screen:#?}");
+        app.handle_event(key(KeyCode::Down, KeyModifiers::CONTROL));
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[11].contains("18 │line 18"), "{screen:#?}");
+        app.handle_event(key(KeyCode::PageUp, KeyModifiers::CONTROL));
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[11].contains("11 │line 11"), "{screen:#?}");
+        // The wheel over the pane scrolls it too, and stops at the ends.
+        mouse(&mut app, MouseEventKind::ScrollDown, 20, 14);
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[11].contains("14 │line 14"), "{screen:#?}");
+        for _ in 0..20 {
+            mouse(&mut app, MouseEventKind::ScrollDown, 20, 14);
+        }
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[11].contains("24 │line 24"), "{screen:#?}");
+        assert!(screen[17].contains("30 │line 30"), "{screen:#?}");
+        // Closing and reopening keeps the scroll position.
+        press(&mut app, KeyCode::Esc);
+        ctrl_shift_f(&mut app);
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[11].contains("24 │line 24"), "{screen:#?}");
+        // Enter selects the match and centers it in the editor.
+        press(&mut app, KeyCode::Enter);
+        let screen = draw(&mut app, 60, 20);
+        assert_eq!(
+            app.tabs[0].view.editor().selected_text().as_deref(),
+            Some("needle")
+        );
+        assert!(screen[10].contains("20 │needle here"), "{screen:#?}");
+    }
+
+    #[test]
+    fn project_search_context_pane_keeps_indentation_and_scrolls_sideways() {
+        // The context pane's text is 51 columns wide on a 60-column
+        // screen with a one-digit gutter. The match on line 2 sits past
+        // column 60; line 3 is the longest.
+        let text = format!(
+            "fn a() {{\n    let x = {}needle {};\n    {}\n}}\n",
+            "-".repeat(50),
+            "+".repeat(10),
+            "=".repeat(100)
+        );
+        let (_dir, mut app) = project_with_files(&[("a.rs", &text)]);
+        ctrl_shift_f(&mut app);
+        type_str(&mut app, "needle");
+        wait_for_project_search(&app);
+        // Scrolled just far enough to show the end of the match, every
+        // line by the same amount, the indentation intact.
+        let screen = draw(&mut app, 60, 20);
+        // The text after the gutter's guide (the dialog's border is the
+        // first bar on the row).
+        let text = |row: &str| row.splitn(3, '│').nth(2).unwrap().to_owned();
+        assert_eq!(
+            text(&screen[11]),
+            "                                                   │  "
+        );
+        assert!(
+            text(&screen[12]).starts_with("-------------------"),
+            "{screen:#?}"
+        );
+        assert!(screen[12].contains("-needle│"), "{screen:#?}");
+        assert!(text(&screen[13]).starts_with("=========="), "{screen:#?}");
+        assert!(text(&screen[14]).starts_with(' '), "{screen:#?}");
+        // The wheel scrolls left, back to the indentation...
+        for _ in 0..30 {
+            mouse(&mut app, MouseEventKind::ScrollLeft, 20, 12);
+        }
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[11].contains("1 │fn a() {"), "{screen:#?}");
+        assert!(screen[12].contains("2 │    let x = ---"), "{screen:#?}");
+        assert!(screen[13].contains("3 │    ====="), "{screen:#?}");
+        assert!(screen[14].contains("4 │}"), "{screen:#?}");
+        // ...and right, as far as the longest visible line and two spare
+        // columns: 104 + 2 - 51.
+        for _ in 0..40 {
+            mouse(&mut app, MouseEventKind::ScrollRight, 20, 12);
+        }
+        assert_eq!(app.project_search.as_ref().unwrap().context_col(), 55);
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[13].trim_end().ends_with("=  │"), "{screen:#?}");
+        // Closing and reopening keeps the position.
+        press(&mut app, KeyCode::Esc);
+        ctrl_shift_f(&mut app);
+        draw(&mut app, 60, 20);
+        assert_eq!(app.project_search.as_ref().unwrap().context_col(), 55);
+    }
+
+    #[test]
+    fn project_search_highlights_syntax_in_rows_and_preview() {
+        let (_dir, mut app) = project_with_files(&[
+            ("a.rs", "let x = 1;\nfn needle() {}\n"),
+            ("b.txt", "needle\n"),
+        ]);
+        let theme = Theme::parse(
+            "syntax-keyword = \"*#010203\"\nsearch-preview-background = \"#040506\"\n",
+        )
+        .unwrap();
+        app.set_theme(theme);
+        ctrl_shift_f(&mut app);
+        type_str(&mut app, "needle");
+        wait_for_project_search(&app);
+        // Row 3 is a.rs's match (highlighted), row 4 b.txt's. Drawing
+        // asks for a.rs to be lexed in the background.
+        press(&mut app, KeyCode::Down);
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[3].contains("fn needle() {}"), "{screen:#?}");
+        let x = column_of(&screen[3], "fn");
+        app.project_search.as_ref().unwrap().wait_for_highlighting();
+        // The tick notices and asks for a redraw, which colors the keyword.
+        assert!(app.tick());
+        let keyword = cell(&mut app, 60, 20, x, 3);
+        assert_eq!(keyword.fg, Color::Rgb(1, 2, 3));
+        assert!(keyword.modifier.contains(Modifier::BOLD));
+        assert_eq!(keyword.bg, theme.command_palette_background);
+        // The preview of b.txt, a file of no known language, is plain
+        // text over the preview background, the match marked as in the
+        // editor.
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[11].contains("1 │needle"), "{screen:#?}");
+        let px = column_of(&screen[11], "needle");
+        let plain = cell(&mut app, 60, 20, px, 11);
+        assert_eq!(plain.fg, theme.command_palette_result_text);
+        assert_eq!(plain.bg, theme.find_result_background);
+        assert_eq!(cell(&mut app, 60, 20, px + 6, 11).bg, Color::Rgb(4, 5, 6));
+        assert_eq!(cell(&mut app, 60, 20, 30, 16).bg, Color::Rgb(4, 5, 6));
+        assert_eq!(
+            cell(&mut app, 60, 20, 30, 8).bg,
+            theme.command_palette_background
+        );
+
+        // The highlighted row keeps the selection colors; its preview,
+        // of a.rs, is highlighted.
+        press(&mut app, KeyCode::Up);
+        let selected = cell(&mut app, 60, 20, x, 3);
+        assert_eq!(selected.fg, theme.command_palette_selection_text);
+        assert_eq!(selected.bg, theme.command_palette_selection_background);
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[12].contains("2 │fn needle() {}"), "{screen:#?}");
+        let px = column_of(&screen[12], "fn");
+        let keyword = cell(&mut app, 60, 20, px, 12);
+        assert_eq!(keyword.fg, Color::Rgb(1, 2, 3));
+        assert!(keyword.modifier.contains(Modifier::BOLD));
+        assert_eq!(keyword.bg, Color::Rgb(4, 5, 6));
+        // The match on that line keeps its find color under the syntax
+        // color.
+        let found = cell(&mut app, 60, 20, px + 3, 12);
+        assert_eq!(found.bg, theme.find_result_background);
+        assert!(found.modifier.contains(Modifier::BOLD));
+
+        // Without the optional color the preview shares the palette's
+        // background.
+        app.set_theme(Theme::parse("search-preview-background = \"\"\n").unwrap());
+        assert_eq!(
+            cell(&mut app, 60, 20, 30, 16).bg,
+            theme.command_palette_background
+        );
+
+        // Hiding the dialog drops the highlighting cache; showing it
+        // again makes a new one, and the keyword colors once more.
+        app.set_theme(theme);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.project_search.as_ref().unwrap().has_highlights());
+        ctrl_shift_f(&mut app);
+        draw(&mut app, 60, 20);
+        assert!(app.project_search.as_ref().unwrap().has_highlights());
+        app.project_search.as_ref().unwrap().wait_for_highlighting();
+        assert!(app.tick());
+        let keyword = cell(&mut app, 60, 20, px, 12);
+        assert_eq!(keyword.fg, Color::Rgb(1, 2, 3));
+    }
+
+    #[test]
+    fn project_search_rows_keep_the_match_in_view() {
+        // The rows are 54 wide: 51 columns to share. The long line and
+        // the long path both overflow, so the path gets a third, cut from
+        // the left; the short line leaves its long path all it needs.
+        let long = format!("{} needle {}", "x".repeat(80), "y".repeat(80));
+        let deep = format!("{}/f.rs", "z".repeat(38));
+        let (_dir, mut app) =
+            project_with_files(&[("deep/dir/name/f.rs", &long), (&deep, "needle\n")]);
+        ctrl_shift_f(&mut app);
+        type_str(&mut app, "needle");
+        wait_for_project_search(&app);
+        let screen = draw(&mut app, 60, 20);
+        let row = screen[3].trim_end();
+        assert!(row.contains("…") && row.contains("needle"), "{row:?}");
+        assert!(row.ends_with("yyy…  …/dir/name/f.rs:1│"), "{row:?}");
+        assert!(
+            !row.contains("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+            "{row:?}"
+        );
+        let row = screen[4].trim_end();
+        assert!(row.ends_with(&format!("{deep}:1│")), "{row:?}");
+        assert!(row.contains(" needle "), "{row:?}");
     }
 
     #[test]

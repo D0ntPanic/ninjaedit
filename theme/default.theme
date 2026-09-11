@@ -18,7 +18,7 @@ status-bar-background = "light"
 status-bar-filename-text = "blue"
 status-bar-position-text = "green"
 status-bar-project-text = "orange"
-command-palette-background = "light"
+command-palette-background = "mid"
 command-palette-box-color = "dimmed"
 command-palette-placeholder-text = "dimmed"
 command-palette-input-background = "dark"
@@ -27,6 +27,8 @@ command-palette-result-text = "content"
 command-palette-result-context-text = "alt"
 command-palette-selection-background = "blue"
 command-palette-selection-text = "black"
+project-search-location-text = "dimmed"
+search-preview-background = "dark"
 
 # Syntax highlighting. A `*` prefix is bold, a `/` prefix is italic.
 # Kinds left unset use their parent kind's style (see the theme docs).

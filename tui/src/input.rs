@@ -73,6 +73,11 @@ impl Input {
         self.edit.select_all();
     }
 
+    /// Select all of the text, so that typing replaces it.
+    pub fn select_all(&mut self) {
+        self.edit.select_all();
+    }
+
     /// Whether a mouse drag is in progress, in which case the input wants
     /// drag and release events even outside its area.
     pub fn is_dragging(&self) -> bool {

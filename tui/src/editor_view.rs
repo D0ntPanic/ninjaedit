@@ -88,6 +88,9 @@ pub struct EditorView {
     /// Rows at the top of the view hidden under an overlay such as the
     /// search box, which a revealed match is kept clear of.
     covered_rows: u16,
+    /// A range the next render centers on, after a jump from outside the
+    /// view (a project search result), selected as a match would be.
+    jump: Option<Range<usize>>,
     drag: Drag,
     /// Presses in the text, to notice a double-click.
     clicks: ClickTracker,
@@ -116,6 +119,7 @@ impl EditorView {
             follow_cursor: true,
             revealed_match: None,
             covered_rows: 0,
+            jump: None,
             drag: Drag::None,
             clicks: ClickTracker::default(),
             gutter: Rect::default(),
@@ -147,6 +151,18 @@ impl EditorView {
     /// search match it scrolls to isn't put under the overlay.
     pub fn set_covered_rows(&mut self, rows: u16) {
         self.covered_rows = rows;
+    }
+
+    /// Select `start..end` and, at the next render, bring it into view the
+    /// way a search match is: centered vertically unless it's already on
+    /// screen, and scrolled sideways as little as will show it. For
+    /// jumping to a place found outside the view, such as a project
+    /// search result.
+    pub fn select_and_center(&mut self, start: usize, end: usize) {
+        self.editor.set_selection(start, end);
+        let range = self.editor.selection().unwrap_or(start..end);
+        self.jump = Some(range);
+        self.follow_cursor = true;
     }
 
     /// First visible display column.
@@ -185,8 +201,13 @@ impl EditorView {
         // since a selection's cursor at the match's end says nothing
         // about where its start is), or else the cursor after it moved.
         let current_match = self.editor.search().and_then(|search| search.current());
-        let reveal = match &current_match {
-            Some(range) if current_match != self.revealed_match => {
+        let reveal = match (self.jump.take(), &current_match) {
+            (Some(range), _) => {
+                let start = self.editor.position_of_offset(range.start);
+                let end = self.editor.position_of_offset(range.end);
+                Some(Reveal::Match(start, end.column))
+            }
+            (None, Some(range)) if current_match != self.revealed_match => {
                 let start = self.editor.position_of_offset(range.start);
                 let end = self.editor.position_of_offset(range.end);
                 Some(Reveal::Match(start, end.column))

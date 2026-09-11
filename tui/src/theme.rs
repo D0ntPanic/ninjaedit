@@ -204,6 +204,8 @@ required {
     command_palette_result_context_text => "command-palette-result-context-text",
     command_palette_selection_background => "command-palette-selection-background",
     command_palette_selection_text => "command-palette-selection-text",
+    /// The file name and line number of a project search result.
+    project_search_location_text => "project-search-location-text",
 }
 optional {
     /// Selected text in the editor. When set it replaces whatever color
@@ -212,6 +214,11 @@ optional {
     /// and the theme's content colors must work over the selection
     /// background.
     selection_text => "selection-text",
+    /// The background of the project search's context pane, so that
+    /// code previewed there can be shown over the editor's background
+    /// (or any other) rather than the palette's. The palette background
+    /// when unset.
+    search_preview_background => "search-preview-background",
 }
 }
 

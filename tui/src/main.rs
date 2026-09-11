@@ -11,6 +11,7 @@ mod clipboard;
 mod editor_view;
 mod input;
 mod palette;
+mod project_search;
 mod search_box;
 mod tabs;
 mod theme;
@@ -18,11 +19,17 @@ mod theme;
 use crate::app::App;
 use crate::theme::Theme;
 use clap::Parser;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
+use crossterm::terminal::supports_keyboard_enhancement;
 use ninjaedit_core::Project;
 use std::io::{self, stdout};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// How long the event loop waits for input before checking for background
@@ -66,17 +73,38 @@ fn main() -> io::Result<()> {
 
     // ratatui's init enables raw mode, enters the alternate screen, and
     // installs a panic hook that undoes both. Our own hook, installed first
-    // so that ratatui's wraps it, turns mouse capture back off as well.
+    // so that ratatui's wraps it, turns mouse capture and the keyboard
+    // protocol back off as well.
+    let enhanced = Arc::new(AtomicBool::new(false));
     let hook = std::panic::take_hook();
+    let hook_enhanced = Arc::clone(&enhanced);
     std::panic::set_hook(Box::new(move |info| {
+        if hook_enhanced.load(Ordering::Relaxed) {
+            let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(stdout(), DisableMouseCapture);
         hook(info);
     }));
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableMouseCapture)?;
+    // Where the terminal supports the kitty keyboard protocol, ask for
+    // unambiguous key codes: without them Ctrl+Shift+F arrives as the same
+    // byte as Ctrl+F.
+    if supports_keyboard_enhancement().unwrap_or(false)
+        && execute!(
+            stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok()
+    {
+        enhanced.store(true, Ordering::Relaxed);
+    }
 
     let result = run(&mut terminal, &mut app);
 
+    if enhanced.load(Ordering::Relaxed) {
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(stdout(), DisableMouseCapture);
     ratatui::restore();
     result

@@ -5,19 +5,23 @@
 pub mod buffer;
 pub mod editor;
 pub mod fuzzy;
+pub mod highlight_cache;
 pub mod indent;
 pub mod index;
 pub mod line_edit;
 pub mod project;
+pub mod project_search;
 pub mod search;
 pub mod syntax;
 pub mod text;
 
 pub use buffer::{FileBuffer, LineEnding};
 pub use editor::{Cell, Editor, Movement, Position};
+pub use highlight_cache::HighlightCache;
 pub use indent::Indentation;
-pub use index::{FileIndex, IndexEntry};
+pub use index::{FileIndex, FileList, IndexEntry};
 pub use line_edit::LineEdit;
 pub use project::Project;
+pub use project_search::{ProjectMatch, ProjectSearch};
 pub use search::{Search, SearchStep};
 pub use syntax::{Highlighter, Language, Token, TokenKind};
