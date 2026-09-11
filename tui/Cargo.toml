@@ -3,6 +3,10 @@ name = "ninjaedit"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+path = "src/main.rs"
+name = "ne"
+
 [dependencies]
 ninjaedit-core = { path = "../core" }
 # Text only: the default `image-data` feature pulls in image decoding we
