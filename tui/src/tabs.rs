@@ -14,7 +14,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 
 const CLOSE: &str = "×";
-const SEPARATOR: &str = "│";
+const SEPARATOR: &str = " ";
 /// The sides of the active tab. Drawn with the tab's background as the
 /// foreground over the bar's background, so the tab appears to slope out
 /// of the bar.

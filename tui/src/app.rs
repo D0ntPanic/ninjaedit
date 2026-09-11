@@ -1331,7 +1331,7 @@ mod tests {
         assert_eq!(screen[0].trim_end(), " a.txt ×  ◢b.txt ×◣  c.txt ×");
         app.activate(2);
         let screen = draw(&mut app, 40, 4);
-        assert_eq!(screen[0].trim_end(), " a.txt × │ b.txt ×  ◢c.txt ×◣");
+        assert_eq!(screen[0].trim_end(), " a.txt ×   b.txt ×  ◢c.txt ×◣");
 
         // The edges are the tab's background drawn over the bar's.
         let theme = Theme::default();
