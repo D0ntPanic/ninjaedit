@@ -25,6 +25,13 @@
 //! Either way the query is selected, so typing starts a new search.
 //! Going to a match selects it in its file, opening the file if need be.
 //!
+//! Not every terminal can tell Ctrl+Shift+F from Ctrl+F, so Ctrl+F with
+//! the search box already open opens the project search instead, taking
+//! over a query typed into the box. With nothing typed (the box empty,
+//! or still holding the seeded selection) Ctrl+F, Ctrl+F is exactly
+//! Ctrl+Shift+F. With no file open there is nothing to search locally,
+//! so Ctrl+F opens the project search right away.
+//!
 //! Closing a modified tab or quitting with unsaved changes asks for the key
 //! to be pressed a second time rather than popping up a dialog.
 
@@ -340,13 +347,15 @@ impl App {
 
     /// Open the search box over the active tab, starting a search from its
     /// cursor, or with the selected text as the query when the selection
-    /// lies within one line. Does nothing with the box already open, or
-    /// with no tab.
+    /// lies within one line. Does nothing with the box already open; with
+    /// no tab there is nothing to search, so the project search opens
+    /// instead.
     fn open_search_box(&mut self) {
         if self.search_box.is_some() {
             return;
         }
         if self.tabs.get(self.active).is_none() {
+            self.open_project_search();
             return;
         }
         self.palette = None;
@@ -355,9 +364,7 @@ impl App {
             return;
         };
         let editor = tab.view.editor_mut_in_place();
-        let seed = editor
-            .selected_text()
-            .filter(|text| !text.contains(['\n', '\r']));
+        let seed = single_line_selection(editor);
         editor.start_search();
         let mut search_box = SearchBox::new();
         let seeded = seed.is_some();
@@ -477,26 +484,51 @@ impl App {
 
     // ----- Project search -------------------------------------------------
 
-    /// Show the project search dialog, seeded with the active tab's
-    /// selection when that lies within one line and isn't what the dialog
-    /// is already searching for; otherwise the dialog comes back as it
-    /// was, its query selected so that typing replaces it.
+    /// Ctrl+Shift+F: show the project search dialog, seeded with the
+    /// active tab's selection when that lies within one line and isn't
+    /// what the dialog is already searching for; otherwise the dialog
+    /// comes back as it was, its query selected so that typing replaces
+    /// it.
     fn open_project_search(&mut self) {
-        self.palette = None;
-        self.close_search_box(true);
+        self.show_project_search(None);
+    }
+
+    /// Ctrl+F with the search box open: move the search to the whole
+    /// project. A query typed into the box is what the dialog searches
+    /// for; with nothing typed this is Ctrl+Shift+F.
+    fn upgrade_search_to_project(&mut self) {
+        let Some(search_box) = &self.search_box else {
+            return;
+        };
+        let query = search_box.query().to_owned();
         let seed = self
             .tabs
             .get(self.active)
-            .and_then(|tab| tab.view.editor().selected_text())
-            .filter(|text| !text.contains(['\n', '\r']));
+            .and_then(|tab| single_line_selection(tab.view.editor()))
+            .map(|seed| literal_query(&seed));
+        let typed = !query.is_empty() && seed.as_deref() != Some(query.as_str());
+        self.show_project_search(typed.then_some(query));
+    }
+
+    /// Show the project search dialog, searching for `query` when given,
+    /// and otherwise seeded from the selection as
+    /// [`open_project_search`](Self::open_project_search) describes.
+    fn show_project_search(&mut self, query: Option<String>) {
+        self.palette = None;
+        let seed = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| single_line_selection(tab.view.editor()));
+        self.close_search_box(true);
         let dialog = self.project_search.get_or_insert_with(|| {
             ProjectSearchDialog::new(
                 self.project.root().to_path_buf(),
                 self.project.index().file_list(),
             )
         });
-        match seed {
-            Some(seed) if !dialog.is_searching_for(&seed) => {
+        match (query, seed) {
+            (Some(query), _) => dialog.set_query_selected(&query),
+            (None, Some(seed)) if !dialog.is_searching_for(&seed) => {
                 dialog.set_query_selected(&literal_query(&seed));
             }
             _ => dialog.select_query(),
@@ -639,6 +671,10 @@ impl App {
                 }
                 KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     self.open_project_search();
+                    return;
+                }
+                KeyCode::Char('f') if self.search_box.is_some() => {
+                    self.upgrade_search_to_project();
                     return;
                 }
                 KeyCode::Char('f') => {
@@ -908,6 +944,14 @@ fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme) {
                 .add_modifier(Modifier::DIM),
         );
     }
+}
+
+/// The selected text, when the selection lies within one line: what a
+/// search opened over it starts out looking for.
+fn single_line_selection(editor: &Editor) -> Option<String> {
+    editor
+        .selected_text()
+        .filter(|text| !text.contains(['\n', '\r']))
 }
 
 /// The directory part of a displayed path, or empty for a bare file name.
@@ -2058,6 +2102,96 @@ mod tests {
                 .selection(),
             Some(0..5)
         );
+    }
+
+    #[test]
+    fn ctrl_f_twice_upgrades_to_project_search() {
+        // b.rs is the active tab; three blank lines keep its text clear
+        // of the search box.
+        let (_dir, mut app) = app_with_files(&[
+            ("a.rs", "needle\nother\n"),
+            ("b.rs", "\n\n\nneedle other\n"),
+        ]);
+        assert_eq!(app.tabs[app.active].title(), "b.rs");
+        // Ctrl+F, Ctrl+F with nothing typed is Ctrl+Shift+F: an empty
+        // project search.
+        ctrl(&mut app, 'f');
+        assert!(app.search_box.is_some());
+        ctrl(&mut app, 'f');
+        assert!(app.search_box.is_none());
+        assert!(app.project_search_open);
+        assert_eq!(app.project_search.as_ref().unwrap().query(), "");
+        // The search box's query carries over, selected so that typing
+        // replaces it, and the file's own search is dropped.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.project_search_open);
+        ctrl(&mut app, 'f');
+        type_str(&mut app, "needle");
+        wait_for_search(&app);
+        ctrl(&mut app, 'f');
+        assert!(app.search_box.is_none());
+        assert!(app.project_search_open);
+        assert!(app.tabs[app.active].view.editor().search().is_none());
+        let dialog = app.project_search.as_ref().unwrap();
+        assert_eq!(dialog.query(), "needle");
+        assert_eq!(dialog.input().edit().selection(), Some(0..6));
+        wait_for_project_search(&app);
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[18].contains("2 matches in 2 files"), "{screen:#?}");
+        // A regular expression carries over as one.
+        press(&mut app, KeyCode::Esc);
+        ctrl(&mut app, 'f');
+        type_str(&mut app, "/oth.r");
+        ctrl(&mut app, 'f');
+        assert_eq!(app.project_search.as_ref().unwrap().query(), "/oth.r");
+        wait_for_project_search(&app);
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[18].contains("2 matches in 2 files"), "{screen:#?}");
+        // Ctrl+F, Ctrl+F over a selection, with nothing typed in between,
+        // is Ctrl+Shift+F over that selection: the dialog is seeded from
+        // it when it isn't already searching for it...
+        press(&mut app, KeyCode::Esc);
+        app.tabs[app.active].view.editor_mut().set_selection(3, 9);
+        ctrl(&mut app, 'f');
+        assert_eq!(app.search_box.as_ref().unwrap().query(), "needle");
+        ctrl(&mut app, 'f');
+        let dialog = app.project_search.as_ref().unwrap();
+        assert_eq!(dialog.query(), "needle");
+        assert_eq!(dialog.input().edit().selection(), Some(0..6));
+        wait_for_project_search(&app);
+        press(&mut app, KeyCode::Enter);
+        // ...and otherwise comes back as it was, so that the matches can
+        // be walked through one by one.
+        assert_eq!(app.tabs[app.active].title(), "a.rs");
+        assert_eq!(app.tabs[app.active].view.editor().selection(), Some(0..6));
+        ctrl(&mut app, 'f');
+        ctrl(&mut app, 'f');
+        let dialog = app.project_search.as_ref().unwrap();
+        assert_eq!(dialog.query(), "needle");
+        assert_eq!(dialog.input().edit().selection(), Some(0..6));
+        assert_eq!(dialog.selected().unwrap().line, 0);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs[app.active].title(), "b.rs");
+        assert_eq!(app.tabs[app.active].view.editor().selection(), Some(3..9));
+    }
+
+    #[test]
+    fn ctrl_f_with_no_file_open_is_project_search() {
+        let (_dir, mut app) = project_with_files(&[("a.rs", "needle\n")]);
+        assert!(app.tabs.is_empty());
+        ctrl(&mut app, 'f');
+        assert!(app.search_box.is_none());
+        assert!(app.project_search_open);
+        type_str(&mut app, "needle");
+        wait_for_project_search(&app);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs[app.active].title(), "a.rs");
+        assert_eq!(app.tabs[app.active].view.editor().selection(), Some(0..6));
+        // With a file open, Ctrl+F is the local search again.
+        ctrl(&mut app, 'f');
+        assert!(app.search_box.is_some());
+        assert!(!app.project_search_open);
     }
 
     #[test]
