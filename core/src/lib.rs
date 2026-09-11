@@ -15,7 +15,7 @@ pub mod search;
 pub mod syntax;
 pub mod text;
 
-pub use buffer::{FileBuffer, LineEnding};
+pub use buffer::{BufferSnapshot, FileBuffer, LineEnding};
 pub use editor::{Cell, Editor, Movement, Position};
 pub use highlight_cache::HighlightCache;
 pub use indent::Indentation;

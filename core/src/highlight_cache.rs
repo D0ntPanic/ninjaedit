@@ -5,11 +5,13 @@
 //! A [`HighlightCache`] is asked for a file with
 //! [`states`](HighlightCache::states). The first time a file is asked
 //! for, the answer is `None` and the file is queued for a worker thread,
-//! which reads it and lexes every line from the top; from then on the
-//! answer is at hand. Files whose language isn't known from their name
-//! are remembered as such and never queued again. A frontend polls
-//! [`generation`](HighlightCache::generation) to learn when a file it
-//! asked for has been lexed and is worth redrawing with.
+//! which reads it (or takes it as an editor has it, if the cache was made
+//! with [`with_buffers`](HighlightCache::with_buffers)) and lexes every
+//! line from the top; from then on the answer is at hand. Files whose
+//! language isn't known from their name are remembered as such and never
+//! queued again. A frontend polls [`generation`](HighlightCache::generation)
+//! to learn when a file it asked for has been lexed and is worth
+//! redrawing with.
 //!
 //! What is kept for a file is not its tokens but, as the editor's
 //! [`Highlighter`](crate::Highlighter) keeps, the small fixed-size
@@ -20,7 +22,7 @@
 //! all. The cache holds up to [`MAX_FILES`] files, dropping the least
 //! recently asked for beyond that.
 
-use crate::project_search::lines;
+use crate::project_search::{Buffers, lines};
 use crate::syntax::{Language, LexState, Token};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -90,6 +92,8 @@ struct Shared {
     /// hand.
     idle: Condvar,
     generation: AtomicU64,
+    /// Files to lex as they are in editors rather than on disk.
+    buffers: Arc<Buffers>,
 }
 
 /// A background lexer with a cache of the results; see the [module
@@ -100,6 +104,14 @@ pub struct HighlightCache {
 
 impl HighlightCache {
     pub fn new() -> HighlightCache {
+        Self::with_buffers(Arc::new(Buffers::new()))
+    }
+
+    /// A cache that lexes the files in `buffers` as they are there, and
+    /// the rest from disk. The buffers are fixed for the cache's life: a
+    /// frontend makes a new cache when they change, as the project search
+    /// dialog does whenever it is shown.
+    pub fn with_buffers(buffers: Arc<Buffers>) -> HighlightCache {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 files: HashMap::new(),
@@ -111,6 +123,7 @@ impl HighlightCache {
             wake: Condvar::new(),
             idle: Condvar::new(),
             generation: AtomicU64::new(0),
+            buffers,
         });
         let worker_shared = Arc::clone(&shared);
         thread::Builder::new()
@@ -213,7 +226,7 @@ fn run_worker(shared: Arc<Shared>) {
                 state = shared.wake.wait(state).unwrap();
             }
         };
-        let entry = match lex_file(&path) {
+        let entry = match lex_file(&path, &shared.buffers) {
             Some(states) => Entry::Lexed(Arc::new(states)),
             None => Entry::Unsupported,
         };
@@ -235,17 +248,27 @@ fn run_worker(shared: Arc<Shared>) {
 
 /// Lex every line of a file from the top, keeping the state each starts
 /// in.
-fn lex_file(path: &Path) -> Option<FileStates> {
+fn lex_file(path: &Path, buffers: &Buffers) -> Option<FileStates> {
     let language = Language::from_path(path)?;
-    let bytes = fs::read(path).ok()?;
     let lexer = language.lexer();
     let mut state = LexState::default();
     let mut states = Vec::new();
     let mut scratch = Vec::new();
-    for (_, line) in lines(&bytes) {
+    let mut lex = |line: &[u8]| {
         states.push(state);
         scratch.clear();
         state = lexer.lex_line(state, line, &mut scratch);
+    };
+    if let Some(snapshot) = buffers.get(path) {
+        let mut lines = snapshot.lines_from(0);
+        while let Some(line) = lines.next_line() {
+            lex(line);
+        }
+    } else {
+        let bytes = fs::read(path).ok()?;
+        for (_, line) in lines(&bytes) {
+            lex(line);
+        }
     }
     Some(FileStates { language, states })
 }
@@ -303,6 +326,29 @@ mod tests {
         assert!(cache.states(&missing).is_none());
         assert!(cache.wait_idle(WAIT));
         assert!(cache.states(&missing).is_none());
+    }
+
+    #[test]
+    fn open_buffers_are_lexed_in_place_of_disk() {
+        use crate::buffer::FileBuffer;
+        let dir = tempfile::tempdir().unwrap();
+        let rust = dir.path().join("a.rs");
+        fs::write(&rust, "fn main() {}\n").unwrap();
+        let mut buffers = Buffers::new();
+        let buffer = FileBuffer::from_text("/* open\nstill */ fn\n");
+        buffers.insert(rust.clone(), buffer.snapshot());
+        let rust: Arc<Path> = Arc::from(rust);
+        let cache = HighlightCache::with_buffers(Arc::new(buffers));
+        assert!(cache.states(&rust).is_none());
+        assert!(cache.wait_idle(WAIT));
+        let states = cache.states(&rust).expect("lexed");
+        // Three lines, counting the empty one after the trailing newline,
+        // and the second starts inside the comment opened on the first.
+        assert_eq!(states.line_count(), 3);
+        let tokens = states.tokens(1, b"still */ fn");
+        assert_eq!(tokens[0].kind, TokenKind::Comment);
+        assert_eq!(tokens[0].range, 0..8);
+        assert_eq!(tokens.last().unwrap().kind, TokenKind::Keyword);
     }
 
     #[test]

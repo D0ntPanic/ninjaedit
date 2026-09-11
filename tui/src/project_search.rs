@@ -11,9 +11,15 @@
 //! a background thread has lexed the file (see [`HighlightCache`]); a
 //! file is lexed once however many matches fall in it, and until then
 //! its lines show plain. The cache is dropped whenever the dialog is
-//! hidden, since it is easily made again, unlike the results. The pane
-//! below shows the
-//! highlighted match's file around the match,
+//! hidden, since it is easily made again, unlike the results.
+//!
+//! Files open with unsaved changes are searched, and shown, as their
+//! editors have them rather than as they are on disk: the application
+//! hands their contents over each time it shows the dialog (see
+//! [`set_buffers`](ProjectSearchDialog::set_buffers)), and the results
+//! are made afresh when those have changed since.
+//!
+//! The pane below shows the highlighted match's file around the match,
 //! laid out as the editor would show it: the match is brought into view
 //! the way a jump to it in the editor is, and from there Ctrl+Up,
 //! Ctrl+Down, Ctrl+PageUp, and Ctrl+PageDown scroll the pane, as does
@@ -35,10 +41,12 @@ use crate::palette::{palette_background, render_frame};
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::highlight_cache::FileStates;
-use ninjaedit_core::project_search::{SearchPhase, read_lines};
+use ninjaedit_core::project_search::{Buffers, SearchPhase};
 use ninjaedit_core::search::literal_query;
 use ninjaedit_core::text;
-use ninjaedit_core::{FileList, HighlightCache, ProjectMatch, ProjectSearch, Token, TokenKind};
+use ninjaedit_core::{
+    BufferSnapshot, FileList, HighlightCache, ProjectMatch, ProjectSearch, Token, TokenKind,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
 use ratatui::style::{Modifier, Style};
@@ -83,6 +91,13 @@ pub struct ProjectSearchDialog {
     /// Syntax highlighting of the files on show, lexed in the background.
     /// Made when the dialog is drawn and dropped when it is hidden.
     highlights: Option<HighlightCache>,
+    /// The contents of files open with unsaved changes, as last handed
+    /// over, which the search and the highlight cache use in place of
+    /// the files on disk.
+    buffers: Arc<Buffers>,
+    /// The version of each of those buffers, sorted by path, to tell
+    /// whether what is handed over next differs.
+    pub(crate) buffer_versions: Vec<(PathBuf, u64)>,
     /// The cache's generation as of the last poll.
     highlight_generation: u64,
     /// Index of the highlighted match. Clamped to the matches at render,
@@ -120,6 +135,8 @@ impl ProjectSearchDialog {
             search,
             highlight_generation: 0,
             highlights: None,
+            buffers: Arc::new(Buffers::new()),
+            buffer_versions: Vec::new(),
             selected: 0,
             first_visible: 0,
             context: None,
@@ -163,6 +180,39 @@ impl ProjectSearchDialog {
     /// disturbing the search or its results.
     pub fn select_query(&mut self) {
         self.input.select_all();
+    }
+
+    /// Search the files open with unsaved changes as their editors have
+    /// them: `buffers` holds each one's path, its
+    /// [version](ninjaedit_core::FileBuffer::version), and its contents.
+    /// Nothing changes unless the set of files or any of their versions
+    /// differs from last time; when it does, the results are made afresh
+    /// and the highlighted row goes back to the top, since the old rows
+    /// no longer mean anything.
+    pub fn set_buffers(&mut self, mut buffers: Vec<(PathBuf, u64, BufferSnapshot)>) {
+        buffers.sort_by(|a, b| a.0.cmp(&b.0));
+        let versions: Vec<(PathBuf, u64)> = buffers
+            .iter()
+            .map(|(path, version, _)| (path.clone(), *version))
+            .collect();
+        if versions == self.buffer_versions {
+            return;
+        }
+        self.buffer_versions = versions;
+        self.buffers = Arc::new(
+            buffers
+                .into_iter()
+                .map(|(path, _, snapshot)| (path, snapshot))
+                .collect(),
+        );
+        self.highlights = None;
+        self.highlight_generation = 0;
+        self.context = None;
+        self.search.set_buffers(Arc::clone(&self.buffers));
+        self.search.wait_for(SEARCH_GRACE);
+        self.selected = 0;
+        self.first_visible = 0;
+        self.center_context = true;
     }
 
     /// Search for what the input now holds, giving a quick search a
@@ -508,7 +558,9 @@ impl ProjectSearchDialog {
         let selected = self.selected;
         let first_visible = self.first_visible;
         let root = &self.root;
-        let highlights = self.highlights.get_or_insert_with(HighlightCache::new);
+        let highlights = self
+            .highlights
+            .get_or_insert_with(|| HighlightCache::with_buffers(Arc::clone(&self.buffers)));
         // Consecutive rows are often in one file: look its states up once.
         let mut file_states: Option<(Arc<Path>, Option<Arc<FileStates>>)> = None;
         for (row, m) in matches.iter().enumerate() {
@@ -583,7 +635,7 @@ impl ProjectSearchDialog {
             return;
         };
         if self.context.as_ref().map(|(path, _)| &**path) != Some(&*m.path) {
-            let lines = read_lines(&m.path).unwrap_or_default();
+            let lines = self.search.file_lines(&m.path).unwrap_or_default();
             self.context = Some((Arc::clone(&m.path), lines));
             self.context_col = 0;
             self.center_context = true;
@@ -597,7 +649,7 @@ impl ProjectSearchDialog {
         buf.set_style(area, background);
         let states = self
             .highlights
-            .get_or_insert_with(HighlightCache::new)
+            .get_or_insert_with(|| HighlightCache::with_buffers(Arc::clone(&self.buffers)))
             .states(&m.path);
         let number_width = digits(lines.len().max(1));
         // Number, space, guide, then the text.

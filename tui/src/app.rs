@@ -520,12 +520,28 @@ impl App {
             .get(self.active)
             .and_then(|tab| single_line_selection(tab.view.editor()));
         self.close_search_box(true);
+        // Files with unsaved changes are searched as their editors have
+        // them; the dialog notices when these differ from last time.
+        let buffers = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let editor = tab.view.editor();
+                if !editor.is_modified() {
+                    return None;
+                }
+                let buffer = editor.buffer();
+                let path = buffer.path()?.to_path_buf();
+                Some((path, buffer.version(), buffer.snapshot()))
+            })
+            .collect();
         let dialog = self.project_search.get_or_insert_with(|| {
             ProjectSearchDialog::new(
                 self.project.root().to_path_buf(),
                 self.project.index().file_list(),
             )
         });
+        dialog.set_buffers(buffers);
         match (query, seed) {
             (Some(query), _) => dialog.set_query_selected(&query),
             (None, Some(seed)) if !dialog.is_searching_for(&seed) => {
@@ -2052,6 +2068,57 @@ mod tests {
         draw(&mut app, 60, 20);
         click(&mut app, 0, 5);
         assert!(!app.project_search_open);
+    }
+
+    #[test]
+    fn project_search_sees_unsaved_edits() {
+        let (dir, mut app) = project_with_files(&[("a.rs", "one\ntwo\n"), ("b.rs", "needle\n")]);
+        app.open_file(dir.path().join("a.rs"));
+        // An unmodified file is searched from disk.
+        ctrl_shift_f(&mut app);
+        type_str(&mut app, "needle");
+        wait_for_project_search(&app);
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[18].contains("1 match"), "{screen:#?}");
+        press(&mut app, KeyCode::Esc);
+        // Edit the first line of a.rs without saving. Reopening the dialog
+        // searches the edit and shows it in the results and the context.
+        type_str(&mut app, "needle ");
+        assert!(app.tabs[app.active].view.editor().is_modified());
+        ctrl_shift_f(&mut app);
+        wait_for_project_search(&app);
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[18].contains("2 matches"), "{screen:#?}");
+        assert!(screen[3].contains("needle one"), "{screen:#?}");
+        assert!(screen[3].contains("a.rs:1│"), "{screen:#?}");
+        assert!(
+            screen[11..18].iter().any(|row| row.contains("needle one")),
+            "{screen:#?}"
+        );
+        // Going to the match selects it in the edited buffer.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs[app.active].title(), "a.rs");
+        assert_eq!(app.tabs[app.active].view.editor().selection(), Some(0..6));
+        // A further edit is picked up on the next showing; an unchanged
+        // buffer leaves the results as they were.
+        let dialog = app.project_search.as_ref().unwrap();
+        let versions = dialog.buffer_versions.clone();
+        ctrl_shift_f(&mut app);
+        assert_eq!(
+            app.project_search.as_ref().unwrap().buffer_versions,
+            versions
+        );
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::End);
+        type_str(&mut app, " needle");
+        ctrl_shift_f(&mut app);
+        wait_for_project_search(&app);
+        assert_ne!(
+            app.project_search.as_ref().unwrap().buffer_versions,
+            versions
+        );
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[18].contains("3 matches"), "{screen:#?}");
     }
 
     #[test]

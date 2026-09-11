@@ -8,8 +8,12 @@
 //! and a leading `/` introduces a regular expression. A match never spans
 //! a line break.
 //!
-//! Files are read from disk, so unsaved changes in an editor are not seen,
-//! and files that look binary (a NUL byte near the start) are skipped. The
+//! Files are read from disk, except those a frontend has handed over the
+//! contents of (see [`ProjectSearch::set_buffers`]): a file open in an
+//! editor is searched as the editor has it, unsaved edits and all, and
+//! its lines can be had the same way for showing the context of a match
+//! (see [`ProjectSearch::file_lines`]). Files that look binary (a NUL byte
+//! near the start) are skipped. The
 //! work is spread over a few threads, but matches are published in a
 //! fixed order: files sorted by path, then top to bottom within each file.
 //! Matches are only ever appended, so an index into them stays valid as
@@ -27,10 +31,11 @@
 //! line, a window of it around the match) so a list of results can be
 //! drawn without touching the files again.
 
+use crate::buffer::BufferSnapshot;
 use crate::index::FileList;
 use crate::search::compile;
 use regex::bytes::Regex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -54,6 +59,11 @@ const LONG_LINE: usize = 1024;
 /// The window kept before and after a match on a long line.
 const WINDOW_BEFORE: usize = 256;
 const WINDOW_AFTER: usize = 512;
+
+/// The contents of files as they are in editors, keyed by absolute path,
+/// to search in place of what is on disk; see
+/// [`ProjectSearch::set_buffers`].
+pub type Buffers = HashMap<PathBuf, BufferSnapshot>;
 
 /// One match in one file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +140,7 @@ pub struct ProjectSearch {
     limit: usize,
     query: String,
     pattern: Result<Option<Regex>, String>,
+    buffers: Arc<Buffers>,
     results: Arc<Results>,
     cancel: Arc<AtomicBool>,
     /// Bumped whenever a worker publishes matches. Shared by every worker
@@ -145,6 +156,7 @@ impl ProjectSearch {
             limit: MAX_MATCHES,
             query: String::new(),
             pattern: Ok(None),
+            buffers: Arc::new(Buffers::new()),
             results: Results::new(SearchPhase::Done),
             cancel: Arc::new(AtomicBool::new(false)),
             generation: Arc::new(AtomicU64::new(0)),
@@ -171,9 +183,38 @@ impl ProjectSearch {
         if query == self.query {
             return;
         }
-        self.cancel.store(true, Ordering::Release);
         self.query = query.to_owned();
         self.pattern = compile(query);
+        self.restart();
+    }
+
+    /// Search files that are open in editors as the editors have them,
+    /// rather than as they are on disk. Only files the project's index
+    /// knows about are searched, whether or not they are in `buffers`. A
+    /// search under way starts over with the new contents, discarding
+    /// what it had found (and the buffers given before, so a file left
+    /// out is read from disk again).
+    pub fn set_buffers(&mut self, buffers: Arc<Buffers>) {
+        self.buffers = buffers;
+        if matches!(self.pattern, Ok(Some(_))) {
+            self.restart();
+        }
+    }
+
+    /// The lines of a file as the search sees them: from its buffer, if
+    /// one was given with [`set_buffers`](Self::set_buffers), and
+    /// otherwise from disk as [`read_lines`] reads them.
+    pub fn file_lines(&self, path: &Path) -> io::Result<Vec<String>> {
+        match self.buffers.get(path) {
+            Some(snapshot) => Ok(snapshot_lines(snapshot)),
+            None => read_lines(path),
+        }
+    }
+
+    /// Stop any search under way and start one afresh for the query,
+    /// unless there is nothing to search for.
+    fn restart(&mut self) {
+        self.cancel.store(true, Ordering::Release);
         self.cancel = Arc::new(AtomicBool::new(false));
         let Ok(Some(regex)) = &self.pattern else {
             self.results = Results::new(SearchPhase::Done);
@@ -183,6 +224,7 @@ impl ProjectSearch {
         let job = Job {
             regex: regex.clone(),
             files: self.files.clone(),
+            buffers: Arc::clone(&self.buffers),
             limit: self.limit,
             results: Arc::clone(&self.results),
             cancel: Arc::clone(&self.cancel),
@@ -291,6 +333,18 @@ pub fn read_lines(path: &Path) -> io::Result<Vec<String>> {
         .collect())
 }
 
+/// The lines of a buffer, without their terminators, as its editor counts
+/// them: unlike [`read_lines`], a trailing terminator is followed by an
+/// empty last line, since the editor shows one.
+pub fn snapshot_lines(snapshot: &BufferSnapshot) -> Vec<String> {
+    let mut out = Vec::with_capacity(snapshot.line_count());
+    let mut lines = snapshot.lines_from(0);
+    while let Some(line) = lines.next_line() {
+        out.push(String::from_utf8_lossy(line).into_owned());
+    }
+    out
+}
+
 /// The lines of `bytes` with the byte offset each starts at.
 pub(crate) fn lines(bytes: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
     let mut start = 0;
@@ -314,6 +368,8 @@ pub(crate) fn lines(bytes: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
 struct Job {
     regex: Regex,
     files: FileList,
+    /// Files to search as they are in editors rather than on disk.
+    buffers: Arc<Buffers>,
     limit: usize,
     results: Arc<Results>,
     cancel: Arc<AtomicBool>,
@@ -429,6 +485,19 @@ impl Job {
     }
 
     fn search_file(&self, path: &Arc<Path>, out: &mut Vec<ProjectMatch>) {
+        if let Some(snapshot) = self.buffers.get(&**path) {
+            // An editor's contents are text by definition, whatever the
+            // file on disk holds.
+            let mut lines = snapshot.lines_from(0);
+            let mut number = 0;
+            while let Some(line) = lines.next_line() {
+                if !self.search_line(path, number, line, out) {
+                    return;
+                }
+                number += 1;
+            }
+            return;
+        }
         let Ok(bytes) = fs::read(path) else {
             return;
         };
@@ -436,36 +505,51 @@ impl Job {
             return;
         }
         for (number, (_, line)) in lines(&bytes).enumerate() {
-            // The matches on a short line share one copy of its text.
-            let mut whole: Option<Arc<str>> = None;
-            for m in self.regex.find_iter(line) {
-                if m.is_empty() {
-                    continue;
-                }
-                if self.counted.fetch_add(1, Ordering::Relaxed) >= self.limit {
-                    self.full.store(true, Ordering::Release);
-                    return;
-                }
-                let (text, range, text_offset) = if line.len() <= LONG_LINE {
-                    let text = whole
-                        .get_or_insert_with(|| String::from_utf8_lossy(line).into())
-                        .clone();
-                    (text, decoded_range(line, m.range()), 0)
-                } else {
-                    let (text, range, offset) = excerpt(line, m.range());
-                    (Arc::from(text), range, offset)
-                };
-                out.push(ProjectMatch {
-                    path: Arc::clone(path),
-                    line: number,
-                    column: m.start(),
-                    len: m.len(),
-                    text,
-                    range,
-                    text_offset,
-                });
+            if !self.search_line(path, number, line, out) {
+                return;
             }
         }
+    }
+
+    /// Find the matches on one line. Returns false once the limit is
+    /// reached, when there is no point going on.
+    fn search_line(
+        &self,
+        path: &Arc<Path>,
+        number: usize,
+        line: &[u8],
+        out: &mut Vec<ProjectMatch>,
+    ) -> bool {
+        // The matches on a short line share one copy of its text.
+        let mut whole: Option<Arc<str>> = None;
+        for m in self.regex.find_iter(line) {
+            if m.is_empty() {
+                continue;
+            }
+            if self.counted.fetch_add(1, Ordering::Relaxed) >= self.limit {
+                self.full.store(true, Ordering::Release);
+                return false;
+            }
+            let (text, range, text_offset) = if line.len() <= LONG_LINE {
+                let text = whole
+                    .get_or_insert_with(|| String::from_utf8_lossy(line).into())
+                    .clone();
+                (text, decoded_range(line, m.range()), 0)
+            } else {
+                let (text, range, offset) = excerpt(line, m.range());
+                (Arc::from(text), range, offset)
+            };
+            out.push(ProjectMatch {
+                path: Arc::clone(path),
+                line: number,
+                column: m.start(),
+                len: m.len(),
+                text,
+                range,
+                text_offset,
+            });
+        }
+        true
     }
 }
 
@@ -641,6 +725,70 @@ mod tests {
         assert_eq!(paths.len(), 200);
         assert!(paths.windows(2).all(|w| w[0] < w[1]), "{paths:?}");
         assert_eq!(search.file_count(), 200);
+    }
+
+    #[test]
+    fn open_buffers_are_searched_in_place_of_disk() {
+        use crate::buffer::FileBuffer;
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        write(&root, "a.txt", b"needle on disk\n");
+        write(&root, "b.txt", b"needle\n");
+        let index = FileIndex::new(&root);
+        let mut search = ProjectSearch::new(index.file_list());
+        search.set_query("needle");
+        assert!(search.wait_for(WAIT));
+        assert_eq!(search.match_count(), 2);
+        assert_eq!(
+            search.file_lines(&root.join("a.txt")).unwrap(),
+            vec!["needle on disk"]
+        );
+
+        // Handing over a buffer restarts the search with its contents.
+        let mut buffers = Buffers::new();
+        let edited = FileBuffer::from_text("edited\r\nneedle needle\n");
+        buffers.insert(root.join("a.txt"), edited.snapshot());
+        // A buffer for a file the index doesn't know is never searched.
+        let elsewhere = fs::canonicalize(tempfile::tempdir().unwrap().path())
+            .unwrap()
+            .join("c.txt");
+        buffers.insert(elsewhere, FileBuffer::from_text("needle\n").snapshot());
+        search.set_buffers(Arc::new(buffers));
+        assert!(search.wait_for(WAIT));
+        assert_eq!(
+            summarize(&search, &root),
+            vec![
+                (
+                    "a.txt".into(),
+                    1,
+                    0,
+                    "needle needle".into(),
+                    "needle".into()
+                ),
+                (
+                    "a.txt".into(),
+                    1,
+                    7,
+                    "needle needle".into(),
+                    "needle".into()
+                ),
+                ("b.txt".into(), 0, 0, "needle".into(), "needle".into()),
+            ]
+        );
+        assert_eq!(
+            search.file_lines(&root.join("a.txt")).unwrap(),
+            vec!["edited", "needle needle", ""]
+        );
+        assert_eq!(
+            search.file_lines(&root.join("b.txt")).unwrap(),
+            vec!["needle"]
+        );
+
+        // Taking the buffers away goes back to the disk.
+        search.set_buffers(Arc::new(Buffers::new()));
+        assert!(search.wait_for(WAIT));
+        assert_eq!(search.match_count(), 2);
+        assert_eq!(search.slice(0..1)[0].text.as_ref(), "needle on disk");
     }
 
     #[test]

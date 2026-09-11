@@ -195,6 +195,8 @@ pub struct FileBuffer {
     eol: LineEnding,
     path: Option<PathBuf>,
     modified: bool,
+    /// Bumped by every edit; see [`version`](Self::version).
+    version: u64,
 }
 
 impl FileBuffer {
@@ -205,6 +207,7 @@ impl FileBuffer {
             eol: LineEnding::native(),
             path: None,
             modified: false,
+            version: 0,
         }
     }
 
@@ -215,6 +218,7 @@ impl FileBuffer {
             eol: detect_eol(bytes),
             path: None,
             modified: false,
+            version: 0,
         }
     }
 
@@ -239,6 +243,13 @@ impl FileBuffer {
     /// Whether the buffer has been edited since it was loaded or last saved.
     pub fn is_modified(&self) -> bool {
         self.modified
+    }
+
+    /// A counter that changes with every edit, for telling cheaply whether
+    /// the contents have changed since they were last looked at. Saving
+    /// doesn't change it: the contents don't.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// Override the modified flag. Used by the editor model, which tracks
@@ -390,6 +401,7 @@ impl FileBuffer {
         }
         self.fix_crlf_boundaries();
         self.modified = true;
+        self.version += 1;
     }
 
     /// Delete a byte range.
@@ -422,6 +434,7 @@ impl FileBuffer {
         self.fix_crlf_boundaries();
         self.coalesce();
         self.modified = true;
+        self.version += 1;
     }
 
     /// The byte offset at which a line starts. Accepts `0..line_count()`.
