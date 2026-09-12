@@ -44,7 +44,7 @@ use std::time::Duration;
 use std::{fs, io};
 
 /// The most matches a search keeps; see the [module documentation](self).
-pub const MAX_MATCHES: usize = 1_000_000;
+pub const MAX_MATCHES: usize = 10_000;
 /// Files searched as one unit; matches are published a chunk at a time.
 const CHUNK: usize = 32;
 /// The most worker threads a search runs.

@@ -32,7 +32,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use vte::{Params, Perform};
 
 /// Lines of scrollback kept by default.
-pub const DEFAULT_SCROLLBACK: usize = 10_000;
+pub const DEFAULT_SCROLLBACK: usize = 100_000;
 /// Tab stops start out this many columns apart.
 const TAB_WIDTH: usize = 8;
 
