@@ -32,11 +32,17 @@
 //! Ctrl+Shift+F. With no file open there is nothing to search locally,
 //! so Ctrl+F opens the project search right away.
 //!
+//! The go to line box (Ctrl+L) floats where the search box does, and
+//! like it never shows at the same time as the palette. Enter moves the
+//! active tab's cursor to the start of the line typed, clamped to the
+//! first or last line when the number is out of range, and closes the box.
+//!
 //! Closing a modified tab or quitting with unsaved changes asks for the key
 //! to be pressed a second time rather than popping up a dialog.
 
 use crate::clipboard::Clipboard;
 use crate::editor_view::EditorView;
+use crate::goto_line::{GoToLineBox, GoToLineOutcome};
 use crate::palette::{Palette, PaletteAction, PaletteItem, PaletteOutcome};
 use crate::project_search::{ProjectSearchDialog, ProjectSearchOutcome};
 use crate::search_box::{self, SearchBox, SearchOutcome};
@@ -114,6 +120,9 @@ pub struct App {
     search_box: Option<SearchBox>,
     /// The last query searched for with Enter, for Ctrl+G to repeat.
     last_search: String,
+    /// The go to line box, over the active tab. Never open at the same
+    /// time as the palette, the search box, or the project search.
+    goto_line: Option<GoToLineBox>,
     /// The project search dialog, kept (with its results) once opened so
     /// that it comes back as it was. Shown while `project_search_open`,
     /// never at the same time as the palette or the search box.
@@ -143,6 +152,7 @@ impl App {
             palette_is_files: false,
             search_box: None,
             last_search: String::new(),
+            goto_line: None,
             project_search: None,
             project_search_open: false,
             status: None,
@@ -279,6 +289,7 @@ impl App {
     /// preselected: Enter alone flips back to it.
     fn open_tabs_palette(&mut self) {
         self.close_search_box(true);
+        self.goto_line = None;
         self.hide_project_search();
         let mut order: Vec<usize> = (0..self.tabs.len()).collect();
         order.sort_by_key(|&index| std::cmp::Reverse(self.tabs[index].last_viewed));
@@ -303,6 +314,7 @@ impl App {
 
     fn open_files_palette(&mut self) {
         self.close_search_box(true);
+        self.goto_line = None;
         self.hide_project_search();
         let mut palette = Palette::new(FILES_PLACEHOLDER, self.file_items());
         self.refresh_index_hint(&mut palette);
@@ -359,6 +371,7 @@ impl App {
             return;
         }
         self.palette = None;
+        self.goto_line = None;
         self.hide_project_search();
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
@@ -421,6 +434,39 @@ impl App {
                 }
             }
             SearchOutcome::Next => self.step_search(),
+        }
+    }
+
+    // ----- Go to line -----------------------------------------------------
+
+    /// Ctrl+L: open the go to line box over the active tab. Does nothing
+    /// with the box already open, or with no tab to move around in.
+    fn open_goto_line(&mut self) {
+        if self.goto_line.is_some() {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let line_count = tab.view.editor().buffer().line_count();
+        self.palette = None;
+        self.close_search_box(true);
+        self.hide_project_search();
+        self.goto_line = Some(GoToLineBox::new(line_count));
+    }
+
+    fn handle_goto_line_outcome(&mut self, outcome: GoToLineOutcome) {
+        match outcome {
+            GoToLineOutcome::Continue => {}
+            GoToLineOutcome::Close => self.goto_line = None,
+            GoToLineOutcome::Accept(line) => {
+                self.goto_line = None;
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    // Line numbers are typed counting from one; zero and
+                    // anything past the end clamp to the first and last.
+                    tab.view.go_to_line(line.saturating_sub(1));
+                }
+            }
         }
     }
 
@@ -515,6 +561,7 @@ impl App {
     /// [`open_project_search`](Self::open_project_search) describes.
     fn show_project_search(&mut self, query: Option<String>) {
         self.palette = None;
+        self.goto_line = None;
         let seed = self
             .tabs
             .get(self.active)
@@ -645,6 +692,8 @@ impl App {
                     if search_box.paste(&text) {
                         self.update_search_query();
                     }
+                } else if let Some(goto_line) = &mut self.goto_line {
+                    goto_line.paste(&text);
                 } else if self.project_search_open
                     && let Some(dialog) = &mut self.project_search
                 {
@@ -697,6 +746,10 @@ impl App {
                     self.open_search_box();
                     return;
                 }
+                KeyCode::Char('l') => {
+                    self.open_goto_line();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -712,6 +765,11 @@ impl App {
         if let Some(search_box) = &mut self.search_box {
             let outcome = search_box.handle_key(key, &mut self.clipboard);
             self.handle_search_outcome(outcome);
+            return;
+        }
+        if let Some(goto_line) = &mut self.goto_line {
+            let outcome = goto_line.handle_key(key, &mut self.clipboard);
+            self.handle_goto_line_outcome(outcome);
             return;
         }
         if self.project_search_open
@@ -785,6 +843,17 @@ impl App {
             }
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.close_search_box(true);
+                return;
+            }
+        }
+        // The go to line box works like the search box.
+        if let Some(goto_line) = &mut self.goto_line {
+            if goto_line.contains(x, y) || goto_line.is_dragging() {
+                goto_line.handle_mouse(mouse);
+                return;
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.goto_line = None;
                 return;
             }
         }
@@ -866,6 +935,9 @@ impl App {
         if let Some(search_box) = &mut self.search_box {
             search_box.set_hint(hint);
             cursor = search_box.render(screen, buf, theme);
+        }
+        if let Some(goto_line) = &mut self.goto_line {
+            cursor = goto_line.render(screen, buf, theme);
         }
         if self.project_search_open
             && let Some(dialog) = &mut self.project_search
@@ -983,6 +1055,7 @@ fn parent_of(path: &str) -> String {
 mod tests {
     use super::*;
     use crossterm::event::KeyEventState;
+    use ninjaedit_core::Position;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
@@ -1724,6 +1797,122 @@ mod tests {
         assert!(app.tabs[0].view.editor().search().is_none());
         ctrl(&mut app, 'f');
         assert!(app.search_box.is_some() && app.palette.is_none());
+    }
+
+    #[test]
+    fn ctrl_l_goes_to_a_line_clamped_to_the_file() {
+        let text: String = (1..=50).map(|n| format!("line {n}\n")).collect();
+        let (_dir, mut app) = app_with_files(&[("a.txt", &text)]);
+        ctrl(&mut app, 'l');
+        assert!(app.goto_line.is_some());
+        let screen = draw(&mut app, 60, 12);
+        assert!(screen[2].contains("Go to line"), "{screen:#?}");
+        assert!(screen[3].contains("51 lines"), "{screen:#?}");
+        type_str(&mut app, "30");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.goto_line.is_none());
+        let editor = app.tabs[0].view.editor();
+        assert_eq!(
+            editor.cursor_position(),
+            Position {
+                line: 29,
+                column: 0
+            }
+        );
+        // The line is brought into view, centered.
+        let screen = draw(&mut app, 60, 12);
+        let shown: Vec<&str> = screen[1..11].iter().map(|row| row.trim_start()).collect();
+        assert!(shown[5].starts_with("30 │line 30"), "{screen:#?}");
+        let status = &screen[11];
+        assert!(status.contains("Ln 30, Col 1"), "{screen:#?}");
+
+        // Out of range numbers clamp to the ends of the file.
+        ctrl(&mut app, 'l');
+        type_str(&mut app, "9999");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.tabs[0].view.editor().cursor_position(),
+            Position {
+                line: 50,
+                column: 0
+            }
+        );
+        ctrl(&mut app, 'l');
+        type_str(&mut app, "0");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs[0].view.editor().cursor(), 0);
+        ctrl(&mut app, 'l');
+        type_str(&mut app, "99999999999999999999999999");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.tabs[0].view.editor().cursor_position(),
+            Position {
+                line: 50,
+                column: 0
+            }
+        );
+
+        // Going to a line drops the selection.
+        app.tabs[0].view.editor_mut().set_selection(0, 5);
+        ctrl(&mut app, 'l');
+        type_str(&mut app, " 2 ");
+        press(&mut app, KeyCode::Enter);
+        let editor = app.tabs[0].view.editor();
+        assert_eq!(editor.selection(), None);
+        assert_eq!(editor.cursor_position(), Position { line: 1, column: 0 });
+    }
+
+    #[test]
+    fn go_to_line_box_wants_a_number_and_closes_like_the_search_box() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "one\ntwo\nthree\n")]);
+        ctrl(&mut app, 'l');
+        // Enter with nothing, or with something other than a number,
+        // keeps the box open and says why.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.goto_line.is_some());
+        let screen = draw(&mut app, 60, 8);
+        assert!(screen[3].contains("enter a line number"), "{screen:#?}");
+        type_str(&mut app, "2x");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.goto_line.is_some());
+        let screen = draw(&mut app, 60, 8);
+        assert!(screen[3].contains("enter a line number"), "{screen:#?}");
+        press(&mut app, KeyCode::Backspace);
+        let screen = draw(&mut app, 60, 8);
+        assert!(screen[3].contains("4 lines"), "{screen:#?}");
+        assert_eq!(app.tabs[0].view.editor().cursor(), 0);
+        // Escape closes the box without moving.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.goto_line.is_none());
+        assert_eq!(app.tabs[0].view.editor().cursor(), 0);
+
+        // A click outside the box closes it; the palette and the search
+        // box replace it, and it replaces them.
+        ctrl(&mut app, 'l');
+        click(&mut app, 5, 6);
+        assert!(app.goto_line.is_none());
+        ctrl(&mut app, 'l');
+        ctrl(&mut app, 't');
+        assert!(app.goto_line.is_none() && app.palette.is_some());
+        ctrl(&mut app, 'l');
+        assert!(app.goto_line.is_some() && app.palette.is_none());
+        ctrl(&mut app, 'f');
+        assert!(app.goto_line.is_none() && app.search_box.is_some());
+        ctrl(&mut app, 'l');
+        assert!(app.goto_line.is_some() && app.search_box.is_none());
+        assert!(app.tabs[0].view.editor().search().is_none());
+        // Ctrl+L with the box open leaves it as it is.
+        type_str(&mut app, "3");
+        ctrl(&mut app, 'l');
+        assert_eq!(app.goto_line.as_ref().unwrap().text(), "3");
+        // Pasting goes into the box.
+        app.handle_event(Event::Paste("1".to_owned()));
+        assert_eq!(app.goto_line.as_ref().unwrap().text(), "31");
+
+        // With no file open there is nothing to go to.
+        let (_dir, mut app) = app_with_files(&[]);
+        ctrl(&mut app, 'l');
+        assert!(app.goto_line.is_none());
     }
 
     #[test]

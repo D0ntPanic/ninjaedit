@@ -165,6 +165,16 @@ impl EditorView {
         self.follow_cursor = true;
     }
 
+    /// Move the cursor to the start of a line (counted from zero, clamped
+    /// to the buffer) and, at the next render, bring it into view the way
+    /// a jump does: centered vertically unless it's already on screen.
+    pub fn go_to_line(&mut self, line: usize) {
+        self.editor.go_to_line(line);
+        let cursor = self.editor.cursor();
+        self.jump = Some(cursor..cursor);
+        self.follow_cursor = true;
+    }
+
     /// First visible display column.
     #[cfg(test)]
     pub fn scroll_col(&self) -> usize {

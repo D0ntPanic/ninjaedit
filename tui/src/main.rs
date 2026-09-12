@@ -9,6 +9,7 @@ mod app;
 mod clicks;
 mod clipboard;
 mod editor_view;
+mod goto_line;
 mod input;
 mod palette;
 mod project_search;

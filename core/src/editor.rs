@@ -479,6 +479,14 @@ impl Editor {
         self.end_movement();
     }
 
+    /// Place the cursor at the start of a line (counted from zero) and
+    /// clear the selection. A line past the end of the buffer goes to the
+    /// last line.
+    pub fn go_to_line(&mut self, line: usize) {
+        let offset = self.offset_of_position(Position { line, column: 0 });
+        self.set_cursor(offset);
+    }
+
     /// Select from `anchor` to `cursor`, leaving the cursor at `cursor`. Both
     /// are clamped and snapped like [`set_cursor`](Self::set_cursor).
     pub fn set_selection(&mut self, anchor: usize, cursor: usize) {
@@ -1353,6 +1361,25 @@ mod tests {
         for c in s.chars() {
             editor.insert_char(c);
         }
+    }
+
+    #[test]
+    fn go_to_line_moves_to_the_line_start_and_clamps() {
+        let mut ed = editor("one\ntwo\nthree\n");
+        ed.set_selection(1, 6);
+        ed.go_to_line(1);
+        assert_eq!(ed.cursor_position(), Position { line: 1, column: 0 });
+        assert_eq!(ed.selection(), None);
+        ed.go_to_line(0);
+        assert_eq!(ed.cursor(), 0);
+        // Past the end is the last line: the empty one after the final
+        // line break.
+        ed.go_to_line(1000);
+        assert_eq!(ed.cursor_position(), Position { line: 3, column: 0 });
+        assert_eq!(ed.cursor(), 14);
+        let mut ed = editor("no newline");
+        ed.go_to_line(5);
+        assert_eq!(ed.cursor(), 0);
     }
 
     #[test]
