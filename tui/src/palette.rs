@@ -65,8 +65,12 @@ pub fn render_frame(area: Rect, hint: Option<&str>, buf: &mut Buffer, theme: &Th
 pub enum PaletteAction {
     SwitchTab(usize),
     OpenFile(PathBuf),
-    /// Give the keyboard to the editor.
+    /// Show the editor in place of any mode standing in for it, and give
+    /// it the keyboard.
     FocusEditor,
+    /// Show the settings page in the editor's place and give it the
+    /// keyboard.
+    OpenSettings,
     /// Show a tool in the pane below the editor, starting it if need be,
     /// and give it the keyboard.
     OpenTool(ToolKind),

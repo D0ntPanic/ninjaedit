@@ -25,4 +25,4 @@ pub use cell::{Cell, Color, Style, Underline};
 pub use emulator::{CursorStyle, Event, Modes, MouseMode, Terminal};
 pub use grid::Row;
 pub use keys::{Key, Modifiers, MouseButton, MouseEvent, MouseEventKind};
-pub use pty::{Command, ExitStatus, Output, Session, SessionId};
+pub use pty::{Command, ExitStatus, Output, Session, SessionId, detected_shell};

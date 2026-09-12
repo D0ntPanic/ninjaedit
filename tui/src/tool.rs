@@ -3,10 +3,12 @@
 //!
 //! A [`Tool`] is one running (or finished) program shown in a
 //! [`TerminalView`]: a shell for now, later a build, a program's output, a
-//! debugger, a coding agent. Each keeps the command that started it so it
-//! can be started again after it exits, and the [`Session`] driving the
-//! pty while it runs. The session's output reaches the tool from the
-//! application, which owns the channel the pty reader threads write to.
+//! debugger, a coding agent. Each keeps the [`Session`] driving the pty
+//! while it runs; the application supplies the command each time one is
+//! started, since what it is (which shell, say) comes from the settings
+//! and may have changed since the last run. The session's output reaches
+//! the tool from the application, which owns the channel the pty reader
+//! threads write to.
 //!
 //! The [`ToolPane`] is the bottom half of the screen: a stack of tools
 //! with one active, shown or hidden as a whole, and a split with the
@@ -20,6 +22,7 @@
 //! can list them all and the pane can find the one already running.
 
 use crate::terminal_view::TerminalView;
+use ninjaedit_core::Settings;
 use ninjaedit_core::terminal::{Command, ExitStatus, Session, SessionId};
 use std::io;
 use std::path::Path;
@@ -50,10 +53,15 @@ impl ToolKind {
         }
     }
 
-    /// The command that runs this tool in `directory`.
-    fn command(self, directory: &Path) -> Command {
+    /// The command that runs this tool in `directory`: for the shell, the
+    /// program the settings name, or the user's shell when they don't.
+    pub fn command(self, directory: &Path, settings: &Settings) -> Command {
         match self {
-            ToolKind::Shell => Command::shell().current_dir(directory),
+            ToolKind::Shell => match settings.shell() {
+                Some(shell) => Command::new(shell),
+                None => Command::shell(),
+            }
+            .current_dir(directory),
         }
     }
 }
@@ -73,8 +81,9 @@ pub struct Tool {
     name: String,
     /// The view onto the running (or last) program's screen.
     view: TerminalView,
-    /// The command, kept so the tool can be restarted after it exits.
-    command: Command,
+    /// Lines of scrollback the terminal keeps, from the settings; kept so
+    /// a restart's fresh terminal gets the same.
+    scrollback: usize,
     /// The pty session while the program runs; `None` before it starts or
     /// after it exits.
     session: Option<Session>,
@@ -85,30 +94,31 @@ pub struct Tool {
 }
 
 impl Tool {
-    /// A tool of `kind` that will run `command`, named `name`, its
-    /// terminal starting at `cols` by `rows`.
+    /// A tool of `kind` named `name`, its terminal starting at `cols` by
+    /// `rows` and keeping `scrollback` lines.
     pub fn new(
         kind: ToolKind,
         name: impl Into<String>,
-        command: Command,
         cols: u16,
         rows: u16,
+        scrollback: usize,
     ) -> Tool {
+        let mut view = TerminalView::new(cols, rows);
+        view.terminal_mut().set_scrollback_limit(scrollback);
         Tool {
             kind,
             name: name.into(),
-            view: TerminalView::new(cols, rows),
-            command,
+            view,
+            scrollback,
             session: None,
             exit: None,
             sent_size: (cols, rows),
         }
     }
 
-    /// A tool of `kind` working in `directory` (for the shell, running the
-    /// user's `$SHELL` there).
-    pub fn of_kind(kind: ToolKind, directory: &Path, cols: u16, rows: u16) -> Tool {
-        Tool::new(kind, kind.name(), kind.command(directory), cols, rows)
+    /// A tool of `kind`, named after it.
+    pub fn of_kind(kind: ToolKind, cols: u16, rows: u16, scrollback: usize) -> Tool {
+        Tool::new(kind, kind.name(), cols, rows, scrollback)
     }
 
     pub fn kind(&self) -> ToolKind {
@@ -145,23 +155,22 @@ impl Tool {
     }
 
     /// Start the program if it isn't running, wiping any previous screen so
-    /// a restarted shell begins clean. `spawn` runs the command and returns
-    /// its session; the application supplies it so the pty output is routed
-    /// to its event channel.
-    pub fn start(
-        &mut self,
-        spawn: impl FnOnce(&Command, u16, u16) -> io::Result<Session>,
-    ) -> io::Result<()> {
+    /// a restarted shell begins clean. `spawn` runs the tool's command at
+    /// the given terminal size and returns its session; the application
+    /// supplies it so the command comes from the current settings and the
+    /// pty output is routed to its event channel.
+    pub fn start(&mut self, spawn: impl FnOnce(u16, u16) -> io::Result<Session>) -> io::Result<()> {
         if self.session.is_some() {
             return Ok(());
         }
         let (cols, rows) = self.view.size();
         if self.exit.is_some() {
             // A restart begins on a fresh screen.
-            *self.view.terminal_mut() =
-                ninjaedit_core::terminal::Terminal::new(cols as usize, rows as usize);
+            let terminal = self.view.terminal_mut();
+            *terminal = ninjaedit_core::terminal::Terminal::new(cols as usize, rows as usize);
+            terminal.set_scrollback_limit(self.scrollback);
         }
-        let session = spawn(&self.command, cols, rows)?;
+        let session = spawn(cols, rows)?;
         self.sent_size = (cols, rows);
         self.session = Some(session);
         self.exit = None;
@@ -193,6 +202,13 @@ impl Tool {
         if let Some(session) = &mut self.session {
             session.kill();
         }
+    }
+
+    /// Change how many lines of scrollback the terminal keeps, as the
+    /// settings did. Lines beyond a lower limit are dropped at once.
+    pub fn set_scrollback_limit(&mut self, lines: usize) {
+        self.scrollback = lines;
+        self.view.terminal_mut().set_scrollback_limit(lines);
     }
 
     /// Match the pty's size to the view after a render changed it.

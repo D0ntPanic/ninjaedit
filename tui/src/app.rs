@@ -1,5 +1,5 @@
-//! Application state: the project, the open tabs, the command palette, and
-//! the status bar, plus the routing of events between them.
+//! Application state: the project, the open tabs, the command palette, the
+//! settings, and the status bar, plus the routing of events between them.
 //!
 //! Layout, top to bottom: the tab bar, the editor for the active tab (or a
 //! hint when nothing is open), and the status bar. The command palette,
@@ -37,15 +37,28 @@
 //! active tab's cursor to the start of the line typed, clamped to the
 //! first or last line when the number is out of range, and closes the box.
 //!
-//! The modes palette (Ctrl+E) lists the editor and every tool (the shell
-//! today; builds, debuggers and the like later) in the same palette the
-//! tab and file searches use. Picking one shows it and gives it the
-//! keyboard, starting the tool if it isn't running. Unlike the other
-//! palettes it opens from the shell as well as from the editor, and while
-//! it is open it has the keyboard whichever view is focused; the view it
-//! is listing first (the current one) keeps the focus if it is closed
-//! without a choice. The other view is preselected, so Ctrl+E, Enter
-//! flips between the editor and the last tool.
+//! The modes palette (Ctrl+E) lists the editor, the settings page, and
+//! every tool (the shell today; builds, debuggers and the like later) in
+//! the same palette the tab and file searches use. Picking one shows it
+//! and gives it the keyboard, starting a tool if it isn't running. Unlike
+//! the other palettes it opens from the shell as well as from the editor,
+//! and while it is open it has the keyboard whichever view is focused;
+//! the view it is listing first (the current one) keeps the focus if it
+//! is closed without a choice. The rest follow most recently used first,
+//! so the view before this one is preselected and Ctrl+E, Enter goes
+//! back to it, whichever way the user came.
+//!
+//! The settings page is the first of the editor's modes: views that
+//! stand in for the editor and its tab bar in the upper part of the
+//! screen (the tool pane, if showing, stays below). A mode is left by
+//! choosing the editor in the modes palette, by closing its tab, or by
+//! anything that brings a file to the front: opening one with Ctrl+O,
+//! switching to one with Ctrl+T, going to a project search match.
+//! Focusing a tool leaves the mode where it is above the pane. The
+//! settings themselves live in `~/.ninjaedit/settings.toml` and are saved
+//! whenever the page changes one, and applied at once to what is
+//! running: a terminal's scrollback is trimmed, the project search takes
+//! the new limit, and the next shell to start is the one named.
 //!
 //! With a tool focused its program gets the whole keyboard, since a shell
 //! or a coding agent has uses for nearly every key and its line editing
@@ -78,6 +91,7 @@ use crate::goto_line::{GoToLineBox, GoToLineOutcome};
 use crate::palette::{Palette, PaletteAction, PaletteItem, PaletteOutcome};
 use crate::project_search::{ProjectSearchDialog, ProjectSearchOutcome};
 use crate::search_box::{self, SearchBox, SearchOutcome};
+use crate::settings_view::{self, SettingsOutcome, SettingsView};
 use crate::tabs::{TabBar, TabHit, TabLabel};
 use crate::theme::Theme;
 use crate::tool::{Tool, ToolKind, ToolPane};
@@ -86,7 +100,7 @@ use crossterm::event::{
 };
 use ninjaedit_core::search::literal_query;
 use ninjaedit_core::terminal::{Command, Output, Session, SessionId};
-use ninjaedit_core::{Editor, Project, ProjectMatch, SearchStep};
+use ninjaedit_core::{Editor, Project, ProjectMatch, SearchStep, Settings, Storage};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
@@ -106,11 +120,62 @@ pub enum AppEvent {
     Pty(SessionId, Output),
 }
 
-/// Which of the two on-screen views the keyboard drives.
+/// Which of the two on-screen views the keyboard drives: the upper one
+/// (the editor, or the mode standing in for it) or the tool pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Focus {
     Editor,
     Tool,
+}
+
+/// What the upper part of the screen shows: the editor with its tabs,
+/// or a mode standing in for it.
+enum Mode {
+    Editor,
+    Settings(SettingsView),
+}
+
+/// One of the places the keyboard can be, as the modes palette lists
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum View {
+    Editor,
+    Settings,
+    Tool(ToolKind),
+}
+
+impl View {
+    /// Every view, in the order the modes palette lists the ones not
+    /// used recently: the settings last, being the least often wanted.
+    fn all() -> impl Iterator<Item = View> {
+        std::iter::once(View::Editor)
+            .chain(ToolKind::ALL.into_iter().map(View::Tool))
+            .chain(std::iter::once(View::Settings))
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            View::Editor => EDITOR_MODE_LABEL,
+            View::Settings => settings_view::TITLE,
+            View::Tool(kind) => kind.name(),
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            View::Editor => "Edit the open files",
+            View::Settings => "Change the editor's settings",
+            View::Tool(kind) => kind.description(),
+        }
+    }
+
+    fn action(self) -> PaletteAction {
+        match self {
+            View::Editor => PaletteAction::FocusEditor,
+            View::Settings => PaletteAction::OpenSettings,
+            View::Tool(kind) => PaletteAction::OpenTool(kind),
+        }
+    }
 }
 
 /// The height of the bar dragged to resize the editor/tool split.
@@ -118,9 +183,11 @@ const DIVIDER_HEIGHT: u16 = 1;
 
 const TABS_PLACEHOLDER: &str = "Search open tabs";
 const FILES_PLACEHOLDER: &str = "Search files in project";
-const MODES_PLACEHOLDER: &str = "Switch to the editor or a tool";
+const MODES_PLACEHOLDER: &str = "Editor, settings, or a tool";
 /// The modes palette's row for the editor.
 const EDITOR_MODE_LABEL: &str = "Editor";
+/// What the status bar shows on the settings page.
+const SETTINGS_HINT: &str = "Tab/↑↓ next · Enter apply · Ctrl+R default · Ctrl+E leave";
 /// What the status bar shows while the prefix waits for its key.
 const PREFIX_HINT: &str =
     "Ctrl+]  then Ctrl+ E mode · O file · T tab · F search · L line · Q quit · ] itself";
@@ -166,7 +233,21 @@ impl Tab {
 
 pub struct App {
     project: Project,
+    /// Where the settings (and the rest of what outlives a run) live.
+    storage: Storage,
+    settings: Settings,
     theme: Theme,
+    /// What the upper part of the screen shows.
+    mode: Mode,
+    /// The tab bar drawn in place of the editor's while a mode is up,
+    /// with the mode's one tab.
+    mode_tab_bar: TabBar,
+    /// The views the keyboard has been in, most recent last, without
+    /// the current one: the order the modes palette lists them in.
+    view_history: Vec<View>,
+    /// The view the keyboard was in after the last event, to notice when
+    /// it moves.
+    last_view: View,
     tabs: Vec<Tab>,
     active: usize,
     /// Counts tab activations, to order tabs by most recently viewed.
@@ -222,11 +303,24 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(project: Project, events: Sender<AppEvent>) -> App {
+    pub fn new(project: Project, storage: Storage, events: Sender<AppEvent>) -> App {
+        // A settings file that can't be read is reported rather than
+        // fatal: the defaults do until it is fixed, and saving from the
+        // settings page replaces it.
+        let (settings, status) = match storage.load_settings() {
+            Ok(settings) => (settings, None),
+            Err(err) => (Settings::default(), Some(err.to_string())),
+        };
         App {
             index_generation: project.index().generation(),
             project,
+            storage,
+            settings,
             theme: Theme::default(),
+            mode: Mode::Editor,
+            mode_tab_bar: TabBar::default(),
+            view_history: Vec::new(),
+            last_view: View::Editor,
             tabs: Vec::new(),
             active: 0,
             view_clock: 0,
@@ -238,7 +332,7 @@ impl App {
             goto_line: None,
             project_search: None,
             project_search_open: false,
-            status: None,
+            status,
             confirm: None,
             clipboard: Clipboard::new(),
             quit: false,
@@ -439,60 +533,143 @@ impl App {
         palette.set_hint(hint);
     }
 
-    /// Ctrl+E: open the modes palette, listing the editor and every kind
-    /// of tool. The focused view comes first and the next one is
-    /// preselected, so Enter alone flips to it, as the tab search does.
+    /// Ctrl+E: open the modes palette, listing the editor, the settings
+    /// page, and every kind of tool. The current view comes first, then
+    /// the others most recently used first, so the one before this is
+    /// preselected and Enter alone goes back to it, as the tab search
+    /// does.
     fn open_modes_palette(&mut self) {
         self.close_search_box(true);
         self.goto_line = None;
         self.hide_project_search();
-        let editor = PaletteItem {
-            label: EDITOR_MODE_LABEL.to_owned(),
-            detail: "Edit the open files".to_owned(),
-            search: EDITOR_MODE_LABEL.to_owned(),
-            action: PaletteAction::FocusEditor,
-        };
-        let tools = ToolKind::ALL.into_iter().map(|kind| PaletteItem {
-            label: kind.name().to_owned(),
-            detail: kind.description().to_owned(),
-            search: kind.name().to_owned(),
-            action: PaletteAction::OpenTool(kind),
-        });
-        let mut items: Vec<PaletteItem> = std::iter::once(editor).chain(tools).collect();
-        if let Some(kind) = self.focused_tool_kind()
-            && let Some(current) = items
-                .iter()
-                .position(|item| item.action == PaletteAction::OpenTool(kind))
-        {
-            let current = items.remove(current);
-            items.insert(0, current);
-        }
+        self.track_view();
+        let current = self.current_view();
+        let mut views = vec![current];
+        views.extend(self.view_history.iter().rev().copied());
+        let rest: Vec<View> = View::all().filter(|view| !views.contains(view)).collect();
+        views.extend(rest);
+        let items = views
+            .into_iter()
+            .map(|view| PaletteItem {
+                label: view.label().to_owned(),
+                detail: view.description().to_owned(),
+                search: view.label().to_owned(),
+                action: view.action(),
+            })
+            .collect();
         let mut palette = Palette::new(MODES_PLACEHOLDER, items);
         palette.select(1);
         self.palette = Some(palette);
         self.palette_is_files = false;
     }
 
-    /// The kind of the tool the keyboard is on, if it is on one.
-    fn focused_tool_kind(&self) -> Option<ToolKind> {
-        (self.focus == Focus::Tool && self.tool_pane.is_visible())
-            .then(|| self.tool_pane.active().map(Tool::kind))
-            .flatten()
+    /// Where the keyboard is: a tool when one is focused, else whatever
+    /// the upper part of the screen shows.
+    fn current_view(&self) -> View {
+        if self.focus == Focus::Tool
+            && self.tool_pane.is_visible()
+            && let Some(tool) = self.tool_pane.active()
+        {
+            return View::Tool(tool.kind());
+        }
+        match self.mode {
+            Mode::Editor => View::Editor,
+            Mode::Settings(_) => View::Settings,
+        }
+    }
+
+    /// Note where the keyboard is now, so the modes palette can list the
+    /// views most recently used first.
+    fn track_view(&mut self) {
+        let current = self.current_view();
+        if current == self.last_view {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.last_view, current);
+        self.view_history
+            .retain(|view| *view != previous && *view != current);
+        self.view_history.push(previous);
     }
 
     fn run_palette_action(&mut self, action: PaletteAction) {
         self.palette = None;
         match action {
             PaletteAction::SwitchTab(index) => {
-                self.focus = Focus::Editor;
+                self.enter_editor();
                 self.activate(index);
             }
             PaletteAction::OpenFile(path) => {
-                self.focus = Focus::Editor;
+                self.enter_editor();
                 self.open_file(path);
             }
-            PaletteAction::FocusEditor => self.focus = Focus::Editor,
+            PaletteAction::FocusEditor => self.enter_editor(),
+            PaletteAction::OpenSettings => self.open_settings(),
             PaletteAction::OpenTool(kind) => self.open_tool(kind),
+        }
+    }
+
+    // ----- Modes and settings ---------------------------------------------
+
+    /// Show the settings page in the editor's place and give it the
+    /// keyboard.
+    fn open_settings(&mut self) {
+        self.close_editor_overlays();
+        if !matches!(self.mode, Mode::Settings(_)) {
+            self.mode = Mode::Settings(SettingsView::new(&self.settings));
+        }
+        self.focus = Focus::Editor;
+    }
+
+    /// Show the editor in place of any mode, and give it the keyboard.
+    /// Values typed into the settings page but not yet applied are
+    /// applied on the way out.
+    fn enter_editor(&mut self) {
+        self.leave_mode();
+        self.focus = Focus::Editor;
+    }
+
+    /// Put the editor back in the upper part of the screen.
+    fn leave_mode(&mut self) {
+        match std::mem::replace(&mut self.mode, Mode::Editor) {
+            Mode::Editor => {}
+            Mode::Settings(mut view) => {
+                let outcome = view.commit_all(&mut self.settings);
+                self.handle_settings_outcome(outcome);
+            }
+        }
+    }
+
+    fn handle_settings_outcome(&mut self, outcome: SettingsOutcome) {
+        match outcome {
+            SettingsOutcome::Continue => {}
+            SettingsOutcome::Changed => self.settings_changed(),
+        }
+    }
+
+    /// The settings changed: keep them, and apply them to what is
+    /// running.
+    fn settings_changed(&mut self) {
+        self.apply_settings();
+        if let Err(err) = self.storage.save_settings(&self.settings) {
+            self.status = Some(format!(
+                "Could not save {}: {err}",
+                self.storage
+                    .path(ninjaedit_core::storage::SETTINGS_FILE)
+                    .display()
+            ));
+        }
+    }
+
+    /// Apply the settings to what is running: every terminal's scrollback
+    /// and the project search's limit. The shell setting applies to the
+    /// next shell started.
+    fn apply_settings(&mut self) {
+        let scrollback = self.settings.terminal_scrollback();
+        for tool in self.tool_pane.tools_mut() {
+            tool.set_scrollback_limit(scrollback);
+        }
+        if let Some(dialog) = &mut self.project_search {
+            dialog.set_limit(self.settings.search_max_results());
         }
     }
 
@@ -507,7 +684,8 @@ impl App {
         if self.search_box.is_some() {
             return;
         }
-        if self.tabs.get(self.active).is_none() {
+        // A mode in the editor's place has nothing to search either.
+        if self.tabs.get(self.active).is_none() || !matches!(self.mode, Mode::Editor) {
             self.open_project_search();
             return;
         }
@@ -584,7 +762,7 @@ impl App {
     /// Ctrl+L: open the go to line box over the active tab. Does nothing
     /// with the box already open, or with no tab to move around in.
     fn open_goto_line(&mut self) {
-        if self.goto_line.is_some() {
+        if self.goto_line.is_some() || !matches!(self.mode, Mode::Editor) {
             return;
         }
         let Some(tab) = self.tabs.get(self.active) else {
@@ -616,6 +794,9 @@ impl App {
     /// Ctrl+G: move the active tab's search on to its next match, or with
     /// no search going, search again for the last query from the cursor.
     fn find_next(&mut self) {
+        if !matches!(self.mode, Mode::Editor) {
+            return;
+        }
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -731,6 +912,7 @@ impl App {
                 self.project.index().file_list(),
             )
         });
+        dialog.set_limit(self.settings.search_max_results());
         dialog.set_buffers(buffers);
         match (query, seed) {
             (Some(query), _) => dialog.set_query_selected(&query),
@@ -759,8 +941,8 @@ impl App {
             ProjectSearchOutcome::Close => self.hide_project_search(),
             ProjectSearchOutcome::Navigate(found) => {
                 self.hide_project_search();
+                self.enter_editor();
                 self.go_to_match(&found);
-                self.focus = Focus::Editor;
             }
         }
     }
@@ -825,14 +1007,16 @@ impl App {
                 // sensible default before the first one; the next render
                 // fits it exactly.
                 let (cols, rows) = self.default_tool_size();
-                let tool = Tool::of_kind(kind, self.project.root(), cols, rows);
-                self.tool_pane.add(tool);
+                let scrollback = self.settings.terminal_scrollback();
+                self.tool_pane
+                    .add(Tool::of_kind(kind, cols, rows, scrollback));
             }
         }
         self.start_active_tool();
     }
 
-    /// Start the active tool's program if it isn't already running.
+    /// Start the active tool's program if it isn't already running, with
+    /// the command the settings now call for.
     fn start_active_tool(&mut self) {
         let events = self.events.clone();
         let Some(tool) = self.tool_pane.active_mut() else {
@@ -842,9 +1026,8 @@ impl App {
             return;
         }
         let name = tool.kind().name().to_lowercase();
-        if let Err(err) =
-            tool.start(|command, cols, rows| spawn_session(command, cols, rows, events))
-        {
+        let command = tool.kind().command(self.project.root(), &self.settings);
+        if let Err(err) = tool.start(|cols, rows| spawn_session(&command, cols, rows, events)) {
             self.status = Some(format!("Could not start {name}: {err}"));
         }
     }
@@ -1018,6 +1201,7 @@ impl App {
                 }
             }
         }
+        self.track_view();
     }
 
     /// Periodic housekeeping while idle. Returns whether the screen needs
@@ -1073,35 +1257,42 @@ impl App {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.handle_key(key),
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::Paste(text) => {
-                if let Some(palette) = &mut self.palette {
-                    palette.paste(&text);
-                } else if let Some(search_box) = &mut self.search_box {
-                    if search_box.paste(&text) {
-                        self.update_search_query();
-                    }
-                } else if let Some(goto_line) = &mut self.goto_line {
-                    goto_line.paste(&text);
-                } else if self.project_search_open
-                    && let Some(dialog) = &mut self.project_search
-                {
-                    dialog.paste(&text);
-                } else if self.focus == Focus::Tool {
-                    // Pasting into the shell sends the text as the program
-                    // reads it, wrapped for bracketed paste if it asked. A
-                    // prefix waiting for a key goes first, like any other
-                    // key it isn't followed by one of the editor's.
-                    if let Some(prefix) = self.prefix.take() {
-                        self.send_key_to_tool(prefix);
-                    }
-                    if let Some(tool) = self.tool_pane.active_mut() {
-                        let bytes = tool.view_mut().paste(&text);
-                        tool.write(bytes);
-                    }
-                } else if let Some(tab) = self.tabs.get_mut(self.active) {
-                    tab.view.editor_mut().paste(&text);
-                }
+                self.handle_paste(&text);
             }
             _ => {}
+        }
+        self.track_view();
+    }
+
+    fn handle_paste(&mut self, text: &str) {
+        if let Some(palette) = &mut self.palette {
+            palette.paste(text);
+        } else if let Some(search_box) = &mut self.search_box {
+            if search_box.paste(text) {
+                self.update_search_query();
+            }
+        } else if let Some(goto_line) = &mut self.goto_line {
+            goto_line.paste(text);
+        } else if self.project_search_open
+            && let Some(dialog) = &mut self.project_search
+        {
+            dialog.paste(text);
+        } else if self.focus == Focus::Tool {
+            // Pasting into the shell sends the text as the program
+            // reads it, wrapped for bracketed paste if it asked. A
+            // prefix waiting for a key goes first, like any other
+            // key it isn't followed by one of the editor's.
+            if let Some(prefix) = self.prefix.take() {
+                self.send_key_to_tool(prefix);
+            }
+            if let Some(tool) = self.tool_pane.active_mut() {
+                let bytes = tool.view_mut().paste(text);
+                tool.write(bytes);
+            }
+        } else if let Mode::Settings(view) = &mut self.mode {
+            view.paste(text);
+        } else if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.view.editor_mut().paste(text);
         }
     }
 
@@ -1149,6 +1340,13 @@ impl App {
         {
             let outcome = dialog.handle_key(key, &mut self.clipboard);
             self.handle_project_search_outcome(outcome);
+            return;
+        }
+
+        // A mode in the editor's place gets the editor's keys.
+        if let Mode::Settings(view) = &mut self.mode {
+            let outcome = view.handle_key(key, &mut self.clipboard, &mut self.settings);
+            self.handle_settings_outcome(outcome);
             return;
         }
 
@@ -1289,6 +1487,30 @@ impl App {
             }
         }
 
+        // ----- A mode in the editor's place -----
+        if matches!(self.mode, Mode::Settings(_)) {
+            // The mode's tab: its close button leaves the mode.
+            if let Some(hit) = self.mode_tab_bar.hit(x, y) {
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                    match hit {
+                        TabHit::Close(_) => self.enter_editor(),
+                        TabHit::Tab(_) => self.focus = Focus::Editor,
+                    }
+                }
+                return;
+            }
+            if let Mode::Settings(view) = &mut self.mode
+                && (view.contains(x, y) || view.is_dragging())
+            {
+                if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                    self.focus = Focus::Editor;
+                }
+                let outcome = view.handle_mouse(mouse, &mut self.settings);
+                self.handle_settings_outcome(outcome);
+            }
+            return;
+        }
+
         // A drag that started in the editor stays with it wherever the
         // pointer goes, so selections can extend past the edge of the view.
         if let Some(tab) = self.tabs.get_mut(self.active)
@@ -1371,31 +1593,44 @@ impl App {
         let theme = &self.theme;
         let editor_focused = self.focus == Focus::Editor;
 
-        let labels: Vec<TabLabel> = self
-            .tabs
-            .iter()
-            .map(|tab| TabLabel {
-                title: tab.title(),
-                modified: tab.view.editor().is_modified(),
-            })
-            .collect();
-        self.tab_bar
-            .render(tab_area, buf, theme, &labels, self.active, editor_focused);
-
         let mut cursor = None;
-        match self.tabs.get_mut(self.active) {
-            Some(tab) => {
-                // The search box, drawn later, sits over the top of the
-                // editor, and the editor is showing search matches.
-                let covered = if self.search_box.is_some() {
-                    search_box::HEIGHT
-                } else {
-                    0
-                };
-                tab.view.set_covered_rows(covered);
-                cursor = tab.view.render(self.editor_area, buf, theme);
+        match &mut self.mode {
+            Mode::Editor => {
+                let labels: Vec<TabLabel> = self
+                    .tabs
+                    .iter()
+                    .map(|tab| TabLabel {
+                        title: tab.title(),
+                        modified: tab.view.editor().is_modified(),
+                    })
+                    .collect();
+                self.tab_bar
+                    .render(tab_area, buf, theme, &labels, self.active, editor_focused);
+                match self.tabs.get_mut(self.active) {
+                    Some(tab) => {
+                        // The search box, drawn later, sits over the top
+                        // of the editor, and the editor is showing search
+                        // matches.
+                        let covered = if self.search_box.is_some() {
+                            search_box::HEIGHT
+                        } else {
+                            0
+                        };
+                        tab.view.set_covered_rows(covered);
+                        cursor = tab.view.render(self.editor_area, buf, theme);
+                    }
+                    None => render_empty(self.editor_area, buf, theme),
+                }
             }
-            None => render_empty(self.editor_area, buf, theme),
+            Mode::Settings(view) => {
+                let label = TabLabel {
+                    title: settings_view::TITLE.to_owned(),
+                    modified: false,
+                };
+                self.mode_tab_bar
+                    .render(tab_area, buf, theme, &[label], 0, editor_focused);
+                cursor = view.render(self.editor_area, buf, theme, &self.settings);
+            }
         }
 
         // The tool pane: the divider, the tool tab bar, and the active
@@ -1503,11 +1738,14 @@ impl App {
         // tool, not the editor: nothing to show, unless the user has
         // scrolled back through the shell's output.
         let tool_focused = self.focus == Focus::Tool && self.tool_pane.is_visible();
+        let in_editor = matches!(self.mode, Mode::Editor);
         let position = if tool_focused {
             self.tool_pane.active().and_then(|tool| {
                 let back = tool.view().scrollback_offset();
                 (back > 0).then(|| format!(" scrollback −{back} "))
             })
+        } else if !in_editor {
+            None
         } else {
             tab.map(|tab| {
                 let position = tab.view.editor().cursor_position();
@@ -1531,6 +1769,7 @@ impl App {
             _ if self.prefix.is_some() => PREFIX_HINT.to_owned(),
             Some(message) => message.clone(),
             None if tool_focused => self.tool_pane.active().map(Tool::title).unwrap_or_default(),
+            None if !in_editor => SETTINGS_HINT.to_owned(),
             None => match tab.and_then(Tab::path) {
                 Some(path) => self.display_path(path),
                 None => "Ctrl+O to open a file, Ctrl+Q to quit".to_owned(),
@@ -1597,7 +1836,7 @@ fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme) {
         "Ctrl+Shift+F   search in project files",
         "Ctrl+T         switch between open tabs",
         "Ctrl+`         open a shell below the editor",
-        "Ctrl+E         switch between the editor and tools",
+        "Ctrl+E         switch views: editor, settings, tools",
         "Ctrl+]         in a tool, prefix for the editor's keys",
         "Ctrl+Q         quit",
     ];
@@ -1647,6 +1886,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
+    use std::time::Duration;
 
     fn app_with_files(files: &[(&str, &str)]) -> (tempfile::TempDir, App) {
         let dir = tempfile::tempdir().unwrap();
@@ -1656,7 +1896,8 @@ mod tests {
             std::fs::write(path, contents).unwrap();
         }
         let (events, _events_rx) = std::sync::mpsc::channel();
-        let mut app = App::new(Project::open(dir.path()).unwrap(), events);
+        let storage = Storage::new(dir.path().join(".storage"));
+        let mut app = App::new(Project::open(dir.path()).unwrap(), storage, events);
         for (name, _) in files {
             app.open_file(dir.path().join(name));
         }
@@ -1737,9 +1978,221 @@ mod tests {
         }));
     }
 
+    fn settings_file(app: &App) -> Option<String> {
+        app.storage
+            .read(ninjaedit_core::storage::SETTINGS_FILE)
+            .unwrap()
+    }
+
+    #[test]
+    fn settings_page_opens_from_the_modes_palette_and_saves_changes() {
+        let (dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        draw(&mut app, 80, 20);
+
+        // The settings come last in a fresh palette, so Ctrl+E, Enter
+        // still opens the shell; typing finds them.
+        ctrl(&mut app, 'e');
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[3].contains(EDITOR_MODE_LABEL), "{screen:#?}");
+        assert!(screen[4].contains("Shell"), "{screen:#?}");
+        assert!(screen[5].contains(settings_view::TITLE), "{screen:#?}");
+        type_str(&mut app, "sett");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Settings(_)));
+        assert_eq!(app.focus, Focus::Editor);
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[0].contains(settings_view::TITLE), "{screen:#?}");
+        assert!(
+            !screen[0].contains("a.txt"),
+            "the mode's tab replaces the editor's"
+        );
+        assert!(
+            screen.iter().any(|r| r.contains("Shell executable")),
+            "{screen:#?}"
+        );
+        assert!(screen[19].contains("Ctrl+R default"), "{screen:#?}");
+        assert!(!screen[19].contains("Ln 1"), "{screen:#?}");
+
+        // Down to the scrollback field, a new value, Enter: applied and
+        // saved to the storage, where nothing was before.
+        assert_eq!(settings_file(&app), None);
+        press(&mut app, KeyCode::Down);
+        ctrl(&mut app, 'a');
+        type_str(&mut app, "250");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.settings.terminal_scrollback(), 250);
+        let file = settings_file(&app).expect("saved");
+        assert!(file.contains("scrollback = 250"), "{file}");
+        let screen = draw(&mut app, 80, 20);
+        assert!(
+            screen
+                .iter()
+                .any(|r| r.contains("Scrollback lines") && r.contains("modified")),
+            "{screen:#?}"
+        );
+
+        // Ctrl+E now lists the settings first and the editor, where the
+        // user came from, second: Enter goes back to it. A value typed but
+        // not applied is applied on the way out.
+        press(&mut app, KeyCode::Down);
+        ctrl(&mut app, 'a');
+        type_str(&mut app, "77");
+        ctrl(&mut app, 'e');
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[3].contains(settings_view::TITLE), "{screen:#?}");
+        assert!(screen[4].contains(EDITOR_MODE_LABEL), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Editor));
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.settings.search_max_results(), 77);
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[0].contains("a.txt"), "{screen:#?}");
+
+        // A new app on the same storage reads the settings back.
+        let (events, _events_rx) = std::sync::mpsc::channel();
+        let storage = Storage::new(dir.path().join(".storage"));
+        let again = App::new(Project::open(dir.path()).unwrap(), storage, events);
+        assert_eq!(again.settings.terminal_scrollback(), 250);
+        assert_eq!(again.settings.search_max_results(), 77);
+        assert_eq!(again.status, None);
+    }
+
+    #[test]
+    fn ctrl_r_resets_and_ctrl_o_or_ctrl_t_leave_the_settings_page() {
+        let (dir, mut app) = app_with_files(&[("a.txt", "hi\n"), ("b.txt", "yo\n")]);
+        app.open_settings();
+        type_str(&mut app, "/bin/dash");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.settings.shell(), Some("/bin/dash"));
+        assert!(settings_file(&app).unwrap().contains("/bin/dash"));
+        ctrl(&mut app, 'r');
+        assert_eq!(app.settings.shell(), None);
+        assert!(!settings_file(&app).unwrap().contains("shell"));
+
+        // Ctrl+T's tab switch brings the editor back.
+        ctrl(&mut app, 't');
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Editor));
+        assert_eq!(app.tabs[app.active].title(), "a.txt");
+
+        // As does opening a file with Ctrl+O.
+        app.open_settings();
+        assert!(matches!(app.mode, Mode::Settings(_)));
+        assert!(
+            app.project
+                .index()
+                .wait_for_primary(Duration::from_secs(10))
+        );
+        ctrl(&mut app, 'o');
+        type_str(&mut app, "b.txt");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Editor));
+        assert_eq!(app.tabs[app.active].title(), "b.txt");
+
+        // The editor's own keys do nothing to the hidden tabs from the
+        // page: Ctrl+W closes no tab, Ctrl+L opens no box.
+        app.open_settings();
+        ctrl(&mut app, 'w');
+        assert_eq!(app.tabs.len(), 2);
+        ctrl(&mut app, 'l');
+        assert!(app.goto_line.is_none());
+        // Closing the page's tab with the mouse leaves it too.
+        let screen = draw(&mut app, 60, 20);
+        let close = screen[0].chars().position(|c| c == '×').unwrap() as u16;
+        click(&mut app, close, 0);
+        assert!(matches!(app.mode, Mode::Editor));
+        drop(dir);
+    }
+
+    #[test]
+    fn a_bad_settings_file_is_reported_and_replaced_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().join(".storage"));
+        storage
+            .write(
+                ninjaedit_core::storage::SETTINGS_FILE,
+                "[search]\nmax-results = -5\n",
+            )
+            .unwrap();
+        let (events, _events_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Project::open(dir.path()).unwrap(), storage, events);
+        let status = app.status.clone().expect("reported");
+        assert!(status.contains("settings.toml"), "{status}");
+        assert!(status.contains("search.max-results"), "{status}");
+        assert_eq!(app.settings, Settings::default());
+        let screen = draw(&mut app, 200, 10);
+        assert!(screen[9].contains("search.max-results"), "{screen:#?}");
+
+        app.open_settings();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        ctrl(&mut app, 'a');
+        type_str(&mut app, "5");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.settings.search_max_results(), 5);
+        assert!(settings_file(&app).unwrap().contains("max-results = 5"));
+    }
+
     // The shell tool spawns a real process, so these are unix-only and
     // never rely on its output (the event receiver is dropped by the test
     // helper), only on the pane's structure and focus.
+    #[cfg(unix)]
+    #[test]
+    fn scrollback_setting_applies_to_a_running_shell() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        draw(&mut app, 40, 20);
+        ctrl(&mut app, '`');
+        assert_eq!(app.focus, Focus::Tool);
+        // Forty lines of output into a 24-row terminal leave scrollback.
+        let output: String = (0..40).map(|i| format!("line {i}\r\n")).collect();
+        app.tool_pane.tools_mut()[0].process(output.as_bytes());
+        let before = app.tool_pane.tools()[0]
+            .view()
+            .terminal_mut_for_test()
+            .scrollback_len();
+        assert!(before > 3, "{before}");
+
+        // Settings from the shell go through the prefix; the shell stays
+        // below the page and is listed as where the user came from.
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'e');
+        type_str(&mut app, "sett");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Settings(_)));
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(app.tool_pane.is_visible());
+        press(&mut app, KeyCode::Down);
+        ctrl(&mut app, 'a');
+        type_str(&mut app, "3");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.tool_pane.tools()[0]
+                .view()
+                .terminal_mut_for_test()
+                .scrollback_len(),
+            3
+        );
+        ctrl(&mut app, 'e');
+        let screen = draw(&mut app, 40, 20);
+        assert!(screen[3].contains(settings_view::TITLE), "{screen:#?}");
+        assert!(screen[4].contains("Shell"), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus, Focus::Tool);
+        assert!(
+            matches!(app.mode, Mode::Settings(_)),
+            "focusing a tool keeps the page"
+        );
+        // From the shell, Ctrl+E, Enter goes back to the page; the editor
+        // is one further down.
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'e');
+        let screen = draw(&mut app, 40, 20);
+        assert!(screen[3].contains("Shell"), "{screen:#?}");
+        assert!(screen[4].contains(settings_view::TITLE), "{screen:#?}");
+        assert!(screen[5].contains(EDITOR_MODE_LABEL), "{screen:#?}");
+        press(&mut app, KeyCode::Esc);
+    }
+
     #[cfg(unix)]
     #[test]
     fn shell_toggles_split_and_focus() {
@@ -2998,7 +3451,8 @@ mod tests {
             std::fs::write(path, contents).unwrap();
         }
         let (events, _events_rx) = std::sync::mpsc::channel();
-        let app = App::new(Project::open(dir.path()).unwrap(), events);
+        let storage = Storage::new(dir.path().join(".storage"));
+        let app = App::new(Project::open(dir.path()).unwrap(), storage, events);
         (dir, app)
     }
 

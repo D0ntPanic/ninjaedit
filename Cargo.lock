@@ -1217,6 +1217,7 @@ dependencies = [
  "portable-pty",
  "regex",
  "tempfile",
+ "toml",
  "unicode-segmentation",
  "unicode-width",
  "vte",

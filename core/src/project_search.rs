@@ -20,12 +20,13 @@
 //! more arrive, and a frontend can poll [`ProjectSearch::generation`] to
 //! learn when it has more to show.
 //!
-//! A search stops at [`MAX_MATCHES`] matches (a query like `/.` matches
-//! every character in the project, and a half-typed query can easily be
-//! that broad): the workers stop as soon as that many have been found,
-//! the search reports itself [`truncated`](ProjectSearch::is_truncated),
-//! and what was found stays available, in order. Far more matches than
-//! anyone could look through fit under the limit.
+//! A search stops at a limit, [`MAX_MATCHES`] unless the settings say
+//! otherwise (a query like `/.` matches every character in the project,
+//! and a half-typed query can easily be that broad): the workers stop as
+//! soon as that many have been found, the search reports itself
+//! [`truncated`](ProjectSearch::is_truncated), and what was found stays
+//! available, in order. Far more matches than anyone could look through
+//! fit under the default limit.
 //!
 //! Each [`ProjectMatch`] carries the text of its line (or, for a very long
 //! line, a window of it around the match) so a list of results can be
@@ -135,8 +136,8 @@ impl Results {
 /// documentation](self).
 pub struct ProjectSearch {
     files: FileList,
-    /// The most matches to find; [`MAX_MATCHES`] unless lowered for a
-    /// test.
+    /// The most matches to find; [`MAX_MATCHES`] unless changed with
+    /// [`set_limit`](Self::set_limit).
     limit: usize,
     query: String,
     pattern: Result<Option<Regex>, String>,
@@ -254,14 +255,20 @@ impl ProjectSearch {
         self.phase() == SearchPhase::Done
     }
 
-    /// Whether the search stopped at [`MAX_MATCHES`] with more to find.
+    /// Whether the search stopped at its [limit](Self::limit) with more
+    /// to find.
     pub fn is_truncated(&self) -> bool {
         self.results.found.lock().unwrap().truncated
     }
 
-    /// Lower the number of matches to stop at for the next queries.
-    #[cfg(test)]
-    fn set_limit(&mut self, limit: usize) {
+    /// The number of matches a search stops at.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Change the number of matches to stop at, for the queries set from
+    /// now on; a search already running keeps its limit.
+    pub fn set_limit(&mut self, limit: usize) {
         self.limit = limit;
     }
 

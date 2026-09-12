@@ -9,11 +9,13 @@ mod app;
 mod clicks;
 mod clipboard;
 mod editor_view;
+mod fields;
 mod goto_line;
 mod input;
 mod palette;
 mod project_search;
 mod search_box;
+mod settings_view;
 mod tabs;
 mod terminal_view;
 mod theme;
@@ -28,7 +30,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::supports_keyboard_enhancement;
-use ninjaedit_core::Project;
+use ninjaedit_core::{Project, Storage};
 use std::io::{self, stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -72,11 +74,19 @@ fn main() -> io::Result<()> {
     let cwd = std::env::current_dir()?;
     let project = Project::discover(&cwd)?;
 
+    // Settings and the rest of what outlives a run live in ~/.ninjaedit.
+    // The app reads the settings itself, reporting a bad file in the
+    // status bar rather than refusing to start over it.
+    let storage = Storage::in_home().unwrap_or_else(|err| {
+        eprintln!("ninjaedit: {err}");
+        std::process::exit(1);
+    });
+
     // One channel carries everything the loop reacts to: terminal input on
     // a reader thread, and the output of programs running in tool panes
     // from their pty threads. The app keeps the sender to start sessions.
     let (events, event_queue) = mpsc::channel();
-    let mut app = App::new(project, events.clone());
+    let mut app = App::new(project, storage, events.clone());
     app.set_theme(theme);
     for file in args.files {
         app.open_file(std::path::absolute(&file)?);

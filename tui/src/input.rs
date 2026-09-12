@@ -1,5 +1,6 @@
 //! A one-line text input: the command palette's and the search box's
-//! query field.
+//! query field, and each field of a settings page (see the `fields`
+//! module for several of them together).
 //!
 //! The text itself, with its cursor and selection, is a
 //! [`LineEdit`] from the core crate. This widget maps keys and the mouse
@@ -66,11 +67,22 @@ impl Input {
         &self.edit
     }
 
+    /// Replace the text, with the cursor at its end and nothing selected.
+    pub fn set_text(&mut self, text: &str) {
+        self.edit.set_text(text);
+    }
+
     /// Replace the text, leaving it all selected so that typing replaces
     /// it and Backspace clears it.
     pub fn set_text_selected(&mut self, text: &str) {
         self.edit.set_text(text);
         self.edit.select_all();
+    }
+
+    /// Clear the selection, leaving the cursor where it is, as a field
+    /// losing the focus does.
+    pub fn clear_selection(&mut self) {
+        self.edit.clear_selection();
     }
 
     /// Select all of the text, so that typing replaces it.

@@ -73,13 +73,9 @@ impl Command {
         }
     }
 
-    /// The user's interactive shell: `$SHELL`, or the system's default
-    /// when that isn't set.
+    /// The user's interactive shell, as [`detected_shell`] finds it.
     pub fn shell() -> Command {
-        let program = std::env::var_os("SHELL")
-            .filter(|shell| !shell.is_empty())
-            .unwrap_or_else(default_shell);
-        Command::new(program)
+        Command::new(detected_shell())
     }
 
     pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Command {
@@ -119,6 +115,15 @@ impl Command {
         }
         builder
     }
+}
+
+/// The user's interactive shell: `$SHELL`, or the system's default when
+/// that isn't set. This is what the shell tool runs unless the settings
+/// name another program.
+pub fn detected_shell() -> OsString {
+    std::env::var_os("SHELL")
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or_else(default_shell)
 }
 
 #[cfg(windows)]

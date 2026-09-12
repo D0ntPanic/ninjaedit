@@ -61,6 +61,12 @@ impl TerminalView {
         &mut self.terminal
     }
 
+    /// The terminal, for tests to look at its state.
+    #[cfg(test)]
+    pub fn terminal_mut_for_test(&self) -> &Terminal {
+        &self.terminal
+    }
+
     /// Feed the program's output to the emulator. When the user is scrolled
     /// back reading older output, the view stays anchored to those lines as
     /// new ones push into the scrollback, rather than following the program

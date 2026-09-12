@@ -182,6 +182,19 @@ impl ProjectSearchDialog {
         self.input.select_all();
     }
 
+    /// Stop searches at `limit` matches, as the settings say. When that
+    /// differs from the limit the results were found under, the search
+    /// runs again, since they may be cut short (or short of the cut).
+    pub fn set_limit(&mut self, limit: usize) {
+        if self.search.limit() == limit {
+            return;
+        }
+        self.search.set_limit(limit);
+        if !self.query().is_empty() {
+            self.query_changed();
+        }
+    }
+
     /// Search the files open with unsaved changes as their editors have
     /// them: `buffers` holds each one's path, its
     /// [version](ninjaedit_core::FileBuffer::version), and its contents.
