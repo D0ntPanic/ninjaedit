@@ -2,7 +2,8 @@
 //! ranked list of results under it.
 //!
 //! The palette is generic over what it searches. The application builds a
-//! list of [`PaletteItem`]s (open tabs, project files, ...) and the palette
+//! list of [`PaletteItem`]s (open tabs, project files, modes and tools,
+//! ...) and the palette
 //! ranks them against whatever is typed with the fuzzy matcher from the
 //! core crate. Enter activates the selected result, which starts out as the
 //! best match; the arrow keys and the mouse choose another. The query is
@@ -13,6 +14,7 @@
 use crate::clipboard::Clipboard;
 use crate::input::{Input, InputKey};
 use crate::theme::Theme;
+use crate::tool::ToolKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::fuzzy;
 use ratatui::buffer::Buffer;
@@ -63,6 +65,11 @@ pub fn render_frame(area: Rect, hint: Option<&str>, buf: &mut Buffer, theme: &Th
 pub enum PaletteAction {
     SwitchTab(usize),
     OpenFile(PathBuf),
+    /// Give the keyboard to the editor.
+    FocusEditor,
+    /// Show a tool in the pane below the editor, starting it if need be,
+    /// and give it the keyboard.
+    OpenTool(ToolKind),
 }
 
 /// One searchable entry.

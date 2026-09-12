@@ -15,11 +15,48 @@
 //! quitting the editor, which drops the sessions, ends them.
 //!
 //! Several tools are planned, so the pane is a list from the start even
-//! though the shell is the only one wired up today.
+//! though the shell is the only one wired up today. [`ToolKind`] names
+//! each kind of tool the editor can open, so the modes palette (Ctrl+E)
+//! can list them all and the pane can find the one already running.
 
 use crate::terminal_view::TerminalView;
 use ninjaedit_core::terminal::{Command, ExitStatus, Session, SessionId};
 use std::io;
+use std::path::Path;
+
+/// A kind of tool the editor can open in the pane. Each new tool gets a
+/// variant here, and with it a row in the modes palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolKind {
+    Shell,
+}
+
+impl ToolKind {
+    /// Every kind, in the order the modes palette lists them.
+    pub const ALL: [ToolKind; 1] = [ToolKind::Shell];
+
+    /// The short name shown in the tool's tab and the palette.
+    pub fn name(self) -> &'static str {
+        match self {
+            ToolKind::Shell => "Shell",
+        }
+    }
+
+    /// A line about what the tool does, shown after the name in the
+    /// palette.
+    pub fn description(self) -> &'static str {
+        match self {
+            ToolKind::Shell => "Run commands in a shell below the editor",
+        }
+    }
+
+    /// The command that runs this tool in `directory`.
+    fn command(self, directory: &Path) -> Command {
+        match self {
+            ToolKind::Shell => Command::shell().current_dir(directory),
+        }
+    }
+}
 
 /// The starting fraction of the editor-plus-tool area given to the tool
 /// pane.
@@ -31,6 +68,7 @@ const MAX_SPLIT: f32 = 0.9;
 
 /// One program in the tool pane.
 pub struct Tool {
+    kind: ToolKind,
     /// A short name for the tab (a program that sets a title replaces it).
     name: String,
     /// The view onto the running (or last) program's screen.
@@ -47,10 +85,17 @@ pub struct Tool {
 }
 
 impl Tool {
-    /// A tool that will run `command`, named `name`, its terminal starting
-    /// at `cols` by `rows`.
-    pub fn new(name: impl Into<String>, command: Command, cols: u16, rows: u16) -> Tool {
+    /// A tool of `kind` that will run `command`, named `name`, its
+    /// terminal starting at `cols` by `rows`.
+    pub fn new(
+        kind: ToolKind,
+        name: impl Into<String>,
+        command: Command,
+        cols: u16,
+        rows: u16,
+    ) -> Tool {
         Tool {
+            kind,
             name: name.into(),
             view: TerminalView::new(cols, rows),
             command,
@@ -60,10 +105,14 @@ impl Tool {
         }
     }
 
-    /// A shell tool running the user's `$SHELL` in `directory`.
-    pub fn shell(directory: &std::path::Path, cols: u16, rows: u16) -> Tool {
-        let command = Command::shell().current_dir(directory);
-        Tool::new("Shell", command, cols, rows)
+    /// A tool of `kind` working in `directory` (for the shell, running the
+    /// user's `$SHELL` there).
+    pub fn of_kind(kind: ToolKind, directory: &Path, cols: u16, rows: u16) -> Tool {
+        Tool::new(kind, kind.name(), kind.command(directory), cols, rows)
+    }
+
+    pub fn kind(&self) -> ToolKind {
+        self.kind
     }
 
     pub fn view(&self) -> &TerminalView {
@@ -184,11 +233,6 @@ impl ToolPane {
         self.visible && !self.tools.is_empty()
     }
 
-    /// Whether there are any tools, running or not.
-    pub fn has_tools(&self) -> bool {
-        !self.tools.is_empty()
-    }
-
     pub fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
     }
@@ -238,6 +282,11 @@ impl ToolPane {
         self.tools
             .iter()
             .position(|tool| tool.session().map(Session::id) == Some(id))
+    }
+
+    /// The index of the (first) tool of a kind, running or not.
+    pub fn index_of_kind(&self, kind: ToolKind) -> Option<usize> {
+        self.tools.iter().position(|tool| tool.kind() == kind)
     }
 
     /// The fraction of the shared area the pane takes.

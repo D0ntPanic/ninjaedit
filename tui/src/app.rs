@@ -37,6 +37,38 @@
 //! active tab's cursor to the start of the line typed, clamped to the
 //! first or last line when the number is out of range, and closes the box.
 //!
+//! The modes palette (Ctrl+E) lists the editor and every tool (the shell
+//! today; builds, debuggers and the like later) in the same palette the
+//! tab and file searches use. Picking one shows it and gives it the
+//! keyboard, starting the tool if it isn't running. Unlike the other
+//! palettes it opens from the shell as well as from the editor, and while
+//! it is open it has the keyboard whichever view is focused; the view it
+//! is listing first (the current one) keeps the focus if it is closed
+//! without a choice. The other view is preselected, so Ctrl+E, Enter
+//! flips between the editor and the last tool.
+//!
+//! With a tool focused its program gets the whole keyboard, since a shell
+//! or a coding agent has uses for nearly every key and its line editing
+//! (Ctrl+E for the end of the line, say) is muscle memory. The one key
+//! the program never sees is the prefix, Ctrl+], telnet's escape
+//! character: it holds the next key back, and that key goes to the
+//! editor instead, meaning what it means there: Ctrl+] Ctrl+E opens the
+//! modes palette, Ctrl+O the file search, Ctrl+T the tab search, Ctrl+F
+//! and Ctrl+Shift+F the searches, Ctrl+L the go to line box, Ctrl+Q
+//! quits, and Ctrl+, and Ctrl+. move the focus. So a file named in a
+//! build's output is a prefix and a few keys away without leaving the
+//! shell first; the overlay takes the keyboard while it is open, and
+//! whichever it ends in the editor (a file opened, a match or a line
+//! gone to) moves the focus there, while closing it leaves the focus on
+//! the shell. Ctrl+] Ctrl+] sends one Ctrl+] to the program, and any key
+//! the editor has no use for after the prefix is sent along with the
+//! prefix, so nothing is lost, only held for a keystroke. There is no
+//! timeout; the status bar shows the prefix while it waits. Terminals without the kitty keyboard protocol deliver Ctrl+]
+//! as Ctrl+5, which is also how to type it on a layout that puts ] behind
+//! AltGr, so both spellings are the prefix. Ctrl+` toggles the shell
+//! without a prefix from either view: it only arrives at all on terminals
+//! where it is unambiguous.
+//!
 //! Closing a modified tab or quitting with unsaved changes asks for the key
 //! to be pressed a second time rather than popping up a dialog.
 
@@ -48,7 +80,7 @@ use crate::project_search::{ProjectSearchDialog, ProjectSearchOutcome};
 use crate::search_box::{self, SearchBox, SearchOutcome};
 use crate::tabs::{TabBar, TabHit, TabLabel};
 use crate::theme::Theme;
-use crate::tool::{Tool, ToolPane};
+use crate::tool::{Tool, ToolKind, ToolPane};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -86,6 +118,12 @@ const DIVIDER_HEIGHT: u16 = 1;
 
 const TABS_PLACEHOLDER: &str = "Search open tabs";
 const FILES_PLACEHOLDER: &str = "Search files in project";
+const MODES_PLACEHOLDER: &str = "Switch to the editor or a tool";
+/// The modes palette's row for the editor.
+const EDITOR_MODE_LABEL: &str = "Editor";
+/// What the status bar shows while the prefix waits for its key.
+const PREFIX_HINT: &str =
+    "Ctrl+]  then Ctrl+ E mode · O file · T tab · F search · L line · Q quit · ] itself";
 /// How long a change to the search query waits for the search to finish,
 /// so that in all but the largest files the matches show up in the same
 /// frame as the keystroke rather than a tick later.
@@ -177,6 +215,10 @@ pub struct App {
     content_area: Rect,
     /// Whether a mouse drag is moving the editor/tool divider.
     dragging_divider: bool,
+    /// The prefix key (Ctrl+]) pressed with a tool focused, waiting for
+    /// the key it applies to. Kept as pressed so it can be sent on to the
+    /// program in whichever spelling the terminal used.
+    prefix: Option<KeyEvent>,
 }
 
 impl App {
@@ -209,6 +251,7 @@ impl App {
             tool_term_area: Rect::default(),
             content_area: Rect::default(),
             dragging_divider: false,
+            prefix: None,
         }
     }
 
@@ -396,11 +439,60 @@ impl App {
         palette.set_hint(hint);
     }
 
+    /// Ctrl+E: open the modes palette, listing the editor and every kind
+    /// of tool. The focused view comes first and the next one is
+    /// preselected, so Enter alone flips to it, as the tab search does.
+    fn open_modes_palette(&mut self) {
+        self.close_search_box(true);
+        self.goto_line = None;
+        self.hide_project_search();
+        let editor = PaletteItem {
+            label: EDITOR_MODE_LABEL.to_owned(),
+            detail: "Edit the open files".to_owned(),
+            search: EDITOR_MODE_LABEL.to_owned(),
+            action: PaletteAction::FocusEditor,
+        };
+        let tools = ToolKind::ALL.into_iter().map(|kind| PaletteItem {
+            label: kind.name().to_owned(),
+            detail: kind.description().to_owned(),
+            search: kind.name().to_owned(),
+            action: PaletteAction::OpenTool(kind),
+        });
+        let mut items: Vec<PaletteItem> = std::iter::once(editor).chain(tools).collect();
+        if let Some(kind) = self.focused_tool_kind()
+            && let Some(current) = items
+                .iter()
+                .position(|item| item.action == PaletteAction::OpenTool(kind))
+        {
+            let current = items.remove(current);
+            items.insert(0, current);
+        }
+        let mut palette = Palette::new(MODES_PLACEHOLDER, items);
+        palette.select(1);
+        self.palette = Some(palette);
+        self.palette_is_files = false;
+    }
+
+    /// The kind of the tool the keyboard is on, if it is on one.
+    fn focused_tool_kind(&self) -> Option<ToolKind> {
+        (self.focus == Focus::Tool && self.tool_pane.is_visible())
+            .then(|| self.tool_pane.active().map(Tool::kind))
+            .flatten()
+    }
+
     fn run_palette_action(&mut self, action: PaletteAction) {
         self.palette = None;
         match action {
-            PaletteAction::SwitchTab(index) => self.activate(index),
-            PaletteAction::OpenFile(path) => self.open_file(path),
+            PaletteAction::SwitchTab(index) => {
+                self.focus = Focus::Editor;
+                self.activate(index);
+            }
+            PaletteAction::OpenFile(path) => {
+                self.focus = Focus::Editor;
+                self.open_file(path);
+            }
+            PaletteAction::FocusEditor => self.focus = Focus::Editor,
+            PaletteAction::OpenTool(kind) => self.open_tool(kind),
         }
     }
 
@@ -480,6 +572,7 @@ impl App {
                         self.last_search = search_box.query().to_owned();
                     }
                     self.close_search_box(false);
+                    self.focus = Focus::Editor;
                 }
             }
             SearchOutcome::Next => self.step_search(),
@@ -514,6 +607,7 @@ impl App {
                     // Line numbers are typed counting from one; zero and
                     // anything past the end clamp to the first and last.
                     tab.view.go_to_line(line.saturating_sub(1));
+                    self.focus = Focus::Editor;
                 }
             }
         }
@@ -666,6 +760,7 @@ impl App {
             ProjectSearchOutcome::Navigate(found) => {
                 self.hide_project_search();
                 self.go_to_match(&found);
+                self.focus = Focus::Editor;
             }
         }
     }
@@ -692,37 +787,47 @@ impl App {
 
     // ----- Tool pane ------------------------------------------------------
 
-    /// Ctrl+`: show the shell and focus it, or, when it's already showing,
-    /// hide it and go back to the editor. Hiding leaves the program
-    /// running; showing again returns to it, or starts a new shell when
-    /// the last one has exited.
+    /// Ctrl+`: show the shell and focus it; with it showing but the editor
+    /// focused, just focus it; and with it focused, hide the pane and go
+    /// back to the editor. Hiding leaves the program running; showing
+    /// again returns to it, or starts a new shell when the last one has
+    /// exited.
     fn toggle_shell(&mut self) {
-        if self.tool_pane.is_visible() {
+        let shell_showing = self.tool_pane.is_visible()
+            && self.tool_pane.active().map(Tool::kind) == Some(ToolKind::Shell);
+        if shell_showing && self.focus == Focus::Tool {
             self.tool_pane.set_visible(false);
             self.focus = Focus::Editor;
         } else {
-            self.close_editor_overlays();
-            self.ensure_shell();
-            // Show and focus the pane only if the shell actually started;
-            // a failure leaves a message in the status bar instead.
-            if self.tool_pane.active().is_some_and(Tool::is_running) {
-                self.tool_pane.set_visible(true);
-                self.focus = Focus::Tool;
-            }
+            self.open_tool(ToolKind::Shell);
         }
     }
 
-    /// Make sure there is a shell tool and that it is running, starting or
-    /// restarting it as needed. Reports a failure to start in the status
-    /// bar and leaves the pane hidden.
-    fn ensure_shell(&mut self) {
-        if !self.tool_pane.has_tools() {
-            // Sized to the terminal area the last render measured, or a
-            // sensible default before the first one; the next render fits
-            // it exactly.
-            let (cols, rows) = self.default_tool_size();
-            let tool = Tool::shell(self.project.root(), cols, rows);
-            self.tool_pane.add(tool);
+    /// Show a tool in the pane and give it the keyboard, starting or
+    /// restarting its program as needed. A failure to start leaves a
+    /// message in the status bar instead, and the focus where it was.
+    fn open_tool(&mut self, kind: ToolKind) {
+        self.close_editor_overlays();
+        self.ensure_tool(kind);
+        if self.tool_pane.active().is_some_and(Tool::is_running) {
+            self.tool_pane.set_visible(true);
+            self.focus = Focus::Tool;
+        }
+    }
+
+    /// Make sure there is a tool of `kind`, active in the pane, and that
+    /// it is running. Reports a failure to start in the status bar.
+    fn ensure_tool(&mut self, kind: ToolKind) {
+        match self.tool_pane.index_of_kind(kind) {
+            Some(index) => self.tool_pane.set_active(index),
+            None => {
+                // Sized to the terminal area the last render measured, or a
+                // sensible default before the first one; the next render
+                // fits it exactly.
+                let (cols, rows) = self.default_tool_size();
+                let tool = Tool::of_kind(kind, self.project.root(), cols, rows);
+                self.tool_pane.add(tool);
+            }
         }
         self.start_active_tool();
     }
@@ -736,10 +841,11 @@ impl App {
         if tool.is_running() {
             return;
         }
+        let name = tool.kind().name().to_lowercase();
         if let Err(err) =
             tool.start(|command, cols, rows| spawn_session(command, cols, rows, events))
         {
-            self.status = Some(format!("Could not start shell: {err}"));
+            self.status = Some(format!("Could not start {name}: {err}"));
         }
     }
 
@@ -779,6 +885,16 @@ impl App {
         }
     }
 
+    /// Whether a floating overlay (a palette, the search or go to line
+    /// box, the project search) is open, and so has the keyboard whichever
+    /// view is focused.
+    fn overlay_open(&self) -> bool {
+        self.palette.is_some()
+            || self.search_box.is_some()
+            || self.goto_line.is_some()
+            || self.project_search_open
+    }
+
     /// Close any floating editor overlay, so it doesn't linger over the
     /// screen once the keyboard has moved to the tool pane.
     fn close_editor_overlays(&mut self) {
@@ -795,6 +911,75 @@ impl App {
             let bytes = tool.view_mut().handle_key(key);
             tool.write(bytes);
         }
+    }
+
+    /// Whether a key is the prefix, Ctrl+], in either of its spellings:
+    /// a terminal without the kitty keyboard protocol delivers the byte
+    /// it sends as Ctrl+5.
+    fn is_prefix(key: KeyEvent) -> bool {
+        key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
+    }
+
+    /// A key pressed with a tool focused: the prefix holds the next key
+    /// for the editor, Ctrl+` toggles the shell, and everything else goes
+    /// to the program. `confirm` is the confirmation pending before this
+    /// key, kept alive through the prefix so that Ctrl+] Ctrl+Q twice
+    /// quits with unsaved changes.
+    fn handle_tool_key(&mut self, key: KeyEvent, confirm: Option<Confirm>) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(prefix) = self.prefix.take() {
+            if Self::is_prefix(key) {
+                self.send_key_to_tool(prefix);
+            } else if !(ctrl && self.handle_shared_key(key, confirm)) {
+                // Not a key of the editor's: the program gets both.
+                self.send_key_to_tool(prefix);
+                self.send_key_to_tool(key);
+            }
+            return;
+        }
+        if Self::is_prefix(key) {
+            self.prefix = Some(key);
+            self.confirm = confirm;
+            return;
+        }
+        if ctrl && key.code == KeyCode::Char('`') {
+            self.toggle_shell();
+            return;
+        }
+        self.confirm = confirm;
+        self.send_key_to_tool(key);
+    }
+
+    /// The Ctrl bindings the editor and, after the prefix, the tool pane
+    /// share: everything that opens something or moves between views, as
+    /// against the keys that edit the active tab. Returns whether the key
+    /// was one of them.
+    fn handle_shared_key(&mut self, key: KeyEvent, confirm: Option<Confirm>) -> bool {
+        match key.code {
+            KeyCode::Char('q') => {
+                self.confirm = confirm;
+                self.request_quit();
+            }
+            KeyCode::Char('`') => self.toggle_shell(),
+            KeyCode::Char('e') => self.open_modes_palette(),
+            KeyCode::Char(',') => self.focus_previous(),
+            KeyCode::Char('.') => self.focus_next(),
+            KeyCode::Char('t') => self.open_tabs_palette(),
+            KeyCode::Char('o') => self.open_files_palette(),
+            // With the kitty keyboard protocol Ctrl+Shift+F arrives as a
+            // shifted 'F' (or as 'f' with the shift modifier); a plain
+            // terminal can't tell it from Ctrl+F.
+            KeyCode::Char('F') => self.open_project_search(),
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.open_project_search()
+            }
+            KeyCode::Char('f') if self.search_box.is_some() => self.upgrade_search_to_project(),
+            KeyCode::Char('f') => self.open_search_box(),
+            KeyCode::Char('l') => self.open_goto_line(),
+            _ => return false,
+        }
+        true
     }
 
     /// Handle output or the exit of a tool's program.
@@ -829,6 +1014,7 @@ impl App {
                 if was_active && self.tool_pane.is_visible() {
                     self.tool_pane.set_visible(false);
                     self.focus = Focus::Editor;
+                    self.prefix = None;
                 }
             }
         }
@@ -901,7 +1087,12 @@ impl App {
                     dialog.paste(&text);
                 } else if self.focus == Focus::Tool {
                     // Pasting into the shell sends the text as the program
-                    // reads it, wrapped for bracketed paste if it asked.
+                    // reads it, wrapped for bracketed paste if it asked. A
+                    // prefix waiting for a key goes first, like any other
+                    // key it isn't followed by one of the editor's.
+                    if let Some(prefix) = self.prefix.take() {
+                        self.send_key_to_tool(prefix);
+                    }
                     if let Some(tool) = self.tool_pane.active_mut() {
                         let bytes = tool.view_mut().paste(&text);
                         tool.write(bytes);
@@ -919,75 +1110,20 @@ impl App {
         let confirm = self.confirm.take();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-        // Bindings that work whatever the focus, so the editor is always
-        // reachable from a shell and the shell from the editor.
-        if ctrl {
-            match key.code {
-                KeyCode::Char('q') => {
-                    self.confirm = confirm;
-                    self.request_quit();
-                    return;
-                }
-                KeyCode::Char('`') => {
-                    self.toggle_shell();
-                    return;
-                }
-                KeyCode::Char(',') => {
-                    self.focus_previous();
-                    return;
-                }
-                KeyCode::Char('.') => {
-                    self.focus_next();
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        // With the tool pane focused the program gets every other key, so
-        // a shell or coding agent has the full keyboard.
-        if self.focus == Focus::Tool {
-            self.confirm = confirm;
-            self.send_key_to_tool(key);
+        // With the tool pane focused the program gets every key but the
+        // prefix and Ctrl+`, so a shell or coding agent has the full
+        // keyboard; only an overlay opened after the prefix takes the
+        // keyboard from it.
+        if self.focus == Focus::Tool && !self.overlay_open() {
+            self.handle_tool_key(key, confirm);
             return;
         }
 
-        // Editor bindings.
-        if ctrl {
-            match key.code {
-                KeyCode::Char('t') => {
-                    self.open_tabs_palette();
-                    return;
-                }
-                KeyCode::Char('o') => {
-                    self.open_files_palette();
-                    return;
-                }
-                // With the kitty keyboard protocol Ctrl+Shift+F arrives as
-                // a shifted 'F' (or as 'f' with the shift modifier); a
-                // plain terminal can't tell it from Ctrl+F.
-                KeyCode::Char('F') => {
-                    self.open_project_search();
-                    return;
-                }
-                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    self.open_project_search();
-                    return;
-                }
-                KeyCode::Char('f') if self.search_box.is_some() => {
-                    self.upgrade_search_to_project();
-                    return;
-                }
-                KeyCode::Char('f') => {
-                    self.open_search_box();
-                    return;
-                }
-                KeyCode::Char('l') => {
-                    self.open_goto_line();
-                    return;
-                }
-                _ => {}
-            }
+        self.prefix = None;
+
+        // Bindings shared with the tool pane, where they follow the prefix.
+        if ctrl && self.handle_shared_key(key, confirm) {
+            return;
         }
 
         if let Some(palette) = &mut self.palette {
@@ -1042,6 +1178,11 @@ impl App {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         let (x, y) = (mouse.column, mouse.row);
+        // A click with the prefix waiting decides where the next key goes
+        // by itself, so the prefix is dropped rather than left dangling.
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            self.prefix = None;
+        }
 
         // A divider drag owns the mouse until the button comes up.
         if self.dragging_divider {
@@ -1312,10 +1453,10 @@ impl App {
         {
             cursor = dialog.render(screen, buf, theme);
         }
-        // With the tool focused (and so no editor overlay open) the tool's
-        // cursor is the one to show; otherwise the editor's or an
+        // With the tool focused the tool's cursor is the one to show,
+        // unless an overlay is open over it; otherwise the editor's or an
         // overlay's.
-        let show = if self.focus == Focus::Tool {
+        let show = if self.focus == Focus::Tool && !self.overlay_open() {
             tool_cursor
         } else {
             cursor
@@ -1387,6 +1528,7 @@ impl App {
             (project, theme.status_bar_project_text),
         ];
         let left = match &self.status {
+            _ if self.prefix.is_some() => PREFIX_HINT.to_owned(),
             Some(message) => message.clone(),
             None if tool_focused => self.tool_pane.active().map(Tool::title).unwrap_or_default(),
             None => match tab.and_then(Tab::path) {
@@ -1455,6 +1597,8 @@ fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme) {
         "Ctrl+Shift+F   search in project files",
         "Ctrl+T         switch between open tabs",
         "Ctrl+`         open a shell below the editor",
+        "Ctrl+E         switch between the editor and tools",
+        "Ctrl+]         in a tool, prefix for the editor's keys",
         "Ctrl+Q         quit",
     ];
     let top = area.y + area.height.saturating_sub(lines.len() as u16) / 2;
@@ -1613,16 +1757,225 @@ mod tests {
         assert!(divider > 1 && divider < 18, "divider row {divider}");
         assert!(screen[divider + 1].contains("Shell"), "{screen:#?}");
 
-        // Ctrl+. and Ctrl+, flip focus between the two views.
+        // From the shell, Ctrl+. needs the prefix; from the editor, Ctrl+,
+        // doesn't.
+        ctrl(&mut app, '.');
+        assert_eq!(app.focus, Focus::Tool);
+        ctrl(&mut app, ']');
         ctrl(&mut app, '.');
         assert_eq!(app.focus, Focus::Editor);
         ctrl(&mut app, ',');
         assert_eq!(app.focus, Focus::Tool);
 
-        // Ctrl+` again hides it and returns to the editor.
+        // From the editor, Ctrl+` with the shell showing focuses it rather
+        // than hiding it; from the shell it hides it and returns to the
+        // editor.
+        ctrl(&mut app, ']');
+        ctrl(&mut app, '.');
+        assert_eq!(app.focus, Focus::Editor);
+        ctrl(&mut app, '`');
+        assert!(app.tool_pane.is_visible());
+        assert_eq!(app.focus, Focus::Tool);
         ctrl(&mut app, '`');
         assert!(!app.tool_pane.is_visible());
         assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefix_holds_one_key_for_the_editor() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        draw(&mut app, 40, 20);
+        ctrl(&mut app, '`');
+        assert_eq!(app.focus, Focus::Tool);
+
+        // The prefix waits, and says so in the status bar.
+        ctrl(&mut app, ']');
+        assert!(app.prefix.is_some());
+        let screen = draw(&mut app, 40, 20);
+        assert!(screen[19].trim_start().starts_with("Ctrl+]"), "{screen:#?}");
+
+        // A key the editor has no binding for goes through to the shell,
+        // prefix and all, and the wait is over.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.prefix.is_none());
+        assert_eq!(app.focus, Focus::Tool);
+        assert!(app.palette.is_none());
+
+        // So does a second prefix.
+        ctrl(&mut app, ']');
+        ctrl(&mut app, ']');
+        assert!(app.prefix.is_none());
+        assert_eq!(app.focus, Focus::Tool);
+
+        // Ctrl+5 is the same key, as terminals without the kitty protocol
+        // deliver it.
+        ctrl(&mut app, '5');
+        assert!(app.prefix.is_some());
+        ctrl(&mut app, 'e');
+        assert!(app.palette.is_some());
+        press(&mut app, KeyCode::Esc);
+
+        // A click drops a waiting prefix rather than holding it for the
+        // editor.
+        ctrl(&mut app, ']');
+        click(&mut app, 2, 2);
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(app.prefix.is_none());
+
+        // In the editor the prefix isn't special, so Ctrl+] Ctrl+E works
+        // there too, out of habit.
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'e');
+        assert!(app.palette.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefixed_editor_keys_work_from_the_shell() {
+        let (_dir, mut app) = app_with_files(&[("alpha.rs", "one\ntwo\nthree\n"), ("beta.rs", "")]);
+        app.project
+            .index()
+            .wait_for_primary(std::time::Duration::from_secs(10));
+        draw(&mut app, 40, 20);
+        ctrl(&mut app, '`');
+        assert_eq!(app.focus, Focus::Tool);
+
+        // Ctrl+] Ctrl+T: the tab search opens over the shell and takes the
+        // keyboard; picking a tab focuses the editor.
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 't');
+        assert!(app.palette.is_some());
+        type_str(&mut app, "alpha");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.tabs[app.active].title(), "alpha.rs");
+        assert!(app.tool_pane.is_visible());
+
+        // Ctrl+] Ctrl+O: likewise for the file search, while Escape leaves
+        // the shell focused.
+        ctrl(&mut app, ',');
+        assert_eq!(app.focus, Focus::Tool);
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'o');
+        assert!(app.palette.is_some());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus, Focus::Tool);
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'o');
+        type_str(&mut app, "beta");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.tabs[app.active].title(), "beta.rs");
+
+        // Ctrl+] Ctrl+L: the go to line box takes the keyboard from the
+        // shell, and Enter lands in the editor.
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 't');
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs[app.active].title(), "alpha.rs");
+        ctrl(&mut app, ',');
+        assert_eq!(app.focus, Focus::Tool);
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'l');
+        assert!(app.goto_line.is_some());
+        let screen = draw(&mut app, 40, 20);
+        assert!(screen[1].contains('╭'), "{screen:#?}");
+        type_str(&mut app, "3");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.goto_line.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.tabs[app.active].view.editor().cursor_position().line, 2);
+
+        // Ctrl+] Ctrl+F: the search box, and Ctrl+F again upgrades it to
+        // the project search as in the editor.
+        ctrl(&mut app, ',');
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'f');
+        assert!(app.search_box.is_some());
+        ctrl(&mut app, 'f');
+        assert!(app.search_box.is_none() && app.project_search_open);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.project_search_open);
+        assert_eq!(app.focus, Focus::Tool);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefixed_quit_confirms_unsaved_changes() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        press(&mut app, KeyCode::Char('z'));
+        draw(&mut app, 40, 20);
+        ctrl(&mut app, '`');
+        assert_eq!(app.focus, Focus::Tool);
+
+        // Ctrl+Q alone is the shell's; after the prefix it asks first.
+        ctrl(&mut app, 'q');
+        assert!(!app.should_quit());
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'q');
+        assert!(!app.should_quit());
+        assert_eq!(app.confirm, Some(Confirm::Quit));
+        // The confirmation survives the second prefix.
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'q');
+        assert!(app.should_quit());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modes_palette_switches_between_editor_and_shell() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        draw(&mut app, 40, 20);
+
+        // Ctrl+E from the editor lists the editor first and preselects the
+        // shell, so Enter alone opens it.
+        ctrl(&mut app, 'e');
+        let screen = draw(&mut app, 40, 20);
+        assert!(screen[2].contains(MODES_PLACEHOLDER), "{screen:#?}");
+        assert!(screen[3].contains(EDITOR_MODE_LABEL), "{screen:#?}");
+        assert!(screen[4].contains("Shell"), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.palette.is_none());
+        assert!(app.tool_pane.is_visible());
+        assert_eq!(app.focus, Focus::Tool);
+
+        // From the shell Ctrl+E is the shell's; after the prefix the
+        // palette opens, takes the keyboard, and lists the shell first.
+        // Escape leaves the shell focused.
+        ctrl(&mut app, 'e');
+        assert!(app.palette.is_none());
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'e');
+        assert!(app.palette.is_some());
+        let screen = draw(&mut app, 40, 20);
+        assert!(screen[3].contains("Shell"), "{screen:#?}");
+        assert!(screen[4].contains(EDITOR_MODE_LABEL), "{screen:#?}");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.palette.is_none());
+        assert_eq!(app.focus, Focus::Tool);
+
+        // Typing narrows it like any palette; picking the editor focuses
+        // it and leaves the shell showing.
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'e');
+        type_str(&mut app, "edit");
+        let screen = draw(&mut app, 40, 20);
+        assert!(screen[3].contains(EDITOR_MODE_LABEL), "{screen:#?}");
+        // The shell row is filtered out: the frame closes right under the
+        // editor row.
+        assert!(screen[4].contains('╰'), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(app.tool_pane.is_visible());
+        assert_eq!(app.tool_pane.tools().len(), 1);
+
+        // Picking the shell again reuses the running one rather than
+        // adding another.
+        ctrl(&mut app, 'e');
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus, Focus::Tool);
+        assert_eq!(app.tool_pane.tools().len(), 1);
     }
 
     #[cfg(unix)]
