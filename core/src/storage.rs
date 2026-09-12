@@ -9,16 +9,46 @@
 //! only an editor that has something to keep leaves anything behind, and
 //! a write replaces the file in one step, so a crash mid-way leaves the
 //! old one intact rather than a half-written new one.
+//!
+//! State that belongs to one project lives under `projects/` in a
+//! directory of its own, named after the project and the hash of its
+//! root path (see [`Storage::project`]). The name keeps the directory
+//! recognizable when browsing; the hash keeps two projects with the same
+//! name apart.
 
+use crate::project::Project;
 use crate::settings::{Settings, SettingsError};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use twox_hash::XxHash64;
 
 /// The storage directory's name within the home directory.
 pub const DIRECTORY_NAME: &str = ".ninjaedit";
 /// The settings file's name within the storage directory.
 pub const SETTINGS_FILE: &str = "settings.toml";
+/// The directory within the storage that holds the per-project
+/// directories.
+pub const PROJECTS_DIRECTORY: &str = "projects";
+
+/// The seed for every xxhash64 hash the editor takes. It is fixed so
+/// hashes that name things on disk, like project directories, come out
+/// the same from one run to the next.
+const HASH_SEED: u64 = 0;
+
+/// The xxhash64 hash of `data`. This is fast rather than cryptographic:
+/// use it to name and look things up, not to protect them.
+pub fn hash_bytes(data: &[u8]) -> u64 {
+    XxHash64::oneshot(HASH_SEED, data)
+}
+
+/// The name of the directory a project's state is kept in, within the
+/// projects directory: the project's name, a dash, and the xxhash64 hash
+/// of its root path as sixteen hex digits.
+pub fn project_directory_name(project: &Project) -> String {
+    let hash = hash_bytes(project.root().as_os_str().as_encoded_bytes());
+    format!("{}-{hash:016x}", project.name())
+}
 
 /// The directory the editor keeps its persistent state in.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +81,19 @@ impl Storage {
     /// The path of a file kept in the storage.
     pub fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
+    }
+
+    /// The directory that holds every project's storage.
+    pub fn projects_dir(&self) -> PathBuf {
+        self.dir.join(PROJECTS_DIRECTORY)
+    }
+
+    /// The storage for `project`'s own state: a directory under
+    /// `projects/` named after the project and the hash of its root
+    /// path. Like any storage, it need not exist yet; it is made on the
+    /// first write into it.
+    pub fn project(&self, project: &Project) -> Storage {
+        Storage::new(self.projects_dir().join(project_directory_name(project)))
     }
 
     /// Read a file kept in the storage, or `None` if there isn't one.
@@ -137,5 +180,56 @@ mod tests {
         storage.write(SETTINGS_FILE, "[terminal\n").unwrap();
         let err = storage.load_settings().unwrap_err().to_string();
         assert!(err.contains(SETTINGS_FILE), "{err}");
+    }
+
+    #[test]
+    fn hash_is_xxhash64() {
+        // Reference values from the xxHash specification.
+        assert_eq!(hash_bytes(b""), 0xef46db3751d8e999);
+        assert_eq!(hash_bytes(b"a"), 0xd24ec4f1a98c6e5b);
+    }
+
+    #[test]
+    fn project_storage_is_named_by_name_and_path_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().join("store"));
+
+        // Two projects with the same name but different roots get
+        // different directories; the same project always gets the same.
+        let a = dir.path().join("a").join("app");
+        let b = dir.path().join("b").join("app");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let project_a = Project::open(&a).unwrap();
+        let project_b = Project::open(&b).unwrap();
+
+        let name_a = project_directory_name(&project_a);
+        let name_b = project_directory_name(&project_b);
+        assert_ne!(name_a, name_b);
+        assert_eq!(name_a, project_directory_name(&Project::open(&a).unwrap()));
+        let expected_hash = hash_bytes(project_a.root().as_os_str().as_encoded_bytes());
+        assert_eq!(name_a, format!("app-{expected_hash:016x}"));
+        assert_eq!(name_a.len(), "app-".len() + 16);
+
+        let project_storage = storage.project(&project_a);
+        assert_eq!(project_storage.dir(), storage.projects_dir().join(&name_a));
+        assert_ne!(storage.project(&project_b).dir(), project_storage.dir());
+
+        // Nothing exists until something is written, and a write goes to
+        // the project's own directory rather than the top-level one.
+        assert!(!storage.projects_dir().exists());
+        project_storage.write("state.txt", "kept").unwrap();
+        assert_eq!(
+            project_storage.read("state.txt").unwrap().as_deref(),
+            Some("kept")
+        );
+        assert_eq!(storage.read("state.txt").unwrap(), None);
+        assert!(
+            storage
+                .projects_dir()
+                .join(&name_a)
+                .join("state.txt")
+                .is_file()
+        );
     }
 }

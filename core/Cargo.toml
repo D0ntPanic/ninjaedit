@@ -16,3 +16,4 @@ vte = "0.15"
 portable-pty = "0.9"
 compact_str = "0.9"
 toml = "1.1.5"
+twox-hash = { version = "2.1.4", default-features = false, features = ["xxhash64"] }
