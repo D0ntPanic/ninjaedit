@@ -13,6 +13,7 @@ pub mod project;
 pub mod project_search;
 pub mod search;
 pub mod syntax;
+pub mod terminal;
 pub mod text;
 
 pub use buffer::{BufferSnapshot, FileBuffer, LineEnding};
@@ -25,3 +26,4 @@ pub use project::Project;
 pub use project_search::{ProjectMatch, ProjectSearch};
 pub use search::{Search, SearchStep};
 pub use syntax::{Highlighter, Language, Token, TokenKind};
+pub use terminal::Terminal;

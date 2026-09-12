@@ -30,6 +30,30 @@ command-palette-selection-text = "black"
 project-search-location-text = "dimmed"
 search-preview-background = "dark"
 
+# The active tab of whichever view doesn't have the keyboard focus.
+unfocused-active-tab-background = "mid"
+unfocused-active-tab-text = "alt"
+
+# Terminals in the tool pane.
+terminal-background = "tool"
+terminal-text = "content"
+terminal-black = "light"
+terminal-red = "red"
+terminal-green = "green"
+terminal-yellow = "orange"
+terminal-blue = "blue"
+terminal-magenta = "lavender"
+terminal-cyan = "cyan"
+terminal-white = "content"
+terminal-bright-black = "dimmed"
+terminal-bright-red = "#f0a8b0"
+terminal-bright-green = "light-green"
+terminal-bright-yellow = "yellow"
+terminal-bright-blue = "#a0d8f4"
+terminal-bright-magenta = "magenta"
+terminal-bright-cyan = "light-cyan"
+terminal-bright-white = "#ffffff"
+
 # Syntax highlighting. A `*` prefix is bold, a `/` prefix is italic.
 # Kinds left unset use their parent kind's style (see the theme docs).
 syntax-comment = "alt"

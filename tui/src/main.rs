@@ -15,9 +15,11 @@ mod palette;
 mod project_search;
 mod search_box;
 mod tabs;
+mod terminal_view;
 mod theme;
+mod tool;
 
-use crate::app::App;
+use crate::app::{App, AppEvent};
 use crate::theme::Theme;
 use clap::Parser;
 use crossterm::event::{
@@ -31,10 +33,13 @@ use std::io::{self, stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
-/// How long the event loop waits for input before checking for background
-/// changes (such as the file index filling in).
+/// How long the event loop waits when idle before checking for background
+/// changes (such as the file index filling in). Input and program output
+/// wake it at once through the event channel, so this only paces the
+/// housekeeping [`App::tick`] does.
 const TICK: Duration = Duration::from_millis(100);
 
 /// A terminal IDE for fast navigation of large projects.
@@ -66,7 +71,12 @@ fn main() -> io::Result<()> {
     // or the current directory itself if it isn't inside one.
     let cwd = std::env::current_dir()?;
     let project = Project::discover(&cwd)?;
-    let mut app = App::new(project);
+
+    // One channel carries everything the loop reacts to: terminal input on
+    // a reader thread, and the output of programs running in tool panes
+    // from their pty threads. The app keeps the sender to start sessions.
+    let (events, event_queue) = mpsc::channel();
+    let mut app = App::new(project, events.clone());
     app.set_theme(theme);
     for file in args.files {
         app.open_file(std::path::absolute(&file)?);
@@ -101,7 +111,23 @@ fn main() -> io::Result<()> {
         enhanced.store(true, Ordering::Relaxed);
     }
 
-    let result = run(&mut terminal, &mut app);
+    // Read terminal input on its own thread and forward it to the event
+    // channel, so the loop can wait on input and program output together.
+    // The thread ends when reading stdin fails, as it does on shutdown.
+    {
+        let events = events.clone();
+        std::thread::Builder::new()
+            .name("input".to_owned())
+            .spawn(move || {
+                while let Ok(event) = event::read() {
+                    if events.send(AppEvent::Terminal(event)).is_err() {
+                        break;
+                    }
+                }
+            })?;
+    }
+
+    let result = run(&mut terminal, &mut app, &event_queue);
 
     if enhanced.load(Ordering::Relaxed) {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
@@ -111,29 +137,46 @@ fn main() -> io::Result<()> {
     result
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    events: &mpsc::Receiver<AppEvent>,
+) -> io::Result<()> {
     let mut dirty = true;
     while !app.should_quit() {
         if dirty {
             terminal.draw(|frame| app.render(frame))?;
             dirty = false;
         }
-        if event::poll(TICK)? {
-            // Handle every pending event before redrawing so a burst of
-            // input (a paste, a fast scroll) doesn't cost a frame each.
-            loop {
-                let event = event::read()?;
-                if !matches!(event, Event::FocusGained | Event::FocusLost) {
-                    dirty = true;
-                }
-                app.handle_event(event);
-                if !event::poll(Duration::ZERO)? {
-                    break;
+        match events.recv_timeout(TICK) {
+            Ok(event) => {
+                // Handle every queued event before redrawing so a burst of
+                // input or program output doesn't cost a frame each.
+                dirty |= handle(app, event);
+                while let Ok(event) = events.try_recv() {
+                    dirty |= handle(app, event);
                 }
             }
-        } else if app.tick() {
-            dirty = true;
+            Err(RecvTimeoutError::Timeout) => {
+                if app.tick() {
+                    dirty = true;
+                }
+            }
+            // Both the input thread and every pty thread are gone.
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
     Ok(())
+}
+
+/// Route one event to the app and say whether the screen needs redrawing.
+/// Focus notifications alone don't, so a terminal that reports focus
+/// doesn't cost a redraw each time the window is clicked away and back.
+fn handle(app: &mut App, event: AppEvent) -> bool {
+    let redraw = !matches!(
+        event,
+        AppEvent::Terminal(Event::FocusGained | Event::FocusLost)
+    );
+    app.handle_app_event(event);
+    redraw
 }

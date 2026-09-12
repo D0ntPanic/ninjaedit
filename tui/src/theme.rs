@@ -18,6 +18,15 @@
 //! colors it wants to change; anything it leaves out keeps the default.
 //! Unknown keys are an error, since they are almost always typos.
 //!
+//! Two views can be on screen at once, the editor and the tool pane
+//! below it, and only one has the keyboard focus. The active tab in the
+//! bar of the view without it is drawn with `unfocused-active-tab-text`
+//! and `unfocused-active-tab-background` rather than `active-tab-*`, so
+//! a theme decides how the focused view stands out. A terminal in the
+//! tool pane draws with `terminal-background` and `terminal-text`, and
+//! maps the sixteen ANSI colors through `terminal-black` ...
+//! `terminal-bright-white`.
+//!
 //! A few colors are optional, such as `selection-text`: leaving one out
 //! (or setting it to `""`, to undo the default) means the interface falls
 //! back to a related color instead.
@@ -150,6 +159,28 @@ fn syntax_kind(key: &str) -> Option<TokenKind> {
 }
 
 impl Theme {
+    /// One of the sixteen ANSI colors, black being 0 and bright white 15.
+    pub fn terminal_palette(&self, index: u8) -> Color {
+        match index {
+            0 => self.terminal_black,
+            1 => self.terminal_red,
+            2 => self.terminal_green,
+            3 => self.terminal_yellow,
+            4 => self.terminal_blue,
+            5 => self.terminal_magenta,
+            6 => self.terminal_cyan,
+            7 => self.terminal_white,
+            8 => self.terminal_bright_black,
+            9 => self.terminal_bright_red,
+            10 => self.terminal_bright_green,
+            11 => self.terminal_bright_yellow,
+            12 => self.terminal_bright_blue,
+            13 => self.terminal_bright_magenta,
+            14 => self.terminal_bright_cyan,
+            _ => self.terminal_bright_white,
+        }
+    }
+
     /// The style for a kind of token, following parents for kinds the
     /// theme doesn't style and ending at `view-text`.
     pub fn syntax(&self, kind: TokenKind) -> TextStyle {
@@ -206,6 +237,33 @@ required {
     command_palette_selection_text => "command-palette-selection-text",
     /// The file name and line number of a project search result.
     project_search_location_text => "project-search-location-text",
+    /// The active tab of a view that doesn't have the keyboard focus:
+    /// the editor's tab bar while a tool is focused, or the tool pane's
+    /// bar while the editor is. These are what show which view has the
+    /// focus, so they should look different from `active-tab-*`.
+    unfocused_active_tab_background => "unfocused-active-tab-background",
+    unfocused_active_tab_text => "unfocused-active-tab-text",
+    /// The background of a terminal in the tool pane.
+    terminal_background => "terminal-background",
+    /// Terminal text drawn in the default color.
+    terminal_text => "terminal-text",
+    // The sixteen ANSI colors a program in a terminal can ask for.
+    terminal_black => "terminal-black",
+    terminal_red => "terminal-red",
+    terminal_green => "terminal-green",
+    terminal_yellow => "terminal-yellow",
+    terminal_blue => "terminal-blue",
+    terminal_magenta => "terminal-magenta",
+    terminal_cyan => "terminal-cyan",
+    terminal_white => "terminal-white",
+    terminal_bright_black => "terminal-bright-black",
+    terminal_bright_red => "terminal-bright-red",
+    terminal_bright_green => "terminal-bright-green",
+    terminal_bright_yellow => "terminal-bright-yellow",
+    terminal_bright_blue => "terminal-bright-blue",
+    terminal_bright_magenta => "terminal-bright-magenta",
+    terminal_bright_cyan => "terminal-bright-cyan",
+    terminal_bright_white => "terminal-bright-white",
 }
 optional {
     /// Selected text in the editor. When set it replaces whatever color

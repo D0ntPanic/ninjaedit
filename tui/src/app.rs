@@ -48,18 +48,41 @@ use crate::project_search::{ProjectSearchDialog, ProjectSearchOutcome};
 use crate::search_box::{self, SearchBox, SearchOutcome};
 use crate::tabs::{TabBar, TabHit, TabLabel};
 use crate::theme::Theme;
+use crate::tool::{Tool, ToolPane};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ninjaedit_core::search::literal_query;
+use ninjaedit_core::terminal::{Command, Output, Session, SessionId};
 use ninjaedit_core::{Editor, Project, ProjectMatch, SearchStep};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position as ScreenPosition, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use std::path::Path;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
+
+/// Everything the event loop reacts to: input from the terminal and the
+/// output of programs running in tool panes. Both arrive on one channel so
+/// the loop can wait on them together; see `main`.
+pub enum AppEvent {
+    /// A crossterm event: a key, a mouse action, a paste, a resize.
+    Terminal(Event),
+    /// Output (or the exit) of the program in a tool's session.
+    Pty(SessionId, Output),
+}
+
+/// Which of the two on-screen views the keyboard drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Focus {
+    Editor,
+    Tool,
+}
+
+/// The height of the bar dragged to resize the editor/tool split.
+const DIVIDER_HEIGHT: u16 = 1;
 
 const TABS_PLACEHOLDER: &str = "Search open tabs";
 const FILES_PLACEHOLDER: &str = "Search files in project";
@@ -136,10 +159,28 @@ pub struct App {
     clipboard: Clipboard,
     quit: bool,
     editor_area: Rect,
+    /// The tools shown below the editor.
+    tool_pane: ToolPane,
+    /// The tool pane's own tab bar, one tab per tool.
+    tool_tab_bar: TabBar,
+    /// Which view the keyboard drives.
+    focus: Focus,
+    /// Where programs' output is sent so it reaches the event loop: the
+    /// sink each session is spawned with is built from a clone of this.
+    events: Sender<AppEvent>,
+    /// The screen regions of the tool pane from the last render, to
+    /// hit-test the mouse.
+    divider_area: Rect,
+    tool_term_area: Rect,
+    /// The editor-plus-divider-plus-tool region, for turning a divider
+    /// drag into a split fraction.
+    content_area: Rect,
+    /// Whether a mouse drag is moving the editor/tool divider.
+    dragging_divider: bool,
 }
 
 impl App {
-    pub fn new(project: Project) -> App {
+    pub fn new(project: Project, events: Sender<AppEvent>) -> App {
         App {
             index_generation: project.index().generation(),
             project,
@@ -160,6 +201,14 @@ impl App {
             clipboard: Clipboard::new(),
             quit: false,
             editor_area: Rect::default(),
+            tool_pane: ToolPane::default(),
+            tool_tab_bar: TabBar::default(),
+            focus: Focus::Editor,
+            events,
+            divider_area: Rect::default(),
+            tool_term_area: Rect::default(),
+            content_area: Rect::default(),
+            dragging_divider: false,
         }
     }
 
@@ -641,6 +690,150 @@ impl App {
         tab.view.select_and_center(start, end);
     }
 
+    // ----- Tool pane ------------------------------------------------------
+
+    /// Ctrl+`: show the shell and focus it, or, when it's already showing,
+    /// hide it and go back to the editor. Hiding leaves the program
+    /// running; showing again returns to it, or starts a new shell when
+    /// the last one has exited.
+    fn toggle_shell(&mut self) {
+        if self.tool_pane.is_visible() {
+            self.tool_pane.set_visible(false);
+            self.focus = Focus::Editor;
+        } else {
+            self.close_editor_overlays();
+            self.ensure_shell();
+            // Show and focus the pane only if the shell actually started;
+            // a failure leaves a message in the status bar instead.
+            if self.tool_pane.active().is_some_and(Tool::is_running) {
+                self.tool_pane.set_visible(true);
+                self.focus = Focus::Tool;
+            }
+        }
+    }
+
+    /// Make sure there is a shell tool and that it is running, starting or
+    /// restarting it as needed. Reports a failure to start in the status
+    /// bar and leaves the pane hidden.
+    fn ensure_shell(&mut self) {
+        if !self.tool_pane.has_tools() {
+            // Sized to the terminal area the last render measured, or a
+            // sensible default before the first one; the next render fits
+            // it exactly.
+            let (cols, rows) = self.default_tool_size();
+            let tool = Tool::shell(self.project.root(), cols, rows);
+            self.tool_pane.add(tool);
+        }
+        self.start_active_tool();
+    }
+
+    /// Start the active tool's program if it isn't already running.
+    fn start_active_tool(&mut self) {
+        let events = self.events.clone();
+        let Some(tool) = self.tool_pane.active_mut() else {
+            return;
+        };
+        if tool.is_running() {
+            return;
+        }
+        if let Err(err) =
+            tool.start(|command, cols, rows| spawn_session(command, cols, rows, events))
+        {
+            self.status = Some(format!("Could not start shell: {err}"));
+        }
+    }
+
+    /// The terminal size to start a tool at before a render has measured
+    /// the pane: the last tool area if there is one, else a common default.
+    fn default_tool_size(&self) -> (u16, u16) {
+        if self.tool_term_area.width > 0 && self.tool_term_area.height > 0 {
+            (self.tool_term_area.width, self.tool_term_area.height)
+        } else {
+            (80, 24)
+        }
+    }
+
+    /// Ctrl+. and Ctrl+,: move the keyboard focus to the next or previous
+    /// view. With the tool pane hidden there is only the editor, so this
+    /// does nothing.
+    fn focus_next(&mut self) {
+        self.switch_focus();
+    }
+
+    fn focus_previous(&mut self) {
+        // With two views, previous and next are the same flip.
+        self.switch_focus();
+    }
+
+    fn switch_focus(&mut self) {
+        if !self.tool_pane.is_visible() {
+            self.focus = Focus::Editor;
+            return;
+        }
+        self.focus = match self.focus {
+            Focus::Editor => Focus::Tool,
+            Focus::Tool => Focus::Editor,
+        };
+        if self.focus == Focus::Tool {
+            self.close_editor_overlays();
+        }
+    }
+
+    /// Close any floating editor overlay, so it doesn't linger over the
+    /// screen once the keyboard has moved to the tool pane.
+    fn close_editor_overlays(&mut self) {
+        self.palette = None;
+        self.close_search_box(true);
+        self.goto_line = None;
+        self.hide_project_search();
+    }
+
+    /// Send a key press to the focused tool's program, and write back any
+    /// reply the terminal makes to it (a cursor report, say).
+    fn send_key_to_tool(&mut self, key: KeyEvent) {
+        if let Some(tool) = self.tool_pane.active_mut() {
+            let bytes = tool.view_mut().handle_key(key);
+            tool.write(bytes);
+        }
+    }
+
+    /// Handle output or the exit of a tool's program.
+    fn handle_pty(&mut self, id: SessionId, output: Output) {
+        match output {
+            Output::Bytes(bytes) => {
+                let mut clipboard = Vec::new();
+                if let Some(tool) = self.tool_pane.tool_of_session(id) {
+                    tool.process(&bytes);
+                    let responses = tool.view_mut().terminal_mut().take_responses();
+                    tool.write(responses);
+                    // Collect the program's requests before dropping the
+                    // borrow, since acting on them needs the app.
+                    for event in tool.view_mut().terminal_mut().take_events() {
+                        if let ninjaedit_core::terminal::Event::Clipboard(text) = event {
+                            clipboard.push(text);
+                        }
+                    }
+                }
+                for text in clipboard {
+                    self.clipboard.set(text);
+                }
+            }
+            Output::Exited(status) => {
+                let Some(index) = self.tool_pane.index_of_session(id) else {
+                    return;
+                };
+                let was_active = index == self.tool_pane.active_index();
+                self.tool_pane.tools_mut()[index].note_exit(status);
+                // The user quit the shell: give the whole screen back to
+                // the editor. Showing it again starts a fresh shell.
+                if was_active && self.tool_pane.is_visible() {
+                    self.tool_pane.set_visible(false);
+                    self.focus = Focus::Editor;
+                }
+            }
+        }
+    }
+
     /// Periodic housekeeping while idle. Returns whether the screen needs
     /// redrawing.
     pub fn tick(&mut self) -> bool {
@@ -681,6 +874,14 @@ impl App {
 
     // ----- Events ---------------------------------------------------------
 
+    /// Handle one loop event, from the terminal or from a program.
+    pub fn handle_app_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::Terminal(event) => self.handle_event(event),
+            AppEvent::Pty(id, output) => self.handle_pty(id, output),
+        }
+    }
+
     pub fn handle_event(&mut self, event: Event) {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.handle_key(key),
@@ -698,6 +899,13 @@ impl App {
                     && let Some(dialog) = &mut self.project_search
                 {
                     dialog.paste(&text);
+                } else if self.focus == Focus::Tool {
+                    // Pasting into the shell sends the text as the program
+                    // reads it, wrapped for bracketed paste if it asked.
+                    if let Some(tool) = self.tool_pane.active_mut() {
+                        let bytes = tool.view_mut().paste(&text);
+                        tool.write(bytes);
+                    }
                 } else if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.view.editor_mut().paste(&text);
                 }
@@ -711,7 +919,8 @@ impl App {
         let confirm = self.confirm.take();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-        // Global bindings.
+        // Bindings that work whatever the focus, so the editor is always
+        // reachable from a shell and the shell from the editor.
         if ctrl {
             match key.code {
                 KeyCode::Char('q') => {
@@ -719,6 +928,33 @@ impl App {
                     self.request_quit();
                     return;
                 }
+                KeyCode::Char('`') => {
+                    self.toggle_shell();
+                    return;
+                }
+                KeyCode::Char(',') => {
+                    self.focus_previous();
+                    return;
+                }
+                KeyCode::Char('.') => {
+                    self.focus_next();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // With the tool pane focused the program gets every other key, so
+        // a shell or coding agent has the full keyboard.
+        if self.focus == Focus::Tool {
+            self.confirm = confirm;
+            self.send_key_to_tool(key);
+            return;
+        }
+
+        // Editor bindings.
+        if ctrl {
+            match key.code {
                 KeyCode::Char('t') => {
                     self.open_tabs_palette();
                     return;
@@ -807,6 +1043,16 @@ impl App {
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         let (x, y) = (mouse.column, mouse.row);
 
+        // A divider drag owns the mouse until the button comes up.
+        if self.dragging_divider {
+            match mouse.kind {
+                MouseEventKind::Drag(_) => self.resize_split(y),
+                MouseEventKind::Up(_) => self.dragging_divider = false,
+                _ => {}
+            }
+            return;
+        }
+
         // A drag that started in the palette's or the search box's query
         // stays with it wherever the pointer goes.
         if let Some(palette) = &mut self.palette {
@@ -858,6 +1104,50 @@ impl App {
             }
         }
 
+        // ----- The tool pane, when it's showing -----
+        let at = ScreenPosition::new(x, y);
+        if self.tool_pane.is_visible() {
+            // Press the divider to start dragging it.
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && self.divider_area.contains(at)
+            {
+                self.dragging_divider = true;
+                self.resize_split(y);
+                return;
+            }
+            // A drag that started in the tool (a selection, or a program
+            // tracking the mouse) follows the pointer outside it.
+            let tool_dragging = self
+                .tool_pane
+                .active()
+                .is_some_and(|tool| tool.view().is_dragging());
+            if tool_dragging
+                && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
+            {
+                self.route_tool_mouse(mouse);
+                return;
+            }
+            // The tool pane's tab bar: switch tools, or close (kill) one.
+            if let Some(hit) = self.tool_tab_bar.hit(x, y) {
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                    self.focus = Focus::Tool;
+                    match hit {
+                        TabHit::Tab(index) => self.tool_pane.set_active(index),
+                        TabHit::Close(index) => self.kill_tool(index),
+                    }
+                }
+                return;
+            }
+            // The tool's terminal.
+            if self.tool_term_area.contains(at) {
+                if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                    self.focus = Focus::Tool;
+                }
+                self.route_tool_mouse(mouse);
+                return;
+            }
+        }
+
         // A drag that started in the editor stays with it wherever the
         // pointer goes, so selections can extend past the edge of the view.
         if let Some(tab) = self.tabs.get_mut(self.active)
@@ -871,6 +1161,7 @@ impl App {
         if let Some(hit) = self.tab_bar.hit(x, y) {
             if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.confirm = None;
+                self.focus = Focus::Editor;
                 match hit {
                     TabHit::Tab(index) => self.activate(index),
                     TabHit::Close(index) => self.request_close_tab(index),
@@ -882,8 +1173,41 @@ impl App {
         if let Some(tab) = self.tabs.get_mut(self.active)
             && tab.view.contains(x, y)
         {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.focus = Focus::Editor;
+            }
             tab.view.handle_mouse(mouse);
         }
+    }
+
+    /// Send a mouse event to the active tool and write back any report it
+    /// makes to the program.
+    fn route_tool_mouse(&mut self, mouse: MouseEvent) {
+        if let Some(tool) = self.tool_pane.active_mut() {
+            let bytes = tool.view_mut().handle_mouse(mouse);
+            tool.write(bytes);
+        }
+    }
+
+    /// Kill a tool's program. Its exit, reported through the event
+    /// channel, hides the pane if it was the active tool.
+    fn kill_tool(&mut self, index: usize) {
+        if let Some(tool) = self.tool_pane.tools_mut().get_mut(index) {
+            tool.kill();
+        }
+    }
+
+    /// Move the editor/tool divider so it sits at screen row `y`, giving
+    /// the tool pane the space below it.
+    fn resize_split(&mut self, y: u16) {
+        let content = self.content_area;
+        if content.height == 0 {
+            return;
+        }
+        let y = y.clamp(content.y, content.bottom());
+        let tool_rows = content.bottom().saturating_sub(y);
+        self.tool_pane
+            .set_split(tool_rows as f32 / content.height as f32);
     }
 
     // ----- Rendering ------------------------------------------------------
@@ -895,9 +1219,16 @@ impl App {
         }
         let tab_area = Rect::new(screen.x, screen.y, screen.width, 1);
         let status_area = Rect::new(screen.x, screen.bottom() - 1, screen.width, 1);
-        self.editor_area = Rect::new(screen.x, screen.y + 1, screen.width, screen.height - 2);
+        // Between the tab bar and the status bar sit the editor and, when
+        // it's showing, the tool pane below it, split by a draggable
+        // divider.
+        let content = Rect::new(screen.x, screen.y + 1, screen.width, screen.height - 2);
+        self.content_area = content;
+        self.layout_content(content);
+
         let buf = frame.buffer_mut();
         let theme = &self.theme;
+        let editor_focused = self.focus == Focus::Editor;
 
         let labels: Vec<TabLabel> = self
             .tabs
@@ -908,7 +1239,7 @@ impl App {
             })
             .collect();
         self.tab_bar
-            .render(tab_area, buf, theme, &labels, self.active);
+            .render(tab_area, buf, theme, &labels, self.active, editor_focused);
 
         let mut cursor = None;
         match self.tabs.get_mut(self.active) {
@@ -924,6 +1255,43 @@ impl App {
                 cursor = tab.view.render(self.editor_area, buf, theme);
             }
             None => render_empty(self.editor_area, buf, theme),
+        }
+
+        // The tool pane: the divider, the tool tab bar, and the active
+        // tool's terminal.
+        let mut tool_cursor = None;
+        if self.tool_pane.is_visible() && self.tool_term_area.height > 0 {
+            render_divider(self.divider_area, buf, theme);
+            let tool_labels: Vec<TabLabel> = self
+                .tool_pane
+                .tools()
+                .iter()
+                .map(|tool| TabLabel {
+                    title: tool.title(),
+                    modified: false,
+                })
+                .collect();
+            let tool_tab_area = Rect::new(
+                self.divider_area.x,
+                self.divider_area.bottom(),
+                self.divider_area.width,
+                1,
+            );
+            let active = self.tool_pane.active_index();
+            self.tool_tab_bar.render(
+                tool_tab_area,
+                buf,
+                theme,
+                &tool_labels,
+                active,
+                !editor_focused,
+            );
+            let area = self.tool_term_area;
+            if let Some(tool) = self.tool_pane.active_mut() {
+                tool_cursor = tool.view_mut().render(area, buf, theme);
+                // The pty follows the size the render settled on.
+                tool.sync_size();
+            }
         }
 
         self.render_status(status_area, buf);
@@ -944,9 +1312,45 @@ impl App {
         {
             cursor = dialog.render(screen, buf, theme);
         }
-        if let Some(cursor) = cursor {
-            frame.set_cursor_position(cursor);
+        // With the tool focused (and so no editor overlay open) the tool's
+        // cursor is the one to show; otherwise the editor's or an
+        // overlay's.
+        let show = if self.focus == Focus::Tool {
+            tool_cursor
+        } else {
+            cursor
+        };
+        if let Some(position) = show {
+            frame.set_cursor_position(position);
         }
+    }
+
+    /// Place the editor and the tool pane within the content region,
+    /// setting the areas the render draws into and the mouse hit-tests
+    /// against. With the tool pane hidden the editor takes it all.
+    fn layout_content(&mut self, content: Rect) {
+        // The tool pane needs at least a tab row and a terminal row, plus
+        // the divider, and the editor at least one row.
+        let fits = self.tool_pane.is_visible() && content.height >= 4;
+        if !fits {
+            self.editor_area = content;
+            self.divider_area = Rect::default();
+            self.tool_term_area = Rect::default();
+            return;
+        }
+        let total = content.height;
+        let tool_rows =
+            ((self.tool_pane.split() * total as f32).round() as u16).clamp(2, total - 2);
+        let editor_height = total - DIVIDER_HEIGHT - tool_rows;
+        self.editor_area = Rect::new(content.x, content.y, content.width, editor_height);
+        self.divider_area = Rect::new(
+            content.x,
+            content.y + editor_height,
+            content.width,
+            DIVIDER_HEIGHT,
+        );
+        let tool_top = content.y + editor_height + DIVIDER_HEIGHT;
+        self.tool_term_area = Rect::new(content.x, tool_top + 1, content.width, tool_rows - 1);
     }
 
     fn render_status(&self, area: Rect, buf: &mut Buffer) {
@@ -954,10 +1358,21 @@ impl App {
         let base = Style::default().bg(theme.status_bar_background);
         buf.set_style(area, base);
         let tab = self.tabs.get(self.active);
-        let position = tab.map(|tab| {
-            let position = tab.view.editor().cursor_position();
-            format!(" Ln {}, Col {} ", position.line + 1, position.column + 1)
-        });
+        // With the tool pane focused the position report is about the
+        // tool, not the editor: nothing to show, unless the user has
+        // scrolled back through the shell's output.
+        let tool_focused = self.focus == Focus::Tool && self.tool_pane.is_visible();
+        let position = if tool_focused {
+            self.tool_pane.active().and_then(|tool| {
+                let back = tool.view().scrollback_offset();
+                (back > 0).then(|| format!(" scrollback −{back} "))
+            })
+        } else {
+            tab.map(|tab| {
+                let position = tab.view.editor().cursor_position();
+                format!(" Ln {}, Col {} ", position.line + 1, position.column + 1)
+            })
+        };
         let mut project = format!(" {} ", self.project.name());
         if let Some(position) = &position {
             // Drop the project name when there's no room for it.
@@ -973,6 +1388,7 @@ impl App {
         ];
         let left = match &self.status {
             Some(message) => message.clone(),
+            None if tool_focused => self.tool_pane.active().map(Tool::title).unwrap_or_default(),
             None => match tab.and_then(Tab::path) {
                 Some(path) => self.display_path(path),
                 None => "Ctrl+O to open a file, Ctrl+Q to quit".to_owned(),
@@ -1000,6 +1416,33 @@ impl App {
     }
 }
 
+/// Run a command in a pty, routing its output to the application's event
+/// channel so the loop wakes when the program writes or exits.
+fn spawn_session(
+    command: &Command,
+    cols: u16,
+    rows: u16,
+    events: Sender<AppEvent>,
+) -> std::io::Result<Session> {
+    Session::spawn(command, cols as usize, rows as usize, move |id, output| {
+        // The loop has ended once the receiver is gone; nothing to do.
+        let _ = events.send(AppEvent::Pty(id, output));
+    })
+}
+
+/// Draw the draggable divider between the editor and the tool pane.
+fn render_divider(area: Rect, buf: &mut Buffer, theme: &Theme) {
+    if area.height == 0 {
+        return;
+    }
+    let style = Style::default()
+        .fg(theme.scroll_bar_track)
+        .bg(theme.view_background);
+    for x in area.x..area.right() {
+        buf[(x, area.y)].set_symbol("─").set_style(style);
+    }
+}
+
 fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme) {
     buf.set_style(area, Style::default().bg(theme.view_background));
     if area.height == 0 {
@@ -1011,6 +1454,7 @@ fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme) {
         "Ctrl+O         open a project file",
         "Ctrl+Shift+F   search in project files",
         "Ctrl+T         switch between open tabs",
+        "Ctrl+`         open a shell below the editor",
         "Ctrl+Q         quit",
     ];
     let top = area.y + area.height.saturating_sub(lines.len() as u16) / 2;
@@ -1067,7 +1511,8 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, contents).unwrap();
         }
-        let mut app = App::new(Project::open(dir.path()).unwrap());
+        let (events, _events_rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Project::open(dir.path()).unwrap(), events);
         for (name, _) in files {
             app.open_file(dir.path().join(name));
         }
@@ -1137,6 +1582,93 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }));
+    }
+
+    fn mouse_at(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+        app.handle_event(Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+
+    // The shell tool spawns a real process, so these are unix-only and
+    // never rely on its output (the event receiver is dropped by the test
+    // helper), only on the pane's structure and focus.
+    #[cfg(unix)]
+    #[test]
+    fn shell_toggles_split_and_focus() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        draw(&mut app, 40, 20);
+        assert!(!app.tool_pane.is_visible());
+        assert_eq!(app.focus, Focus::Editor);
+
+        // Ctrl+` shows the shell, focuses it, and splits the screen.
+        ctrl(&mut app, '`');
+        assert!(app.tool_pane.is_visible());
+        assert_eq!(app.focus, Focus::Tool);
+        let screen = draw(&mut app, 40, 20);
+        let divider = screen.iter().position(|r| r.contains('─')).unwrap();
+        assert!(divider > 1 && divider < 18, "divider row {divider}");
+        assert!(screen[divider + 1].contains("Shell"), "{screen:#?}");
+
+        // Ctrl+. and Ctrl+, flip focus between the two views.
+        ctrl(&mut app, '.');
+        assert_eq!(app.focus, Focus::Editor);
+        ctrl(&mut app, ',');
+        assert_eq!(app.focus, Focus::Tool);
+
+        // Ctrl+` again hides it and returns to the editor.
+        ctrl(&mut app, '`');
+        assert!(!app.tool_pane.is_visible());
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dragging_the_divider_resizes_the_split() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        ctrl(&mut app, '`');
+        draw(&mut app, 40, 20);
+        let start = app.divider_area.y;
+        let tall_editor = app.editor_area.height;
+        // Drag the divider up: the editor shrinks, the tool grows.
+        mouse_at(&mut app, MouseEventKind::Down(MouseButton::Left), 5, start);
+        mouse_at(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            5,
+            start - 4,
+        );
+        mouse_at(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            5,
+            start - 4,
+        );
+        draw(&mut app, 40, 20);
+        assert!(
+            app.editor_area.height < tall_editor,
+            "editor did not shrink"
+        );
+        assert!(app.divider_area.y < start, "divider did not move up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clicking_a_view_focuses_it() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        ctrl(&mut app, '`');
+        draw(&mut app, 40, 20);
+        assert_eq!(app.focus, Focus::Tool);
+        // Click in the editor: focus moves there.
+        click(&mut app, 6, 2);
+        assert_eq!(app.focus, Focus::Editor);
+        // Click in the tool's terminal: focus moves back.
+        let row = app.tool_term_area.y;
+        click(&mut app, 6, row);
+        assert_eq!(app.focus, Focus::Tool);
     }
 
     #[test]
@@ -2112,7 +2644,8 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, contents).unwrap();
         }
-        let app = App::new(Project::open(dir.path()).unwrap());
+        let (events, _events_rx) = std::sync::mpsc::channel();
+        let app = App::new(Project::open(dir.path()).unwrap(), events);
         (dir, app)
     }
 

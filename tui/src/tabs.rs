@@ -6,6 +6,10 @@
 //! can be resolved to a tab or its close button. When the tabs don't all
 //! fit, the bar scrolls horizontally just enough to keep the active tab in
 //! view.
+//!
+//! The bar serves both the editor and the tool pane. Whichever of them
+//! doesn't have the keyboard focus draws its active tab in the theme's
+//! unfocused colors, which is how the user tells where their typing goes.
 
 use crate::theme::Theme;
 use ratatui::buffer::Buffer;
@@ -60,6 +64,7 @@ impl TabBar {
         theme: &Theme,
         tabs: &[TabLabel],
         active: usize,
+        focused: bool,
     ) {
         self.area = area;
         self.extents.clear();
@@ -97,12 +102,20 @@ impl TabBar {
             self.offset = start;
         }
 
+        let (active_text, active_background) = if focused {
+            (theme.active_tab_text, theme.active_tab_background)
+        } else {
+            (
+                theme.unfocused_active_tab_text,
+                theme.unfocused_active_tab_background,
+            )
+        };
         let active_style = Style::default()
-            .fg(theme.active_tab_text)
-            .bg(theme.active_tab_background)
+            .fg(active_text)
+            .bg(active_background)
             .add_modifier(Modifier::BOLD);
         let edge = Style::default()
-            .fg(theme.active_tab_background)
+            .fg(active_background)
             .bg(theme.inactive_tab_background);
         let visible = self.offset..self.offset + width;
         for (index, (label, &(start, end))) in labels.iter().zip(&positions).enumerate() {
