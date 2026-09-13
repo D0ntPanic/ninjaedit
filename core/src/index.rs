@@ -17,6 +17,12 @@
 //! (other tools, agents in another terminal, git operations) are picked up
 //! automatically. UI code can poll [`FileIndex::generation`] to learn when the
 //! tree has changed and needs redrawing.
+//!
+//! An index can also be [shallow](FileIndex::shallow): it lists the root
+//! directory's own entries and stops there, never descending into
+//! subdirectories (and watching only the root). That's for editing files
+//! in a directory that isn't a project, where crawling everything beneath
+//! it, say the whole filesystem, would be far more work than was asked for.
 
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -100,6 +106,9 @@ struct State {
 
 struct Shared {
     root_path: PathBuf,
+    /// Whether subdirectories are scanned at all. A shallow index only
+    /// ever holds the root's own entries.
+    recursive: bool,
     state: Mutex<State>,
     cond: Condvar,
     generation: AtomicU64,
@@ -122,10 +131,23 @@ pub struct FileIndex {
 impl FileIndex {
     /// Start indexing `root` in the background and watching it for changes.
     pub fn new(root: impl Into<PathBuf>) -> FileIndex {
-        let root: PathBuf = root.into();
+        FileIndex::start(root.into(), true)
+    }
+
+    /// Start indexing only the entries of `root` itself, in the
+    /// background, and watching that directory (not its subdirectories)
+    /// for changes. Subdirectories are listed but never scanned, so
+    /// [`children`](Self::children) of one is `None` and
+    /// [`files`](Self::files) holds only the root's own files.
+    pub fn shallow(root: impl Into<PathBuf>) -> FileIndex {
+        FileIndex::start(root.into(), false)
+    }
+
+    fn start(root: PathBuf, recursive: bool) -> FileIndex {
         let root = fs::canonicalize(&root).unwrap_or(root);
         let shared = Arc::new(Shared {
             root_path: root.clone(),
+            recursive,
             state: Mutex::new(State {
                 root: DirNode::new(OsString::new(), false),
                 primary_done: false,
@@ -144,7 +166,12 @@ impl FileIndex {
             let _ = watcher_tx.send(Msg::Fs(event));
         })
         .and_then(|mut watcher| {
-            watcher.watch(&root, RecursiveMode::Recursive)?;
+            let mode = if recursive {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+            watcher.watch(&root, mode)?;
             Ok(watcher)
         })
         .ok();
@@ -166,6 +193,12 @@ impl FileIndex {
     /// The project root being indexed (canonicalized).
     pub fn root(&self) -> &Path {
         &self.shared.root_path
+    }
+
+    /// Whether the index descends into subdirectories, as opposed to a
+    /// [shallow](Self::shallow) index of the root's own entries only.
+    pub fn is_recursive(&self) -> bool {
+        self.shared.recursive
     }
 
     /// Whether every non-ignored directory has been scanned. Searches over
@@ -630,8 +663,10 @@ impl Worker {
                 })
                 .collect();
         }
-        for (path, ignored) in to_enqueue {
-            self.enqueue(path, ignored);
+        if self.shared.recursive {
+            for (path, ignored) in to_enqueue {
+                self.enqueue(path, ignored);
+            }
         }
         self.shared.generation.fetch_add(1, Ordering::Release);
     }
@@ -778,6 +813,49 @@ mod tests {
         // Files inside an ignored directory are ignored by inheritance.
         let target_debug = index.children(Path::new("target").join("debug")).unwrap();
         assert!(target_debug.iter().all(|e| e.ignored));
+    }
+
+    #[test]
+    fn shallow_index_stops_at_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        build_tree(dir.path());
+        let index = FileIndex::shallow(dir.path());
+        assert!(!index.is_recursive());
+        assert!(index.wait_for_full(WAIT), "indexing did not finish");
+        let root = index.root().to_path_buf();
+
+        assert_eq!(
+            relative(index.files(false), &root),
+            vec![".gitignore", "README.md"]
+        );
+        assert_eq!(
+            relative(index.files(true), &root),
+            vec![".gitignore", "README.md", "notes.log"]
+        );
+        // Subdirectories are listed, but their contents are never looked at.
+        let dirs: Vec<_> = index
+            .children("")
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.is_dir)
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(dirs, vec![".git", "src", "sub", "target"]);
+        assert!(index.children("src").is_none());
+
+        // Changes in the root are still picked up; those below it are not.
+        write(&root.join("new.rs"), "new");
+        assert!(
+            eventually(|| relative(index.files(false), &root).contains(&"new.rs".to_string())),
+            "new root file was not picked up by the watcher"
+        );
+        write(&root.join("src/new_file.rs"), "new");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(index.children("src").is_none());
+        assert_eq!(
+            relative(index.files(false), &root),
+            vec![".gitignore", "README.md", "new.rs"]
+        );
     }
 
     #[test]

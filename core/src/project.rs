@@ -5,6 +5,13 @@
 //! equal iff their roots are the same directory). Everything else it carries,
 //! such as the file index, is transient state that is rebuilt on open and
 //! maintained in the background so the project itself opens instantly.
+//!
+//! Not every directory the editor is started in is a project. One that
+//! isn't inside a git repository is opened as a plain
+//! [directory](ProjectKind::Directory): its own files are indexed so they
+//! can be opened quickly, but nothing beneath it is, since a user who
+//! starts the editor in, say, their home directory or the root of the
+//! filesystem to edit one file hasn't asked for all of that to be crawled.
 
 use crate::buffer::FileBuffer;
 use crate::index::FileIndex;
@@ -12,9 +19,24 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// What a [`Project`] is: a real project, or a lone directory being
+/// edited in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectKind {
+    /// A project proper, indexed in full: the working tree of a git
+    /// repository, or any directory opened as one with
+    /// [`Project::open`].
+    Project,
+    /// A directory that isn't part of a project, opened with
+    /// [`Project::open_directory`]. Only its own files are indexed; its
+    /// subdirectories are listed but never descended into.
+    Directory,
+}
+
 /// A project rooted at a directory.
 pub struct Project {
     root: PathBuf,
+    kind: ProjectKind,
     index: FileIndex,
 }
 
@@ -24,6 +46,17 @@ impl Project {
     /// so callers that need a complete file list should go through the
     /// index's wait methods.
     pub fn open(root: impl AsRef<Path>) -> io::Result<Project> {
+        Project::open_as(root.as_ref(), ProjectKind::Project)
+    }
+
+    /// Open `root` as a lone [directory](ProjectKind::Directory) rather
+    /// than a project: only its own files are indexed, and only it is
+    /// watched for changes. Returns immediately like [`open`](Self::open).
+    pub fn open_directory(root: impl AsRef<Path>) -> io::Result<Project> {
+        Project::open_as(root.as_ref(), ProjectKind::Directory)
+    }
+
+    fn open_as(root: &Path, kind: ProjectKind) -> io::Result<Project> {
         let root = fs::canonicalize(root)?;
         if !root.is_dir() {
             return Err(io::Error::new(
@@ -31,20 +64,28 @@ impl Project {
                 format!("{} is not a directory", root.display()),
             ));
         }
-        let index = FileIndex::new(root.clone());
-        Ok(Project { root, index })
+        let index = match kind {
+            ProjectKind::Project => FileIndex::new(root.clone()),
+            ProjectKind::Directory => FileIndex::shallow(root.clone()),
+        };
+        Ok(Project { root, kind, index })
     }
 
     /// Open the project that contains `path`: the working tree of the git
-    /// repository `path` belongs to, or `path` itself if it is not inside a
-    /// repository (or the repository is bare). `path` must be a directory.
+    /// repository `path` belongs to, indexed in full. If `path` is not
+    /// inside a repository (or the repository is bare), it isn't in a
+    /// project at all, and `path` itself is opened as a lone
+    /// [directory](ProjectKind::Directory) instead. `path` must be a
+    /// directory.
     pub fn discover(path: impl AsRef<Path>) -> io::Result<Project> {
         let path = path.as_ref();
-        let root = git2::Repository::discover(path)
+        let workdir = git2::Repository::discover(path)
             .ok()
-            .and_then(|repo| repo.workdir().map(Path::to_path_buf))
-            .unwrap_or_else(|| path.to_path_buf());
-        Project::open(root)
+            .and_then(|repo| repo.workdir().map(Path::to_path_buf));
+        match workdir {
+            Some(root) => Project::open(root),
+            None => Project::open_directory(path),
+        }
     }
 
     /// The project's root directory (canonicalized).
@@ -52,7 +93,14 @@ impl Project {
         &self.root
     }
 
-    /// The project's display name: the root directory's name.
+    /// Whether this is a project proper or a lone directory.
+    pub fn kind(&self) -> ProjectKind {
+        self.kind
+    }
+
+    /// The project's display name: the root directory's name (or the
+    /// whole root path for a directory without one, like the root of the
+    /// filesystem).
     pub fn name(&self) -> String {
         self.root
             .file_name()
@@ -135,12 +183,36 @@ mod tests {
         let nested = root.join("a").join("b");
         fs::create_dir_all(&nested).unwrap();
 
-        // Not a repository: the directory itself is the project.
-        assert_eq!(Project::discover(&nested).unwrap().root(), nested);
+        // Not a repository: the directory itself is opened, as a lone
+        // directory rather than a project.
+        let lone = Project::discover(&nested).unwrap();
+        assert_eq!(lone.root(), nested);
+        assert_eq!(lone.kind(), ProjectKind::Directory);
+        assert!(!lone.index().is_recursive());
 
         git2::Repository::init(&root).unwrap();
-        assert_eq!(Project::discover(&nested).unwrap().root(), root);
+        let found = Project::discover(&nested).unwrap();
+        assert_eq!(found.root(), root);
+        assert_eq!(found.kind(), ProjectKind::Project);
+        assert!(found.index().is_recursive());
         assert_eq!(Project::discover(&root).unwrap().root(), root);
+    }
+
+    #[test]
+    fn directory_indexes_only_its_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("top.txt"), "top").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub").join("deep.txt"), "deep").unwrap();
+
+        let project = Project::open_directory(dir.path()).unwrap();
+        assert!(project.index().wait_for_full(Duration::from_secs(10)));
+        let files = project.index().files(true);
+        assert_eq!(files, vec![project.root().join("top.txt")]);
+
+        let project = Project::open(dir.path()).unwrap();
+        assert!(project.index().wait_for_full(Duration::from_secs(10)));
+        assert_eq!(project.index().files(true).len(), 2);
     }
 
     #[test]

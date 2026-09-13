@@ -30,7 +30,7 @@ use crossterm::event::{
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::terminal::supports_keyboard_enhancement;
+use crossterm::terminal::{SetTitle, supports_keyboard_enhancement};
 use ninjaedit_core::{Project, Storage};
 use std::io::{self, stdout};
 use std::path::PathBuf;
@@ -70,8 +70,9 @@ fn main() -> io::Result<()> {
         None => Theme::default(),
     };
 
-    // The project is the git repository the current directory belongs to,
-    // or the current directory itself if it isn't inside one.
+    // The project is the git repository the current directory belongs to.
+    // If it isn't inside one there is no project: the directory itself is
+    // opened, with just its own files indexed.
     let cwd = std::env::current_dir()?;
     let project = Project::discover(&cwd)?;
 
@@ -108,7 +109,7 @@ fn main() -> io::Result<()> {
         hook(info);
     }));
     let mut terminal = ratatui::init();
-    execute!(stdout(), EnableMouseCapture)?;
+    execute!(stdout(), EnableMouseCapture, SetTitle(app.window_title()))?;
     // Where the terminal supports the kitty keyboard protocol, ask for
     // unambiguous key codes: without them Ctrl+Shift+F arrives as the same
     // byte as Ctrl+F.

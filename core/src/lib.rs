@@ -30,7 +30,7 @@ pub use highlight_cache::HighlightCache;
 pub use indent::Indentation;
 pub use index::{FileIndex, FileList, IndexEntry};
 pub use line_edit::LineEdit;
-pub use project::Project;
+pub use project::{Project, ProjectKind};
 pub use project_search::{ProjectMatch, ProjectSearch};
 pub use search::{Search, SearchStep};
 pub use settings::{Category, SettingKey, Settings, SettingsError};

@@ -129,7 +129,8 @@ use ninjaedit_core::build::root_candidates;
 use ninjaedit_core::search::literal_query;
 use ninjaedit_core::terminal::{Command, ExitStatus, Output, Session, SessionId};
 use ninjaedit_core::{
-    BuildConfig, BuildRoot, Editor, Job, Project, ProjectMatch, SearchStep, Settings, Step, Storage,
+    BuildConfig, BuildRoot, Editor, Job, Project, ProjectKind, ProjectMatch, SearchStep, Settings,
+    Step, Storage,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -548,6 +549,16 @@ impl App {
             Ok(()) => format!("Saved {title}"),
             Err(err) => format!("Could not save {title}: {err}"),
         });
+    }
+
+    /// The title for the terminal window: the editor's name and the
+    /// project's, or the directory's path when there isn't a project.
+    pub fn window_title(&self) -> String {
+        let location = match self.project.kind() {
+            ProjectKind::Project => self.project.name(),
+            ProjectKind::Directory => self.project.root().display().to_string(),
+        };
+        format!("{EDITOR_NAME} — {location}")
     }
 
     /// A path for display: relative to the project when inside it.
@@ -2076,7 +2087,7 @@ impl App {
                         tab.view.set_covered_rows(covered);
                         cursor = tab.view.render(self.editor_area, buf, theme);
                     }
-                    None => render_empty(self.editor_area, buf, theme),
+                    None => render_empty(self.editor_area, buf, theme, &self.project),
                 }
             }
             Mode::Settings(view) => {
@@ -2233,16 +2244,10 @@ impl App {
             .current_target()
             .map(|(_, t)| format!("▸ {} ", t.name))
             .unwrap_or_default();
-        let mut project = format!(" {} ", self.project.name());
         let width_of = |text: &str| Span::raw(text).width() as u16;
         let position_width = position.as_deref().map_or(0, width_of);
-        // Drop the project name, then the build segments, when there's
-        // no room for them beside the position.
-        if position_width + width_of(&configuration) + width_of(&target) + width_of(&project) + 20
-            > area.width
-        {
-            project.clear();
-        }
+        // Drop the build segments when there's no room for them beside
+        // the position.
         if position_width + width_of(&configuration) + width_of(&target) + 20 > area.width {
             configuration.clear();
             target.clear();
@@ -2251,7 +2256,6 @@ impl App {
             (position.unwrap_or_default(), theme.status_bar_position_text),
             (configuration, theme.status_bar_position_text),
             (target, theme.status_bar_position_text),
-            (project, theme.status_bar_project_text),
         ];
         let mode_hint = match &self.mode {
             Mode::Editor => "",
@@ -2327,41 +2331,74 @@ fn render_divider(area: Rect, buf: &mut Buffer, theme: &Theme) {
     }
 }
 
-fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme) {
+/// The name of the editor, as shown on the empty page and in the
+/// terminal's title.
+pub const EDITOR_NAME: &str = "Ninja Edit";
+
+/// What's shown on the empty page under the editor's name when the
+/// directory the editor was started in isn't part of a project.
+const NOT_A_PROJECT: &str = "not a project: only this directory's own files are indexed";
+
+/// The page shown where the editor would be when no file is open: the
+/// editor's name, where it was started (the project, or the directory
+/// when there isn't a project), and the keys to get going with.
+fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme, project: &Project) {
     buf.set_style(area, Style::default().bg(theme.view_background));
     if area.height == 0 {
         return;
     }
-    let lines = [
-        "No files open",
-        "",
-        "Ctrl+O         open a project file",
-        "Ctrl+Shift+F   search in project files",
-        "Ctrl+T         switch between open tabs",
-        "Ctrl+`         open a shell below the editor",
-        "Ctrl+B         build the current target (Ctrl+R runs it)",
-        "Ctrl+E         switch views: editor, pages, tools",
-        "Ctrl+]         in a tool, prefix for the editor's keys",
-        "Ctrl+Q         quit",
-    ];
+    // A path too wide for the view keeps its end, the part that says
+    // where this is, behind an ellipsis.
+    let mut location = project.root().display().to_string();
+    let width = area.width as usize;
+    let chars = location.chars().count();
+    if chars > width && width > 0 {
+        location = std::iter::once('…')
+            .chain(location.chars().skip(chars + 1 - width))
+            .collect();
+    }
+    let (open_hint, note) = match project.kind() {
+        ProjectKind::Project => ("Ctrl+O         open a project file", None),
+        ProjectKind::Directory => (
+            "Ctrl+O         open a file in this directory",
+            Some(NOT_A_PROJECT),
+        ),
+    };
+    let mut lines: Vec<(&str, bool)> = vec![(EDITOR_NAME, true), (&location, false)];
+    lines.extend(note.map(|note| (note, false)));
+    lines.extend(
+        [
+            "",
+            "No files open",
+            "",
+            open_hint,
+            "Ctrl+Shift+F   search in project files",
+            "Ctrl+T         switch between open tabs",
+            "Ctrl+`         open a shell below the editor",
+            "Ctrl+B         build the current target (Ctrl+R runs it)",
+            "Ctrl+E         switch views: editor, pages, tools",
+            "Ctrl+]         in a tool, prefix for the editor's keys",
+            "Ctrl+Q         quit",
+        ]
+        .map(|line| (line, false)),
+    );
     let top = area.y + area.height.saturating_sub(lines.len() as u16) / 2;
-    for (i, line) in lines.iter().enumerate() {
+    let base = Style::default()
+        .fg(theme.view_text)
+        .bg(theme.view_background);
+    for (i, (line, heading)) in lines.iter().enumerate() {
         let y = top + i as u16;
         if y >= area.bottom() {
             break;
         }
         let width = Span::raw(*line).width() as u16;
         let x = area.x + area.width.saturating_sub(width) / 2;
-        buf.set_stringn(
-            x,
-            y,
-            line,
-            area.width as usize,
-            Style::default()
-                .fg(theme.view_text)
-                .bg(theme.view_background)
-                .add_modifier(Modifier::DIM),
-        );
+        let style = if *heading {
+            base.add_modifier(Modifier::BOLD)
+        } else {
+            base.add_modifier(Modifier::DIM)
+        };
+        buf.set_stringn(x, y, line, area.width as usize, style);
     }
 }
 
@@ -3357,6 +3394,50 @@ mod tests {
     }
 
     #[test]
+    fn empty_page_names_the_editor_and_the_project() {
+        let (dir, mut app) = project_with_files(&[("a.txt", "one\n")]);
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let screen = draw(&mut app, 80, 20);
+        let text = screen.join("\n");
+        assert!(text.contains(EDITOR_NAME), "{screen:#?}");
+        assert!(text.contains(&root.display().to_string()), "{screen:#?}");
+        assert!(text.contains("No files open"), "{screen:#?}");
+        assert!(text.contains("open a project file"), "{screen:#?}");
+        assert!(!text.contains("not a project"), "{screen:#?}");
+        // The status bar no longer carries the project's name.
+        let name = root.file_name().unwrap().to_string_lossy();
+        assert!(!screen[19].contains(name.as_ref()), "{screen:#?}");
+        assert_eq!(app.window_title(), format!("{EDITOR_NAME} — {name}"));
+    }
+
+    #[test]
+    fn empty_page_says_when_the_directory_is_not_a_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let (events, _events_rx) = std::sync::mpsc::channel();
+        let storage = Storage::new(dir.path().join(".storage"));
+        let mut app = App::new(
+            Project::open_directory(dir.path()).unwrap(),
+            storage,
+            events,
+        );
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let screen = draw(&mut app, 80, 20);
+        let text = screen.join("\n");
+        assert!(text.contains(EDITOR_NAME), "{screen:#?}");
+        assert!(text.contains(&root.display().to_string()), "{screen:#?}");
+        assert!(text.contains(NOT_A_PROJECT), "{screen:#?}");
+        assert!(
+            text.contains("open a file in this directory"),
+            "{screen:#?}"
+        );
+        assert_eq!(
+            app.window_title(),
+            format!("{EDITOR_NAME} — {}", root.display())
+        );
+    }
+
+    #[test]
     fn vertical_scrollbar_tracks_scrolling() {
         let text: String = (1..=40).map(|i| format!("line {i}\n")).collect();
         let (_dir, mut app) = app_with_files(&[("a.txt", &text)]);
@@ -4329,6 +4410,16 @@ mod tests {
         ));
     }
 
+    /// A screen row up to the project search dialog's right border,
+    /// leaving out whatever the empty page behind it shows past the box
+    /// (its location line can be wider than the box).
+    fn boxed(row: &str) -> String {
+        match row.rfind('│') {
+            Some(end) => row[..end + '│'.len_utf8()].to_owned(),
+            None => row.trim_end().to_owned(),
+        }
+    }
+
     /// Wait for the project search to finish, since it runs in the
     /// background.
     fn wait_for_project_search(app: &App) {
@@ -4367,11 +4458,11 @@ mod tests {
         wait_for_project_search(&app);
         let screen = draw(&mut app, 60, 20);
         assert!(screen[3].contains("let needle = 1;"), "{screen:#?}");
-        assert!(screen[3].trim_end().ends_with("a.rs:2│"), "{screen:#?}");
+        assert!(boxed(&screen[3]).ends_with("a.rs:2│"), "{screen:#?}");
         assert!(screen[4].contains("needle"), "{screen:#?}");
-        assert!(screen[4].trim_end().ends_with("b/c.rs:1│"), "{screen:#?}");
+        assert!(boxed(&screen[4]).ends_with("b/c.rs:1│"), "{screen:#?}");
         assert!(screen[5].contains("needle again"), "{screen:#?}");
-        assert!(screen[5].trim_end().ends_with("b/c.rs:3│"), "{screen:#?}");
+        assert!(boxed(&screen[5]).ends_with("b/c.rs:3│"), "{screen:#?}");
         assert!(screen[10].starts_with("  ├"), "{screen:#?}");
         assert!(screen[11].contains("1 │fn alpha() {}"), "{screen:#?}");
         assert!(screen[12].contains("2 │let needle = 1;"), "{screen:#?}");
@@ -4860,14 +4951,14 @@ mod tests {
         type_str(&mut app, "needle");
         wait_for_project_search(&app);
         let screen = draw(&mut app, 60, 20);
-        let row = screen[3].trim_end();
+        let row = boxed(&screen[3]);
         assert!(row.contains("…") && row.contains("needle"), "{row:?}");
         assert!(row.ends_with("yyy…  …/dir/name/f.rs:1│"), "{row:?}");
         assert!(
             !row.contains("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
             "{row:?}"
         );
-        let row = screen[4].trim_end();
+        let row = boxed(&screen[4]);
         assert!(row.ends_with(&format!("{deep}:1│")), "{row:?}");
         assert!(row.contains(" needle "), "{row:?}");
     }

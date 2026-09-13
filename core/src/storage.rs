@@ -46,10 +46,23 @@ pub fn hash_bytes(data: &[u8]) -> u64 {
 
 /// The name of the directory a project's state is kept in, within the
 /// projects directory: the project's name, a dash, and the xxhash64 hash
-/// of its root path as sixteen hex digits.
+/// of its root path as sixteen hex digits. A name that is itself a path,
+/// as the root of the filesystem's is, has its separators replaced so
+/// the result stays one directory name.
 pub fn project_directory_name(project: &Project) -> String {
     let hash = hash_bytes(project.root().as_os_str().as_encoded_bytes());
-    format!("{}-{hash:016x}", project.name())
+    let name: String = project
+        .name()
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    format!("{name}-{hash:016x}")
 }
 
 /// The directory the editor keeps its persistent state in.
