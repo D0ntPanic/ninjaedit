@@ -2562,48 +2562,78 @@ fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme, project: &Project) 
             .collect();
     }
     let (open_hint, note) = match project.kind() {
-        ProjectKind::Project => ("Ctrl+O         open a project file", None),
-        ProjectKind::Directory => (
-            "Ctrl+O         open a file in this directory",
-            Some(NOT_A_PROJECT),
-        ),
+        ProjectKind::Project => ("open a project file", None),
+        ProjectKind::Directory => ("open a file in this directory", Some(NOT_A_PROJECT)),
     };
-    let mut lines: Vec<(&str, bool)> = vec![(EDITOR_NAME, true), (&location, false)];
-    lines.extend(note.map(|note| (note, false)));
-    lines.extend(
-        [
-            "",
-            "No files open",
-            "",
-            open_hint,
-            "Ctrl+Shift+F   search in project files",
-            "Ctrl+T         switch between open tabs",
-            "Ctrl+`         open a shell below the editor",
-            "Ctrl+B         build the current target (Ctrl+R runs it)",
-            "Ctrl+E         switch views: editor, pages, tools",
-            "Ctrl+P         search every command and its key",
-            "Ctrl+]         in a tool, prefix for the editor's keys",
-            "Ctrl+Q         quit",
-        ]
-        .map(|line| (line, false)),
-    );
+    let keys: [(&str, &str); 10] = [
+        ("Ctrl+O", open_hint),
+        ("Ctrl+Shift+F", "search in project files"),
+        ("Ctrl+T", "switch between open tabs"),
+        ("Ctrl+`", "open a shell below the editor"),
+        ("Ctrl+B", "build the current target"),
+        ("Ctrl+R", "run the current target"),
+        ("Ctrl+E", "switch views: editor, pages, tools"),
+        ("Ctrl+P", "search every command and its key"),
+        ("Ctrl+]", "in a tool, prefix for the editor's keys"),
+        ("Ctrl+Q", "quit"),
+    ];
+    // The keys read as a table: every key is padded to the widest one so
+    // the descriptions line up in a column, and the whole table is
+    // centered as one block rather than row by row.
+    let key_column = keys
+        .iter()
+        .map(|(key, _)| Span::raw(*key).width())
+        .max()
+        .unwrap_or(0)
+        + 3;
+    let table: Vec<String> = keys
+        .iter()
+        .map(|(key, description)| format!("{key:<key_column$}{description}"))
+        .collect();
+    let table_width = table
+        .iter()
+        .map(|row| Span::raw(row.as_str()).width())
+        .max()
+        .unwrap_or(0) as u16;
+
+    enum Line<'a> {
+        Heading(&'a str),
+        Centered(&'a str),
+        Row(&'a str),
+    }
+    let mut lines = vec![Line::Heading(EDITOR_NAME), Line::Centered(&location)];
+    lines.extend(note.map(Line::Centered));
+    lines.extend([
+        Line::Centered(""),
+        Line::Centered("No files open"),
+        Line::Centered(""),
+    ]);
+    lines.extend(table.iter().map(|row| Line::Row(row)));
+
     let top = area.y + area.height.saturating_sub(lines.len() as u16) / 2;
     let base = Style::default()
         .fg(theme.view_text)
         .bg(theme.view_background);
-    for (i, (line, heading)) in lines.iter().enumerate() {
+    let table_x = area.x + area.width.saturating_sub(table_width) / 2;
+    for (i, line) in lines.iter().enumerate() {
         let y = top + i as u16;
         if y >= area.bottom() {
             break;
         }
-        let width = Span::raw(*line).width() as u16;
-        let x = area.x + area.width.saturating_sub(width) / 2;
-        let style = if *heading {
-            base.add_modifier(Modifier::BOLD)
-        } else {
-            base.add_modifier(Modifier::DIM)
+        let (text, x, style) = match line {
+            Line::Heading(text) => {
+                let width = Span::raw(*text).width() as u16;
+                let x = area.x + area.width.saturating_sub(width) / 2;
+                (*text, x, base.add_modifier(Modifier::BOLD))
+            }
+            Line::Centered(text) => {
+                let width = Span::raw(*text).width() as u16;
+                let x = area.x + area.width.saturating_sub(width) / 2;
+                (*text, x, base.add_modifier(Modifier::DIM))
+            }
+            Line::Row(text) => (*text, table_x, base.add_modifier(Modifier::DIM)),
         };
-        buf.set_stringn(x, y, line, area.width as usize, style);
+        buf.set_stringn(x, y, text, area.width as usize, style);
     }
 }
 
@@ -3777,6 +3807,32 @@ mod tests {
         let name = root.file_name().unwrap().to_string_lossy();
         assert!(!screen[19].contains(name.as_ref()), "{screen:#?}");
         assert_eq!(app.window_title(), format!("{EDITOR_NAME} — {name}"));
+    }
+
+    #[test]
+    fn empty_page_lays_the_keys_out_as_a_table() {
+        let (_dir, mut app) = project_with_files(&[("a.txt", "one\n")]);
+        let screen = draw(&mut app, 80, 24);
+        // The last line is the status bar, which mentions keys of its own.
+        let rows: Vec<&String> = screen[..screen.len() - 1]
+            .iter()
+            .filter(|l| l.contains("Ctrl+"))
+            .collect();
+        assert_eq!(rows.len(), 10, "{screen:#?}");
+        // Every key starts in the same column, and so does every description.
+        let key_column = rows[0].find("Ctrl+").unwrap();
+        let description_column = rows[0].find("open a project file").unwrap();
+        for row in &rows {
+            assert_eq!(row.find("Ctrl+"), Some(key_column), "{row:?}");
+            let description = row[key_column..].trim_start_matches(|c: char| !c.is_whitespace());
+            let description_start = row.len() - description.trim_start().len();
+            assert_eq!(description_start, description_column, "{row:?}");
+        }
+        // The table is centered as a block: its widest row has as much
+        // room on the left as on the right.
+        let widest = rows.iter().map(|r| r.trim_end().len()).max().unwrap();
+        let right = 80 - widest;
+        assert!(key_column.abs_diff(right) <= 1, "{screen:#?}");
     }
 
     #[test]
