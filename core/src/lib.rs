@@ -39,5 +39,5 @@ pub use project_search::{ProjectMatch, ProjectSearch};
 pub use search::{Search, SearchStep};
 pub use settings::{Category, SettingKey, Settings, SettingsError};
 pub use storage::Storage;
-pub use syntax::{Highlighter, Language, Token, TokenKind};
+pub use syntax::{ConflictSide, Highlighter, Language, Token, TokenKind};
 pub use terminal::Terminal;

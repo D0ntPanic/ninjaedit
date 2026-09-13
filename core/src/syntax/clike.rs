@@ -836,6 +836,7 @@ impl Lexer for Spec {
                 | Some(Context::Fence { .. })
                 | Some(Context::Paragraph)
                 | Some(Context::Bracket { .. })
+                | Some(Context::Conflict { .. })
                 | None => lx.next_token(&mut state),
                 Some(Context::Preprocessor) => unreachable!("popped at line start"),
             };

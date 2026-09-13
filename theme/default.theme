@@ -30,6 +30,11 @@ command-palette-selection-text = "black"
 project-search-location-text = "dimmed"
 search-preview-background = "dark"
 
+# The lines of a merge conflict, by side, from each marker to the next.
+conflict-ours-background = "dark-green"
+conflict-base-background = "dark-grey"
+conflict-theirs-background = "dark-indigo"
+
 # The active tab of whichever view doesn't have the keyboard focus.
 unfocused-active-tab-background = "mid"
 unfocused-active-tab-text = "alt"
@@ -89,6 +94,7 @@ syntax-link = "light-cyan"
 syntax-list-marker = "orange"
 syntax-quote = "/alt"
 syntax-variable = "lavender"
+syntax-conflict-marker = "*red"
 
 [names]
 black = "#000000"
@@ -104,6 +110,9 @@ content = "#e0e0e0"
 alt = "#a0a0a0"
 dimmed = "#707070"
 dark-dimmed = "#404040"
+dark-grey = "#353535"
+dark-green = "#2d3f30"
+dark-indigo = "#2d3648"
 green = "#a2d9af"
 light-green = "#c3e6bd"
 lavender = "#c4b5e6"

@@ -4399,6 +4399,44 @@ mod tests {
     }
 
     #[test]
+    fn conflict_tint_reaches_the_screen() {
+        // A file of unknown kind still gets its conflict highlighted.
+        let (_dir, mut app) = app_with_files(&[(
+            "a.txt",
+            "top\n<<<<<<< editor\nours\n=======\ntheirs\n>>>>>>> disk\nend\n",
+        )]);
+        app.set_theme(
+            Theme::parse(
+                "conflict-ours-background = \"#010203\"\n\
+                 conflict-theirs-background = \"#040506\"\n\
+                 syntax-conflict-marker = \"*#070809\"\n",
+            )
+            .unwrap(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(20, 9)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let default = Theme::default();
+        // Rows 1..=7 are the file's lines; the gutter is 4 wide.
+        assert_eq!(buffer[(4, 1)].bg, default.view_background);
+        let marker = &buffer[(4, 2)];
+        assert_eq!(marker.symbol(), "<");
+        assert_eq!(marker.fg, Color::Rgb(7, 8, 9));
+        assert!(marker.modifier.contains(Modifier::BOLD));
+        assert_eq!(marker.bg, Color::Rgb(1, 2, 3));
+        // The tint runs past the end of the text, but not into the gutter.
+        assert_eq!(buffer[(4, 3)].bg, Color::Rgb(1, 2, 3));
+        assert_eq!(buffer[(15, 3)].bg, Color::Rgb(1, 2, 3));
+        assert_eq!(buffer[(1, 3)].bg, default.view_background);
+        assert_eq!(buffer[(4, 4)].bg, Color::Rgb(4, 5, 6));
+        assert_eq!(buffer[(4, 5)].bg, Color::Rgb(4, 5, 6));
+        assert_eq!(buffer[(4, 6)].bg, Color::Rgb(4, 5, 6));
+        assert_eq!(buffer[(4, 7)].bg, default.view_background);
+        // Text inside keeps the view's text color over the tint.
+        assert_eq!(buffer[(4, 5)].fg, default.view_text);
+    }
+
+    #[test]
     fn active_tab_has_sloped_edges() {
         let (_dir, mut app) = app_with_files(&[("a.txt", ""), ("b.txt", ""), ("c.txt", "")]);
         app.activate(1);

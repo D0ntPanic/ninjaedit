@@ -59,7 +59,9 @@ impl FileStates {
     pub fn tokens(&self, line: usize, content: &[u8]) -> Vec<Token> {
         let mut tokens = Vec::new();
         if let Some(&state) = self.states.get(line) {
-            self.language.lexer().lex_line(state, content, &mut tokens);
+            self.language
+                .file_lexer()
+                .lex_line(state, content, &mut tokens);
         }
         tokens
     }
@@ -250,7 +252,7 @@ fn run_worker(shared: Arc<Shared>) {
 /// in.
 fn lex_file(path: &Path, buffers: &Buffers) -> Option<FileStates> {
     let language = Language::from_path(path)?;
-    let lexer = language.lexer();
+    let lexer = language.file_lexer();
     let mut state = LexState::default();
     let mut states = Vec::new();
     let mut scratch = Vec::new();

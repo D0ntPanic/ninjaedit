@@ -360,6 +360,21 @@ impl EditorView {
             };
             buf.set_string(area.x + 1, y, &number, text_style.fg(color));
 
+            // The lines of a merge conflict are tinted by side, across
+            // the whole text area; the text keeps its syntax colors.
+            let row_style = match self
+                .editor
+                .conflict_side(line)
+                .and_then(|side| theme.conflict_background(side))
+            {
+                Some(background) => {
+                    let row_style = text_style.bg(background);
+                    buf.set_style(Rect::new(self.text.x, y, self.text.width, 1), row_style);
+                    row_style
+                }
+                None => text_style,
+            };
+
             let visible = self.scroll_col..self.scroll_col + text_width;
             for cell in cells {
                 if cell.width == 0 || cell.column + cell.width <= visible.start {
@@ -390,7 +405,7 @@ impl EditorView {
                     }
                     _ if in_current => syntax.apply(found_current),
                     _ if in_match => syntax.apply(found),
-                    _ => syntax.apply(text_style),
+                    _ => syntax.apply(row_style),
                 };
                 let fits = cell.column >= visible.start && cell.column + cell.width <= visible.end;
                 let start = cell.column.max(visible.start);

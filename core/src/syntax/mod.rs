@@ -24,13 +24,19 @@
 //! by whether a call follows, `Foo::bar` marks `Foo` as a type by its
 //! capital and `foo::bar` marks `foo` as a namespace, and so on; see the
 //! [`clike`] module for the rules. The [`Language`] of a file is chosen by
-//! its extension.
+//! its extension; a file whose kind isn't known is [`Language::Plain`].
+//!
+//! Merge conflict markers belong to no language, so a file's lexer (see
+//! [`Language::file_lexer`]) is its language's lexer wrapped in one that
+//! recognizes them in any file; see the [`conflicts`] module.
 
 mod clike;
 mod cmake;
+mod conflicts;
 mod highlighter;
 mod json;
 mod markdown;
+mod plain;
 mod toml;
 
 pub use highlighter::Highlighter;
@@ -110,6 +116,9 @@ pub enum TokenKind {
     /// A variable reference in languages that mark them, such as `${var}`
     /// in CMake.
     Variable,
+    /// A merge conflict marker line: `<<<<<<<`, `|||||||`, `=======`, or
+    /// `>>>>>>>` with its label. See the [`conflicts`] module.
+    ConflictMarker,
 }
 
 impl TokenKind {
@@ -151,10 +160,11 @@ impl TokenKind {
         TokenKind::ListMarker,
         TokenKind::Quote,
         TokenKind::Variable,
+        TokenKind::ConflictMarker,
     ];
 
     /// The number of kinds; `index` is always below it.
-    pub const COUNT: usize = 36;
+    pub const COUNT: usize = 37;
 
     /// A stable index for tables, `0..COUNT`.
     pub fn index(self) -> usize {
@@ -200,6 +210,7 @@ impl TokenKind {
             TokenKind::ListMarker => "list-marker",
             TokenKind::Quote => "quote",
             TokenKind::Variable => "variable",
+            TokenKind::ConflictMarker => "conflict-marker",
         }
     }
 
@@ -223,6 +234,7 @@ impl TokenKind {
             TokenKind::Heading | TokenKind::ListMarker => TokenKind::Keyword,
             TokenKind::Link => TokenKind::String,
             TokenKind::Quote => TokenKind::Comment,
+            TokenKind::ConflictMarker => TokenKind::Invalid,
             TokenKind::Strong | TokenKind::Emphasis => return None,
             TokenKind::Keyword
             | TokenKind::Operator
@@ -248,6 +260,8 @@ pub struct Token {
 /// A language with a lexer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Language {
+    /// Text of no known kind, which gets no highlighting of its own.
+    Plain,
     Rust,
     C,
     Cpp,
@@ -263,7 +277,8 @@ pub enum Language {
 
 impl Language {
     /// Every language, in a stable order; see [`index`](Self::index).
-    pub const ALL: [Language; 11] = [
+    pub const ALL: [Language; 12] = [
+        Language::Plain,
         Language::Rust,
         Language::C,
         Language::Cpp,
@@ -310,8 +325,9 @@ impl Language {
         })
     }
 
-    /// Guess a file's language from its name. Headers are treated as C++,
-    /// which highlights C correctly as well.
+    /// Guess a file's language from its name, or `None` when nothing is
+    /// known about it (the file is then [`Plain`](Self::Plain)). Headers
+    /// are treated as C++, which highlights C correctly as well.
     pub fn from_path(path: &Path) -> Option<Language> {
         let name = path.file_name()?.to_str()?;
         match name {
@@ -346,6 +362,7 @@ impl Language {
 
     pub fn name(self) -> &'static str {
         match self {
+            Language::Plain => "Plain Text",
             Language::Rust => "Rust",
             Language::C => "C",
             Language::Cpp => "C++",
@@ -360,9 +377,12 @@ impl Language {
         }
     }
 
-    /// The lexer for this language.
+    /// The lexer for this language alone. Highlighting a file should use
+    /// [`file_lexer`](Self::file_lexer) instead; this is for lexers that
+    /// embed one language in another, such as Markdown's code fences.
     pub fn lexer(self) -> &'static dyn Lexer {
         match self {
+            Language::Plain => &plain::Plain,
             Language::Rust => &clike::RUST,
             Language::C => &clike::C,
             Language::Cpp => &clike::CPP,
@@ -376,6 +396,43 @@ impl Language {
             Language::CMake => &cmake::CMake,
         }
     }
+
+    /// The lexer for a file in this language: the language's own lexer,
+    /// with merge conflict markers recognized throughout (see the
+    /// [`conflicts`] module).
+    pub fn file_lexer(self) -> &'static dyn Lexer {
+        &FILE_LEXERS[self.index() as usize]
+    }
+}
+
+/// One [`Conflicts`](conflicts::Conflicts) wrapper per language, indexed
+/// by [`Language::index`].
+static FILE_LEXERS: [conflicts::Conflicts; Language::ALL.len()] = {
+    let mut lexers = [conflicts::Conflicts {
+        inner: Language::Plain,
+    }; Language::ALL.len()];
+    let mut i = 0;
+    while i < Language::ALL.len() {
+        lexers[i] = conflicts::Conflicts {
+            inner: Language::ALL[i],
+        };
+        i += 1;
+    }
+    lexers
+};
+
+/// Which side of a merge conflict a line is on; see the [`conflicts`]
+/// module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ConflictSide {
+    /// Between `<<<<<<<` and the next marker: the lines as this side had
+    /// them. For the editor's own merges, the buffer's unsaved edits.
+    Ours,
+    /// Between `|||||||` and `=======`: the lines both sides started from.
+    Base,
+    /// Between `=======` and `>>>>>>>`: the lines as the other side has
+    /// them. For the editor's own merges, the file on disk.
+    Theirs,
 }
 
 /// A lexer for one language. Implementations are stateless; everything
@@ -438,6 +495,9 @@ pub enum Context {
     /// Inside a CMake bracket argument or comment, `[=[ ... ]=]` with
     /// `equals` equals signs.
     Bracket { equals: u8, comment: bool },
+    /// Inside one side of a merge conflict. Always the outermost context;
+    /// see the [`conflicts`] module.
+    Conflict { side: ConflictSide },
 }
 
 /// The lexer state at a line boundary: a small stack of the
@@ -545,7 +605,7 @@ impl LexState {
 /// line. For tests and for highlighting text that isn't in a buffer, such
 /// as a diff hunk.
 pub fn lex_text(language: Language, text: &str) -> Vec<Vec<Token>> {
-    let lexer = language.lexer();
+    let lexer = language.file_lexer();
     let mut state = LexState::default();
     let mut lines = Vec::new();
     for line in text.split_inclusive('\n') {
@@ -736,6 +796,7 @@ pub(super) mod test_support {
             TokenKind::ListMarker => b'-',
             TokenKind::Quote => b'Q',
             TokenKind::Variable => b'$',
+            TokenKind::ConflictMarker => b'X',
         }
     }
 

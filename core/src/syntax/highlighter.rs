@@ -34,7 +34,7 @@
 //! reaches them. Frontends poll [`Highlighter::generation`] to learn when
 //! the worker has changed something worth redrawing.
 
-use super::{Language, LexState, Lexer, Token};
+use super::{ConflictSide, Context, Language, LexState, Lexer, Token};
 use crate::buffer::{BufferSnapshot, FileBuffer};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -111,7 +111,7 @@ impl Highlighter {
         }));
         let generation = Arc::new(AtomicU64::new(0));
         let (jobs, rx) = mpsc::channel();
-        let lexer = language.lexer();
+        let lexer = language.file_lexer();
         let worker_shared = Arc::clone(&shared);
         let worker_generation = Arc::clone(&generation);
         std::thread::Builder::new()
@@ -200,6 +200,26 @@ impl Highlighter {
         let mut tokens = Vec::new();
         self.lexer.lex_line(state, content, &mut tokens);
         tokens
+    }
+
+    /// The side of a merge conflict that `line` is on, if any. A marker
+    /// line counts with the side it opens, and the closing `>>>>>>>` with
+    /// the side it closes, so a whole conflict is covered from its first
+    /// marker to its last. Read from the cached states like
+    /// [`tokens`](Self::tokens), with the same catching up.
+    pub fn conflict_side(&self, buffer: &FileBuffer, line: usize) -> Option<ConflictSide> {
+        // The state at the end of the line is the state at the start of
+        // the next, which is what tells a marker line's own side.
+        self.catch_up(buffer, line + 1);
+        let shared = self.shared.lock().unwrap();
+        let side_at = |line: usize| match shared.states.get(line) {
+            Some(state) if !state.is_unknown() => match state.bottom() {
+                Some(Context::Conflict { side }) => Some(side),
+                _ => None,
+            },
+            _ => None,
+        };
+        side_at(line + 1).or_else(|| side_at(line))
     }
 
     /// Bring the states up to `line` current if the sweep position is
@@ -454,7 +474,7 @@ mod tests {
     /// Lex the whole buffer from scratch and return every line's state,
     /// the reference the incremental states must match.
     fn reference_states(language: Language, buffer: &FileBuffer) -> Vec<LexState> {
-        let lexer = language.lexer();
+        let lexer = language.file_lexer();
         let snapshot = buffer.snapshot();
         let mut lines = snapshot.lines_from(0);
         let mut states = vec![LexState::default()];

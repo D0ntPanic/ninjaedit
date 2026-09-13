@@ -30,7 +30,9 @@
 //!
 //! A few colors are optional, such as `selection-text`: leaving one out
 //! (or setting it to `""`, to undo the default) means the interface falls
-//! back to a related color instead.
+//! back to a related color instead, or to drawing nothing extra: the
+//! `conflict-*-background` colors tint the lines of a merge conflict by
+//! side in the editor, and a side without one keeps the view background.
 //!
 //! Syntax highlighting colors are the `syntax-` keys, one per
 //! [`TokenKind`] (`syntax-keyword`, `syntax-doc-comment`, ...). They may
@@ -48,7 +50,7 @@
 //! is a type; see [`TokenKind::parent`]), and at the root falls back to
 //! `view-text`.
 
-use ninjaedit_core::TokenKind;
+use ninjaedit_core::{ConflictSide, TokenKind};
 use ratatui::style::{Color, Modifier, Style};
 use std::collections::HashMap;
 use std::fmt;
@@ -281,7 +283,29 @@ optional {
     /// (or any other) rather than the palette's. The palette background
     /// when unset.
     search_preview_background => "search-preview-background",
+    /// The background of the lines on our side of a merge conflict in the
+    /// editor, from the `<<<<<<<` marker to the next. The view background
+    /// when unset. See [`ConflictSide`].
+    conflict_ours_background => "conflict-ours-background",
+    /// The background of the common ancestor's lines in a merge conflict,
+    /// from the `|||||||` marker to the `=======`.
+    conflict_base_background => "conflict-base-background",
+    /// The background of the lines on their side of a merge conflict,
+    /// from the `=======` marker to the `>>>>>>>`.
+    conflict_theirs_background => "conflict-theirs-background",
 }
+}
+
+impl Theme {
+    /// The background for the lines on one side of a merge conflict, if
+    /// the theme tints that side.
+    pub fn conflict_background(&self, side: ConflictSide) -> Option<Color> {
+        match side {
+            ConflictSide::Ours => self.conflict_ours_background,
+            ConflictSide::Base => self.conflict_base_background,
+            ConflictSide::Theirs => self.conflict_theirs_background,
+        }
+    }
 }
 
 /// Why a theme could not be loaded.
@@ -549,6 +573,31 @@ mod tests {
         assert!(error("view-text = \"*#000000\"").contains("can't be bold or italic"));
         assert!(error("syntax-nope = \"#000000\"").contains("not a theme color"));
         assert!(error("syntax-comment = \"*\"").contains("nor a named color"));
+    }
+
+    #[test]
+    fn conflict_backgrounds_are_optional() {
+        let theme = Theme::parse(
+            "conflict-ours-background = \"#010203\"\nconflict-theirs-background = \"\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            theme.conflict_background(ConflictSide::Ours),
+            Some(Color::Rgb(1, 2, 3))
+        );
+        assert_eq!(theme.conflict_background(ConflictSide::Theirs), None);
+        assert_eq!(
+            theme.conflict_background(ConflictSide::Base),
+            Theme::default().conflict_base_background
+        );
+        assert!(Theme::default().conflict_ours_background.is_some());
+        assert!(Theme::default().conflict_theirs_background.is_some());
+        assert!(
+            Theme::parse("conflict-ours-background = \"*#010203\"\n")
+                .unwrap_err()
+                .to_string()
+                .contains("interface color")
+        );
     }
 
     #[test]

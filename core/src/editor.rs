@@ -34,11 +34,14 @@
 //! itself unmodified whenever it is back at that point, whether by undo,
 //! redo, or save.
 //!
-//! Syntax highlighting: when the buffer's file has a recognized
-//! [`Language`], the editor keeps a [`Highlighter`] in step with every
-//! edit, and [`Editor::line_cells`] reports each character's
-//! [`TokenKind`] for the frontend to style. See the
-//! [`syntax`](crate::syntax) module.
+//! Syntax highlighting: the editor keeps a [`Highlighter`] for the
+//! buffer's [`Language`] (guessed from the file's name, or
+//! [`Language::Plain`]) in step with every edit, and
+//! [`Editor::line_cells`] reports each character's [`TokenKind`] for the
+//! frontend to style. Merge conflict markers are highlighted in every
+//! language, and [`Editor::conflict_side`] says which side of a conflict a
+//! line is on so a frontend can tint it. See the [`syntax`](crate::syntax)
+//! module.
 //!
 //! Indentation: the editor guesses the buffer's [`Indentation`] style when
 //! it is created (see the [`indent`](crate::indent) module) and uses it for
@@ -87,7 +90,7 @@ use crate::buffer::{BufferSnapshot, DiskChange, FileBuffer};
 use crate::indent::{self, Indentation};
 use crate::merge;
 use crate::search::{Search, SearchStep};
-use crate::syntax::{Highlighter, Language, Token, TokenKind};
+use crate::syntax::{ConflictSide, Highlighter, Language, Token, TokenKind};
 use crate::text::{self, Grapheme};
 use std::io;
 use std::ops::Range;
@@ -151,8 +154,7 @@ pub struct Cell {
     pub column: usize,
     /// The number of cells the character occupies (may be zero).
     pub width: usize,
-    /// What the character is part of, for styling. [`TokenKind::Text`]
-    /// when the buffer's language is unknown.
+    /// What the character is part of, for styling.
     pub kind: TokenKind,
 }
 
@@ -303,8 +305,8 @@ pub struct Editor {
     /// yet; see the [module documentation](self). Only ever spaces and
     /// tabs. When set, the cursor is at the start of an empty line.
     pending: Option<String>,
-    /// Syntax highlighting, when the buffer's language is known.
-    highlighter: Option<Highlighter>,
+    /// Syntax highlighting.
+    highlighter: Highlighter,
     /// The search in progress or accepted, if any. Its offsets are only
     /// valid for the buffer as it was when it began, so every edit drops
     /// it.
@@ -319,8 +321,11 @@ impl Editor {
     /// selection. The indentation style is guessed from the contents.
     pub fn new(buffer: FileBuffer) -> Editor {
         let save_point = if buffer.is_modified() { None } else { Some(0) };
-        let language = buffer.path().and_then(Language::from_path);
-        let highlighter = language.map(|language| Highlighter::new(language, buffer.line_count()));
+        let language = buffer
+            .path()
+            .and_then(Language::from_path)
+            .unwrap_or(Language::Plain);
+        let highlighter = Highlighter::new(language, buffer.line_count());
         let indentation = indent::detect(&buffer.snapshot()).unwrap_or_default();
         Editor {
             buffer,
@@ -348,36 +353,40 @@ impl Editor {
 
     // ----- Syntax highlighting --------------------------------------------
 
-    /// The language the buffer is highlighted as, if any. Chosen from the
-    /// file's name when the editor is created or the buffer is saved under
-    /// a new name; see [`set_language`](Self::set_language) to override.
-    pub fn language(&self) -> Option<Language> {
-        self.highlighter.as_ref().map(Highlighter::language)
+    /// The language the buffer is highlighted as: guessed from the file's
+    /// name when the editor is created or the buffer is saved under a new
+    /// name, [`Language::Plain`] when nothing is known about it. See
+    /// [`set_language`](Self::set_language) to override.
+    pub fn language(&self) -> Language {
+        self.highlighter.language()
     }
 
-    /// Highlight the buffer as `language`, or not at all with `None`.
-    pub fn set_language(&mut self, language: Option<Language>) {
+    /// Highlight the buffer as `language`.
+    pub fn set_language(&mut self, language: Language) {
         if language == self.language() {
             return;
         }
-        self.highlighter =
-            language.map(|language| Highlighter::new(language, self.buffer.line_count()));
+        self.highlighter = Highlighter::new(language, self.buffer.line_count());
     }
 
     /// The syntax tokens of a line, with ranges relative to the start of
-    /// the line's content. Empty when the language is unknown.
+    /// the line's content.
     pub fn line_tokens(&self, line: usize) -> Vec<Token> {
-        match &self.highlighter {
-            Some(highlighter) => highlighter.tokens(&self.buffer, line),
-            None => Vec::new(),
-        }
+        self.highlighter.tokens(&self.buffer, line)
+    }
+
+    /// The side of a merge conflict that `line` is on, if any, marker
+    /// lines included; see [`Highlighter::conflict_side`]. For a frontend
+    /// to tint the lines of a conflict by side.
+    pub fn conflict_side(&self, line: usize) -> Option<ConflictSide> {
+        self.highlighter.conflict_side(&self.buffer, line)
     }
 
     /// A counter that changes when background highlighting has updated
     /// lines, so a frontend knows to redraw. See
     /// [`Highlighter::generation`].
     pub fn highlight_generation(&self) -> u64 {
-        self.highlighter.as_ref().map_or(0, Highlighter::generation)
+        self.highlighter.generation()
     }
 
     /// The number of cells between tab stops, used for display columns.
@@ -404,10 +413,7 @@ impl Editor {
         let bytes = self
             .buffer
             .bytes_in_range(layout.start..layout.start + layout.len());
-        let tokens = match &self.highlighter {
-            Some(highlighter) => highlighter.tokens_of(&self.buffer, line, &bytes),
-            None => Vec::new(),
-        };
+        let tokens = self.highlighter.tokens_of(&self.buffer, line, &bytes);
         let mut next_token = 0;
         layout
             .cells
@@ -1024,15 +1030,13 @@ impl Editor {
         let old_end = self.buffer.line_of_offset(offset + len);
         self.buffer.delete(offset..offset + len);
         self.buffer.insert_bytes(offset, bytes);
-        if let Some(highlighter) = &self.highlighter {
-            let new_end = self.buffer.line_of_offset(offset + bytes.len());
-            highlighter.lines_changed(
-                start,
-                old_end - start + 1,
-                new_end - start + 1,
-                self.buffer.line_count(),
-            );
-        }
+        let new_end = self.buffer.line_of_offset(offset + bytes.len());
+        self.highlighter.lines_changed(
+            start,
+            old_end - start + 1,
+            new_end - start + 1,
+            self.buffer.line_count(),
+        );
     }
 
     fn state(&self) -> CursorState {
@@ -1317,7 +1321,12 @@ impl Editor {
     pub fn save_as(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
         self.buffer.save_as(path)?;
         self.mark_saved();
-        self.set_language(self.buffer.path().and_then(Language::from_path));
+        self.set_language(
+            self.buffer
+                .path()
+                .and_then(Language::from_path)
+                .unwrap_or(Language::Plain),
+        );
         Ok(())
     }
 
@@ -1990,9 +1999,9 @@ mod tests {
     #[test]
     fn highlighting_follows_edits() {
         let mut ed = editor("fn main() {\n    let x = 1;\n}\n");
-        assert_eq!(ed.language(), None);
+        assert_eq!(ed.language(), Language::Plain);
         assert!(ed.line_cells(0).iter().all(|c| c.kind == TokenKind::Text));
-        ed.set_language(Some(Language::Rust));
+        ed.set_language(Language::Rust);
         let kinds = |ed: &Editor, line: usize| -> Vec<TokenKind> {
             ed.line_cells(line).iter().map(|c| c.kind).collect()
         };
@@ -2033,8 +2042,44 @@ mod tests {
             }
         );
         assert!(ed.line_tokens(1).is_empty(), "empty line inside the string");
-        ed.set_language(None);
+        ed.set_language(Language::Plain);
         assert!(ed.line_tokens(0).is_empty());
+    }
+
+    #[test]
+    fn conflict_markers_in_any_language() {
+        // Plain text, as a file of unknown kind is.
+        let mut ed = editor("a\n<<<<<<< editor\nours\n=======\ntheirs\n>>>>>>> disk\nb\n");
+        assert_eq!(ed.language(), Language::Plain);
+        let sides: Vec<Option<ConflictSide>> = (0..7).map(|line| ed.conflict_side(line)).collect();
+        use ConflictSide::*;
+        assert_eq!(
+            sides,
+            [
+                None,
+                Some(Ours),
+                Some(Ours),
+                Some(Theirs),
+                Some(Theirs),
+                Some(Theirs),
+                None
+            ]
+        );
+        assert!(
+            ed.line_cells(1)
+                .iter()
+                .all(|c| c.kind == TokenKind::ConflictMarker)
+        );
+        assert!(ed.line_cells(2).iter().all(|c| c.kind == TokenKind::Text));
+
+        // Resolving the conflict by deleting its markers takes the
+        // highlighting with it, in step with the edits.
+        ed.set_selection(ed.buffer().offset_of_line(1), ed.buffer().offset_of_line(2));
+        ed.cut();
+        assert!((0..6).all(|line| ed.conflict_side(line).is_none()));
+        assert!(ed.line_cells(2).iter().all(|c| c.kind == TokenKind::Text));
+        ed.undo();
+        assert_eq!(ed.conflict_side(4), Some(Theirs));
     }
 
     #[test]
