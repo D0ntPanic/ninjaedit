@@ -37,7 +37,7 @@ use crate::clicks::ClickTracker;
 use crate::clipboard::Clipboard;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ninjaedit_core::{Cell, Editor, Movement, Position};
+use ninjaedit_core::{Cell, ConflictStep, Editor, Movement, Position};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
 use ratatui::style::Style;
@@ -173,6 +173,23 @@ impl EditorView {
         let cursor = self.editor.cursor();
         self.jump = Some(cursor..cursor);
         self.follow_cursor = true;
+    }
+
+    /// Move the cursor to the start of the next (or previous) merge
+    /// conflict, wrapping around the buffer, and bring it into view the
+    /// way a jump does. See [`Editor::next_conflict`].
+    pub fn step_conflict(&mut self, forward: bool) -> ConflictStep {
+        let step = if forward {
+            self.editor.next_conflict()
+        } else {
+            self.editor.previous_conflict()
+        };
+        if step != ConflictStep::NoConflicts {
+            let cursor = self.editor.cursor();
+            self.jump = Some(cursor..cursor);
+            self.follow_cursor = true;
+        }
+        step
     }
 
     /// Move the cursor to a line and a character within it (both counted

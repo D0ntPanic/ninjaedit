@@ -7,7 +7,10 @@
 //! also where to learn the keys. The commands without one are for now
 //! and then: throwing away a build directory to configure from nothing
 //! is wanted when debugging a build, not by accident from a key beside
-//! another. The application runs them; this module only describes them.
+//! another. Stepping between merge conflicts has no key either, but is
+//! wanted several times in a row, so the palette puts the command it
+//! last ran at the top when it opens: Ctrl+P, Enter runs it again.
+//! The application runs them; this module only describes them.
 //! The views the modes palette (Ctrl+E) lists sit alongside them in
 //! the palette, as does "Run <target>" for each build target, but
 //! those come from the application, which knows what is open and what
@@ -25,6 +28,8 @@ pub enum Command {
     FindNext,
     SearchProject,
     GoToLine,
+    NextConflict,
+    PreviousConflict,
     Undo,
     Redo,
     Cut,
@@ -47,7 +52,7 @@ impl Command {
     /// Every command, in the order the palette lists them before
     /// anything is typed: files, searching, editing, building, views,
     /// and quitting last.
-    pub const ALL: [Command; 25] = [
+    pub const ALL: [Command; 27] = [
         Command::OpenFile,
         Command::SwitchTab,
         Command::Save,
@@ -57,6 +62,8 @@ impl Command {
         Command::FindNext,
         Command::SearchProject,
         Command::GoToLine,
+        Command::NextConflict,
+        Command::PreviousConflict,
         Command::Undo,
         Command::Redo,
         Command::Cut,
@@ -87,6 +94,8 @@ impl Command {
             Command::FindNext => "Find next",
             Command::SearchProject => "Search in project",
             Command::GoToLine => "Go to line",
+            Command::NextConflict => "Next conflict",
+            Command::PreviousConflict => "Previous conflict",
             Command::Undo => "Undo",
             Command::Redo => "Redo",
             Command::Cut => "Cut",
@@ -121,6 +130,12 @@ impl Command {
             Command::FindNext => "Go to the next match of the last search",
             Command::SearchProject => "Search every file in the project",
             Command::GoToLine => "Move the cursor to a line by number",
+            Command::NextConflict => {
+                "Move the cursor to the start of the next merge conflict, wrapping around the end of the file"
+            }
+            Command::PreviousConflict => {
+                "Move the cursor to the start of the previous merge conflict, wrapping around the start of the file"
+            }
             Command::Undo => "Undo the last edit",
             Command::Redo => "Redo the last undone edit",
             Command::Cut => "Cut the selection to the clipboard",
@@ -168,6 +183,8 @@ impl Command {
             Command::PreviousView => "Ctrl+,",
             Command::Quit => "Ctrl+Q",
             Command::DiscardChanges
+            | Command::NextConflict
+            | Command::PreviousConflict
             | Command::SelectConfiguration
             | Command::SelectTarget
             | Command::DeleteBuildDir

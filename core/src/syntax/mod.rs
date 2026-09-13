@@ -41,6 +41,8 @@ mod toml;
 
 pub use highlighter::Highlighter;
 
+pub(crate) use conflicts::is_conflict_start;
+
 use std::ops::Range;
 use std::path::Path;
 

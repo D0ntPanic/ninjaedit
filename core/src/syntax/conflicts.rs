@@ -84,6 +84,13 @@ fn marker_of(line: &[u8]) -> Option<Marker> {
     }
 }
 
+/// Whether a line's content (without its terminator) is the `<<<<<<<`
+/// marker that opens a conflict: where "next conflict" and "previous
+/// conflict" take the cursor.
+pub(crate) fn is_conflict_start(line: &[u8]) -> bool {
+    marker_of(line) == Some(Marker::Start)
+}
+
 impl Lexer for Conflicts {
     fn lex_line(&self, state: LexState, line: &[u8], out: &mut Vec<Token>) -> LexState {
         let side = match state.bottom() {
@@ -188,6 +195,16 @@ mod tests {
         assert_eq!(side(lex(start, ">>>>>>> x")), None);
         // A second opening marker starts over on our side.
         assert_eq!(side(lex(theirs, "<<<<<<< c")), Some(ConflictSide::Ours));
+    }
+
+    #[test]
+    fn conflict_start() {
+        assert!(is_conflict_start(b"<<<<<<<"));
+        assert!(is_conflict_start(b"<<<<<<< HEAD"));
+        assert!(!is_conflict_start(b"<<<<<<<HEAD"));
+        assert!(!is_conflict_start(b"======="));
+        assert!(!is_conflict_start(b">>>>>>> theirs"));
+        assert!(!is_conflict_start(b""));
     }
 
     #[test]

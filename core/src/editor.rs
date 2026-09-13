@@ -41,7 +41,8 @@
 //! frontend to style. Merge conflict markers are highlighted in every
 //! language, and [`Editor::conflict_side`] says which side of a conflict a
 //! line is on so a frontend can tint it. See the [`syntax`](crate::syntax)
-//! module.
+//! module. [`Editor::next_conflict`] and [`Editor::previous_conflict`]
+//! move the cursor from conflict to conflict, wrapping around the buffer.
 //!
 //! Indentation: the editor guesses the buffer's [`Indentation`] style when
 //! it is created (see the [`indent`](crate::indent) module) and uses it for
@@ -90,7 +91,7 @@ use crate::buffer::{BufferSnapshot, DiskChange, FileBuffer};
 use crate::indent::{self, Indentation};
 use crate::merge;
 use crate::search::{Search, SearchStep};
-use crate::syntax::{ConflictSide, Highlighter, Language, Token, TokenKind};
+use crate::syntax::{self, ConflictSide, Highlighter, Language, Token, TokenKind};
 use crate::text::{self, Grapheme};
 use std::io;
 use std::ops::Range;
@@ -380,6 +381,57 @@ impl Editor {
     /// to tint the lines of a conflict by side.
     pub fn conflict_side(&self, line: usize) -> Option<ConflictSide> {
         self.highlighter.conflict_side(&self.buffer, line)
+    }
+
+    /// Move the cursor to the start of the next merge conflict: the
+    /// `<<<<<<<` line after the cursor's, or the first in the buffer
+    /// when there is none after it. The selection is cleared. See
+    /// [`ConflictStep`] for what is reported.
+    pub fn next_conflict(&mut self) -> ConflictStep {
+        let starts = self.conflict_starts();
+        let line = self.buffer.line_of_offset(self.cursor);
+        let after = starts.iter().find(|&&start| start > line);
+        self.step_conflict(after, starts.first())
+    }
+
+    /// Move the cursor to the start of the previous merge conflict: the
+    /// `<<<<<<<` line before the cursor's, or the last in the buffer
+    /// when there is none before it. The selection is cleared. See
+    /// [`ConflictStep`] for what is reported.
+    pub fn previous_conflict(&mut self) -> ConflictStep {
+        let starts = self.conflict_starts();
+        let line = self.buffer.line_of_offset(self.cursor);
+        let before = starts.iter().rev().find(|&&start| start < line);
+        self.step_conflict(before, starts.last())
+    }
+
+    /// Go to `next` if there is one, else wrap around to `wrapped`.
+    fn step_conflict(&mut self, next: Option<&usize>, wrapped: Option<&usize>) -> ConflictStep {
+        let (line, step) = match (next, wrapped) {
+            (Some(&line), _) => (line, ConflictStep::Moved),
+            (None, Some(&line)) => (line, ConflictStep::Wrapped),
+            (None, None) => return ConflictStep::NoConflicts,
+        };
+        self.go_to_line(line);
+        step
+    }
+
+    /// The lines that open a conflict, in order. Read straight from the
+    /// buffer rather than the highlighter's states, which may still be
+    /// catching up on a large file: a jump has to land on what is there
+    /// now.
+    fn conflict_starts(&self) -> Vec<usize> {
+        let snapshot = self.buffer.snapshot();
+        let mut lines = snapshot.lines_from(0);
+        let mut starts = Vec::new();
+        let mut line = 0;
+        while let Some(content) = lines.next_line() {
+            if syntax::is_conflict_start(content) {
+                starts.push(line);
+            }
+            line += 1;
+        }
+        starts
     }
 
     /// A counter that changes when background highlighting has updated
@@ -1523,6 +1575,20 @@ struct External {
     depth: usize,
 }
 
+/// The outcome of [`Editor::next_conflict`] or
+/// [`Editor::previous_conflict`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictStep {
+    /// The cursor moved to the next conflict in the direction asked.
+    Moved,
+    /// There was no conflict in that direction, so the cursor wrapped
+    /// around the buffer to the first (or last) one, which may be the
+    /// conflict it was already on.
+    Wrapped,
+    /// The buffer has no conflict markers; the cursor stayed put.
+    NoConflicts,
+}
+
 /// What [`Editor::check_disk`] found and did about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExternalChange {
@@ -2082,6 +2148,44 @@ mod tests {
         assert_eq!(ed.conflict_side(4), Some(Theirs));
     }
 
+    #[test]
+    fn next_and_previous_conflict_wrap_around() {
+        let mut ed = editor(
+            "a\n<<<<<<< x\nb\n=======\nc\n>>>>>>> y\nd\n<<<<<<< x\ne\n=======\nf\n>>>>>>> y\ng\n",
+        );
+        let line = |ed: &Editor| ed.cursor_position().line;
+        assert_eq!(ed.next_conflict(), ConflictStep::Moved);
+        assert_eq!(line(&ed), 1);
+        assert_eq!(ed.next_conflict(), ConflictStep::Moved);
+        assert_eq!(line(&ed), 7);
+        assert_eq!(ed.next_conflict(), ConflictStep::Wrapped);
+        assert_eq!(line(&ed), 1);
+        assert_eq!(ed.previous_conflict(), ConflictStep::Wrapped);
+        assert_eq!(line(&ed), 7);
+        assert_eq!(ed.previous_conflict(), ConflictStep::Moved);
+        assert_eq!(line(&ed), 1);
+
+        // From inside a conflict, "next" is the following one and
+        // "previous" is the start of this one; the cursor lands at the
+        // start of the marker line with no selection.
+        ed.set_selection(22, 23);
+        assert_eq!(line(&ed), 4);
+        assert_eq!(ed.previous_conflict(), ConflictStep::Moved);
+        assert_eq!(ed.cursor(), 2);
+        assert_eq!(ed.anchor(), None);
+        ed.go_to_line(4);
+        assert_eq!(ed.next_conflict(), ConflictStep::Moved);
+        assert_eq!(line(&ed), 7);
+
+        // Markers with other shapes don't count, and without any the
+        // cursor stays put.
+        let mut ed = editor("<<<<<<<<\n <<<<<<< x\n=======\n>>>>>>> y\n");
+        ed.go_to_line(2);
+        assert_eq!(ed.next_conflict(), ConflictStep::NoConflicts);
+        assert_eq!(ed.previous_conflict(), ConflictStep::NoConflicts);
+        assert_eq!(line(&ed), 2);
+        assert_eq!(editor("").next_conflict(), ConflictStep::NoConflicts);
+    }
     #[test]
     fn character_movement_handles_utf8_and_crlf() {
         let mut ed = editor("aé\r\nb");

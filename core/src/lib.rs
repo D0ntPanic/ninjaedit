@@ -29,7 +29,7 @@ pub use build::{
     Step, TargetKey,
 };
 pub use diagnostics::{SourceLink, SourceLocation, find_source_links};
-pub use editor::{Cell, Editor, ExternalChange, Movement, Position};
+pub use editor::{Cell, ConflictStep, Editor, ExternalChange, Movement, Position};
 pub use highlight_cache::HighlightCache;
 pub use indent::Indentation;
 pub use index::{FileIndex, FileList, IndexEntry};

@@ -41,7 +41,11 @@
 //! module) and every view, with the key each is bound to, so it is
 //! both a way to run what has no key and the place to learn the keys
 //! that do. The commands run from it as their keys would; a view is
-//! shown and focused as the modes palette would.
+//! shown and focused as the modes palette would. Whatever it last ran
+//! is listed first the next time it opens, so Ctrl+P, Enter repeats it:
+//! the way to step through a file's merge conflicts with "Next
+//! conflict", which has no key of its own. Typing a query ranks the
+//! entries as usual.
 //!
 //! The modes palette (Ctrl+E) lists the editor, the settings page, and
 //! every tool (the shell today; builds, debuggers and the like later) in
@@ -149,8 +153,8 @@ use ninjaedit_core::build::{NO_ROOT_MESSAGE, root_candidates};
 use ninjaedit_core::search::literal_query;
 use ninjaedit_core::terminal::{ExitStatus, Output, Session, SessionId};
 use ninjaedit_core::{
-    BuildConfig, BuildRoot, Editor, ExternalChange, Job, Project, ProjectKind, ProjectMatch,
-    SearchStep, Selection, Settings, SourceLocation, Step, Storage,
+    BuildConfig, BuildRoot, ConflictStep, Editor, ExternalChange, Job, Project, ProjectKind,
+    ProjectMatch, SearchStep, Selection, Settings, SourceLocation, Step, Storage,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -279,6 +283,17 @@ const FILE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const SEARCH_WRAPPED: &str =
     "Search wrapped around to where it started; press Ctrl+G to go around again";
 
+/// Which palette is open, as far as the application needs to know.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaletteKind {
+    /// The file search, which needs refreshing as the index fills in.
+    Files,
+    /// The command palette, which remembers what it ran.
+    Commands,
+    /// Tabs, modes, build roots, configurations, or targets.
+    Other,
+}
+
 /// An action that discards unsaved changes and so needs confirming.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Confirm {
@@ -358,9 +373,11 @@ pub struct App {
     view_clock: u64,
     tab_bar: TabBar,
     palette: Option<Palette>,
-    /// Whether the open palette searches project files, and so needs
-    /// refreshing as the index fills in.
-    palette_is_files: bool,
+    /// Which palette is open, for the two that need telling apart.
+    palette_kind: PaletteKind,
+    /// The entry last picked from the command palette, listed first the
+    /// next time it opens so that Enter alone runs it again.
+    last_command: Option<PaletteAction>,
     /// The search box, driving a search in the active tab. Never open at
     /// the same time as the palette.
     search_box: Option<SearchBox>,
@@ -463,7 +480,8 @@ impl App {
             view_clock: 0,
             tab_bar: TabBar::default(),
             palette: None,
-            palette_is_files: false,
+            palette_kind: PaletteKind::Other,
+            last_command: None,
             search_box: None,
             last_search: String::new(),
             goto_line: None,
@@ -712,7 +730,7 @@ impl App {
         let mut palette = Palette::new(TABS_PLACEHOLDER, items);
         palette.select(1);
         self.palette = Some(palette);
-        self.palette_is_files = false;
+        self.palette_kind = PaletteKind::Other;
     }
 
     fn open_files_palette(&mut self) {
@@ -722,7 +740,7 @@ impl App {
         let mut palette = Palette::new(FILES_PLACEHOLDER, self.file_items());
         self.refresh_index_hint(&mut palette);
         self.palette = Some(palette);
-        self.palette_is_files = true;
+        self.palette_kind = PaletteKind::Files;
     }
 
     fn file_items(&self) -> Vec<PaletteItem> {
@@ -779,13 +797,14 @@ impl App {
         let mut palette = Palette::new(MODES_PLACEHOLDER, items);
         palette.select(1);
         self.palette = Some(palette);
-        self.palette_is_files = false;
+        self.palette_kind = PaletteKind::Other;
     }
 
     /// Ctrl+P: open the command palette, listing every command, then
     /// every view with the key bound to each, then "Run <target>" for
-    /// every target that isn't disabled. The description is searched
-    /// too, so "clean" finds the commands that delete build directories.
+    /// every target that isn't disabled, with whatever it last ran ahead
+    /// of them all. The description is searched too, so "clean" finds
+    /// the commands that delete build directories.
     fn open_command_palette(&mut self) {
         self.close_search_box(true);
         self.goto_line = None;
@@ -804,13 +823,21 @@ impl App {
             shortcut: view.shortcut(),
             action: view.action(),
         });
-        let items = commands
+        let mut items: Vec<PaletteItem> = commands
             .chain(views)
             .chain(self.run_target_items())
             .collect();
+        // The entry last run comes first, so Enter alone repeats it. A
+        // "Run <target>" whose target is gone has no entry to move.
+        if let Some(last) = &self.last_command
+            && let Some(index) = items.iter().position(|item| item.action == *last)
+        {
+            let item = items.remove(index);
+            items.insert(0, item);
+        }
         let palette = Palette::new(COMMANDS_PLACEHOLDER, items);
         self.palette = Some(palette);
-        self.palette_is_files = false;
+        self.palette_kind = PaletteKind::Commands;
     }
 
     /// The command palette's "Run <target>" entries: one for each
@@ -858,6 +885,8 @@ impl App {
             Command::FindNext => self.find_next(),
             Command::SearchProject => self.open_project_search(),
             Command::GoToLine => self.open_goto_line(),
+            Command::NextConflict => self.step_conflict(true),
+            Command::PreviousConflict => self.step_conflict(false),
             Command::Undo => self.press_editor_key('z'),
             Command::Redo => self.press_editor_key('y'),
             Command::Cut => self.press_editor_key('x'),
@@ -925,6 +954,9 @@ impl App {
 
     fn run_palette_action(&mut self, action: PaletteAction) {
         self.palette = None;
+        if self.palette_kind == PaletteKind::Commands {
+            self.last_command = Some(action.clone());
+        }
         match action {
             PaletteAction::SwitchTab(index) => {
                 self.enter_editor();
@@ -1099,7 +1131,7 @@ impl App {
         let mut palette = Palette::new(ADD_ROOT_PLACEHOLDER, items);
         self.refresh_index_hint(&mut palette);
         self.palette = Some(palette);
-        self.palette_is_files = false;
+        self.palette_kind = PaletteKind::Other;
     }
 
     /// Add a root file (relative to the project) with its defaults and
@@ -1147,7 +1179,7 @@ impl App {
         let mut palette = Palette::new(CONFIGURATION_PLACEHOLDER, items);
         palette.select(selected);
         self.palette = Some(palette);
-        self.palette_is_files = false;
+        self.palette_kind = PaletteKind::Other;
     }
 
     /// A palette of every root's targets, likewise.
@@ -1179,7 +1211,7 @@ impl App {
         let mut palette = Palette::new(TARGET_PLACEHOLDER, items);
         palette.select(selected);
         self.palette = Some(palette);
-        self.palette_is_files = false;
+        self.palette_kind = PaletteKind::Other;
     }
 
     // ----- Building and running -------------------------------------------
@@ -1554,6 +1586,32 @@ impl App {
                 self.status = Some(format!("No matches for {}", self.last_search));
             }
         }
+    }
+
+    /// "Next conflict" and "Previous conflict": move the active tab's
+    /// cursor to the start of the next or previous merge conflict,
+    /// wrapping around the file, and give the editor the keyboard so the
+    /// jump can be seen. The status bar says when it wrapped, and when
+    /// there is nothing to go to.
+    fn step_conflict(&mut self, forward: bool) {
+        if !matches!(self.mode, Mode::Editor) {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        match tab.view.step_conflict(forward) {
+            ConflictStep::Moved => {}
+            ConflictStep::Wrapped => {
+                let end = if forward { "first" } else { "last" };
+                self.status = Some(format!("Wrapped around to the {end} conflict in the file"));
+            }
+            ConflictStep::NoConflicts => {
+                self.status = Some("No merge conflicts in this file".to_owned());
+                return;
+            }
+        }
+        self.focus = Focus::Editor;
     }
 
     fn step_search(&mut self) {
@@ -2012,7 +2070,7 @@ impl App {
             return redraw;
         }
         self.index_generation = generation;
-        if self.palette_is_files {
+        if self.palette_kind == PaletteKind::Files {
             if let Some(mut palette) = self.palette.take() {
                 palette.set_items(self.file_items());
                 self.refresh_index_hint(&mut palette);
@@ -3373,6 +3431,88 @@ mod tests {
         type_str(&mut app, "quit");
         press(&mut app, KeyCode::Enter);
         assert!(app.should_quit());
+    }
+
+    #[test]
+    fn conflict_commands_step_between_conflicts_and_the_palette_repeats_them() {
+        let (_dir, mut app) = app_with_files(&[(
+            "a.txt",
+            "a\n<<<<<<< ours\nb\n=======\nc\n>>>>>>> theirs\nd\n<<<<<<< ours\ne\n=======\nf\n>>>>>>> theirs\ng\n",
+        )]);
+        draw(&mut app, 80, 20);
+        let line = |app: &App| app.tabs[0].view.editor().cursor_position().line;
+
+        // Before anything has run, the palette lists the commands in
+        // their own order.
+        ctrl(&mut app, 'p');
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[3].contains("Open file"), "{screen:#?}");
+        type_str(&mut app, "next conflict");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.palette.is_none());
+        assert_eq!(line(&app), 1);
+        assert_eq!(app.status, None);
+
+        // Now "Next conflict" is first, so Ctrl+P, Enter repeats it; the
+        // second time it wraps around and says so.
+        ctrl(&mut app, 'p');
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[3].contains("Next conflict"), "{screen:#?}");
+        assert!(screen[4].contains("Open file"), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(line(&app), 7);
+        ctrl(&mut app, 'p');
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(line(&app), 1);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Wrapped around to the first conflict in the file")
+        );
+
+        // A query ranks the entries as usual.
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "open file");
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[3].contains("Open file"), "{screen:#?}");
+        press(&mut app, KeyCode::Esc);
+
+        // Previous wraps the other way, and becomes the one to repeat.
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "previous conflict");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(line(&app), 7);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Wrapped around to the last conflict in the file")
+        );
+        ctrl(&mut app, 'p');
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[3].contains("Previous conflict"), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(line(&app), 1);
+        assert_eq!(app.status, None);
+
+        // Picking from another palette (a view from the modes palette)
+        // doesn't change what the command palette repeats.
+        ctrl(&mut app, 'e');
+        type_str(&mut app, "editor");
+        press(&mut app, KeyCode::Enter);
+        ctrl(&mut app, 'p');
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[3].contains("Previous conflict"), "{screen:#?}");
+        press(&mut app, KeyCode::Esc);
+
+        // With the markers gone there is nothing to go to.
+        app.tabs[0].view.editor_mut().select_all();
+        app.tabs[0].view.editor_mut().insert_text("plain\n");
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "next conflict");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(line(&app), 1);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("No merge conflicts in this file")
+        );
     }
 
     #[test]
