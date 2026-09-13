@@ -9,8 +9,9 @@
 //! is wanted when debugging a build, not by accident from a key beside
 //! another. The application runs them; this module only describes them.
 //! The views the modes palette (Ctrl+E) lists sit alongside them in
-//! the palette, but those come from the application, which knows what
-//! is open.
+//! the palette, as does "Run <target>" for each build target, but
+//! those come from the application, which knows what is open and what
+//! the project builds.
 
 /// A command the palette can run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

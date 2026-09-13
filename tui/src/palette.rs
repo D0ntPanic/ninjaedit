@@ -95,6 +95,12 @@ pub enum PaletteAction {
         root: usize,
         index: usize,
     },
+    /// Build and run a target of a build root without making it the
+    /// current one.
+    RunTarget {
+        root: usize,
+        index: usize,
+    },
     /// Run one of the editor's commands, as its key would.
     Command(Command),
 }

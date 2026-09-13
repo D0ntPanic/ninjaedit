@@ -45,7 +45,12 @@
 //!
 //! The project has a **current** configuration and target, the ones a
 //! build (Ctrl+B) and a run (Ctrl+R) use. Both belong to one root; picking
-//! a configuration from another root brings the target along.
+//! a configuration from another root brings the target along. Any other
+//! target can be run without becoming current
+//! ([`BuildConfig::selection_with_target`] says what it runs with,
+//! [`BuildConfig::run_job_for`] runs it): a benchmark or a test suite
+//! that is wanted now and then, while the target being worked on stays
+//! a keystroke away.
 //!
 //! What a configuration has built can be thrown away to start over
 //! ([`BuildConfig::clean_job`] for the current one,
@@ -79,6 +84,10 @@ pub const BUILD_FILE: &str = "build.toml";
 pub const CMAKE_BUILD_DIR_PREFIX: &str = "cmake-build-";
 /// The generator CMake configures with unless the settings say otherwise.
 pub const DEFAULT_CMAKE_GENERATOR: &str = "Ninja";
+/// Why nothing can be built with no roots: what a job asked of a
+/// configuration without a selection says.
+pub const NO_ROOT_MESSAGE: &str =
+    "No build root: add a Cargo.toml or CMakeLists.txt on the build configuration page";
 
 const FILE_HEADER: &str = "# ninjaedit build configuration for this project.\n";
 /// The file keys that say a target was discovered, and as what, and that
@@ -858,9 +867,14 @@ impl BuildConfig {
 
     /// The current configuration with its root, if there is one.
     pub fn current_configuration(&self) -> Option<(&BuildRoot, &Configuration)> {
-        let current = self.current?;
-        let root = self.roots.get(current.root)?;
-        Some((root, root.configurations.get(current.configuration)?))
+        self.configuration_for(self.current?)
+    }
+
+    /// A selection's configuration with its root, if the selection
+    /// points at one.
+    pub fn configuration_for(&self, selection: Selection) -> Option<(&BuildRoot, &Configuration)> {
+        let root = self.roots.get(selection.root)?;
+        Some((root, root.configurations.get(selection.configuration)?))
     }
 
     /// The current target with its root, if there is one.
@@ -903,10 +917,22 @@ impl BuildConfig {
     /// as [`select_configuration`](Self::select_configuration) does the
     /// target.
     pub fn select_target(&mut self, root: usize, index: usize) -> bool {
-        let Some(new_root) = self.roots.get(root) else {
+        let Some(selection) = self.selection_with_target(root, index) else {
             return false;
         };
         let before = self.current;
+        self.current = Some(selection);
+        self.current != before
+    }
+
+    /// What [`select_target`](Self::select_target) would make current,
+    /// without making it so: the target with the current configuration
+    /// if it is in the same root, and otherwise with that root's
+    /// configuration of the same name, or its first. For running a
+    /// target that isn't the current one with what it would run with if
+    /// it were. `None` for a root that doesn't exist.
+    pub fn selection_with_target(&self, root: usize, index: usize) -> Option<Selection> {
+        let new_root = self.roots.get(root)?;
         let configuration = match self.current {
             Some(current) if current.root == root => current.configuration,
             Some(current) => {
@@ -914,18 +940,17 @@ impl BuildConfig {
                     .roots
                     .get(current.root)
                     .and_then(|r| r.configurations.get(current.configuration))
-                    .map(|c| c.name.clone());
+                    .map(|c| c.name.as_str());
                 name.and_then(|name| new_root.configurations.iter().position(|c| c.name == name))
                     .unwrap_or(0)
             }
             None => 0,
         };
-        self.current = Some(Selection {
+        Some(Selection {
             root,
             configuration,
             target: index,
-        });
-        self.current != before
+        })
     }
 
     /// Keep the selection pointing at something after the lists changed:
@@ -1234,23 +1259,25 @@ impl BuildConfig {
 
     // ----- Building and running -------------------------------------------
 
-    /// The current root, configuration, and target, or why there aren't
-    /// all three.
-    fn current_parts(&self) -> Result<(&BuildRoot, &Configuration, &Target), String> {
-        let current = self.current.ok_or(
-            "No build root: add a Cargo.toml or CMakeLists.txt on the build configuration page",
-        )?;
+    /// The current selection, or why there is none.
+    fn current_selection(&self) -> Result<Selection, String> {
+        self.current.ok_or_else(|| NO_ROOT_MESSAGE.to_owned())
+    }
+
+    /// A selection's root, configuration, and target, or why there
+    /// aren't all three.
+    fn parts(&self, selection: Selection) -> Result<(&BuildRoot, &Configuration, &Target), String> {
         let root = self
             .roots
-            .get(current.root)
+            .get(selection.root)
             .ok_or("No build root selected")?;
         let configuration = root
             .configurations
-            .get(current.configuration)
+            .get(selection.configuration)
             .ok_or_else(|| format!("{} has no configuration to build with", root.label()))?;
         let target = root
             .targets
-            .get(current.target)
+            .get(selection.target)
             .ok_or_else(|| format!("{} has no target to build", root.label()))?;
         if target.disabled {
             return Err(format!(
@@ -1264,7 +1291,17 @@ impl BuildConfig {
     /// The directory the current CMake configuration builds in, if the
     /// current root is a CMake one.
     pub fn cmake_build_dir(&self, project_root: &Path) -> Option<PathBuf> {
-        let (root, configuration) = self.current_configuration()?;
+        self.cmake_build_dir_for(project_root, self.current?)
+    }
+
+    /// The directory a selection's CMake configuration builds in, if its
+    /// root is a CMake one.
+    pub fn cmake_build_dir_for(
+        &self,
+        project_root: &Path,
+        selection: Selection,
+    ) -> Option<PathBuf> {
+        let (root, configuration) = self.configuration_for(selection)?;
         (root.system == BuildSystem::CMake)
             .then(|| cmake_build_dir(project_root, root, configuration))
     }
@@ -1281,7 +1318,20 @@ impl BuildConfig {
         configure: bool,
         settings: &Settings,
     ) -> Result<Job, String> {
-        let (root, configuration, target) = self.current_parts()?;
+        self.build_job_for(self.current_selection()?, project_root, configure, settings)
+    }
+
+    /// The commands that build a selection's target with its
+    /// configuration, as [`build_job`](Self::build_job) does the current
+    /// one's.
+    pub fn build_job_for(
+        &self,
+        selection: Selection,
+        project_root: &Path,
+        configure: bool,
+        settings: &Settings,
+    ) -> Result<Job, String> {
+        let (root, configuration, target) = self.parts(selection)?;
         let mut job = Job {
             title: format!("Build {} ({})", target.name, configuration.name),
             steps: Vec::new(),
@@ -1343,7 +1393,22 @@ impl BuildConfig {
         configure: bool,
         settings: &Settings,
     ) -> Result<Job, String> {
-        let (root, configuration, target) = self.current_parts()?;
+        self.run_job_for(self.current_selection()?, project_root, configure, settings)
+    }
+
+    /// The commands that build and then run a selection's target with
+    /// its configuration, as [`run_job`](Self::run_job) does the current
+    /// one's. With [`selection_with_target`](Self::selection_with_target)
+    /// this runs a target other than the current one, with what it
+    /// would run with if it were, without changing what is current.
+    pub fn run_job_for(
+        &self,
+        selection: Selection,
+        project_root: &Path,
+        configure: bool,
+        settings: &Settings,
+    ) -> Result<Job, String> {
+        let (root, configuration, target) = self.parts(selection)?;
         let dir = root_dir(project_root, root);
         match root.system {
             BuildSystem::Cargo => {
@@ -1384,7 +1449,7 @@ impl BuildConfig {
                         target.name
                     ));
                 }
-                let mut job = self.build_job(project_root, configure, settings)?;
+                let mut job = self.build_job_for(selection, project_root, configure, settings)?;
                 job.title = format!("Run {} ({})", target.name, configuration.name);
                 let build_dir = cmake_build_dir(project_root, root, configuration);
                 let executable = build_dir.join(&target.executable);
@@ -2644,6 +2709,56 @@ mod tests {
         assert!(config.select_configuration(1, 0));
         assert_eq!(config.current_target().unwrap().1.name, "All");
         assert!(!config.select_configuration(5, 0), "no such root");
+    }
+
+    #[test]
+    fn a_target_can_be_run_without_becoming_current() {
+        let mut config = two_roots();
+        let project = Path::new("/proj");
+        let settings = Settings::default();
+        config.select_configuration(0, 1);
+        let before = config.current().unwrap();
+        assert_eq!(config.current_target().unwrap().1.name, "app");
+
+        // Another target in the same root runs with the current
+        // configuration.
+        let selection = config.selection_with_target(0, 1).unwrap();
+        assert_eq!(
+            config.configuration_for(selection).unwrap().1.name,
+            "release"
+        );
+        let job = config
+            .run_job_for(selection, project, false, &settings)
+            .unwrap();
+        assert_eq!(job.title, "Run tool (release)");
+        assert!(args(&job.steps[0].command).contains(&"--release".to_owned()));
+        assert!(config.cmake_build_dir_for(project, selection).is_none());
+
+        // One in another root runs with that root's configuration of the
+        // same name, or its first; the build directory follows.
+        let selection = config.selection_with_target(1, 1).unwrap();
+        assert_eq!(config.configuration_for(selection).unwrap().1.name, "Debug");
+        let job = config
+            .run_job_for(selection, project, true, &settings)
+            .unwrap();
+        assert_eq!(job.title, "Run tool (Debug)");
+        assert_eq!(job.steps.len(), 3, "configure, build, run");
+        assert_eq!(
+            config.cmake_build_dir_for(project, selection),
+            Some(PathBuf::from("/proj/native/cmake-build-debug"))
+        );
+        let build = config
+            .build_job_for(selection, project, false, &settings)
+            .unwrap();
+        assert_eq!(build.title, "Build tool (Debug)");
+
+        // Nothing moved.
+        assert_eq!(config.current(), Some(before));
+        assert_eq!(config.current_target().unwrap().1.name, "app");
+        assert!(config.selection_with_target(5, 0).is_none(), "no such root");
+        // And selecting it for real lands on the same selection.
+        assert!(config.select_target(1, 1));
+        assert_eq!(config.current(), Some(selection));
     }
 
     #[test]

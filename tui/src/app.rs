@@ -93,7 +93,13 @@
 //! "Delete all build directories" (every root's); each runs as a job
 //! in the output tool, so what it did and any failure are there to
 //! read. Neither has a key: they are for debugging a build, not for a
-//! slip of the fingers.
+//! slip of the fingers. The command palette also has "Run <target>"
+//! for every target that isn't disabled: it builds and runs that one
+//! with the configuration selecting it would bring (the current one in
+//! its root, or that root's of the same name, or its first) and leaves
+//! the current target and configuration alone, so a benchmark or a
+//! test suite can be run now and then without losing the target being
+//! worked on from Ctrl+R.
 //!
 //! With a tool focused its program gets the whole keyboard, since a shell
 //! or a coding agent has uses for nearly every key and its line editing
@@ -139,12 +145,12 @@ use crate::tool::{Tool, ToolKind, ToolPane};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ninjaedit_core::build::root_candidates;
+use ninjaedit_core::build::{NO_ROOT_MESSAGE, root_candidates};
 use ninjaedit_core::search::literal_query;
 use ninjaedit_core::terminal::{ExitStatus, Output, Session, SessionId};
 use ninjaedit_core::{
-    BuildConfig, BuildRoot, Editor, Job, Project, ProjectKind, ProjectMatch, SearchStep, Settings,
-    SourceLocation, Step, Storage,
+    BuildConfig, BuildRoot, Editor, Job, Project, ProjectKind, ProjectMatch, SearchStep, Selection,
+    Settings, SourceLocation, Step, Storage,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -696,10 +702,10 @@ impl App {
         self.palette_is_files = false;
     }
 
-    /// Ctrl+P: open the command palette, listing every command and then
-    /// every view with the key bound to each. The description is
-    /// searched too, so "clean" finds the commands that delete build
-    /// directories.
+    /// Ctrl+P: open the command palette, listing every command, then
+    /// every view with the key bound to each, then "Run <target>" for
+    /// every target that isn't disabled. The description is searched
+    /// too, so "clean" finds the commands that delete build directories.
     fn open_command_palette(&mut self) {
         self.close_search_box(true);
         self.goto_line = None;
@@ -718,9 +724,46 @@ impl App {
             shortcut: view.shortcut(),
             action: view.action(),
         });
-        let palette = Palette::new(COMMANDS_PLACEHOLDER, commands.chain(views).collect());
+        let items = commands
+            .chain(views)
+            .chain(self.run_target_items())
+            .collect();
+        let palette = Palette::new(COMMANDS_PLACEHOLDER, items);
         self.palette = Some(palette);
         self.palette_is_files = false;
+    }
+
+    /// The command palette's "Run <target>" entries: one for each
+    /// target that isn't disabled, in name order within each root, each
+    /// saying what configuration it would run with.
+    fn run_target_items(&self) -> Vec<PaletteItem> {
+        let mut items = Vec::new();
+        for (r, root) in self.build.roots().iter().enumerate() {
+            for i in root.targets_by_name() {
+                let target = &root.targets()[i];
+                if target.disabled {
+                    continue;
+                }
+                let configuration = self
+                    .build
+                    .selection_with_target(r, i)
+                    .and_then(|selection| self.build.configuration_for(selection))
+                    .map_or_else(String::new, |(_, c)| format!(" with {}", c.name));
+                let detail = format!(
+                    "Build and run it{} in {}, without making it the current target",
+                    configuration,
+                    root.label()
+                );
+                items.push(PaletteItem {
+                    label: format!("Run {}", target.name),
+                    search: format!("Run {} {}", target.name, detail),
+                    detail,
+                    shortcut: None,
+                    action: PaletteAction::RunTarget { root: r, index: i },
+                });
+            }
+        }
+        items
     }
 
     /// Run a command picked from the command palette, as its key would.
@@ -825,6 +868,7 @@ impl App {
                     self.selection_changed();
                 }
             }
+            PaletteAction::RunTarget { root, index } => self.run_target(root, index),
             PaletteAction::Command(command) => self.run_command(command),
         }
     }
@@ -1081,14 +1125,35 @@ impl App {
 
     fn start_current_job(&mut self, run: bool) {
         self.commit_build_page();
-        let configure = self.cmake_configure_needed();
+        match self.build.current() {
+            Some(selection) => self.start_selected_job(selection, run),
+            // There is no selection only with no roots.
+            None => self.status = Some(NO_ROOT_MESSAGE.to_owned()),
+        }
+    }
+
+    /// "Run <target>" from the command palette: build and run a target
+    /// that needn't be the current one, with the configuration selecting
+    /// it would bring, leaving the current target and configuration as
+    /// they are.
+    fn run_target(&mut self, root: usize, index: usize) {
+        self.commit_build_page();
+        if let Some(selection) = self.build.selection_with_target(root, index) {
+            self.start_selected_job(selection, true);
+        }
+    }
+
+    /// Build, or build and run, a selection's target with its
+    /// configuration in the output tool.
+    fn start_selected_job(&mut self, selection: Selection, run: bool) {
+        let configure = self.cmake_configure_needed(selection);
         let root = self.project.root().to_path_buf();
         let job = if run {
             self.build
-                .run_job(&root, configure.is_some(), &self.settings)
+                .run_job_for(selection, &root, configure.is_some(), &self.settings)
         } else {
             self.build
-                .build_job(&root, configure.is_some(), &self.settings)
+                .build_job_for(selection, &root, configure.is_some(), &self.settings)
         };
         match job {
             Ok(job) => {
@@ -1096,7 +1161,7 @@ impl App {
                 self.start_job(job);
                 // A compiler run by CMake's build tool may name files
                 // relative to the build directory.
-                if let Some(dir) = self.build.cmake_build_dir(&root) {
+                if let Some(dir) = self.build.cmake_build_dir_for(&root, selection) {
                     self.job_dirs.push(dir);
                 }
             }
@@ -1137,13 +1202,15 @@ impl App {
         }
     }
 
-    /// Whether the current CMake configuration's build directory needs
+    /// Whether a selection's CMake configuration's build directory needs
     /// configuring before a build, and with what: it has no cache yet,
     /// or was last configured with different options. `None` for a
     /// Cargo configuration, or one configured as it now is.
-    fn cmake_configure_needed(&self) -> Option<(PathBuf, String)> {
-        let dir = self.build.cmake_build_dir(self.project.root())?;
-        let (_, configuration) = self.build.current_configuration()?;
+    fn cmake_configure_needed(&self, selection: Selection) -> Option<(PathBuf, String)> {
+        let dir = self
+            .build
+            .cmake_build_dir_for(self.project.root(), selection)?;
+        let (_, configuration) = self.build.configuration_for(selection)?;
         let signature = configuration.cmake_configure_signature(&self.settings);
         let configured =
             dir.join("CMakeCache.txt").is_file() && self.configured.get(&dir) == Some(&signature);
@@ -3253,6 +3320,78 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.job_title, "Delete all build directories");
         assert!(app.configured.is_empty());
+    }
+
+    #[test]
+    fn a_target_runs_from_the_command_palette_without_becoming_current() {
+        let (_dir, mut app) = app_with_files(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n"),
+            ("a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            ("b/Cargo.toml", "[package]\nname = \"b\"\n"),
+            (
+                "native/CMakeLists.txt",
+                "project(x)\nadd_executable(tool tool.c)\n",
+            ),
+        ]);
+        draw(&mut app, 80, 20);
+        let root = app.project.root().to_path_buf();
+        app.build
+            .add_root(BuildRoot::discover(&root, "native/CMakeLists.txt").unwrap())
+            .unwrap();
+        assert!(app.build.select_configuration(0, 1), "release");
+        let before = app.build.current().unwrap();
+        assert_eq!(app.build.current_target().unwrap().1.name, "a");
+
+        // Every target has a "Run" entry saying what it runs with; a
+        // disabled one has none.
+        app.build.set_target_disabled(1, 0, true);
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "run tool");
+        let screen = draw(&mut app, 80, 20);
+        let row = screen
+            .iter()
+            .find(|r| r.contains("Run tool"))
+            .expect("the CMake target");
+        assert!(row.contains("with Debug"), "{row}");
+        assert!(row.contains("native/CMakeLists.txt"), "{row}");
+        assert!(
+            !screen.iter().any(|r| r.contains("Run All")),
+            "disabled: {screen:#?}"
+        );
+        press(&mut app, KeyCode::Esc);
+
+        // Running one leaves the selection alone and runs it with the
+        // current configuration.
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "run b");
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[3].contains("Run b"), "{screen:#?}");
+        assert!(screen[3].contains("with release"), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.palette.is_none());
+        assert_eq!(app.job_title, "Run b (release)");
+        assert!(app.tool_pane.is_visible());
+        assert_eq!(app.tool_pane.active().unwrap().kind(), ToolKind::Output);
+        assert_eq!(app.build.current(), Some(before));
+        assert_eq!(app.build.current_target().unwrap().1.name, "a");
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[19].contains(" release ▸ a "), "{screen:#?}");
+        assert!(build_file(&app).is_none(), "nothing to save");
+
+        // One from the other root configures its build directory and
+        // looks there for the files its compiler names.
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "run tool");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.job_title, "Run tool (Debug)");
+        let build_dir = root.join("native/cmake-build-debug");
+        assert_eq!(
+            app.job_configure.as_ref().map(|(dir, _)| dir),
+            Some(&build_dir)
+        );
+        assert!(app.job_dirs.contains(&build_dir), "{:?}", app.job_dirs);
+        assert_eq!(app.build.current(), Some(before));
     }
 
     /// Feed the app events from the channel until `done`, or fail after
