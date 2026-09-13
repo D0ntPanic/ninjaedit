@@ -47,6 +47,12 @@
 //! build (Ctrl+B) and a run (Ctrl+R) use. Both belong to one root; picking
 //! a configuration from another root brings the target along.
 //!
+//! What a configuration has built can be thrown away to start over
+//! ([`BuildConfig::clean_job`] for the current one,
+//! [`BuildConfig::clean_all_job`] for every root): a CMake build
+//! directory is deleted, and Cargo is asked to clean the profile (or,
+//! for every root, its whole target directory).
+//!
 //! Frontends edit the lists through [`BuildConfig`]'s text methods, the
 //! way the settings are edited: each option is a text field, and
 //! [`ConfigurationKey`] and [`TargetKey`] list the options each build
@@ -1402,6 +1408,56 @@ impl BuildConfig {
         }
     }
 
+    /// The command that deletes what the current configuration has
+    /// built, so the next build starts from nothing: for CMake, its
+    /// build directory; for Cargo, the profile's artifacts, which
+    /// `cargo clean` knows better than this module where to find. Meant
+    /// for a command palette rather than a key: it is for debugging a
+    /// build, not for every day.
+    pub fn clean_job(&self, project_root: &Path) -> Result<Job, String> {
+        let (root, configuration) = self
+            .current_configuration()
+            .ok_or("No build configuration selected")?;
+        Ok(Job {
+            title: format!("Delete build directory ({})", configuration.name),
+            steps: vec![clean_step(project_root, root, configuration)?],
+        })
+    }
+
+    /// The commands that delete everything every root has built: each
+    /// CMake configuration's build directory, and each Cargo root's
+    /// whole target directory.
+    pub fn clean_all_job(&self, project_root: &Path) -> Result<Job, String> {
+        let mut steps = Vec::new();
+        for root in &self.roots {
+            match root.system {
+                BuildSystem::Cargo => {
+                    let command = Command::new("cargo")
+                        .arg("clean")
+                        .arg("--manifest-path")
+                        .arg(project_root.join(&root.path))
+                        .current_dir(root_dir(project_root, root));
+                    steps.push(Step {
+                        description: format!("Cleaning {}", root.label()),
+                        command,
+                    });
+                }
+                BuildSystem::CMake => {
+                    for configuration in &root.configurations {
+                        steps.push(clean_step(project_root, root, configuration)?);
+                    }
+                }
+            }
+        }
+        if steps.is_empty() {
+            return Err("No build roots to clean".to_owned());
+        }
+        Ok(Job {
+            title: "Delete all build directories".to_owned(),
+            steps,
+        })
+    }
+
     // ----- The file -------------------------------------------------------
 
     /// Look at the project again for every root's discovered targets;
@@ -1668,6 +1724,41 @@ fn cmake_build_dir(
 
 /// `cargo <subcommand>` in the root's directory with the configuration's
 /// profile and environment.
+/// The step that deletes what `configuration` has built under `root`.
+/// CMake's own `-E rm` does the deleting, so the step is the same on
+/// every platform and its failure shows in the output like any other
+/// command's.
+fn clean_step(
+    project_root: &Path,
+    root: &BuildRoot,
+    configuration: &Configuration,
+) -> Result<Step, String> {
+    match root.system {
+        BuildSystem::Cargo => {
+            let command = cargo_command(project_root, root, configuration, "clean")?
+                .arg("--manifest-path")
+                .arg(project_root.join(&root.path));
+            Ok(Step {
+                description: format!("Cleaning {} ({})", root.label(), configuration.name),
+                command,
+            })
+        }
+        BuildSystem::CMake => {
+            let build_dir = cmake_build_dir(project_root, root, configuration);
+            let command = Command::new("cmake")
+                .arg("-E")
+                .arg("rm")
+                .arg("-rf")
+                .arg(&build_dir)
+                .current_dir(root_dir(project_root, root));
+            Ok(Step {
+                description: format!("Deleting {}", build_dir.display()),
+                command,
+            })
+        }
+    }
+}
+
 fn cargo_command(
     project_root: &Path,
     root: &BuildRoot,
@@ -3111,6 +3202,65 @@ mod tests {
         assert_eq!(
             sorted_by_name(["b", "A", "a", "B"].into_iter()),
             vec![1, 2, 0, 3]
+        );
+    }
+
+    #[test]
+    fn clean_jobs_delete_the_current_or_every_build_directory() {
+        let mut config = two_roots();
+        let project = Path::new("/proj");
+        // Cargo: clean the profile, leaving the directory to Cargo.
+        config.select_configuration(0, 1);
+        let job = config.clean_job(project).unwrap();
+        assert_eq!(job.title, "Delete build directory (release)");
+        assert_eq!(job.steps.len(), 1);
+        let step = &job.steps[0];
+        assert_eq!(step.description, "Cleaning Cargo.toml (release)");
+        assert_eq!(step.command.program(), "cargo");
+        assert_eq!(
+            args(&step.command),
+            vec!["clean", "--release", "--manifest-path", "/proj/Cargo.toml"]
+        );
+        assert_eq!(step.command.current_dir_path(), Some(project));
+
+        // CMake: delete the named directory with CMake's own rm.
+        config.select_configuration(1, 0);
+        let job = config.clean_job(project).unwrap();
+        assert_eq!(job.title, "Delete build directory (Debug)");
+        let step = &job.steps[0];
+        assert_eq!(step.description, "Deleting /proj/native/cmake-build-debug");
+        assert_eq!(step.command.program(), "cmake");
+        assert_eq!(
+            args(&step.command),
+            vec!["-E", "rm", "-rf", "/proj/native/cmake-build-debug"]
+        );
+        assert_eq!(
+            step.command.current_dir_path(),
+            Some(Path::new("/proj/native"))
+        );
+
+        // Everything: the Cargo root's whole target directory and each
+        // CMake configuration's directory.
+        let job = config.clean_all_job(project).unwrap();
+        assert_eq!(job.title, "Delete all build directories");
+        let commands: Vec<Vec<String>> = job.steps.iter().map(|s| args(&s.command)).collect();
+        assert_eq!(
+            commands,
+            vec![
+                vec!["clean", "--manifest-path", "/proj/Cargo.toml"],
+                vec!["-E", "rm", "-rf", "/proj/native/cmake-build-debug"],
+                vec!["-E", "rm", "-rf", "/proj/native/cmake-build-release"],
+            ]
+        );
+
+        let empty = BuildConfig::default();
+        assert_eq!(
+            empty.clean_job(project).unwrap_err(),
+            "No build configuration selected"
+        );
+        assert_eq!(
+            empty.clean_all_job(project).unwrap_err(),
+            "No build roots to clean"
         );
     }
 

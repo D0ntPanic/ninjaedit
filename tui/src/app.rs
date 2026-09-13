@@ -37,6 +37,12 @@
 //! active tab's cursor to the start of the line typed, clamped to the
 //! first or last line when the number is out of range, and closes the box.
 //!
+//! The command palette (Ctrl+P) lists every command (see the `command`
+//! module) and every view, with the key each is bound to, so it is
+//! both a way to run what has no key and the place to learn the keys
+//! that do. The commands run from it as their keys would; a view is
+//! shown and focused as the modes palette would.
+//!
 //! The modes palette (Ctrl+E) lists the editor, the settings page, and
 //! every tool (the shell today; builds, debuggers and the like later) in
 //! the same palette the tab and file searches use. Picking one shows it
@@ -82,15 +88,21 @@
 //! job while one is running stops the old one.
 //! A CMake configuration's build directory is configured on its first
 //! build of the run of the editor, and again when the options the
-//! configure step depends on change.
+//! configure step depends on change. To start over, the command palette
+//! has "Delete build directory" (the current configuration's) and
+//! "Delete all build directories" (every root's); each runs as a job
+//! in the output tool, so what it did and any failure are there to
+//! read. Neither has a key: they are for debugging a build, not for a
+//! slip of the fingers.
 //!
 //! With a tool focused its program gets the whole keyboard, since a shell
 //! or a coding agent has uses for nearly every key and its line editing
 //! (Ctrl+E for the end of the line, say) is muscle memory. The one key
 //! the program never sees is the prefix, Ctrl+], telnet's escape
 //! character: it holds the next key back, and that key goes to the
-//! editor instead, meaning what it means there: Ctrl+] Ctrl+E opens the
-//! modes palette, Ctrl+O the file search, Ctrl+T the tab search, Ctrl+F
+//! editor instead, meaning what it means there: Ctrl+] Ctrl+P opens the
+//! command palette, Ctrl+E the modes palette, Ctrl+O the file search,
+//! Ctrl+T the tab search, Ctrl+F
 //! and Ctrl+Shift+F the searches, Ctrl+L the go to line box, Ctrl+Q
 //! quits, and Ctrl+, and Ctrl+. move the focus. So a file named in a
 //! build's output is a prefix and a few keys away without leaving the
@@ -114,6 +126,7 @@
 
 use crate::build_view::{self, BuildOutcome, BuildView, Node};
 use crate::clipboard::Clipboard;
+use crate::command::Command;
 use crate::editor_view::EditorView;
 use crate::goto_line::{GoToLineBox, GoToLineOutcome};
 use crate::palette::{Palette, PaletteAction, PaletteItem, PaletteOutcome};
@@ -128,7 +141,7 @@ use crossterm::event::{
 };
 use ninjaedit_core::build::root_candidates;
 use ninjaedit_core::search::literal_query;
-use ninjaedit_core::terminal::{Command, ExitStatus, Output, Session, SessionId};
+use ninjaedit_core::terminal::{ExitStatus, Output, Session, SessionId};
 use ninjaedit_core::{
     BuildConfig, BuildRoot, Editor, Job, Project, ProjectKind, ProjectMatch, SearchStep, Settings,
     SourceLocation, Step, Storage,
@@ -206,6 +219,15 @@ impl View {
         }
     }
 
+    /// The key that shows the view, if one does; the rest are reached
+    /// through the modes palette.
+    fn shortcut(self) -> Option<&'static str> {
+        match self {
+            View::Tool(ToolKind::Shell) => Some("Ctrl+`"),
+            _ => None,
+        }
+    }
+
     fn action(self) -> PaletteAction {
         match self {
             View::Editor => PaletteAction::FocusEditor,
@@ -222,6 +244,7 @@ const DIVIDER_HEIGHT: u16 = 1;
 const TABS_PLACEHOLDER: &str = "Search open tabs";
 const FILES_PLACEHOLDER: &str = "Search files in project";
 const MODES_PLACEHOLDER: &str = "Editor, a page, or a tool";
+const COMMANDS_PLACEHOLDER: &str = "Search commands and views";
 const ADD_ROOT_PLACEHOLDER: &str = "Add a Cargo.toml or CMakeLists.txt as a build root";
 const CONFIGURATION_PLACEHOLDER: &str = "Build configuration to use";
 const TARGET_PLACEHOLDER: &str = "Target to build and run";
@@ -233,9 +256,10 @@ const SETTINGS_HINT: &str = "Tab/↑↓ next · Enter apply · Ctrl+D default ·
 const BUILD_HINT: &str =
     "↑↓ select · Enter options · Ctrl+N new · Ctrl+D duplicate · Del remove · Ctrl+E leave";
 /// What the status bar shows with the output tool focused and idle.
-const OUTPUT_IDLE_HINT: &str = "Ctrl+B build · Ctrl+R run · Ctrl+D dismiss · Ctrl+E mode";
+const OUTPUT_IDLE_HINT: &str =
+    "Ctrl+B build · Ctrl+R run · Ctrl+D dismiss · Ctrl+E mode · Ctrl+P commands";
 /// What the status bar shows while the prefix waits for its key.
-const PREFIX_HINT: &str = "Ctrl+]  then Ctrl+ E mode · O file · T tab · F search · L line · B build · R run · Q quit · ] itself";
+const PREFIX_HINT: &str = "Ctrl+]  then Ctrl+ P commands · E mode · O file · T tab · F search · L line · B build · R run · Q quit · ] itself";
 /// What the output tool shows before the first job.
 const OUTPUT_WELCOME: &str = "Ctrl+B builds and Ctrl+R runs the current target\r\n";
 /// How long a change to the search query waits for the search to finish,
@@ -594,6 +618,7 @@ impl App {
                     label: tab.title(),
                     detail: parent_of(&path),
                     search: path,
+                    shortcut: None,
                     action: PaletteAction::SwitchTab(index),
                 }
             })
@@ -628,6 +653,7 @@ impl App {
                         .unwrap_or_default(),
                     detail: parent_of(&relative),
                     search: relative,
+                    shortcut: None,
                     action: PaletteAction::OpenFile(path),
                 }
             })
@@ -660,6 +686,7 @@ impl App {
                 label: view.label().to_owned(),
                 detail: view.description().to_owned(),
                 search: view.label().to_owned(),
+                shortcut: view.shortcut(),
                 action: view.action(),
             })
             .collect();
@@ -667,6 +694,80 @@ impl App {
         palette.select(1);
         self.palette = Some(palette);
         self.palette_is_files = false;
+    }
+
+    /// Ctrl+P: open the command palette, listing every command and then
+    /// every view with the key bound to each. The description is
+    /// searched too, so "clean" finds the commands that delete build
+    /// directories.
+    fn open_command_palette(&mut self) {
+        self.close_search_box(true);
+        self.goto_line = None;
+        self.hide_project_search();
+        let commands = Command::ALL.into_iter().map(|command| PaletteItem {
+            label: command.label().to_owned(),
+            detail: command.description().to_owned(),
+            search: format!("{} {}", command.label(), command.description()),
+            shortcut: command.shortcut(),
+            action: PaletteAction::Command(command),
+        });
+        let views = View::all().map(|view| PaletteItem {
+            label: view.label().to_owned(),
+            detail: view.description().to_owned(),
+            search: format!("{} {}", view.label(), view.description()),
+            shortcut: view.shortcut(),
+            action: view.action(),
+        });
+        let palette = Palette::new(COMMANDS_PLACEHOLDER, commands.chain(views).collect());
+        self.palette = Some(palette);
+        self.palette_is_files = false;
+    }
+
+    /// Run a command picked from the command palette, as its key would.
+    fn run_command(&mut self, command: Command) {
+        match command {
+            Command::OpenFile => self.open_files_palette(),
+            Command::SwitchTab => self.open_tabs_palette(),
+            Command::Save => self.save_active(),
+            Command::CloseTab => self.request_close_tab(self.active),
+            Command::Find => self.open_search_box(),
+            Command::FindNext => self.find_next(),
+            Command::SearchProject => self.open_project_search(),
+            Command::GoToLine => self.open_goto_line(),
+            Command::Undo => self.press_editor_key('z'),
+            Command::Redo => self.press_editor_key('y'),
+            Command::Cut => self.press_editor_key('x'),
+            Command::Copy => self.press_editor_key('c'),
+            Command::Paste => self.press_editor_key('v'),
+            Command::SelectAll => self.press_editor_key('a'),
+            Command::Build => self.build(),
+            Command::Run => self.run(),
+            Command::SelectConfiguration => self.open_configuration_palette(),
+            Command::SelectTarget => self.open_target_palette(),
+            Command::DeleteBuildDir => self.delete_build_dir(),
+            Command::DeleteAllBuildDirs => self.delete_all_build_dirs(),
+            Command::SwitchView => self.open_modes_palette(),
+            Command::NextView => self.focus_next(),
+            Command::PreviousView => self.focus_previous(),
+            Command::Quit => self.request_quit(),
+        }
+    }
+
+    /// Do what Ctrl and a letter do in the active tab's editor (undo,
+    /// say), for a command that is that key's: the key is the one
+    /// source of what it does. With a mode in the editor's place there
+    /// is no editor to press it in. An edit made this way from a tool
+    /// brings the editor into focus, so it can be seen.
+    fn press_editor_key(&mut self, letter: char) {
+        if !matches!(self.mode, Mode::Editor) {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let key = KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL);
+        tab.view.handle_key(key, &mut self.clipboard);
+        self.focus = Focus::Editor;
     }
 
     /// Where the keyboard is: a tool when one is focused, else whatever
@@ -724,6 +825,7 @@ impl App {
                     self.selection_changed();
                 }
             }
+            PaletteAction::Command(command) => self.run_command(command),
         }
     }
 
@@ -864,6 +966,7 @@ impl App {
                         .unwrap_or_default(),
                     detail: parent_of(&display),
                     search: display,
+                    shortcut: None,
                     action: PaletteAction::AddBuildRoot(path),
                 }
             })
@@ -911,6 +1014,7 @@ impl App {
                     label: configuration.name.clone(),
                     detail: root.label(),
                     search: format!("{} {}", configuration.name, root.label()),
+                    shortcut: None,
                     action: PaletteAction::SelectConfiguration { root: r, index: i },
                 });
             }
@@ -942,6 +1046,7 @@ impl App {
                     label: target.name.clone(),
                     detail: root.label(),
                     search: format!("{} {}", target.name, root.label()),
+                    shortcut: None,
                     action: PaletteAction::SelectTarget { root: r, index: i },
                 });
             }
@@ -965,12 +1070,17 @@ impl App {
         self.start_current_job(true);
     }
 
-    fn start_current_job(&mut self, run: bool) {
-        // Values typed into the page but not yet applied count.
+    /// Values typed into the build configuration page but not yet
+    /// applied count for a job started while it is up.
+    fn commit_build_page(&mut self) {
         if let Mode::Build(view) = &mut self.mode {
             let outcome = view.commit_all(&mut self.build);
             self.handle_build_outcome(outcome);
         }
+    }
+
+    fn start_current_job(&mut self, run: bool) {
+        self.commit_build_page();
         let configure = self.cmake_configure_needed();
         let root = self.project.root().to_path_buf();
         let job = if run {
@@ -989,6 +1099,39 @@ impl App {
                 if let Some(dir) = self.build.cmake_build_dir(&root) {
                     self.job_dirs.push(dir);
                 }
+            }
+            Err(err) => self.status = Some(err),
+        }
+    }
+
+    /// "Delete build directory": throw away what the current
+    /// configuration has built, in the output tool like a build. A
+    /// CMake directory deleted this way is configured again by the
+    /// next build.
+    fn delete_build_dir(&mut self) {
+        self.commit_build_page();
+        let root = self.project.root().to_path_buf();
+        match self.build.clean_job(&root) {
+            Ok(job) => {
+                if let Some(dir) = self.build.cmake_build_dir(&root) {
+                    self.configured.remove(&dir);
+                }
+                self.job_configure = None;
+                self.start_job(job);
+            }
+            Err(err) => self.status = Some(err),
+        }
+    }
+
+    /// "Delete all build directories": likewise for every configuration
+    /// of every root.
+    fn delete_all_build_dirs(&mut self) {
+        self.commit_build_page();
+        match self.build.clean_all_job(self.project.root()) {
+            Ok(job) => {
+                self.configured.clear();
+                self.job_configure = None;
+                self.start_job(job);
             }
             Err(err) => self.status = Some(err),
         }
@@ -1626,6 +1769,7 @@ impl App {
                 self.request_quit();
             }
             KeyCode::Char('`') => self.toggle_shell(),
+            KeyCode::Char('p') => self.open_command_palette(),
             KeyCode::Char('e') => self.open_modes_palette(),
             KeyCode::Char(',') => self.focus_previous(),
             KeyCode::Char('.') => self.focus_next(),
@@ -2367,7 +2511,7 @@ impl App {
 /// Run a command in a pty, routing its output to the application's event
 /// channel so the loop wakes when the program writes or exits.
 fn spawn_session(
-    command: &Command,
+    command: &ninjaedit_core::terminal::Command,
     cols: u16,
     rows: u16,
     events: Sender<AppEvent>,
@@ -2437,6 +2581,7 @@ fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme, project: &Project) 
             "Ctrl+`         open a shell below the editor",
             "Ctrl+B         build the current target (Ctrl+R runs it)",
             "Ctrl+E         switch views: editor, pages, tools",
+            "Ctrl+P         search every command and its key",
             "Ctrl+]         in a tool, prefix for the editor's keys",
             "Ctrl+Q         quit",
         ]
@@ -2974,6 +3119,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn command_palette_lists_commands_with_their_keys_and_runs_them() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        draw(&mut app, 80, 20);
+
+        // Every command with its key at the right end of its row; the
+        // ones without a key show none.
+        ctrl(&mut app, 'p');
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[2].contains(COMMANDS_PLACEHOLDER), "{screen:#?}");
+        let open = screen
+            .iter()
+            .find(|r| r.contains("Open file"))
+            .expect("the open file command");
+        assert!(open.contains("Search the project's files"), "{open}");
+        assert!(open.contains("Ctrl+O │"), "at the right end: {open}");
+        type_str(&mut app, "delete build");
+        let screen = draw(&mut app, 80, 20);
+        let delete = screen
+            .iter()
+            .find(|r| r.contains("Delete build directory"))
+            .expect("the delete command");
+        assert!(!delete.contains("Ctrl"), "{delete}");
+
+        // A view is listed too, and picking it shows it.
+        ctrl(&mut app, 'a');
+        type_str(&mut app, "settings");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.palette.is_none());
+        assert!(matches!(app.mode, Mode::Settings(_)));
+
+        // A command runs as its key would: back to the editor, an edit,
+        // and undo from the palette takes it back.
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "editor");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Editor));
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.tabs[0].view.editor().buffer().to_text(), "xhi\n");
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "undo");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs[0].view.editor().buffer().to_text(), "hi\n");
+
+        // The description is searched too: "clean" finds the commands
+        // that delete build directories, and with no roots there is
+        // nothing to delete.
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "clean everything");
+        let screen = draw(&mut app, 80, 20);
+        assert!(
+            screen[3].contains("Delete all build directories"),
+            "{screen:#?}"
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status.as_deref(), Some("No build roots to clean"));
+        assert!(!app.tool_pane.is_visible());
+
+        // Quit is a command as well.
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "quit");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn deleting_build_directories_runs_as_a_job_and_forgets_what_was_configured() {
+        let (_dir, mut app) = app_with_files(&[("native/CMakeLists.txt", "project(x)\n")]);
+        draw(&mut app, 80, 20);
+        let root = app.project.root().to_path_buf();
+        app.build = BuildConfig::default();
+        app.build
+            .add_root(BuildRoot::discover(&root, "native/CMakeLists.txt").unwrap())
+            .unwrap();
+        let build_dir = app.build.cmake_build_dir(&root).unwrap();
+        assert!(build_dir.ends_with("native/cmake-build-debug"));
+        app.configured
+            .insert(build_dir.clone(), "signature".to_owned());
+        app.configured.insert(
+            build_dir.with_file_name("cmake-build-release"),
+            "x".to_owned(),
+        );
+
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "delete build directory");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.job_title, "Delete build directory (Debug)");
+        assert!(app.tool_pane.is_visible());
+        assert_eq!(app.tool_pane.active().unwrap().kind(), ToolKind::Output);
+        assert!(!app.configured.contains_key(&build_dir));
+        assert_eq!(app.configured.len(), 1, "the other configuration's stays");
+        let text = output_text(&app);
+        assert!(text.contains("Deleting"), "{text}");
+        assert!(text.contains("cmake-build-debug"), "{text}");
+
+        // The output tool has the keyboard now, so the palette comes
+        // after the prefix.
+        assert_eq!(app.focus, Focus::Tool);
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "delete all");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.job_title, "Delete all build directories");
+        assert!(app.configured.is_empty());
+    }
+
     /// Feed the app events from the channel until `done`, or fail after
     /// ten seconds.
     #[cfg(unix)]
@@ -2992,7 +3243,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn output_text(app: &App) -> String {
         let tool = app
             .tool_pane
@@ -3018,7 +3268,9 @@ mod tests {
         draw(&mut app, 60, 20);
         let step = |description: &str, script: &str| Step {
             description: description.to_owned(),
-            command: Command::new("sh").arg("-c").arg(script),
+            command: ninjaedit_core::terminal::Command::new("sh")
+                .arg("-c")
+                .arg(script),
         };
         let job = Job {
             title: "Test job".to_owned(),

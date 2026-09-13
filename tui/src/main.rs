@@ -9,6 +9,7 @@ mod app;
 mod build_view;
 mod clicks;
 mod clipboard;
+mod command;
 mod editor_view;
 mod fields;
 mod goto_line;

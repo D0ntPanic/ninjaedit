@@ -3,15 +3,20 @@
 //!
 //! The palette is generic over what it searches. The application builds a
 //! list of [`PaletteItem`]s (open tabs, project files, modes and tools,
-//! ...) and the palette
+//! commands, ...) and the palette
 //! ranks them against whatever is typed with the fuzzy matcher from the
 //! core crate. Enter activates the selected result, which starts out as the
 //! best match; the arrow keys and the mouse choose another. The query is
 //! an [`Input`], so it edits like a text field: Home and End and the
 //! arrow keys work on it, and Ctrl+Home and Ctrl+End pick the first and
 //! last result instead.
+//!
+//! An item can carry the key it is bound to, shown at the right end of
+//! its row, so a palette of commands doubles as the place to learn the
+//! keys.
 
 use crate::clipboard::Clipboard;
+use crate::command::Command;
 use crate::input::{Input, InputKey};
 use crate::theme::Theme;
 use crate::tool::ToolKind;
@@ -90,6 +95,8 @@ pub enum PaletteAction {
         root: usize,
         index: usize,
     },
+    /// Run one of the editor's commands, as its key would.
+    Command(Command),
 }
 
 /// One searchable entry.
@@ -102,6 +109,9 @@ pub struct PaletteItem {
     /// The full text the query is matched against when the label doesn't
     /// match (a path).
     pub search: String,
+    /// The key the item is bound to, if any, shown at the right end of
+    /// its row.
+    pub shortcut: Option<&'static str>,
     pub action: PaletteAction,
 }
 
@@ -336,6 +346,14 @@ impl Palette {
                 )
             };
             let width = self.rows.width as usize;
+            // The shortcut sits at the right end of the row, with a
+            // space before and after; the label and detail get what is
+            // left, or the whole row when there isn't room for it.
+            let shortcut = item
+                .shortcut
+                .map(|shortcut| (shortcut, Span::raw(shortcut).width() + 2))
+                .filter(|(_, needed)| *needed + 8 <= width);
+            let width = width - shortcut.map_or(0, |(_, needed)| needed);
             let label_width = Span::raw(&item.label).width().min(width.saturating_sub(1));
             buf.set_stringn(self.rows.x + 1, y, &item.label, label_width, base);
             let used = 1 + label_width + 2;
@@ -345,6 +363,15 @@ impl Palette {
                     y,
                     &item.detail,
                     width - used,
+                    context,
+                );
+            }
+            if let Some((shortcut, needed)) = shortcut {
+                buf.set_stringn(
+                    self.rows.x + (width + 1) as u16,
+                    y,
+                    shortcut,
+                    needed - 2,
                     context,
                 );
             }
