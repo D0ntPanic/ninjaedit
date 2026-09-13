@@ -58,7 +58,8 @@
 //! The settings themselves live in `~/.ninjaedit/settings.toml` and are
 //! saved whenever the page changes one, and applied at once to what is
 //! running: a terminal's scrollback is trimmed, the project search takes
-//! the new limit, and the next shell to start is the one named.
+//! the new limit, the next shell to start is the one named, and the next
+//! CMake build configures again if the generator changed.
 //!
 //! The build configuration (see the core crate's `build` module) lives
 //! in the project's own storage directory, in `build.toml`, and is saved
@@ -973,9 +974,11 @@ impl App {
         let configure = self.cmake_configure_needed();
         let root = self.project.root().to_path_buf();
         let job = if run {
-            self.build.run_job(&root, configure.is_some())
+            self.build
+                .run_job(&root, configure.is_some(), &self.settings)
         } else {
-            self.build.build_job(&root, configure.is_some())
+            self.build
+                .build_job(&root, configure.is_some(), &self.settings)
         };
         match job {
             Ok(job) => {
@@ -998,7 +1001,7 @@ impl App {
     fn cmake_configure_needed(&self) -> Option<(PathBuf, String)> {
         let dir = self.build.cmake_build_dir(self.project.root())?;
         let (_, configuration) = self.build.current_configuration()?;
-        let signature = configuration.cmake_configure_signature();
+        let signature = configuration.cmake_configure_signature(&self.settings);
         let configured =
             dir.join("CMakeCache.txt").is_file() && self.configured.get(&dir) == Some(&signature);
         (!configured).then_some((dir, signature))

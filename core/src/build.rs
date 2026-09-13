@@ -39,7 +39,9 @@
 //! Cargo keeps its own build directory and this module leaves it to it.
 //! A CMake configuration builds in `cmake-build-<name>` beside its
 //! `CMakeLists.txt`, the name lowercased, the way CLion does, so one
-//! `.gitignore` line covers every configuration.
+//! `.gitignore` line covers every configuration. The configure step uses
+//! the generator from the settings (Ninja unless changed), except where
+//! a configuration's own configure arguments name one with `-G`.
 //!
 //! The project has a **current** configuration and target, the ones a
 //! build (Ctrl+B) and a run (Ctrl+R) use. Both belong to one root; picking
@@ -53,6 +55,7 @@
 //! [`BuildConfig::run_job`] as a list of commands to run one after
 //! another.
 
+use crate::settings::Settings;
 use crate::terminal::Command;
 use regex::Regex;
 use std::collections::HashSet;
@@ -68,6 +71,8 @@ pub const BUILD_FILE: &str = "build.toml";
 /// What a CMake configuration's build directory is called, before the
 /// configuration's name.
 pub const CMAKE_BUILD_DIR_PREFIX: &str = "cmake-build-";
+/// The generator CMake configures with unless the settings say otherwise.
+pub const DEFAULT_CMAKE_GENERATOR: &str = "Ninja";
 
 const FILE_HEADER: &str = "# ninjaedit build configuration for this project.\n";
 /// The file keys that say a target was discovered, and as what, and that
@@ -437,12 +442,29 @@ impl Configuration {
         format!("{CMAKE_BUILD_DIR_PREFIX}{}", self.name.to_lowercase())
     }
 
+    /// The generator the CMake configure step passes with `-G`: the one
+    /// from the settings, unless the configuration's configure arguments
+    /// give their own or the setting is blank (leaving the choice to
+    /// CMake), in which case `None`.
+    pub fn cmake_generator(&self, settings: &Settings) -> Option<String> {
+        let generator = settings.cmake_generator();
+        if generator.is_empty() {
+            return None;
+        }
+        let args = split_args(&self.configure_args).unwrap_or_default();
+        let names_one = args.iter().any(|arg| arg.starts_with("-G"));
+        (!names_one).then(|| generator.to_owned())
+    }
+
     /// Everything the CMake configure step depends on, so a frontend can
     /// tell when a build directory needs configuring again.
-    pub fn cmake_configure_signature(&self) -> String {
+    pub fn cmake_configure_signature(&self, settings: &Settings) -> String {
         format!(
-            "{}\0{}\0{}",
-            self.build_type, self.configure_args, self.environment
+            "{}\0{}\0{}\0{}",
+            self.build_type,
+            self.configure_args,
+            self.environment,
+            self.cmake_generator(settings).unwrap_or_default()
         )
     }
 }
@@ -1245,8 +1267,14 @@ impl BuildConfig {
     /// configuration. For CMake, `configure` says whether to run the
     /// configure step before the build; a frontend passes `true` until
     /// the build directory has been configured with the configuration
-    /// as it now is.
-    pub fn build_job(&self, project_root: &Path, configure: bool) -> Result<Job, String> {
+    /// as it now is. The settings supply what isn't the configuration's
+    /// to say: the CMake generator.
+    pub fn build_job(
+        &self,
+        project_root: &Path,
+        configure: bool,
+        settings: &Settings,
+    ) -> Result<Job, String> {
         let (root, configuration, target) = self.current_parts()?;
         let mut job = Job {
             title: format!("Build {} ({})", target.name, configuration.name),
@@ -1276,6 +1304,7 @@ impl BuildConfig {
                             root,
                             configuration,
                             &build_dir,
+                            settings,
                         )?,
                     });
                 }
@@ -1302,7 +1331,12 @@ impl BuildConfig {
     /// The commands that build and then run the current target: for
     /// Cargo one `cargo run`, for CMake the build followed by the
     /// target's executable.
-    pub fn run_job(&self, project_root: &Path, configure: bool) -> Result<Job, String> {
+    pub fn run_job(
+        &self,
+        project_root: &Path,
+        configure: bool,
+        settings: &Settings,
+    ) -> Result<Job, String> {
         let (root, configuration, target) = self.current_parts()?;
         let dir = root_dir(project_root, root);
         match root.system {
@@ -1344,7 +1378,7 @@ impl BuildConfig {
                         target.name
                     ));
                 }
-                let mut job = self.build_job(project_root, configure)?;
+                let mut job = self.build_job(project_root, configure, settings)?;
                 job.title = format!("Run {} ({})", target.name, configuration.name);
                 let build_dir = cmake_build_dir(project_root, root, configuration);
                 let executable = build_dir.join(&target.executable);
@@ -1670,6 +1704,7 @@ fn cmake_configure_command(
     root: &BuildRoot,
     configuration: &Configuration,
     build_dir: &Path,
+    settings: &Settings,
 ) -> Result<Command, String> {
     let dir = root_dir(project_root, root);
     let mut command = Command::new("cmake")
@@ -1678,6 +1713,9 @@ fn cmake_configure_command(
         .arg("-B")
         .arg(build_dir)
         .current_dir(&dir);
+    if let Some(generator) = configuration.cmake_generator(settings) {
+        command = command.arg("-G").arg(generator);
+    }
     if !configuration.build_type.is_empty() {
         command = command.arg(format!("-DCMAKE_BUILD_TYPE={}", configuration.build_type));
     }
@@ -2127,6 +2165,7 @@ pub fn command_args(command: &Command) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::SettingKey;
 
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2622,7 +2661,9 @@ mod tests {
     fn cargo_jobs_build_and_run_the_package_with_the_profile() {
         let mut config = two_roots();
         let project = Path::new("/proj");
-        let job = config.build_job(project, true).unwrap();
+        let job = config
+            .build_job(project, true, &Settings::default())
+            .unwrap();
         assert_eq!(job.title, "Build app (dev)");
         assert_eq!(job.steps.len(), 1);
         let step = &job.steps[0];
@@ -2649,7 +2690,9 @@ mod tests {
         config
             .set_target_text(0, 0, TargetKey::Environment, "PORT=80")
             .unwrap();
-        let job = config.build_job(project, false).unwrap();
+        let job = config
+            .build_job(project, false, &Settings::default())
+            .unwrap();
         assert_eq!(
             args(&job.steps[0].command),
             vec![
@@ -2667,7 +2710,9 @@ mod tests {
             job.steps[0].command.envs(),
             &[(OsString::from("RUSTFLAGS"), OsString::from("-Dwarnings"))]
         );
-        let job = config.run_job(project, false).unwrap();
+        let job = config
+            .run_job(project, false, &Settings::default())
+            .unwrap();
         assert_eq!(job.title, "Run app (release)");
         assert_eq!(job.steps.len(), 1);
         let run = &job.steps[0].command;
@@ -2697,7 +2742,9 @@ mod tests {
         config
             .set_configuration_text(0, 1, ConfigurationKey::Profile, "bench")
             .unwrap();
-        let job = config.build_job(project, false).unwrap();
+        let job = config
+            .build_job(project, false, &Settings::default())
+            .unwrap();
         assert_eq!(args(&job.steps[0].command)[1..3], ["--profile", "bench"]);
     }
 
@@ -2726,7 +2773,9 @@ mod tests {
             .set_target_text(1, 1, TargetKey::Environment, "DEBUG=1")
             .unwrap();
 
-        let job = config.build_job(project, true).unwrap();
+        let job = config
+            .build_job(project, true, &Settings::default())
+            .unwrap();
         assert_eq!(job.title, "Build tool (Debug)");
         let descriptions: Vec<&str> = job.steps.iter().map(|s| s.description.as_str()).collect();
         assert_eq!(descriptions, vec!["Configuring Debug", "Building tool"]);
@@ -2743,7 +2792,8 @@ mod tests {
                 "-DFOO=ON",
                 "-G",
                 "Ninja"
-            ]
+            ],
+            "the configuration's own -G stands in for the setting's"
         );
         assert_eq!(
             configure.current_dir_path(),
@@ -2768,19 +2818,25 @@ mod tests {
 
         // Without configuring, and with everything to build.
         config.select_target(1, 0);
-        let job = config.build_job(project, false).unwrap();
+        let job = config
+            .build_job(project, false, &Settings::default())
+            .unwrap();
         assert_eq!(job.steps.len(), 1);
         assert_eq!(
             args(&job.steps[0].command),
             vec!["--build", "/proj/native/cmake-build-debug", "-j", "4"]
         );
         assert_eq!(
-            config.run_job(project, false).unwrap_err(),
+            config
+                .run_job(project, false, &Settings::default())
+                .unwrap_err(),
             "All has no executable to run: set one on the build configuration page"
         );
 
         config.select_target(1, 1);
-        let job = config.run_job(project, false).unwrap();
+        let job = config
+            .run_job(project, false, &Settings::default())
+            .unwrap();
         assert_eq!(job.title, "Run tool (Debug)");
         assert_eq!(job.steps.len(), 2);
         let run = &job.steps[1].command;
@@ -2797,7 +2853,9 @@ mod tests {
         config
             .set_target_text(1, 1, TargetKey::WorkingDirectory, "data")
             .unwrap();
-        let job = config.run_job(project, false).unwrap();
+        let job = config
+            .run_job(project, false, &Settings::default())
+            .unwrap();
         assert_eq!(
             job.steps[1].command.current_dir_path(),
             Some(Path::new("/proj/native/data"))
@@ -2807,15 +2865,93 @@ mod tests {
         config
             .set_configuration_text(1, 0, ConfigurationKey::BuildType, "")
             .unwrap();
-        let job = config.build_job(project, true).unwrap();
+        let job = config
+            .build_job(project, true, &Settings::default())
+            .unwrap();
         assert!(
             !args(&job.steps[0].command)
                 .iter()
                 .any(|a| a.contains("CMAKE_BUILD_TYPE"))
         );
         assert_ne!(
-            config.roots()[1].configurations()[0].cmake_configure_signature(),
-            config.roots()[1].configurations()[1].cmake_configure_signature()
+            config.roots()[1].configurations()[0].cmake_configure_signature(&Settings::default()),
+            config.roots()[1].configurations()[1].cmake_configure_signature(&Settings::default())
+        );
+    }
+
+    #[test]
+    fn cmake_configures_with_the_generator_from_the_settings() {
+        let mut config = two_roots();
+        config.select_target(1, 1);
+        let project = Path::new("/proj");
+        let configure_args = |config: &BuildConfig, settings: &Settings| {
+            let job = config.build_job(project, true, settings).unwrap();
+            args(&job.steps[0].command)
+        };
+        let generator = |args: &[String]| {
+            args.iter()
+                .position(|a| a == "-G")
+                .map(|i| args[i + 1].clone())
+        };
+
+        // Ninja unless set.
+        let settings = Settings::default();
+        let args = configure_args(&config, &settings);
+        assert_eq!(generator(&args), Some("Ninja".to_owned()));
+        assert_eq!(
+            args[..4],
+            ["-S", "/proj/native", "-B", "/proj/native/cmake-build-debug"]
+        );
+        assert_eq!(args[4..], ["-G", "Ninja", "-DCMAKE_BUILD_TYPE=Debug"]);
+        let default_signature =
+            config.roots()[1].configurations()[0].cmake_configure_signature(&settings);
+
+        let mut settings = Settings::default();
+        settings
+            .set_text(SettingKey::CMakeGenerator, "Unix Makefiles")
+            .unwrap();
+        let args = configure_args(&config, &settings);
+        assert_eq!(generator(&args), Some("Unix Makefiles".to_owned()));
+        assert_ne!(
+            config.roots()[1].configurations()[0].cmake_configure_signature(&settings),
+            default_signature,
+            "a new generator means configuring again"
+        );
+
+        // A blank setting leaves the choice to CMake.
+        settings.set_text(SettingKey::CMakeGenerator, "").unwrap();
+        let args = configure_args(&config, &settings);
+        assert_eq!(generator(&args), None);
+        assert!(!args.iter().any(|a| a.starts_with("-G")), "{args:?}");
+
+        // The configuration's own -G, spaced or joined, wins over the
+        // setting's, and is left where the user put it.
+        settings
+            .set_text(SettingKey::CMakeGenerator, "Xcode")
+            .unwrap();
+        for own in ["-G Ninja", "-GNinja", "-DX=1 -G 'Unix Makefiles'"] {
+            config
+                .set_configuration_text(1, 0, ConfigurationKey::ConfigureArgs, own)
+                .unwrap();
+            let args = configure_args(&config, &settings);
+            assert_eq!(
+                args.iter().filter(|a| a.starts_with("-G")).count(),
+                1,
+                "{own}: {args:?}"
+            );
+            assert!(!args.iter().any(|a| a == "Xcode"), "{own}: {args:?}");
+        }
+        assert_eq!(
+            config.roots()[1].configurations()[0].cmake_generator(&settings),
+            None
+        );
+        config
+            .set_configuration_text(1, 0, ConfigurationKey::ConfigureArgs, "-DGEN=1")
+            .unwrap();
+        assert_eq!(
+            config.roots()[1].configurations()[0].cmake_generator(&settings),
+            Some("Xcode".to_owned()),
+            "-D isn't -G"
         );
     }
 
@@ -2873,7 +3009,7 @@ mod tests {
         config.select_target(0, 2);
         assert!(
             config
-                .build_job(root, false)
+                .build_job(root, false, &Settings::default())
                 .unwrap_err()
                 .contains("c is disabled")
         );
@@ -2984,7 +3120,7 @@ mod tests {
         let project = Path::new("/proj");
         assert!(
             config
-                .build_job(project, true)
+                .build_job(project, true, &Settings::default())
                 .unwrap_err()
                 .contains("No build root")
         );
@@ -2992,17 +3128,27 @@ mod tests {
             .add_root(BuildRoot::new(BuildSystem::Cargo, "Cargo.toml"))
             .unwrap();
         assert_eq!(
-            config.build_job(project, true).unwrap_err(),
+            config
+                .build_job(project, true, &Settings::default())
+                .unwrap_err(),
             "Cargo.toml has no configuration to build with"
         );
         config.add_configuration(0);
         assert_eq!(
-            config.build_job(project, true).unwrap_err(),
+            config
+                .build_job(project, true, &Settings::default())
+                .unwrap_err(),
             "Cargo.toml has no target to build"
         );
         config.add_target(0);
         assert_eq!(
-            args(&config.build_job(project, true).unwrap().steps[0].command),
+            args(
+                &config
+                    .build_job(project, true, &Settings::default())
+                    .unwrap()
+                    .steps[0]
+                    .command
+            ),
             vec!["build"]
         );
     }

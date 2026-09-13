@@ -5,7 +5,8 @@
 //! brings a file to the front: Ctrl+O, Ctrl+T, a project search match.
 //!
 //! The page lists every [`SettingKey`] under its category as a text
-//! field with the setting's name above it and a line about it below.
+//! field with the setting's name above it and a line about it below
+//! (wrapped to the page's width).
 //! The fields are a [`Fields`], so Tab and the arrows move between them
 //! and each edits like any text field. A value is applied when its
 //! field is left (Tab, an arrow, a click elsewhere, leaving the page)
@@ -19,7 +20,7 @@
 //! applies them to what is running whenever the page reports a change.
 
 use crate::clipboard::Clipboard;
-use crate::fields::{FieldKey, Fields};
+use crate::fields::{FieldKey, Fields, wrap_words};
 use crate::palette::palette_background;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -50,7 +51,8 @@ pub enum SettingsOutcome {
     Changed,
 }
 
-/// One row of the page.
+/// One entry of the page, as laid out before the width is known; a
+/// note wraps into as many rows as it needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Line {
     Blank,
@@ -62,12 +64,24 @@ enum Line {
     Note(usize),
 }
 
+/// One screen row of the page, after wrapping to a width.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Row {
+    Blank,
+    Header(Category),
+    Name(usize),
+    Field(usize),
+    /// One line of a setting's note: the setting, whether it is the
+    /// reason its value was refused, and the line.
+    Note(usize, bool, String),
+}
+
 pub struct SettingsView {
     fields: Fields,
     /// For each field, why its text was refused, shown until the text
     /// changes.
     errors: Vec<Option<String>>,
-    /// The rows of the page, in order.
+    /// The entries of the page, in order.
     lines: Vec<Line>,
     /// How many rows are scrolled off the top.
     scroll: usize,
@@ -291,20 +305,51 @@ impl SettingsView {
             return None;
         }
 
+        let width = area.width as usize;
+        let field_width = area.width.saturating_sub(INDENT * 2).min(MAX_FIELD_WIDTH);
+        let text_width = width.saturating_sub(INDENT as usize);
+
+        // Lay the entries out as rows for this width: a note wraps, and
+        // is in the error color when its value was refused.
+        let rows: Vec<Row> = self
+            .lines
+            .iter()
+            .flat_map(|line| match *line {
+                Line::Blank => vec![Row::Blank],
+                Line::Header(category) => vec![Row::Header(category)],
+                Line::Name(index) => vec![Row::Name(index)],
+                Line::Field(index) => vec![Row::Field(index)],
+                Line::Note(index) => {
+                    let key = SettingKey::ALL[index];
+                    let (text, is_error) = match &self.errors[index] {
+                        Some(reason) => (reason.clone(), true),
+                        None if settings.is_default(key) => (key.description().to_owned(), false),
+                        None => {
+                            let default = match key.default_text() {
+                                text if text.is_empty() => "blank".to_owned(),
+                                text => text,
+                            };
+                            (format!("{} (default: {default})", key.description()), false)
+                        }
+                    };
+                    wrap_words(&text, text_width)
+                        .into_iter()
+                        .map(|text| Row::Note(index, is_error, text))
+                        .collect()
+                }
+            })
+            .collect();
+
         // Scroll no further than needed to show the last row, then as
         // needed to show the focused field with its name and note.
-        self.scroll = self.scroll.min(self.lines.len().saturating_sub(height));
+        self.scroll = self.scroll.min(rows.len().saturating_sub(height));
         if self.reveal {
             self.reveal = false;
             let focused = self.fields.focused();
-            let first = self
-                .lines
+            let first = rows.iter().position(|row| *row == Row::Name(focused));
+            let last = rows
                 .iter()
-                .position(|line| *line == Line::Name(focused));
-            let last = self
-                .lines
-                .iter()
-                .position(|line| *line == Line::Note(focused));
+                .rposition(|row| matches!(row, Row::Note(index, ..) if *index == focused));
             if let (Some(first), Some(last)) = (first, last) {
                 if first < self.scroll {
                     self.scroll = first;
@@ -324,16 +369,14 @@ impl SettingsView {
         // The page has no color of its own for a refused value; the
         // terminal palette's red says it as well as anything.
         let error = background.fg(theme.terminal_red);
-        let width = area.width as usize;
-        let field_width = area.width.saturating_sub(INDENT * 2).min(MAX_FIELD_WIDTH);
 
         self.fields.clear_layout();
         let mut cursor = None;
-        for (row, line) in self.lines.iter().skip(self.scroll).take(height).enumerate() {
+        for (row, entry) in rows.into_iter().skip(self.scroll).take(height).enumerate() {
             let y = area.y + row as u16;
-            match *line {
-                Line::Blank => {}
-                Line::Header(category) => {
+            match entry {
+                Row::Blank => {}
+                Row::Header(category) => {
                     let title = format!(" {} ", category.name());
                     let title_width = Span::raw(&title).width();
                     let x = area.x + HEADER_INDENT;
@@ -343,7 +386,7 @@ impl SettingsView {
                         buf[(x, y)].set_symbol("─").set_style(rule);
                     }
                 }
-                Line::Name(index) => {
+                Row::Name(index) => {
                     let key = SettingKey::ALL[index];
                     let x = area.x + INDENT;
                     let name_width = Span::raw(key.name()).width();
@@ -355,7 +398,7 @@ impl SettingsView {
                         }
                     }
                 }
-                Line::Field(index) => {
+                Row::Field(index) => {
                     let key = SettingKey::ALL[index];
                     let row = Rect::new(area.x + INDENT, y, field_width, 1);
                     let placeholder = key.placeholder();
@@ -366,21 +409,9 @@ impl SettingsView {
                         cursor = Some(at);
                     }
                 }
-                Line::Note(index) => {
-                    let key = SettingKey::ALL[index];
-                    let x = area.x + INDENT;
-                    let (text, style) = match &self.errors[index] {
-                        Some(reason) => (reason.clone(), error),
-                        None if settings.is_default(key) => (key.description().to_owned(), note),
-                        None => {
-                            let default = match key.default_text() {
-                                text if text.is_empty() => "blank".to_owned(),
-                                text => text,
-                            };
-                            (format!("{} (default: {default})", key.description()), note)
-                        }
-                    };
-                    buf.set_stringn(x, y, &text, width.saturating_sub(INDENT as usize), style);
+                Row::Note(_, is_error, text) => {
+                    let style = if is_error { error } else { note };
+                    buf.set_stringn(area.x + INDENT, y, &text, text_width, style);
                 }
             }
         }
@@ -541,12 +572,17 @@ mod tests {
             SettingsOutcome::Changed
         );
         assert_eq!(settings.search_max_results(), 42);
+        assert_eq!(view.focused_key(), SettingKey::CMakeGenerator);
+        assert_eq!(
+            press(&mut view, &mut settings, KeyCode::Tab),
+            SettingsOutcome::Continue
+        );
         assert_eq!(view.focused_key(), SettingKey::Shell, "Tab wraps");
         assert_eq!(
             press(&mut view, &mut settings, KeyCode::BackTab),
             SettingsOutcome::Continue
         );
-        assert_eq!(view.focused_key(), SettingKey::SearchMaxResults);
+        assert_eq!(view.focused_key(), SettingKey::CMakeGenerator);
     }
 
     #[test]
@@ -652,6 +688,63 @@ mod tests {
         assert_eq!(settings.shell(), Some("/bin/sh"));
         assert_eq!(view.focused_key(), SettingKey::SearchMaxResults);
         assert!(view.contains(8, row));
+    }
+
+    #[test]
+    fn a_narrow_page_wraps_a_note_and_reveals_all_of_it() {
+        let mut settings = Settings::default();
+        let mut view = SettingsView::new(&settings);
+        // Wide enough for the note in one row, then not.
+        let screen = draw(&mut view, &settings, 80, 40);
+        let name = screen
+            .iter()
+            .position(|r| r.contains("Maximum search results"))
+            .unwrap();
+        assert!(
+            screen[name + 2].contains("A project search stops after finding this many matches"),
+            "{screen:#?}"
+        );
+        assert!(screen[name + 3].trim().is_empty(), "{screen:#?}");
+
+        let screen = draw(&mut view, &settings, 40, 40);
+        let name = screen
+            .iter()
+            .position(|r| r.contains("Maximum search results"))
+            .unwrap();
+        let note = format!("{} {}", screen[name + 2].trim(), screen[name + 3].trim());
+        assert_eq!(
+            note, "A project search stops after finding this many matches",
+            "two rows, broken at a space: {screen:#?}"
+        );
+        assert!(screen[name + 4].trim().is_empty(), "{screen:#?}");
+        assert!(
+            screen[name + 3].starts_with("   ") && !screen[name + 3].starts_with("    "),
+            "continuation rows keep the indent: {screen:#?}"
+        );
+
+        // Moving to the field on a short screen scrolls so the whole
+        // note shows, not just its first row.
+        press(&mut view, &mut settings, KeyCode::Down);
+        press(&mut view, &mut settings, KeyCode::Down);
+        let screen = draw(&mut view, &settings, 40, 5);
+        assert!(
+            screen.iter().any(|r| r.contains("this many matches")),
+            "the note's last row: {screen:#?}"
+        );
+        assert!(
+            screen.iter().any(|r| r.contains("Maximum search results")),
+            "{screen:#?}"
+        );
+
+        // A refused value's reason wraps the same way.
+        ctrl(&mut view, &mut settings, 'a');
+        type_str(&mut view, &mut settings, "many");
+        press(&mut view, &mut settings, KeyCode::Enter);
+        let screen = draw(&mut view, &settings, 40, 5);
+        assert!(
+            screen.iter().any(|r| r.contains("must be a whole number")),
+            "{screen:#?}"
+        );
     }
 
     #[test]

@@ -13,6 +13,9 @@
 //!
 //! [search]
 //! max-results = 1000
+//!
+//! [build]
+//! cmake-generator = "Xcode"
 //! ```
 //!
 //! Keys the editor doesn't know are kept as they are and written back, so
@@ -29,6 +32,7 @@
 //! accessor, [`terminal_scrollback`](Settings::terminal_scrollback) and
 //! the like.
 
+use crate::build::DEFAULT_CMAKE_GENERATOR;
 use crate::project_search::MAX_MATCHES;
 use crate::terminal::emulator::DEFAULT_SCROLLBACK;
 use std::fmt;
@@ -39,16 +43,18 @@ use toml::{Table, Value};
 pub enum Category {
     Terminal,
     Search,
+    Build,
 }
 
 impl Category {
     /// Every category, in the order a settings page shows them.
-    pub const ALL: [Category; 2] = [Category::Terminal, Category::Search];
+    pub const ALL: [Category; 3] = [Category::Terminal, Category::Search, Category::Build];
 
     pub fn name(self) -> &'static str {
         match self {
             Category::Terminal => "Terminal",
             Category::Search => "Search",
+            Category::Build => "Build",
         }
     }
 
@@ -57,6 +63,7 @@ impl Category {
         match self {
             Category::Terminal => "terminal",
             Category::Search => "search",
+            Category::Build => "build",
         }
     }
 
@@ -78,21 +85,26 @@ pub enum SettingKey {
     TerminalScrollback,
     /// How many matches a project search stops at.
     SearchMaxResults,
+    /// The generator CMake configures with, passed as `-G`; blank to let
+    /// CMake choose its own.
+    CMakeGenerator,
 }
 
 impl SettingKey {
     /// Every setting, in the order a settings page lists them (grouped by
     /// category, in [`Category::ALL`]'s order).
-    pub const ALL: [SettingKey; 3] = [
+    pub const ALL: [SettingKey; 4] = [
         SettingKey::Shell,
         SettingKey::TerminalScrollback,
         SettingKey::SearchMaxResults,
+        SettingKey::CMakeGenerator,
     ];
 
     pub fn category(self) -> Category {
         match self {
             SettingKey::Shell | SettingKey::TerminalScrollback => Category::Terminal,
             SettingKey::SearchMaxResults => Category::Search,
+            SettingKey::CMakeGenerator => Category::Build,
         }
     }
 
@@ -102,6 +114,7 @@ impl SettingKey {
             SettingKey::Shell => "Shell executable",
             SettingKey::TerminalScrollback => "Scrollback lines",
             SettingKey::SearchMaxResults => "Maximum search results",
+            SettingKey::CMakeGenerator => "CMake generator",
         }
     }
 
@@ -115,6 +128,9 @@ impl SettingKey {
             SettingKey::SearchMaxResults => {
                 "A project search stops after finding this many matches"
             }
+            SettingKey::CMakeGenerator => {
+                "Passed as -G when CMake configures: Ninja, \"Unix Makefiles\", Xcode, and the like; blank for CMake's own choice"
+            }
         }
     }
 
@@ -124,6 +140,7 @@ impl SettingKey {
             SettingKey::Shell => "shell",
             SettingKey::TerminalScrollback => "scrollback",
             SettingKey::SearchMaxResults => "max-results",
+            SettingKey::CMakeGenerator => "cmake-generator",
         }
     }
 
@@ -140,18 +157,21 @@ impl SettingKey {
             SettingKey::Shell => String::new(),
             SettingKey::TerminalScrollback => DEFAULT_SCROLLBACK.to_string(),
             SettingKey::SearchMaxResults => MAX_MATCHES.to_string(),
+            SettingKey::CMakeGenerator => DEFAULT_CMAKE_GENERATOR.to_owned(),
         }
     }
 
     /// What a field shows while its text is empty. For the shell, whose
     /// default is to detect the user's shell, this says which one that is
-    /// on this machine; for the others it is the default value.
+    /// on this machine; for the CMake generator, that a blank leaves the
+    /// choice to CMake; for the others it is the default value.
     pub fn placeholder(self) -> String {
         match self {
             SettingKey::Shell => format!(
                 "autodetected: {}",
                 crate::terminal::detected_shell().to_string_lossy()
             ),
+            SettingKey::CMakeGenerator => "CMake's default generator".to_owned(),
             _ => self.default_text(),
         }
     }
@@ -176,6 +196,7 @@ pub struct Settings {
     shell: Option<String>,
     terminal_scrollback: Option<usize>,
     search_max_results: Option<usize>,
+    cmake_generator: Option<String>,
     /// Whatever else the settings file held: tables and keys this version
     /// of the editor doesn't know, kept to write back.
     unknown: Table,
@@ -203,6 +224,14 @@ impl Settings {
         self.search_max_results.unwrap_or(MAX_MATCHES)
     }
 
+    /// The generator CMake configures with (`-G`), Ninja unless set.
+    /// Empty to pass none and let CMake choose its own.
+    pub fn cmake_generator(&self) -> &str {
+        self.cmake_generator
+            .as_deref()
+            .unwrap_or(DEFAULT_CMAKE_GENERATOR)
+    }
+
     // ----- Text form ------------------------------------------------------
 
     /// A setting's value as text: what a field holds. Blank for a shell
@@ -212,6 +241,7 @@ impl Settings {
             SettingKey::Shell => self.shell().unwrap_or_default().to_owned(),
             SettingKey::TerminalScrollback => self.terminal_scrollback().to_string(),
             SettingKey::SearchMaxResults => self.search_max_results().to_string(),
+            SettingKey::CMakeGenerator => self.cmake_generator().to_owned(),
         }
     }
 
@@ -234,6 +264,9 @@ impl Settings {
                 let matches = parse_count(text, 1)?;
                 self.search_max_results = (matches != MAX_MATCHES).then_some(matches);
             }
+            SettingKey::CMakeGenerator => {
+                self.cmake_generator = (text != DEFAULT_CMAKE_GENERATOR).then(|| text.to_owned());
+            }
         }
         Ok(*self != before)
     }
@@ -244,6 +277,7 @@ impl Settings {
             SettingKey::Shell => self.shell.is_none(),
             SettingKey::TerminalScrollback => self.terminal_scrollback() == DEFAULT_SCROLLBACK,
             SettingKey::SearchMaxResults => self.search_max_results() == MAX_MATCHES,
+            SettingKey::CMakeGenerator => self.cmake_generator() == DEFAULT_CMAKE_GENERATOR,
         }
     }
 
@@ -255,6 +289,7 @@ impl Settings {
             SettingKey::Shell => self.shell = None,
             SettingKey::TerminalScrollback => self.terminal_scrollback = None,
             SettingKey::SearchMaxResults => self.search_max_results = None,
+            SettingKey::CMakeGenerator => self.cmake_generator = None,
         }
         !was_default
     }
@@ -308,6 +343,14 @@ impl Settings {
             SettingKey::SearchMaxResults => {
                 self.search_max_results = Some(read_count(key, value, 1)?);
             }
+            SettingKey::CMakeGenerator => {
+                let generator = value
+                    .as_str()
+                    .ok_or_else(|| SettingsError(format!("`{}` must be a string", key.path())))?
+                    .trim();
+                self.cmake_generator =
+                    (generator != DEFAULT_CMAKE_GENERATOR).then(|| generator.to_owned());
+            }
         }
         Ok(())
     }
@@ -325,6 +368,7 @@ impl Settings {
                 SettingKey::Shell => Value::String(self.text(key)),
                 SettingKey::TerminalScrollback => Value::Integer(self.terminal_scrollback() as i64),
                 SettingKey::SearchMaxResults => Value::Integer(self.search_max_results() as i64),
+                SettingKey::CMakeGenerator => Value::String(self.text(key)),
             };
             let category = table
                 .entry(key.category().table())
@@ -377,6 +421,7 @@ mod tests {
         assert_eq!(settings.shell(), None);
         assert_eq!(settings.terminal_scrollback(), DEFAULT_SCROLLBACK);
         assert_eq!(settings.search_max_results(), MAX_MATCHES);
+        assert_eq!(settings.cmake_generator(), "Ninja");
         for key in SettingKey::ALL {
             assert!(settings.is_default(key), "{key:?}");
             assert_eq!(settings.text(key), key.default_text(), "{key:?}");
@@ -391,6 +436,8 @@ mod tests {
             SettingKey::TerminalScrollback.placeholder(),
             DEFAULT_SCROLLBACK.to_string()
         );
+        assert_eq!(SettingKey::CMakeGenerator.default_text(), "Ninja");
+        assert_ne!(SettingKey::CMakeGenerator.placeholder(), "Ninja");
         // Every setting has a category, and every category its settings.
         let listed: Vec<SettingKey> = Category::ALL.into_iter().flat_map(Category::keys).collect();
         assert_eq!(listed, SettingKey::ALL);
@@ -464,6 +511,23 @@ mod tests {
         assert_eq!(settings.set_text(SettingKey::Shell, "  "), Ok(true));
         assert_eq!(settings.shell(), None);
         assert!(settings.is_default(SettingKey::Shell));
+
+        // The generator is any text; blank is a choice (CMake's own),
+        // not the default.
+        assert_eq!(
+            settings.set_text(SettingKey::CMakeGenerator, " Xcode "),
+            Ok(true)
+        );
+        assert_eq!(settings.cmake_generator(), "Xcode");
+        assert_eq!(settings.text(SettingKey::CMakeGenerator), "Xcode");
+        assert_eq!(settings.set_text(SettingKey::CMakeGenerator, ""), Ok(true));
+        assert_eq!(settings.cmake_generator(), "");
+        assert!(!settings.is_default(SettingKey::CMakeGenerator));
+        assert_eq!(
+            settings.set_text(SettingKey::CMakeGenerator, "Ninja"),
+            Ok(true)
+        );
+        assert!(settings.is_default(SettingKey::CMakeGenerator));
     }
 
     #[test]
@@ -498,6 +562,14 @@ mod tests {
         assert!(text.contains("shell = \"/bin/bash\""), "{text}");
         assert!(text.contains("scrollback = 2000"), "{text}");
         assert!(!text.contains("[search]"), "{text}");
+        assert!(!text.contains("[build]"), "{text}");
+        assert_eq!(Settings::parse(&text).unwrap(), settings);
+
+        // A blank generator is written, since it isn't the default.
+        settings.set_text(SettingKey::CMakeGenerator, "").unwrap();
+        let text = settings.to_toml();
+        assert!(text.contains("[build]"), "{text}");
+        assert!(text.contains("cmake-generator = \"\""), "{text}");
         assert_eq!(Settings::parse(&text).unwrap(), settings);
     }
 
@@ -514,12 +586,16 @@ font = \"mono\"
 [search]
 max-results = 25
 
+[build]
+cmake-generator = \" Unix Makefiles \"
+
 [git]
 sign = true
 ";
         let settings = Settings::parse(text).unwrap();
         assert_eq!(settings.shell(), Some("fish"));
         assert_eq!(settings.search_max_results(), 25);
+        assert_eq!(settings.cmake_generator(), "Unix Makefiles", "trimmed");
         assert_eq!(settings.terminal_scrollback(), DEFAULT_SCROLLBACK);
 
         let written = settings.to_toml();
@@ -547,10 +623,14 @@ sign = true
 
     #[test]
     fn a_default_written_out_by_hand_reads_as_the_default() {
-        let text = format!("[terminal]\nscrollback = {DEFAULT_SCROLLBACK}\n");
+        let text = format!(
+            "[terminal]\nscrollback = {DEFAULT_SCROLLBACK}\n[build]\ncmake-generator = \"Ninja\"\n"
+        );
         let settings = Settings::parse(&text).unwrap();
         assert!(settings.is_default(SettingKey::TerminalScrollback));
+        assert!(settings.is_default(SettingKey::CMakeGenerator));
         assert!(!settings.to_toml().contains("scrollback"));
+        assert!(!settings.to_toml().contains("cmake-generator"));
     }
 
     #[test]
@@ -572,6 +652,10 @@ sign = true
         assert_eq!(
             err("[terminal]\nshell = 3\n"),
             "`terminal.shell` must be a string"
+        );
+        assert_eq!(
+            err("[build]\ncmake-generator = true\n"),
+            "`build.cmake-generator` must be a string"
         );
         assert_eq!(
             err("terminal = 1\n"),
