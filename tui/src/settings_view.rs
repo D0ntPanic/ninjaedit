@@ -13,7 +13,7 @@
 //! value is refused: the setting keeps its value and the reason shows
 //! under the field until the text changes. Escape puts the field's text
 //! back to the setting's value. A setting changed from its default is
-//! tagged, and Ctrl+R puts the focused one back to its default.
+//! tagged, and Ctrl+D puts the focused one back to its default.
 //!
 //! The page only edits the [`Settings`]; the application saves them and
 //! applies them to what is running whenever the page reports a change.
@@ -171,7 +171,7 @@ impl SettingsView {
         outcome
     }
 
-    /// Ctrl+R: put the focused setting back to its default.
+    /// Ctrl+D: put the focused setting back to its default.
     fn reset_focused(&mut self, settings: &mut Settings) -> SettingsOutcome {
         let index = self.fields.focused();
         let key = SettingKey::ALL[index];
@@ -208,7 +208,7 @@ impl SettingsView {
                 self.revert_focused(settings);
                 SettingsOutcome::Continue
             }
-            KeyCode::Char('r') if ctrl => self.reset_focused(settings),
+            KeyCode::Char('d') if ctrl => self.reset_focused(settings),
             KeyCode::Char('s') if ctrl => self.commit_all(settings),
             KeyCode::PageUp => {
                 self.scroll = self.scroll.saturating_sub(self.page());
@@ -593,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_r_resets_the_focused_setting() {
+    fn ctrl_d_resets_the_focused_setting() {
         let mut settings = Settings::default();
         settings.set_text(SettingKey::Shell, "fish").unwrap();
         settings
@@ -602,24 +602,24 @@ mod tests {
         let mut view = SettingsView::new(&settings);
         assert_eq!(view.text(SettingKey::Shell), "fish");
         assert_eq!(
-            ctrl(&mut view, &mut settings, 'r'),
+            ctrl(&mut view, &mut settings, 'd'),
             SettingsOutcome::Changed
         );
         assert_eq!(settings.shell(), None);
         assert_eq!(view.text(SettingKey::Shell), "");
         assert_eq!(
-            ctrl(&mut view, &mut settings, 'r'),
+            ctrl(&mut view, &mut settings, 'd'),
             SettingsOutcome::Continue
         );
         assert_eq!(settings.search_max_results(), 5, "only the focused one");
-        // Ctrl+R with bad text typed drops the text along with the note.
+        // Ctrl+D with bad text typed drops the text along with the note.
         press(&mut view, &mut settings, KeyCode::Tab);
         press(&mut view, &mut settings, KeyCode::Tab);
         type_str(&mut view, &mut settings, "x");
         press(&mut view, &mut settings, KeyCode::Enter);
         assert!(view.error(SettingKey::SearchMaxResults).is_some());
         assert_eq!(
-            ctrl(&mut view, &mut settings, 'r'),
+            ctrl(&mut view, &mut settings, 'd'),
             SettingsOutcome::Changed
         );
         assert!(settings.is_default(SettingKey::SearchMaxResults));

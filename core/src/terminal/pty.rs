@@ -98,6 +98,31 @@ impl Command {
         &self.program
     }
 
+    pub fn args(&self) -> &[OsString] {
+        &self.args
+    }
+
+    /// The directory the program starts in, if one was set.
+    pub fn current_dir_path(&self) -> Option<&Path> {
+        self.cwd.as_deref()
+    }
+
+    /// The variables set for the program, beyond the terminal ones.
+    pub fn envs(&self) -> &[(OsString, OsString)] {
+        &self.env
+    }
+
+    /// The command line as a shell would want it typed, for showing
+    /// what is about to run: arguments with spaces or shell characters
+    /// in them are quoted.
+    pub fn display(&self) -> String {
+        std::iter::once(&self.program)
+            .chain(&self.args)
+            .map(|arg| quote_for_display(&arg.to_string_lossy()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// The command as the pty library wants it, with the environment a
     /// terminal program expects: `TERM` naming what this emulator
     /// imitates and `COLORTERM` promising direct color.
@@ -114,6 +139,20 @@ impl Command {
             builder.env(key, value);
         }
         builder
+    }
+}
+
+/// An argument as a shell would want it typed: as it is when it needs
+/// no quoting, else in single quotes.
+fn quote_for_display(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_alphanumeric() || "-_./:=+,@%".contains(c));
+    if plain {
+        arg.to_owned()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
     }
 }
 
@@ -285,6 +324,20 @@ mod tests {
                 Output::Exited(status) => return (terminal, status),
             }
         }
+    }
+
+    #[test]
+    fn displays_a_command_line_with_quoting() {
+        let command = Command::new("cmake")
+            .arg("-DFOO=a b")
+            .arg("--build")
+            .arg("/tmp/x")
+            .arg("it's");
+        assert_eq!(
+            command.display(),
+            "cmake '-DFOO=a b' --build /tmp/x 'it'\\''s'"
+        );
+        assert_eq!(Command::new("ls").arg("").display(), "ls ''");
     }
 
     #[test]

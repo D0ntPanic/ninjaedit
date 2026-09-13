@@ -1,9 +1,11 @@
 //! Core logic backing the ninjaedit editor: project management, file
-//! indexing, file buffers, fuzzy search, the editor model, and the
-//! settings with the persistent storage they live in. The TUI layer in
+//! indexing, file buffers, fuzzy search, the editor model, the build
+//! configuration, and the settings with the persistent storage they live
+//! in. The TUI layer in
 //! the `tui` crate builds on these types.
 
 pub mod buffer;
+pub mod build;
 pub mod editor;
 pub mod fuzzy;
 pub mod highlight_cache;
@@ -20,6 +22,9 @@ pub mod terminal;
 pub mod text;
 
 pub use buffer::{BufferSnapshot, FileBuffer, LineEnding};
+pub use build::{
+    BuildConfig, BuildRoot, BuildSystem, ConfigurationKey, Job, Selection, Step, TargetKey,
+};
 pub use editor::{Cell, Editor, Movement, Position};
 pub use highlight_cache::HighlightCache;
 pub use indent::Indentation;

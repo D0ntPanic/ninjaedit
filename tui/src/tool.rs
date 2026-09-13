@@ -2,13 +2,20 @@
 //! them.
 //!
 //! A [`Tool`] is one running (or finished) program shown in a
-//! [`TerminalView`]: a shell for now, later a build, a program's output, a
-//! debugger, a coding agent. Each keeps the [`Session`] driving the pty
-//! while it runs; the application supplies the command each time one is
-//! started, since what it is (which shell, say) comes from the settings
-//! and may have changed since the last run. The session's output reaches
-//! the tool from the application, which owns the channel the pty reader
-//! threads write to.
+//! [`TerminalView`]: a shell, the output of a build or of the program
+//! being built, later a debugger or a coding agent. Each keeps the
+//! [`Session`] driving the pty while it runs; the application supplies
+//! the command each time one is started, since what it is (which shell,
+//! say) comes from the settings and may have changed since the last run.
+//! The session's output reaches the tool from the application, which
+//! owns the channel the pty reader threads write to.
+//!
+//! The output tool differs from the shell in having no program of its
+//! own: it sits empty until a build (Ctrl+B) or a run (Ctrl+R) starts,
+//! and shows the commands of that job one after another on one screen.
+//! It stays showing after the last of them exits, since the output is
+//! the point, where a shell that exits takes its pane with it; Ctrl+D
+//! dismisses it once nothing is running.
 //!
 //! The [`ToolPane`] is the bottom half of the screen: a stack of tools
 //! with one active, shown or hidden as a whole, and a split with the
@@ -16,10 +23,9 @@
 //! running, so coming back shows the same shell where it was left; only
 //! quitting the editor, which drops the sessions, ends them.
 //!
-//! Several tools are planned, so the pane is a list from the start even
-//! though the shell is the only one wired up today. [`ToolKind`] names
-//! each kind of tool the editor can open, so the modes palette (Ctrl+E)
-//! can list them all and the pane can find the one already running.
+//! [`ToolKind`] names each kind of tool the editor can open, so the modes
+//! palette (Ctrl+E) can list them all and the pane can find the one
+//! already running.
 
 use crate::terminal_view::TerminalView;
 use ninjaedit_core::Settings;
@@ -32,16 +38,19 @@ use std::path::Path;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolKind {
     Shell,
+    /// The output of the last build or run.
+    Output,
 }
 
 impl ToolKind {
     /// Every kind, in the order the modes palette lists them.
-    pub const ALL: [ToolKind; 1] = [ToolKind::Shell];
+    pub const ALL: [ToolKind; 2] = [ToolKind::Shell, ToolKind::Output];
 
     /// The short name shown in the tool's tab and the palette.
     pub fn name(self) -> &'static str {
         match self {
             ToolKind::Shell => "Shell",
+            ToolKind::Output => "Output",
         }
     }
 
@@ -50,18 +59,34 @@ impl ToolKind {
     pub fn description(self) -> &'static str {
         match self {
             ToolKind::Shell => "Run commands in a shell below the editor",
+            ToolKind::Output => "The output of the last build (Ctrl+B) or run (Ctrl+R)",
         }
     }
 
-    /// The command that runs this tool in `directory`: for the shell, the
-    /// program the settings name, or the user's shell when they don't.
-    pub fn command(self, directory: &Path, settings: &Settings) -> Command {
+    /// The command that runs this tool in `directory` when it is opened:
+    /// for the shell, the program the settings name, or the user's shell
+    /// when they don't. The output tool has none; a build or run starts
+    /// its programs.
+    pub fn command(self, directory: &Path, settings: &Settings) -> Option<Command> {
         match self {
-            ToolKind::Shell => match settings.shell() {
-                Some(shell) => Command::new(shell),
-                None => Command::shell(),
-            }
-            .current_dir(directory),
+            ToolKind::Shell => Some(
+                match settings.shell() {
+                    Some(shell) => Command::new(shell),
+                    None => Command::shell(),
+                }
+                .current_dir(directory),
+            ),
+            ToolKind::Output => None,
+        }
+    }
+
+    /// Whether the tool is worth showing with no program running in it:
+    /// the output tool keeps the output of the last job, and shows a
+    /// hint before the first.
+    pub fn shows_when_idle(self) -> bool {
+        match self {
+            ToolKind::Shell => false,
+            ToolKind::Output => true,
         }
     }
 }
@@ -163,18 +188,36 @@ impl Tool {
         if self.session.is_some() {
             return Ok(());
         }
-        let (cols, rows) = self.view.size();
-        if self.exit.is_some() {
-            // A restart begins on a fresh screen.
-            let terminal = self.view.terminal_mut();
-            *terminal = ninjaedit_core::terminal::Terminal::new(cols as usize, rows as usize);
-            terminal.set_scrollback_limit(self.scrollback);
+        if self.exit.is_some() && !self.kind.shows_when_idle() {
+            // A restarted shell begins on a fresh screen; a job's
+            // commands follow one another on one.
+            self.clear_screen();
         }
+        let (cols, rows) = self.view.size();
         let session = spawn(cols, rows)?;
         self.sent_size = (cols, rows);
         self.session = Some(session);
         self.exit = None;
         Ok(())
+    }
+
+    /// End the program if one is running, without waiting for its exit
+    /// (which is still reported through the session's sink, under the
+    /// old session's id), so that another can start at once in its
+    /// place.
+    pub fn stop(&mut self) {
+        // Dropping the session kills the program.
+        self.session = None;
+        self.exit = None;
+    }
+
+    /// Wipe the screen and the scrollback, as a new job does before its
+    /// first command.
+    pub fn clear_screen(&mut self) {
+        let (cols, rows) = self.view.size();
+        let terminal = self.view.terminal_mut();
+        *terminal = ninjaedit_core::terminal::Terminal::new(cols as usize, rows as usize);
+        terminal.set_scrollback_limit(self.scrollback);
     }
 
     /// Feed program output to the terminal.

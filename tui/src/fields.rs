@@ -22,6 +22,53 @@ use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
+use ratatui::text::Span;
+
+/// Break text into lines no wider than `width` columns at the spaces,
+/// for a note under a field. A word wider than a line is cut where the
+/// line ends. Blank text is one empty line, so a note keeps its row.
+pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_width = 0;
+    for word in text.split_whitespace() {
+        let mut word = word;
+        let mut word_width = Span::raw(word).width();
+        // A word that doesn't fit on the line goes to the next; one
+        // wider than a line is cut into pieces that fit.
+        if line_width > 0 && line_width + 1 + word_width > width {
+            lines.push(std::mem::take(&mut line));
+            line_width = 0;
+        }
+        while word_width > width {
+            let mut taken = 0;
+            let mut cut = 0;
+            for (offset, c) in word.char_indices() {
+                let w = Span::raw(&*c.encode_utf8(&mut [0; 4])).width();
+                if taken + w > width {
+                    break;
+                }
+                taken += w;
+                cut = offset + c.len_utf8();
+            }
+            if cut == 0 {
+                break;
+            }
+            lines.push(word[..cut].to_owned());
+            word = &word[cut..];
+            word_width = Span::raw(word).width();
+        }
+        if line_width > 0 {
+            line.push(' ');
+            line_width += 1;
+        }
+        line.push_str(word);
+        line_width += word_width;
+    }
+    lines.push(line);
+    lines
+}
 
 /// Whether a key meant something to the fields, and what.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,6 +283,26 @@ mod tests {
             })
             .collect();
         (buf, cursors)
+    }
+
+    #[test]
+    fn wraps_at_spaces_and_cuts_long_words() {
+        assert_eq!(wrap_words("", 10), vec![""]);
+        assert_eq!(wrap_words("short", 10), vec!["short"]);
+        assert_eq!(
+            wrap_words("the quick brown fox jumps", 10),
+            vec!["the quick", "brown fox", "jumps"]
+        );
+        assert_eq!(
+            wrap_words("a exactly-10 b", 10),
+            vec!["a", "exactly-10", "b"]
+        );
+        assert_eq!(
+            wrap_words("ab abcdefghijklmno cd", 6),
+            vec!["ab", "abcdef", "ghijkl", "mno cd"]
+        );
+        assert_eq!(wrap_words("  spaced   out  ", 20), vec!["spaced out"]);
+        assert_eq!(wrap_words("x", 0), vec!["x"]);
     }
 
     #[test]

@@ -48,17 +48,40 @@
 //! so the view before this one is preselected and Ctrl+E, Enter goes
 //! back to it, whichever way the user came.
 //!
-//! The settings page is the first of the editor's modes: views that
-//! stand in for the editor and its tab bar in the upper part of the
-//! screen (the tool pane, if showing, stays below). A mode is left by
-//! choosing the editor in the modes palette, by closing its tab, or by
-//! anything that brings a file to the front: opening one with Ctrl+O,
-//! switching to one with Ctrl+T, going to a project search match.
-//! Focusing a tool leaves the mode where it is above the pane. The
-//! settings themselves live in `~/.ninjaedit/settings.toml` and are saved
-//! whenever the page changes one, and applied at once to what is
+//! The settings page and the build configuration page are the editor's
+//! modes: views that stand in for the editor and its tab bar in the
+//! upper part of the screen (the tool pane, if showing, stays below). A
+//! mode is left by choosing the editor in the modes palette, by closing
+//! its tab, or by anything that brings a file to the front: opening one
+//! with Ctrl+O, switching to one with Ctrl+T, going to a project search
+//! match. Focusing a tool leaves the mode where it is above the pane.
+//! The settings themselves live in `~/.ninjaedit/settings.toml` and are
+//! saved whenever the page changes one, and applied at once to what is
 //! running: a terminal's scrollback is trimmed, the project search takes
 //! the new limit, and the next shell to start is the one named.
+//!
+//! The build configuration (see the core crate's `build` module) lives
+//! in the project's own storage directory, in `build.toml`, and is saved
+//! whenever the page changes it or the current configuration or target
+//! is changed. With no file yet, the project's top-level `Cargo.toml`
+//! and `CMakeLists.txt` are found and set up with their defaults, and
+//! every load looks at the project again for the targets it finds
+//! there. The status bar shows the current configuration and target; clicking
+//! either opens a palette to pick another. Ctrl+B builds the current
+//! target with the current configuration and Ctrl+R builds and runs it,
+//! from the editor, a mode, or (after the prefix, or straight away when
+//! nothing is running in it) a tool. Each job runs in the output tool:
+//! its commands one after another on one screen, with a heading before
+//! each and a line saying how it ended. Either gives the output the
+//! keyboard, so Ctrl+C stops the job (or the program) without switching
+//! to it first, and once the job is over Ctrl+D dismisses the output the
+//! way it ends a shell: the pane hides and the editor gets the keyboard
+//! back. Nothing else dismisses it, so a program that ends sooner than
+//! expected doesn't lose its output to the keys meant for it. Starting a
+//! job while one is running stops the old one.
+//! A CMake configuration's build directory is configured on its first
+//! build of the run of the editor, and again when the options the
+//! configure step depends on change.
 //!
 //! With a tool focused its program gets the whole keyboard, since a shell
 //! or a coding agent has uses for nearly every key and its line editing
@@ -76,8 +99,11 @@
 //! the shell. Ctrl+] Ctrl+] sends one Ctrl+] to the program, and any key
 //! the editor has no use for after the prefix is sent along with the
 //! prefix, so nothing is lost, only held for a keystroke. There is no
-//! timeout; the status bar shows the prefix while it waits. Terminals without the kitty keyboard protocol deliver Ctrl+]
-//! as Ctrl+5, which is also how to type it on a layout that puts ] behind
+//! timeout; the status bar shows the prefix while it waits. With nothing
+//! running in the tool (the output tool between jobs) the editor's keys
+//! work without the prefix, since there is no program to want them.
+//! Terminals without the kitty keyboard protocol deliver Ctrl+] as
+//! Ctrl+5, which is also how to type it on a layout that puts ] behind
 //! AltGr, so both spellings are the prefix. Ctrl+` toggles the shell
 //! without a prefix from either view: it only arrives at all on terminals
 //! where it is unambiguous.
@@ -85,6 +111,7 @@
 //! Closing a modified tab or quitting with unsaved changes asks for the key
 //! to be pressed a second time rather than popping up a dialog.
 
+use crate::build_view::{self, BuildOutcome, BuildView, Node};
 use crate::clipboard::Clipboard;
 use crate::editor_view::EditorView;
 use crate::goto_line::{GoToLineBox, GoToLineOutcome};
@@ -98,15 +125,19 @@ use crate::tool::{Tool, ToolKind, ToolPane};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ninjaedit_core::build::root_candidates;
 use ninjaedit_core::search::literal_query;
-use ninjaedit_core::terminal::{Command, Output, Session, SessionId};
-use ninjaedit_core::{Editor, Project, ProjectMatch, SearchStep, Settings, Storage};
+use ninjaedit_core::terminal::{Command, ExitStatus, Output, Session, SessionId};
+use ninjaedit_core::{
+    BuildConfig, BuildRoot, Editor, Job, Project, ProjectMatch, SearchStep, Settings, Step, Storage,
+};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
@@ -133,6 +164,7 @@ enum Focus {
 enum Mode {
     Editor,
     Settings(SettingsView),
+    Build(BuildView),
 }
 
 /// One of the places the keyboard can be, as the modes palette lists
@@ -141,22 +173,24 @@ enum Mode {
 enum View {
     Editor,
     Settings,
+    Build,
     Tool(ToolKind),
 }
 
 impl View {
     /// Every view, in the order the modes palette lists the ones not
-    /// used recently: the settings last, being the least often wanted.
+    /// used recently: the pages last, being the least often wanted.
     fn all() -> impl Iterator<Item = View> {
         std::iter::once(View::Editor)
             .chain(ToolKind::ALL.into_iter().map(View::Tool))
-            .chain(std::iter::once(View::Settings))
+            .chain([View::Build, View::Settings])
     }
 
     fn label(self) -> &'static str {
         match self {
             View::Editor => EDITOR_MODE_LABEL,
             View::Settings => settings_view::TITLE,
+            View::Build => build_view::TITLE,
             View::Tool(kind) => kind.name(),
         }
     }
@@ -165,6 +199,7 @@ impl View {
         match self {
             View::Editor => "Edit the open files",
             View::Settings => "Change the editor's settings",
+            View::Build => "Set up how the project is built and run",
             View::Tool(kind) => kind.description(),
         }
     }
@@ -173,6 +208,7 @@ impl View {
         match self {
             View::Editor => PaletteAction::FocusEditor,
             View::Settings => PaletteAction::OpenSettings,
+            View::Build => PaletteAction::OpenBuildConfig,
             View::Tool(kind) => PaletteAction::OpenTool(kind),
         }
     }
@@ -183,14 +219,23 @@ const DIVIDER_HEIGHT: u16 = 1;
 
 const TABS_PLACEHOLDER: &str = "Search open tabs";
 const FILES_PLACEHOLDER: &str = "Search files in project";
-const MODES_PLACEHOLDER: &str = "Editor, settings, or a tool";
+const MODES_PLACEHOLDER: &str = "Editor, a page, or a tool";
+const ADD_ROOT_PLACEHOLDER: &str = "Add a Cargo.toml or CMakeLists.txt as a build root";
+const CONFIGURATION_PLACEHOLDER: &str = "Build configuration to use";
+const TARGET_PLACEHOLDER: &str = "Target to build and run";
 /// The modes palette's row for the editor.
 const EDITOR_MODE_LABEL: &str = "Editor";
 /// What the status bar shows on the settings page.
-const SETTINGS_HINT: &str = "Tab/↑↓ next · Enter apply · Ctrl+R default · Ctrl+E leave";
+const SETTINGS_HINT: &str = "Tab/↑↓ next · Enter apply · Ctrl+D default · Ctrl+E leave";
+/// What the status bar shows on the build configuration page.
+const BUILD_HINT: &str =
+    "↑↓ select · Enter options · Ctrl+N new · Ctrl+D duplicate · Del remove · Ctrl+E leave";
+/// What the status bar shows with the output tool focused and idle.
+const OUTPUT_IDLE_HINT: &str = "Ctrl+B build · Ctrl+R run · Ctrl+D dismiss · Ctrl+E mode";
 /// What the status bar shows while the prefix waits for its key.
-const PREFIX_HINT: &str =
-    "Ctrl+]  then Ctrl+ E mode · O file · T tab · F search · L line · Q quit · ] itself";
+const PREFIX_HINT: &str = "Ctrl+]  then Ctrl+ E mode · O file · T tab · F search · L line · B build · R run · Q quit · ] itself";
+/// What the output tool shows before the first job.
+const OUTPUT_WELCOME: &str = "Ctrl+B builds and Ctrl+R runs the current target\r\n";
 /// How long a change to the search query waits for the search to finish,
 /// so that in all but the largest files the matches show up in the same
 /// frame as the keystroke rather than a tick later.
@@ -235,7 +280,27 @@ pub struct App {
     project: Project,
     /// Where the settings (and the rest of what outlives a run) live.
     storage: Storage,
+    /// Where the project's own state lives: its build configuration.
+    project_storage: Storage,
     settings: Settings,
+    /// How the project is built and run, and with what.
+    build: BuildConfig,
+    /// The CMake build directories configured during this run, with the
+    /// signature of the configuration they were configured with, so a
+    /// build configures only when that has changed.
+    configured: HashMap<PathBuf, String>,
+    /// The steps of the running job still to run, after the one running.
+    pending_steps: Vec<Step>,
+    /// The running job's title and how many of its steps have started.
+    job_title: String,
+    job_step: usize,
+    /// The build directory and signature the running job's first step is
+    /// configuring, to record once it succeeds.
+    job_configure: Option<(PathBuf, String)>,
+    /// The status bar's configuration and target segments from the last
+    /// render, to hit-test clicks.
+    status_config_area: Rect,
+    status_target_area: Rect,
     theme: Theme,
     /// What the upper part of the screen shows.
     mode: Mode,
@@ -307,15 +372,40 @@ impl App {
         // A settings file that can't be read is reported rather than
         // fatal: the defaults do until it is fixed, and saving from the
         // settings page replaces it.
-        let (settings, status) = match storage.load_settings() {
+        let (settings, mut status) = match storage.load_settings() {
             Ok(settings) => (settings, None),
             Err(err) => (Settings::default(), Some(err.to_string())),
+        };
+        // Likewise the build configuration; with none saved yet the
+        // project's own root files are found.
+        let project_storage = storage.project(&project);
+        let build = match project_storage.load_build_config() {
+            Ok(Some(mut build)) => {
+                // The file holds what the user changed; the project has
+                // the rest of the targets.
+                build.sync_discovered(project.root());
+                build
+            }
+            Ok(None) => BuildConfig::discover(project.root()),
+            Err(err) => {
+                status = Some(err.to_string());
+                BuildConfig::discover(project.root())
+            }
         };
         App {
             index_generation: project.index().generation(),
             project,
             storage,
+            project_storage,
             settings,
+            build,
+            configured: HashMap::new(),
+            pending_steps: Vec::new(),
+            job_title: String::new(),
+            job_step: 0,
+            job_configure: None,
+            status_config_area: Rect::default(),
+            status_target_area: Rect::default(),
             theme: Theme::default(),
             mode: Mode::Editor,
             mode_tab_bar: TabBar::default(),
@@ -533,8 +623,8 @@ impl App {
         palette.set_hint(hint);
     }
 
-    /// Ctrl+E: open the modes palette, listing the editor, the settings
-    /// page, and every kind of tool. The current view comes first, then
+    /// Ctrl+E: open the modes palette, listing the editor, the pages,
+    /// and every kind of tool. The current view comes first, then
     /// the others most recently used first, so the one before this is
     /// preselected and Enter alone goes back to it, as the tab search
     /// does.
@@ -575,6 +665,7 @@ impl App {
         match self.mode {
             Mode::Editor => View::Editor,
             Mode::Settings(_) => View::Settings,
+            Mode::Build(_) => View::Build,
         }
     }
 
@@ -604,7 +695,19 @@ impl App {
             }
             PaletteAction::FocusEditor => self.enter_editor(),
             PaletteAction::OpenSettings => self.open_settings(),
+            PaletteAction::OpenBuildConfig => self.open_build_config(),
             PaletteAction::OpenTool(kind) => self.open_tool(kind),
+            PaletteAction::AddBuildRoot(path) => self.add_build_root(path),
+            PaletteAction::SelectConfiguration { root, index } => {
+                if self.build.select_configuration(root, index) {
+                    self.selection_changed();
+                }
+            }
+            PaletteAction::SelectTarget { root, index } => {
+                if self.build.select_target(root, index) {
+                    self.selection_changed();
+                }
+            }
         }
     }
 
@@ -635,6 +738,10 @@ impl App {
             Mode::Settings(mut view) => {
                 let outcome = view.commit_all(&mut self.settings);
                 self.handle_settings_outcome(outcome);
+            }
+            Mode::Build(mut view) => {
+                let outcome = view.commit_all(&mut self.build);
+                self.handle_build_outcome(outcome);
             }
         }
     }
@@ -670,6 +777,289 @@ impl App {
         }
         if let Some(dialog) = &mut self.project_search {
             dialog.set_limit(self.settings.search_max_results());
+        }
+    }
+
+    // ----- Build configuration --------------------------------------------
+
+    /// Show the build configuration page in the editor's place and give
+    /// it the keyboard.
+    fn open_build_config(&mut self) {
+        self.close_editor_overlays();
+        if !matches!(self.mode, Mode::Build(_)) {
+            self.mode = Mode::Build(BuildView::new(&self.build));
+        }
+        self.focus = Focus::Editor;
+    }
+
+    fn handle_build_outcome(&mut self, outcome: BuildOutcome) {
+        match outcome {
+            BuildOutcome::Continue => {}
+            BuildOutcome::Changed => self.build_changed(),
+            BuildOutcome::AddRoot => self.open_add_root_palette(),
+            BuildOutcome::Notice(message) => self.status = Some(message),
+        }
+    }
+
+    /// The build configuration changed: keep it in the project's
+    /// storage.
+    fn build_changed(&mut self) {
+        if let Err(err) = self.project_storage.save_build_config(&self.build) {
+            self.status = Some(format!(
+                "Could not save {}: {err}",
+                self.project_storage
+                    .path(ninjaedit_core::build::BUILD_FILE)
+                    .display()
+            ));
+        }
+    }
+
+    /// The current configuration or target changed from outside the
+    /// page: save, and show the page the change if it is up.
+    fn selection_changed(&mut self) {
+        if let Mode::Build(view) = &mut self.mode {
+            view.refresh(&self.build);
+        }
+        self.build_changed();
+    }
+
+    /// Offer the project's `Cargo.toml` and `CMakeLists.txt` files that
+    /// aren't build roots yet, to add one.
+    fn open_add_root_palette(&mut self) {
+        self.close_search_box(true);
+        self.goto_line = None;
+        self.hide_project_search();
+        let root = self.project.root();
+        let files = self.project.index().files(false);
+        let relative: Vec<PathBuf> = files
+            .iter()
+            .map(|path| path.strip_prefix(root).unwrap_or(path).to_path_buf())
+            .collect();
+        let existing: Vec<&Path> = self.build.roots().iter().map(BuildRoot::path).collect();
+        let items = root_candidates(relative.iter())
+            .into_iter()
+            .filter(|path| !existing.contains(&path.as_path()))
+            .map(|path| {
+                let display = path.display().to_string();
+                PaletteItem {
+                    label: path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    detail: parent_of(&display),
+                    search: display,
+                    action: PaletteAction::AddBuildRoot(path),
+                }
+            })
+            .collect();
+        let mut palette = Palette::new(ADD_ROOT_PLACEHOLDER, items);
+        self.refresh_index_hint(&mut palette);
+        self.palette = Some(palette);
+        self.palette_is_files = false;
+    }
+
+    /// Add a root file (relative to the project) with its defaults and
+    /// the targets found under it, and select it on the page.
+    fn add_build_root(&mut self, path: PathBuf) {
+        let Some(root) = BuildRoot::discover(self.project.root(), &path) else {
+            self.status = Some(format!("{} is not a build root file", path.display()));
+            return;
+        };
+        match self.build.add_root(root) {
+            Ok(index) => {
+                if let Mode::Build(view) = &mut self.mode {
+                    view.select(Node::Root(index), &self.build);
+                }
+                self.build_changed();
+            }
+            Err(err) => self.status = Some(err),
+        }
+    }
+
+    /// A palette of every root's configurations in name order, the
+    /// current one preselected, to pick the current one.
+    fn open_configuration_palette(&mut self) {
+        self.close_search_box(true);
+        self.goto_line = None;
+        self.hide_project_search();
+        let current = self.build.current();
+        let mut items = Vec::new();
+        let mut selected = 0;
+        for (r, root) in self.build.roots().iter().enumerate() {
+            for i in root.configurations_by_name() {
+                let configuration = &root.configurations()[i];
+                if current.is_some_and(|c| c.root == r && c.configuration == i) {
+                    selected = items.len();
+                }
+                items.push(PaletteItem {
+                    label: configuration.name.clone(),
+                    detail: root.label(),
+                    search: format!("{} {}", configuration.name, root.label()),
+                    action: PaletteAction::SelectConfiguration { root: r, index: i },
+                });
+            }
+        }
+        let mut palette = Palette::new(CONFIGURATION_PLACEHOLDER, items);
+        palette.select(selected);
+        self.palette = Some(palette);
+        self.palette_is_files = false;
+    }
+
+    /// A palette of every root's targets, likewise.
+    fn open_target_palette(&mut self) {
+        self.close_search_box(true);
+        self.goto_line = None;
+        self.hide_project_search();
+        let current = self.build.current();
+        let mut items = Vec::new();
+        let mut selected = 0;
+        for (r, root) in self.build.roots().iter().enumerate() {
+            for i in root.targets_by_name() {
+                let target = &root.targets()[i];
+                if target.disabled {
+                    continue;
+                }
+                if current.is_some_and(|c| c.root == r && c.target == i) {
+                    selected = items.len();
+                }
+                items.push(PaletteItem {
+                    label: target.name.clone(),
+                    detail: root.label(),
+                    search: format!("{} {}", target.name, root.label()),
+                    action: PaletteAction::SelectTarget { root: r, index: i },
+                });
+            }
+        }
+        let mut palette = Palette::new(TARGET_PLACEHOLDER, items);
+        palette.select(selected);
+        self.palette = Some(palette);
+        self.palette_is_files = false;
+    }
+
+    // ----- Building and running -------------------------------------------
+
+    /// Ctrl+B: build the current target with the current configuration
+    /// in the output tool.
+    fn build(&mut self) {
+        self.start_current_job(false);
+    }
+
+    /// Ctrl+R: build and run the current target in the output tool.
+    fn run(&mut self) {
+        self.start_current_job(true);
+    }
+
+    fn start_current_job(&mut self, run: bool) {
+        // Values typed into the page but not yet applied count.
+        if let Mode::Build(view) = &mut self.mode {
+            let outcome = view.commit_all(&mut self.build);
+            self.handle_build_outcome(outcome);
+        }
+        let configure = self.cmake_configure_needed();
+        let root = self.project.root().to_path_buf();
+        let job = if run {
+            self.build.run_job(&root, configure.is_some())
+        } else {
+            self.build.build_job(&root, configure.is_some())
+        };
+        match job {
+            Ok(job) => {
+                self.job_configure = configure;
+                self.start_job(job);
+            }
+            Err(err) => self.status = Some(err),
+        }
+    }
+
+    /// Whether the current CMake configuration's build directory needs
+    /// configuring before a build, and with what: it has no cache yet,
+    /// or was last configured with different options. `None` for a
+    /// Cargo configuration, or one configured as it now is.
+    fn cmake_configure_needed(&self) -> Option<(PathBuf, String)> {
+        let dir = self.build.cmake_build_dir(self.project.root())?;
+        let (_, configuration) = self.build.current_configuration()?;
+        let signature = configuration.cmake_configure_signature();
+        let configured =
+            dir.join("CMakeCache.txt").is_file() && self.configured.get(&dir) == Some(&signature);
+        (!configured).then_some((dir, signature))
+    }
+
+    /// Run a job's steps in the output tool, one after another, stopping
+    /// whatever was running there. Shows the tool and gives it the
+    /// keyboard, so that Ctrl+C reaches the job.
+    fn start_job(&mut self, job: Job) {
+        self.ensure_tool(ToolKind::Output);
+        self.tool_pane.set_visible(true);
+        self.close_editor_overlays();
+        self.focus = Focus::Tool;
+        let Some(tool) = self.tool_pane.active_mut() else {
+            return;
+        };
+        tool.stop();
+        tool.clear_screen();
+        self.job_title = job.title;
+        self.job_step = 0;
+        self.pending_steps = job.steps;
+        self.start_next_step();
+    }
+
+    /// Start the next of the running job's steps, with a heading saying
+    /// what it does and the command it runs.
+    fn start_next_step(&mut self) {
+        if self.pending_steps.is_empty() {
+            return;
+        }
+        let step = self.pending_steps.remove(0);
+        self.job_step += 1;
+        let events = self.events.clone();
+        let Some(index) = self.tool_pane.index_of_kind(ToolKind::Output) else {
+            return;
+        };
+        let tool = &mut self.tool_pane.tools_mut()[index];
+        let heading = format!(
+            "\x1b[1m{}\x1b[0m\r\n\x1b[2m$ {}\x1b[0m\r\n",
+            step.description,
+            step.command.display()
+        );
+        tool.process(heading.as_bytes());
+        let command = step.command;
+        if let Err(err) = tool.start(|cols, rows| spawn_session(&command, cols, rows, events)) {
+            let message = format!(
+                "Could not start {}: {err}",
+                command.program().to_string_lossy()
+            );
+            tool.process(format!("\x1b[1;31m{message}\x1b[0m\r\n").as_bytes());
+            self.pending_steps.clear();
+            self.status = Some(message);
+        }
+    }
+
+    /// A step of the running job exited: go on to the next when it
+    /// succeeded, or stop the job when it failed, saying so either way.
+    fn step_exited(&mut self, index: usize, status: ExitStatus) {
+        let tool = &mut self.tool_pane.tools_mut()[index];
+        if status.success() {
+            if self.job_step == 1
+                && let Some((dir, signature)) = self.job_configure.take()
+            {
+                self.configured.insert(dir, signature);
+            }
+            if self.pending_steps.is_empty() {
+                tool.process(b"\x1b[1;32mFinished\x1b[0m\r\n");
+                self.status = Some(format!("{}: finished", self.job_title));
+            } else {
+                tool.process(b"\r\n");
+                self.start_next_step();
+            }
+        } else {
+            let why = match &status.signal {
+                Some(signal) => format!("killed by {signal}"),
+                None => format!("exit code {}", status.code),
+            };
+            tool.process(format!("\x1b[1;31mFailed: {why}\x1b[0m\r\n").as_bytes());
+            self.pending_steps.clear();
+            self.job_configure = None;
+            self.status = Some(format!("{}: failed with {why}", self.job_title));
         }
     }
 
@@ -988,17 +1378,23 @@ impl App {
     /// Show a tool in the pane and give it the keyboard, starting or
     /// restarting its program as needed. A failure to start leaves a
     /// message in the status bar instead, and the focus where it was.
+    /// The output tool shows whether or not a job is running in it.
     fn open_tool(&mut self, kind: ToolKind) {
         self.close_editor_overlays();
         self.ensure_tool(kind);
-        if self.tool_pane.active().is_some_and(Tool::is_running) {
+        if self
+            .tool_pane
+            .active()
+            .is_some_and(|tool| tool.is_running() || tool.kind().shows_when_idle())
+        {
             self.tool_pane.set_visible(true);
             self.focus = Focus::Tool;
         }
     }
 
     /// Make sure there is a tool of `kind`, active in the pane, and that
-    /// it is running. Reports a failure to start in the status bar.
+    /// it is running, when it is the kind that runs a program of its
+    /// own. Reports a failure to start in the status bar.
     fn ensure_tool(&mut self, kind: ToolKind) {
         match self.tool_pane.index_of_kind(kind) {
             Some(index) => self.tool_pane.set_active(index),
@@ -1008,8 +1404,11 @@ impl App {
                 // fits it exactly.
                 let (cols, rows) = self.default_tool_size();
                 let scrollback = self.settings.terminal_scrollback();
-                self.tool_pane
-                    .add(Tool::of_kind(kind, cols, rows, scrollback));
+                let mut tool = Tool::of_kind(kind, cols, rows, scrollback);
+                if kind == ToolKind::Output {
+                    tool.process(OUTPUT_WELCOME.as_bytes());
+                }
+                self.tool_pane.add(tool);
             }
         }
         self.start_active_tool();
@@ -1026,7 +1425,9 @@ impl App {
             return;
         }
         let name = tool.kind().name().to_lowercase();
-        let command = tool.kind().command(self.project.root(), &self.settings);
+        let Some(command) = tool.kind().command(self.project.root(), &self.settings) else {
+            return;
+        };
         if let Err(err) = tool.start(|cols, rows| spawn_session(&command, cols, rows, events)) {
             self.status = Some(format!("Could not start {name}: {err}"));
         }
@@ -1106,9 +1507,11 @@ impl App {
 
     /// A key pressed with a tool focused: the prefix holds the next key
     /// for the editor, Ctrl+` toggles the shell, and everything else goes
-    /// to the program. `confirm` is the confirmation pending before this
-    /// key, kept alive through the prefix so that Ctrl+] Ctrl+Q twice
-    /// quits with unsaved changes.
+    /// to the program. With no program running (the output tool between
+    /// jobs) the editor's keys need no prefix, and Ctrl+D dismisses the
+    /// tool as it would end a shell. `confirm` is the confirmation
+    /// pending before this key, kept alive through the prefix so that
+    /// Ctrl+] Ctrl+Q twice quits with unsaved changes.
     fn handle_tool_key(&mut self, key: KeyEvent, confirm: Option<Confirm>) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if let Some(prefix) = self.prefix.take() {
@@ -1130,8 +1533,26 @@ impl App {
             self.toggle_shell();
             return;
         }
+        let running = self.tool_pane.active().is_some_and(Tool::is_running);
+        if !running && ctrl {
+            if key.code == KeyCode::Char('d') {
+                self.dismiss_tool();
+                return;
+            }
+            if self.handle_shared_key(key, confirm) {
+                return;
+            }
+        }
         self.confirm = confirm;
         self.send_key_to_tool(key);
+    }
+
+    /// Hide the pane and give the editor the keyboard, as a shell that
+    /// exits does; the tool's output is kept for next time.
+    fn dismiss_tool(&mut self) {
+        self.tool_pane.set_visible(false);
+        self.focus = Focus::Editor;
+        self.prefix = None;
     }
 
     /// The Ctrl bindings the editor and, after the prefix, the tool pane
@@ -1160,6 +1581,8 @@ impl App {
             KeyCode::Char('f') if self.search_box.is_some() => self.upgrade_search_to_project(),
             KeyCode::Char('f') => self.open_search_box(),
             KeyCode::Char('l') => self.open_goto_line(),
+            KeyCode::Char('b') => self.build(),
+            KeyCode::Char('r') => self.run(),
             _ => return false,
         }
         true
@@ -1191,10 +1614,16 @@ impl App {
                     return;
                 };
                 let was_active = index == self.tool_pane.active_index();
-                self.tool_pane.tools_mut()[index].note_exit(status);
-                // The user quit the shell: give the whole screen back to
-                // the editor. Showing it again starts a fresh shell.
-                if was_active && self.tool_pane.is_visible() {
+                let tool = &mut self.tool_pane.tools_mut()[index];
+                tool.note_exit(status.clone());
+                if tool.kind() == ToolKind::Output {
+                    // A job's step ended: on to the next, or say how it
+                    // ended. The output stays showing.
+                    self.step_exited(index, status);
+                } else if was_active && self.tool_pane.is_visible() {
+                    // The user quit the shell: give the whole screen back
+                    // to the editor. Showing it again starts a fresh
+                    // shell.
                     self.tool_pane.set_visible(false);
                     self.focus = Focus::Editor;
                     self.prefix = None;
@@ -1291,6 +1720,8 @@ impl App {
             }
         } else if let Mode::Settings(view) = &mut self.mode {
             view.paste(text);
+        } else if let Mode::Build(view) = &mut self.mode {
+            view.paste(text);
         } else if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.view.editor_mut().paste(text);
         }
@@ -1347,6 +1778,11 @@ impl App {
         if let Mode::Settings(view) = &mut self.mode {
             let outcome = view.handle_key(key, &mut self.clipboard, &mut self.settings);
             self.handle_settings_outcome(outcome);
+            return;
+        }
+        if let Mode::Build(view) = &mut self.mode {
+            let outcome = view.handle_key(key, &mut self.clipboard, &mut self.build);
+            self.handle_build_outcome(outcome);
             return;
         }
 
@@ -1443,8 +1879,20 @@ impl App {
             }
         }
 
-        // ----- The tool pane, when it's showing -----
+        // ----- The status bar's configuration and target -----
         let at = ScreenPosition::new(x, y);
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            if self.status_config_area.contains(at) {
+                self.open_configuration_palette();
+                return;
+            }
+            if self.status_target_area.contains(at) {
+                self.open_target_palette();
+                return;
+            }
+        }
+
+        // ----- The tool pane, when it's showing -----
         if self.tool_pane.is_visible() {
             // Press the divider to start dragging it.
             if mouse.kind == MouseEventKind::Down(MouseButton::Left)
@@ -1488,7 +1936,7 @@ impl App {
         }
 
         // ----- A mode in the editor's place -----
-        if matches!(self.mode, Mode::Settings(_)) {
+        if !matches!(self.mode, Mode::Editor) {
             // The mode's tab: its close button leaves the mode.
             if let Some(hit) = self.mode_tab_bar.hit(x, y) {
                 if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
@@ -1499,14 +1947,23 @@ impl App {
                 }
                 return;
             }
-            if let Mode::Settings(view) = &mut self.mode
-                && (view.contains(x, y) || view.is_dragging())
-            {
-                if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                    self.focus = Focus::Editor;
+            let pressed = matches!(mouse.kind, MouseEventKind::Down(_));
+            match &mut self.mode {
+                Mode::Settings(view) if view.contains(x, y) || view.is_dragging() => {
+                    if pressed {
+                        self.focus = Focus::Editor;
+                    }
+                    let outcome = view.handle_mouse(mouse, &mut self.settings);
+                    self.handle_settings_outcome(outcome);
                 }
-                let outcome = view.handle_mouse(mouse, &mut self.settings);
-                self.handle_settings_outcome(outcome);
+                Mode::Build(view) if view.contains(x, y) || view.is_dragging() => {
+                    if pressed {
+                        self.focus = Focus::Editor;
+                    }
+                    let outcome = view.handle_mouse(mouse, &mut self.build);
+                    self.handle_build_outcome(outcome);
+                }
+                _ => {}
             }
             return;
         }
@@ -1631,6 +2088,15 @@ impl App {
                     .render(tab_area, buf, theme, &[label], 0, editor_focused);
                 cursor = view.render(self.editor_area, buf, theme, &self.settings);
             }
+            Mode::Build(view) => {
+                let label = TabLabel {
+                    title: build_view::TITLE.to_owned(),
+                    modified: false,
+                };
+                self.mode_tab_bar
+                    .render(tab_area, buf, theme, &[label], 0, editor_focused);
+                cursor = view.render(self.editor_area, buf, theme, &self.build);
+            }
         }
 
         // The tool pane: the divider, the tool tab bar, and the active
@@ -1671,6 +2137,7 @@ impl App {
         }
 
         self.render_status(status_area, buf);
+        let theme = &self.theme;
 
         if let Some(palette) = &mut self.palette {
             cursor = palette.render(screen, buf, theme);
@@ -1729,10 +2196,12 @@ impl App {
         self.tool_term_area = Rect::new(content.x, tool_top + 1, content.width, tool_rows - 1);
     }
 
-    fn render_status(&self, area: Rect, buf: &mut Buffer) {
+    fn render_status(&mut self, area: Rect, buf: &mut Buffer) {
         let theme = &self.theme;
         let base = Style::default().bg(theme.status_bar_background);
         buf.set_style(area, base);
+        self.status_config_area = Rect::default();
+        self.status_target_area = Rect::default();
         let tab = self.tabs.get(self.active);
         // With the tool pane focused the position report is about the
         // tool, not the editor: nothing to show, unless the user has
@@ -1752,33 +2221,60 @@ impl App {
                 format!(" Ln {}, Col {} ", position.line + 1, position.column + 1)
             })
         };
+        // The current build configuration and target, each a segment
+        // the mouse can click to pick another.
+        let mut configuration = self
+            .build
+            .current_configuration()
+            .map(|(_, c)| format!(" {} ", c.name))
+            .unwrap_or_default();
+        let mut target = self
+            .build
+            .current_target()
+            .map(|(_, t)| format!("▸ {} ", t.name))
+            .unwrap_or_default();
         let mut project = format!(" {} ", self.project.name());
-        if let Some(position) = &position {
-            // Drop the project name when there's no room for it.
-            if Span::raw(position).width() as u16 + Span::raw(&project).width() as u16 + 20
-                > area.width
-            {
-                project.clear();
-            }
+        let width_of = |text: &str| Span::raw(text).width() as u16;
+        let position_width = position.as_deref().map_or(0, width_of);
+        // Drop the project name, then the build segments, when there's
+        // no room for them beside the position.
+        if position_width + width_of(&configuration) + width_of(&target) + width_of(&project) + 20
+            > area.width
+        {
+            project.clear();
+        }
+        if position_width + width_of(&configuration) + width_of(&target) + 20 > area.width {
+            configuration.clear();
+            target.clear();
         }
         let right = [
             (position.unwrap_or_default(), theme.status_bar_position_text),
+            (configuration, theme.status_bar_position_text),
+            (target, theme.status_bar_position_text),
             (project, theme.status_bar_project_text),
         ];
+        let mode_hint = match &self.mode {
+            Mode::Editor => "",
+            Mode::Settings(_) => SETTINGS_HINT,
+            Mode::Build(_) => BUILD_HINT,
+        };
         let left = match &self.status {
             _ if self.prefix.is_some() => PREFIX_HINT.to_owned(),
             Some(message) => message.clone(),
-            None if tool_focused => self.tool_pane.active().map(Tool::title).unwrap_or_default(),
-            None if !in_editor => SETTINGS_HINT.to_owned(),
+            None if tool_focused => match self.tool_pane.active() {
+                Some(tool) if tool.kind() == ToolKind::Output && !tool.is_running() => {
+                    OUTPUT_IDLE_HINT.to_owned()
+                }
+                Some(tool) => tool.title(),
+                None => String::new(),
+            },
+            None if !in_editor => mode_hint.to_owned(),
             None => match tab.and_then(Tab::path) {
                 Some(path) => self.display_path(path),
                 None => "Ctrl+O to open a file, Ctrl+Q to quit".to_owned(),
             },
         };
-        let right_width: u16 = right
-            .iter()
-            .map(|(text, _)| Span::raw(text).width() as u16)
-            .sum();
+        let right_width: u16 = right.iter().map(|(text, _)| width_of(text)).sum();
         let left_width = area.width.saturating_sub(right_width + 1) as usize;
         buf.set_stringn(
             area.x + 1,
@@ -1789,9 +2285,16 @@ impl App {
         );
         if right_width <= area.width {
             let mut x = area.right() - right_width;
-            for (text, color) in &right {
+            for (index, (text, color)) in right.iter().enumerate() {
+                let width = width_of(text);
                 buf.set_string(x, area.y, text, base.fg(*color));
-                x += Span::raw(text).width() as u16;
+                let segment = Rect::new(x, area.y, width, 1);
+                match index {
+                    1 => self.status_config_area = segment,
+                    2 => self.status_target_area = segment,
+                    _ => {}
+                }
+                x += width;
             }
         }
     }
@@ -1836,7 +2339,8 @@ fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme) {
         "Ctrl+Shift+F   search in project files",
         "Ctrl+T         switch between open tabs",
         "Ctrl+`         open a shell below the editor",
-        "Ctrl+E         switch views: editor, settings, tools",
+        "Ctrl+B         build the current target (Ctrl+R runs it)",
+        "Ctrl+E         switch views: editor, pages, tools",
         "Ctrl+]         in a tool, prefix for the editor's keys",
         "Ctrl+Q         quit",
     ];
@@ -1995,7 +2499,9 @@ mod tests {
         let screen = draw(&mut app, 80, 20);
         assert!(screen[3].contains(EDITOR_MODE_LABEL), "{screen:#?}");
         assert!(screen[4].contains("Shell"), "{screen:#?}");
-        assert!(screen[5].contains(settings_view::TITLE), "{screen:#?}");
+        assert!(screen[5].contains("Output"), "{screen:#?}");
+        assert!(screen[6].contains(build_view::TITLE), "{screen:#?}");
+        assert!(screen[7].contains(settings_view::TITLE), "{screen:#?}");
         type_str(&mut app, "sett");
         press(&mut app, KeyCode::Enter);
         assert!(matches!(app.mode, Mode::Settings(_)));
@@ -2010,7 +2516,7 @@ mod tests {
             screen.iter().any(|r| r.contains("Shell executable")),
             "{screen:#?}"
         );
-        assert!(screen[19].contains("Ctrl+R default"), "{screen:#?}");
+        assert!(screen[19].contains("Ctrl+D default"), "{screen:#?}");
         assert!(!screen[19].contains("Ln 1"), "{screen:#?}");
 
         // Down to the scrollback field, a new value, Enter: applied and
@@ -2058,14 +2564,14 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_r_resets_and_ctrl_o_or_ctrl_t_leave_the_settings_page() {
+    fn ctrl_d_resets_and_ctrl_o_or_ctrl_t_leave_the_settings_page() {
         let (dir, mut app) = app_with_files(&[("a.txt", "hi\n"), ("b.txt", "yo\n")]);
         app.open_settings();
         type_str(&mut app, "/bin/dash");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.settings.shell(), Some("/bin/dash"));
         assert!(settings_file(&app).unwrap().contains("/bin/dash"));
-        ctrl(&mut app, 'r');
+        ctrl(&mut app, 'd');
         assert_eq!(app.settings.shell(), None);
         assert!(!settings_file(&app).unwrap().contains("shell"));
 
@@ -2131,6 +2637,366 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.settings.search_max_results(), 5);
         assert!(settings_file(&app).unwrap().contains("max-results = 5"));
+    }
+
+    fn build_file(app: &App) -> Option<String> {
+        app.project_storage
+            .read(ninjaedit_core::build::BUILD_FILE)
+            .unwrap()
+    }
+
+    #[test]
+    fn build_page_edits_and_saves_the_projects_build_configuration() {
+        let (dir, mut app) = app_with_files(&[
+            ("Cargo.toml", "[package]\nname = \"app\"\n"),
+            ("src/main.rs", "fn main() {}\n"),
+        ]);
+        // The top-level Cargo.toml was found; the status bar shows its
+        // first configuration and target. Nothing is saved until
+        // something changes.
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[19].contains(" dev ▸ app "), "{screen:#?}");
+        assert_eq!(build_file(&app), None);
+
+        ctrl(&mut app, 'e');
+        type_str(&mut app, "build");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Build(_)));
+        assert_eq!(app.focus, Focus::Editor);
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[0].contains(build_view::TITLE), "{screen:#?}");
+        assert!(screen[1].contains("Cargo.toml"), "{screen:#?}");
+        assert!(
+            screen[3].contains("dev") && screen[3].contains("current"),
+            "{screen:#?}"
+        );
+        assert!(screen[19].contains("Ctrl+N new"), "{screen:#?}");
+
+        // Rename the dev configuration: saved to the project's storage,
+        // and the status bar follows.
+        press(&mut app, KeyCode::Enter);
+        ctrl(&mut app, 'a');
+        type_str(&mut app, "debug");
+        press(&mut app, KeyCode::Enter);
+        let file = build_file(&app).expect("saved");
+        assert!(file.contains("name = \"debug\""), "{file}");
+        assert!(file.contains("configuration = \"debug\""), "{file}");
+        assert!(file.contains("target = \"app\""), "{file}");
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[19].contains(" debug ▸ app "), "{screen:#?}");
+
+        // A value typed but not applied is applied on the way out.
+        press(&mut app, KeyCode::Tab);
+        ctrl(&mut app, 'a');
+        type_str(&mut app, "bench");
+        ctrl(&mut app, 'e');
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[3].contains(build_view::TITLE), "{screen:#?}");
+        assert!(screen[4].contains(EDITOR_MODE_LABEL), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Editor));
+        assert_eq!(app.build.roots()[0].configurations()[0].profile, "bench");
+
+        // A new app on the same storage reads it back.
+        let (events, _events_rx) = std::sync::mpsc::channel();
+        let storage = Storage::new(dir.path().join(".storage"));
+        let again = App::new(Project::open(dir.path()).unwrap(), storage, events);
+        assert_eq!(again.build.current_configuration().unwrap().1.name, "debug");
+        assert_eq!(again.build.roots()[0].configurations()[0].profile, "bench");
+        assert_eq!(again.status, None);
+    }
+
+    #[test]
+    fn discovered_targets_stay_out_of_the_file_and_follow_the_project() {
+        let (dir, mut app) = app_with_files(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n"),
+            ("a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            ("b/Cargo.toml", "[package]\nname = \"b\"\n"),
+        ]);
+        // Disable `b` from the page: saved with its origin, while `a`,
+        // untouched, isn't written at all.
+        app.open_build_config();
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.build.roots()[0].targets()[1].name, "b");
+        press(&mut app, KeyCode::Delete);
+        assert!(app.build.roots()[0].targets()[1].disabled);
+        let file = build_file(&app).expect("saved");
+        assert!(file.contains("auto = \"b\""), "{file}");
+        assert!(file.contains("disabled = true"), "{file}");
+        assert!(!file.contains("name = \"a\""), "{file}");
+        // The selector leaves the disabled target out.
+        app.enter_editor();
+        let screen = draw(&mut app, 80, 20);
+        let column = column_of(&screen[19], "▸ a");
+        click(&mut app, column, 19);
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[3].contains(" a "), "{screen:#?}");
+        assert!(screen[4].contains('╰'), "no `b`: {screen:#?}");
+        press(&mut app, KeyCode::Esc);
+
+        // The workspace gains a package: the next launch lists it,
+        // still with `b` disabled and `a` as found.
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("c")).unwrap();
+        std::fs::write(dir.path().join("c/Cargo.toml"), "[package]\nname = \"c\"\n").unwrap();
+        let (events, _events_rx) = std::sync::mpsc::channel();
+        let storage = Storage::new(dir.path().join(".storage"));
+        let again = App::new(Project::open(dir.path()).unwrap(), storage, events);
+        let names: Vec<(String, bool)> = again.build.roots()[0]
+            .targets()
+            .iter()
+            .map(|t| (t.name.clone(), t.disabled))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("a".to_owned(), false),
+                ("b".to_owned(), true),
+                ("c".to_owned(), false)
+            ]
+        );
+        assert_eq!(again.build.current_target().unwrap().1.name, "a");
+    }
+
+    #[test]
+    fn clicking_the_status_bar_picks_a_configuration_or_target() {
+        let (_dir, mut app) = app_with_files(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n"),
+            ("a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            ("b/Cargo.toml", "[package]\nname = \"b\"\n"),
+        ]);
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[19].contains(" dev ▸ a "), "{screen:#?}");
+
+        // The target segment: a palette of targets, the current one
+        // selected; picking another saves the choice.
+        let column = column_of(&screen[19], "▸ a");
+        click(&mut app, column + 2, 19);
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[2].contains(TARGET_PLACEHOLDER), "{screen:#?}");
+        assert!(
+            screen[3].contains("a") && screen[3].contains("Cargo.toml"),
+            "{screen:#?}"
+        );
+        assert!(screen[4].contains("b"), "{screen:#?}");
+        type_str(&mut app, "b");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.palette.is_none());
+        assert_eq!(app.build.current_target().unwrap().1.name, "b");
+        let file = build_file(&app).expect("saved");
+        assert!(file.contains("target = \"b\""), "{file}");
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[19].contains(" dev ▸ b "), "{screen:#?}");
+
+        // The configuration segment likewise; Down, Enter takes the
+        // next one.
+        let column = column_of(&screen[19], " dev ");
+        click(&mut app, column + 1, 19);
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[2].contains(CONFIGURATION_PLACEHOLDER), "{screen:#?}");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.build.current_configuration().unwrap().1.name, "release");
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[19].contains(" release ▸ b "), "{screen:#?}");
+
+        // With the page open, it shows the change.
+        app.open_build_config();
+        let screen = draw(&mut app, 80, 20);
+        assert!(
+            screen[4].contains("release") && screen[4].contains("current"),
+            "{screen:#?}"
+        );
+        let column = column_of(&screen[19], "▸ b");
+        click(&mut app, column, 19);
+        type_str(&mut app, "a");
+        press(&mut app, KeyCode::Enter);
+        let screen = draw(&mut app, 80, 20);
+        let a_row = screen.iter().position(|r| r.contains("  a ")).unwrap();
+        assert!(screen[a_row].contains("current"), "{screen:#?}");
+        assert!(matches!(app.mode, Mode::Build(_)), "the page stays up");
+    }
+
+    #[test]
+    fn ctrl_n_on_a_root_offers_the_projects_other_root_files() {
+        let (_dir, mut app) = app_with_files(&[
+            ("Cargo.toml", "[package]\nname = \"app\"\n"),
+            ("native/CMakeLists.txt", "add_executable(demo demo.c)\n"),
+            ("sub/Cargo.toml", "[package]\nname = \"sub\"\n"),
+        ]);
+        assert!(
+            app.project
+                .index()
+                .wait_for_primary(Duration::from_secs(10))
+        );
+        app.open_build_config();
+        press(&mut app, KeyCode::Home);
+        ctrl(&mut app, 'n');
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[2].contains(ADD_ROOT_PLACEHOLDER), "{screen:#?}");
+        assert!(
+            screen[3].contains("CMakeLists.txt") && screen[3].contains("native"),
+            "{screen:#?}"
+        );
+        assert!(
+            screen[4].contains("Cargo.toml") && screen[4].contains("sub"),
+            "{screen:#?}"
+        );
+        assert!(
+            screen[5].contains('╰'),
+            "the top Cargo.toml is a root already: {screen:#?}"
+        );
+        type_str(&mut app, "cmake");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.build.roots().len(), 2);
+        let root = &app.build.roots()[1];
+        assert_eq!(root.label(), "native/CMakeLists.txt");
+        assert_eq!(root.targets()[1].name, "demo");
+        assert!(build_file(&app).unwrap().contains("native/CMakeLists.txt"));
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[7].contains("native/CMakeLists.txt"), "{screen:#?}");
+        assert!(
+            screen.iter().any(|r| r.contains("CMake root")),
+            "{screen:#?}"
+        );
+        // Ctrl+B with a Cargo target current from the page applies the
+        // fields first; with no roots at all there is nothing to build.
+        app.build = BuildConfig::default();
+        ctrl(&mut app, 'b');
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("No build root"),
+            "{:?}",
+            app.status
+        );
+    }
+
+    /// Feed the app events from the channel until `done`, or fail after
+    /// ten seconds.
+    #[cfg(unix)]
+    fn pump(
+        app: &mut App,
+        events: &std::sync::mpsc::Receiver<AppEvent>,
+        done: impl Fn(&App) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done(app) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let event = events
+                .recv_timeout(remaining)
+                .expect("the job should get there");
+            app.handle_app_event(event);
+        }
+    }
+
+    #[cfg(unix)]
+    fn output_text(app: &App) -> String {
+        let tool = app
+            .tool_pane
+            .tools()
+            .iter()
+            .find(|tool| tool.kind() == ToolKind::Output)
+            .expect("an output tool");
+        let terminal = tool.view().terminal_mut_for_test();
+        let rows = tool.view().size().1 as usize;
+        (0..rows)
+            .map(|row| terminal.row_text(row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_job_runs_its_steps_in_the_output_tool_and_says_how_it_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, events_rx) = std::sync::mpsc::channel();
+        let storage = Storage::new(dir.path().join(".storage"));
+        let mut app = App::new(Project::open(dir.path()).unwrap(), storage, events);
+        draw(&mut app, 60, 20);
+        let step = |description: &str, script: &str| Step {
+            description: description.to_owned(),
+            command: Command::new("sh").arg("-c").arg(script),
+        };
+        let job = Job {
+            title: "Test job".to_owned(),
+            steps: vec![
+                step("Step one", "echo one"),
+                step("Step two", "echo two; exit 3"),
+                step("Step three", "echo three"),
+            ],
+        };
+        app.start_job(job);
+        assert!(app.tool_pane.is_visible());
+        assert_eq!(app.focus, Focus::Tool, "so Ctrl+C reaches the job");
+        assert_eq!(app.tool_pane.active().unwrap().kind(), ToolKind::Output);
+        pump(&mut app, &events_rx, |app| {
+            app.status.as_deref().is_some_and(|s| s.contains("failed"))
+        });
+        let text = output_text(&app);
+        for expected in [
+            "Step one",
+            "$ sh -c 'echo one'",
+            "one",
+            "Step two",
+            "two",
+            "Failed: exit code 3",
+        ] {
+            assert!(text.contains(expected), "{expected:?} in {text}");
+        }
+        assert!(!text.contains("three"), "stopped at the failure: {text}");
+        assert!(app.pending_steps.is_empty());
+        assert!(!app.tool_pane.active().unwrap().is_running());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Test job: failed with exit code 3")
+        );
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen.iter().any(|r| r.contains("Output")), "{screen:#?}");
+
+        // With the output idle and focused, the editor's keys need no
+        // prefix, and Ctrl+D dismisses it: the pane hides and the
+        // editor has the keyboard.
+        ctrl(&mut app, 'e');
+        assert!(app.palette.is_some());
+        press(&mut app, KeyCode::Esc);
+        let screen = draw(&mut app, 100, 20);
+        assert!(screen[19].contains(OUTPUT_IDLE_HINT), "{screen:#?}");
+        press(&mut app, KeyCode::Char('x'));
+        assert!(
+            app.tool_pane.is_visible(),
+            "an ordinary key doesn't dismiss it"
+        );
+        ctrl(&mut app, 'd');
+        assert!(!app.tool_pane.is_visible());
+        assert_eq!(app.focus, Focus::Editor);
+
+        // Another job brings it back with the keyboard; success says so,
+        // on a fresh screen.
+        let job = Job {
+            title: "Quick".to_owned(),
+            steps: vec![step("Only step", "echo done")],
+        };
+        app.start_job(job);
+        assert!(app.tool_pane.is_visible());
+        assert_eq!(app.focus, Focus::Tool);
+        pump(&mut app, &events_rx, |app| {
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("finished"))
+        });
+        let text = output_text(&app);
+        assert!(text.contains("done") && text.contains("Finished"), "{text}");
+        assert!(
+            !text.contains("Step one"),
+            "a new job starts on a fresh screen: {text}"
+        );
+        assert!(app.tool_pane.is_visible(), "the output stays showing");
     }
 
     // The shell tool spawns a real process, so these are unix-only and

@@ -71,9 +71,25 @@ pub enum PaletteAction {
     /// Show the settings page in the editor's place and give it the
     /// keyboard.
     OpenSettings,
+    /// Show the build configuration page in the editor's place and give
+    /// it the keyboard.
+    OpenBuildConfig,
     /// Show a tool in the pane below the editor, starting it if need be,
     /// and give it the keyboard.
     OpenTool(ToolKind),
+    /// Add a build root (the path of a `Cargo.toml` or `CMakeLists.txt`,
+    /// relative to the project) to the build configuration.
+    AddBuildRoot(PathBuf),
+    /// Make a configuration of a build root the current one.
+    SelectConfiguration {
+        root: usize,
+        index: usize,
+    },
+    /// Make a target of a build root the current one.
+    SelectTarget {
+        root: usize,
+        index: usize,
+    },
 }
 
 /// One searchable entry.

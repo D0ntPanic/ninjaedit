@@ -1,6 +1,7 @@
 //! Persistent storage: the directory where the editor keeps everything
-//! that outlives a run. Today that is the settings; worktrees, autosaves,
-//! and the like will live there too.
+//! that outlives a run. Today that is the settings and each project's
+//! build configuration; worktrees, autosaves, and the like will live
+//! there too.
 //!
 //! The directory is `~/.ninjaedit` unless a frontend (or a test) chooses
 //! another. [`Storage`] is little more than that path: each kind of thing
@@ -16,6 +17,7 @@
 //! recognizable when browsing; the hash keeps two projects with the same
 //! name apart.
 
+use crate::build::{BUILD_FILE, BuildConfig, BuildError};
 use crate::project::Project;
 use crate::settings::{Settings, SettingsError};
 use std::fs;
@@ -137,6 +139,26 @@ impl Storage {
     pub fn save_settings(&self, settings: &Settings) -> io::Result<()> {
         self.write(SETTINGS_FILE, &settings.to_toml())
     }
+
+    /// The build configuration kept in a project's storage, or `None`
+    /// when none has been saved yet (in which case the frontend finds
+    /// the project's roots itself).
+    pub fn load_build_config(&self) -> Result<Option<BuildConfig>, BuildError> {
+        let path = self.path(BUILD_FILE);
+        let text = self
+            .read(BUILD_FILE)
+            .map_err(|err| BuildError(format!("could not read {}: {err}", path.display())))?;
+        text.map(|text| {
+            BuildConfig::parse(&text)
+                .map_err(|err| BuildError(format!("{}: {err}", path.display())))
+        })
+        .transpose()
+    }
+
+    /// Keep a project's build configuration in its storage.
+    pub fn save_build_config(&self, config: &BuildConfig) -> io::Result<()> {
+        self.write(BUILD_FILE, &config.to_toml())
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +202,32 @@ mod tests {
         storage.write(SETTINGS_FILE, "[terminal\n").unwrap();
         let err = storage.load_settings().unwrap_err().to_string();
         assert!(err.contains(SETTINGS_FILE), "{err}");
+    }
+
+    #[test]
+    fn build_config_round_trips_through_a_project_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().join("store"));
+        let project_dir = dir.path().join("app");
+        fs::create_dir_all(&project_dir).unwrap();
+        let project = Project::open(&project_dir).unwrap();
+        let project_storage = storage.project(&project);
+        assert_eq!(project_storage.load_build_config().unwrap(), None);
+
+        let mut config = BuildConfig::default();
+        config
+            .add_root(crate::build::BuildRoot::new(
+                crate::build::BuildSystem::Cargo,
+                "Cargo.toml",
+            ))
+            .unwrap();
+        project_storage.save_build_config(&config).unwrap();
+        assert_eq!(project_storage.load_build_config().unwrap(), Some(config));
+        assert!(project_storage.path(BUILD_FILE).is_file());
+
+        project_storage.write(BUILD_FILE, "roots = 1\n").unwrap();
+        let err = project_storage.load_build_config().unwrap_err().to_string();
+        assert!(err.contains(BUILD_FILE), "{err}");
     }
 
     #[test]
