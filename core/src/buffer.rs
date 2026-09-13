@@ -22,6 +22,7 @@ use std::io::{self, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 /// Target chunk size. Chunks are split when they grow past twice this.
 const CHUNK_TARGET: usize = 16 * 1024;
@@ -189,6 +190,48 @@ fn detect_eol(bytes: &[u8]) -> LineEnding {
     }
 }
 
+/// What a buffer's file held when it was last read or written, for telling
+/// when something else has changed it since. The size and modification
+/// time are checked first, as a cheap way to rule out a change; the
+/// contents settle it.
+struct DiskState {
+    snapshot: BufferSnapshot,
+    len: u64,
+    mtime: Option<SystemTime>,
+}
+
+impl DiskState {
+    fn new(bytes: &[u8], metadata: Option<&fs::Metadata>) -> DiskState {
+        DiskState {
+            snapshot: BufferSnapshot {
+                chunks: make_chunks(bytes),
+            },
+            len: metadata.map_or(bytes.len() as u64, fs::Metadata::len),
+            mtime: metadata.and_then(|m| m.modified().ok()),
+        }
+    }
+
+    fn matches(&self, metadata: &fs::Metadata) -> bool {
+        self.len == metadata.len() && self.mtime.is_some() && self.mtime == metadata.modified().ok()
+    }
+}
+
+/// How a buffer's file on disk compares with what the buffer last read or
+/// wrote; see [`FileBuffer::check_disk`].
+pub enum DiskChange {
+    /// The file is as the buffer last saw it.
+    Unchanged,
+    /// Something else has written the file. `previous` is what the buffer
+    /// last saw, when it had seen the file at all; `contents` is what the
+    /// file holds now.
+    Changed {
+        previous: Option<BufferSnapshot>,
+        contents: Vec<u8>,
+    },
+    /// The file has been deleted or moved away.
+    Missing,
+}
+
 /// A loaded file's contents, structured for fast editing of large text files.
 pub struct FileBuffer {
     chunks: Vec<Chunk>,
@@ -197,6 +240,9 @@ pub struct FileBuffer {
     modified: bool,
     /// Bumped by every edit; see [`version`](Self::version).
     version: u64,
+    /// The file as last read or written, when the buffer has a file that
+    /// existed then.
+    disk: Option<DiskState>,
 }
 
 impl FileBuffer {
@@ -208,6 +254,7 @@ impl FileBuffer {
             path: None,
             modified: false,
             version: 0,
+            disk: None,
         }
     }
 
@@ -219,6 +266,7 @@ impl FileBuffer {
             path: None,
             modified: false,
             version: 0,
+            disk: None,
         }
     }
 
@@ -229,9 +277,13 @@ impl FileBuffer {
     /// Load a file from disk.
     pub fn open(path: impl AsRef<Path>) -> io::Result<FileBuffer> {
         let path = path.as_ref();
+        // Stat before reading: a write that lands in between then shows
+        // up as a later change rather than being missed.
+        let metadata = fs::metadata(path)?;
         let bytes = fs::read(path)?;
         let mut buffer = Self::from_bytes(&bytes);
         buffer.path = Some(path.to_path_buf());
+        buffer.disk = Some(DiskState::new(&bytes, Some(&metadata)));
         Ok(buffer)
     }
 
@@ -617,6 +669,9 @@ impl FileBuffer {
         if let Ok(meta) = fs::metadata(path) {
             fs::set_permissions(tmp.path(), meta.permissions())?;
         }
+        // The rename keeps the temporary file's modification time, so
+        // record it now: after the rename another writer could get in.
+        let metadata = tmp.as_file().metadata().ok();
         tmp.persist(path).map_err(|e| e.error)?;
         #[cfg(unix)]
         if let Ok(dir_handle) = fs::File::open(dir) {
@@ -624,7 +679,63 @@ impl FileBuffer {
         }
         self.path = Some(path.to_path_buf());
         self.modified = false;
+        self.disk = Some(DiskState {
+            snapshot: self.snapshot(),
+            len: self.len() as u64,
+            mtime: metadata.and_then(|m| m.modified().ok()),
+        });
         Ok(())
+    }
+
+    /// The file's contents as the buffer last read or wrote them, if the
+    /// buffer has a file that existed then. Edits don't change this: it is
+    /// what [`is_modified`](Self::is_modified) is relative to.
+    pub fn disk_snapshot(&self) -> Option<&BufferSnapshot> {
+        self.disk.as_ref().map(|disk| &disk.snapshot)
+    }
+
+    /// Look at the buffer's file to see whether something else has changed
+    /// it since the buffer last read or wrote it. A change or deletion is
+    /// reported once: the buffer then takes the file's new state as the
+    /// one it last saw, so the caller has to decide what to do with the
+    /// contents returned. A buffer with no file never changes. A new size
+    /// or modification time with the same contents counts as no change.
+    pub fn check_disk(&mut self) -> io::Result<DiskChange> {
+        let Some(path) = &self.path else {
+            return Ok(DiskChange::Unchanged);
+        };
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok(if self.disk.take().is_some() {
+                    DiskChange::Missing
+                } else {
+                    DiskChange::Unchanged
+                });
+            }
+            Err(err) => return Err(err),
+        };
+        if self
+            .disk
+            .as_ref()
+            .is_some_and(|disk| disk.matches(&metadata))
+        {
+            return Ok(DiskChange::Unchanged);
+        }
+        let contents = fs::read(path)?;
+        // Stat again after reading, for the same reason as in `open`: if
+        // the file changed under the read, the recorded time won't match
+        // and the next check reads it again.
+        let metadata = fs::metadata(path).ok();
+        let previous = self.disk.take().map(|disk| disk.snapshot);
+        self.disk = Some(DiskState::new(&contents, metadata.as_ref()));
+        if previous
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.to_bytes() == contents)
+        {
+            return Ok(DiskChange::Unchanged);
+        }
+        Ok(DiskChange::Changed { previous, contents })
     }
 }
 
@@ -1147,5 +1258,58 @@ mod tests {
         }
         // No stray temporary files left behind.
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn check_disk_reports_a_change_once_with_the_previous_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        fs::write(&path, "a\n").unwrap();
+        let mut buffer = FileBuffer::open(&path).unwrap();
+        assert!(matches!(
+            buffer.check_disk().unwrap(),
+            DiskChange::Unchanged
+        ));
+        fs::write(&path, "ab\n").unwrap();
+        match buffer.check_disk().unwrap() {
+            DiskChange::Changed { previous, contents } => {
+                assert_eq!(previous.unwrap().to_bytes(), b"a\n");
+                assert_eq!(contents, b"ab\n");
+            }
+            _ => panic!("expected a change"),
+        }
+        assert!(matches!(
+            buffer.check_disk().unwrap(),
+            DiskChange::Unchanged
+        ));
+        assert_eq!(buffer.disk_snapshot().unwrap().to_bytes(), b"ab\n");
+        // A rewrite with the same contents is not a change.
+        fs::write(&path, "ab\n").unwrap();
+        assert!(matches!(
+            buffer.check_disk().unwrap(),
+            DiskChange::Unchanged
+        ));
+        // Checking never touches the buffer's own contents; its next save
+        // is what it then expects to find.
+        assert_eq!(buffer.to_bytes(), b"a\n");
+        buffer.insert(0, "x");
+        buffer.save().unwrap();
+        assert!(matches!(
+            buffer.check_disk().unwrap(),
+            DiskChange::Unchanged
+        ));
+        assert_eq!(buffer.disk_snapshot().unwrap().to_bytes(), b"xa\n");
+        fs::remove_file(&path).unwrap();
+        assert!(matches!(buffer.check_disk().unwrap(), DiskChange::Missing));
+        assert!(matches!(
+            buffer.check_disk().unwrap(),
+            DiskChange::Unchanged
+        ));
+        assert!(buffer.disk_snapshot().is_none());
+        // A buffer without a file never changes.
+        assert!(matches!(
+            FileBuffer::from_text("x").check_disk().unwrap(),
+            DiskChange::Unchanged
+        ));
     }
 }

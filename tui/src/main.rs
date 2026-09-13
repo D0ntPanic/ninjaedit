@@ -27,7 +27,7 @@ use crate::app::{App, AppEvent};
 use crate::theme::Theme;
 use clap::Parser;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+    self, DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -183,13 +183,6 @@ fn run(
 }
 
 /// Route one event to the app and say whether the screen needs redrawing.
-/// Focus notifications alone don't, so a terminal that reports focus
-/// doesn't cost a redraw each time the window is clicked away and back.
 fn handle(app: &mut App, event: AppEvent) -> bool {
-    let redraw = !matches!(
-        event,
-        AppEvent::Terminal(Event::FocusGained | Event::FocusLost)
-    );
-    app.handle_app_event(event);
-    redraw
+    app.handle_app_event(event)
 }

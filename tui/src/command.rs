@@ -19,6 +19,7 @@ pub enum Command {
     OpenFile,
     SwitchTab,
     Save,
+    DiscardChanges,
     CloseTab,
     Find,
     FindNext,
@@ -46,10 +47,11 @@ impl Command {
     /// Every command, in the order the palette lists them before
     /// anything is typed: files, searching, editing, building, views,
     /// and quitting last.
-    pub const ALL: [Command; 24] = [
+    pub const ALL: [Command; 25] = [
         Command::OpenFile,
         Command::SwitchTab,
         Command::Save,
+        Command::DiscardChanges,
         Command::CloseTab,
         Command::Find,
         Command::FindNext,
@@ -79,6 +81,7 @@ impl Command {
             Command::OpenFile => "Open file",
             Command::SwitchTab => "Switch tab",
             Command::Save => "Save file",
+            Command::DiscardChanges => "Discard unsaved changes",
             Command::CloseTab => "Close tab",
             Command::Find => "Find in file",
             Command::FindNext => "Find next",
@@ -110,6 +113,9 @@ impl Command {
             Command::OpenFile => "Search the project's files and open one",
             Command::SwitchTab => "Search the open tabs and switch to one",
             Command::Save => "Save the active file",
+            Command::DiscardChanges => {
+                "Reload the active file from disk, dropping its unsaved edits (undo brings them back)"
+            }
             Command::CloseTab => "Close the active file's tab",
             Command::Find => "Search the active file",
             Command::FindNext => "Go to the next match of the last search",
@@ -161,7 +167,8 @@ impl Command {
             Command::NextView => "Ctrl+.",
             Command::PreviousView => "Ctrl+,",
             Command::Quit => "Ctrl+Q",
-            Command::SelectConfiguration
+            Command::DiscardChanges
+            | Command::SelectConfiguration
             | Command::SelectTarget
             | Command::DeleteBuildDir
             | Command::DeleteAllBuildDirs => return None,

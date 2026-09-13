@@ -149,8 +149,8 @@ use ninjaedit_core::build::{NO_ROOT_MESSAGE, root_candidates};
 use ninjaedit_core::search::literal_query;
 use ninjaedit_core::terminal::{ExitStatus, Output, Session, SessionId};
 use ninjaedit_core::{
-    BuildConfig, BuildRoot, Editor, Job, Project, ProjectKind, ProjectMatch, SearchStep, Selection,
-    Settings, SourceLocation, Step, Storage,
+    BuildConfig, BuildRoot, Editor, ExternalChange, Job, Project, ProjectKind, ProjectMatch,
+    SearchStep, Selection, Settings, SourceLocation, Step, Storage,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -160,7 +160,7 @@ use ratatui::text::Span;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Everything the event loop reacts to: input from the terminal and the
 /// output of programs running in tool panes. Both arrive on one channel so
@@ -272,6 +272,10 @@ const OUTPUT_WELCOME: &str = "Ctrl+B builds and Ctrl+R runs the current target\r
 /// so that in all but the largest files the matches show up in the same
 /// frame as the keystroke rather than a tick later.
 const SEARCH_GRACE: Duration = Duration::from_millis(15);
+/// How long open files go unchecked for changes on disk when nothing
+/// hints that they should be: the most a change made outside the
+/// project's watched tree can take to show up.
+const FILE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const SEARCH_WRAPPED: &str =
     "Search wrapped around to where it started; press Ctrl+G to go around again";
 
@@ -371,6 +375,11 @@ pub struct App {
     project_search: Option<ProjectSearchDialog>,
     project_search_open: bool,
     index_generation: u64,
+    /// The index's file activity counter as of the last check of open
+    /// files for changes on disk, and when that check was; see
+    /// [`check_open_files`](Self::check_open_files).
+    file_activity: u64,
+    last_file_check: Option<Instant>,
     /// A message shown in the status bar until the next key press.
     status: Option<String>,
     confirm: Option<Confirm>,
@@ -429,6 +438,8 @@ impl App {
         };
         App {
             index_generation: project.index().generation(),
+            file_activity: 0,
+            last_file_check: None,
             project,
             storage,
             project_storage,
@@ -584,6 +595,75 @@ impl App {
             Ok(()) => format!("Saved {title}"),
             Err(err) => format!("Could not save {title}: {err}"),
         });
+    }
+
+    /// Reload the active file from disk over its unsaved edits. Undoable,
+    /// so no confirmation is asked.
+    fn discard_active(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let title = tab.title();
+        self.status = Some(match tab.view.editor_mut().discard_changes() {
+            Ok(true) => format!("Discarded unsaved changes to {title} (undo brings them back)"),
+            Ok(false) => format!("{title} has no unsaved changes"),
+            Err(err) => format!("Could not reload {title}: {err}"),
+        });
+    }
+
+    /// See whether any open file has changed on disk and bring the changes
+    /// in; see [`Editor::check_disk`]. Says what happened in the status
+    /// bar and returns whether anything did. Done when the index reports
+    /// filesystem activity, when the terminal regains focus, and every
+    /// [`FILE_CHECK_INTERVAL`] regardless; see
+    /// [`check_open_files_if_due`](Self::check_open_files_if_due).
+    fn check_open_files(&mut self) -> bool {
+        self.file_activity = self.project.index().activity();
+        self.last_file_check = Some(Instant::now());
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            let title = tab.title();
+            let message = match tab.view.editor_mut_in_place().check_disk() {
+                Ok(ExternalChange::None) => continue,
+                Ok(ExternalChange::Reloaded) => format!("{title} changed on disk: reloaded"),
+                Ok(ExternalChange::Merged) => {
+                    format!(
+                        "{title} changed on disk: merged with unsaved changes (undo to keep yours)"
+                    )
+                }
+                Ok(ExternalChange::Conflicted) => {
+                    tab.view.reveal_cursor();
+                    format!("{title} changed on disk: conflicts with unsaved changes are marked")
+                }
+                Ok(ExternalChange::Unmerged) => {
+                    format!(
+                        "{title} changed on disk but can't be merged with unsaved changes: saving will overwrite it"
+                    )
+                }
+                Ok(ExternalChange::Deleted) => {
+                    format!("{title} was deleted on disk: save to recreate it")
+                }
+                Err(err) => format!("Could not read {title}: {err}"),
+            };
+            self.status = Some(message);
+            changed = true;
+        }
+        changed
+    }
+
+    /// [`check_open_files`](Self::check_open_files) if there has been
+    /// filesystem activity since the last check or it was long enough
+    /// ago. Stats every open file, so not for every idle tick.
+    fn check_open_files_if_due(&mut self) -> bool {
+        let hinted = self.project.index().activity() != self.file_activity;
+        let due = self
+            .last_file_check
+            .is_none_or(|last| last.elapsed() >= FILE_CHECK_INTERVAL);
+        if hinted || due {
+            self.check_open_files()
+        } else {
+            false
+        }
     }
 
     /// The title for the terminal window: the editor's name and the
@@ -772,6 +852,7 @@ impl App {
             Command::OpenFile => self.open_files_palette(),
             Command::SwitchTab => self.open_tabs_palette(),
             Command::Save => self.save_active(),
+            Command::DiscardChanges => self.discard_active(),
             Command::CloseTab => self.request_close_tab(self.active),
             Command::Find => self.open_search_box(),
             Command::FindNext => self.find_next(),
@@ -1907,7 +1988,7 @@ impl App {
     /// Periodic housekeeping while idle. Returns whether the screen needs
     /// redrawing.
     pub fn tick(&mut self) -> bool {
-        let mut redraw = false;
+        let mut redraw = self.check_open_files_if_due();
         if self.project_search_open
             && let Some(dialog) = &mut self.project_search
             && dialog.poll()
@@ -1944,11 +2025,24 @@ impl App {
 
     // ----- Events ---------------------------------------------------------
 
-    /// Handle one loop event, from the terminal or from a program.
-    pub fn handle_app_event(&mut self, event: AppEvent) {
+    /// Handle one loop event, from the terminal or from a program, and
+    /// say whether the screen needs redrawing. Focus changes alone don't:
+    /// a terminal that reports focus doesn't cost a redraw each time the
+    /// window is clicked away and back. Regaining focus is when files
+    /// changed elsewhere are most expected to be current, though, so it
+    /// checks them.
+    pub fn handle_app_event(&mut self, event: AppEvent) -> bool {
         match event {
-            AppEvent::Terminal(event) => self.handle_event(event),
-            AppEvent::Pty(id, output) => self.handle_pty(id, output),
+            AppEvent::Terminal(Event::FocusGained) => self.check_open_files(),
+            AppEvent::Terminal(Event::FocusLost) => false,
+            AppEvent::Terminal(event) => {
+                self.handle_event(event);
+                true
+            }
+            AppEvent::Pty(id, output) => {
+                self.handle_pty(id, output);
+                true
+            }
         }
     }
 
@@ -5543,5 +5637,81 @@ mod tests {
         assert!(!app.should_quit());
         ctrl(&mut app, 'q');
         assert!(app.should_quit());
+    }
+
+    #[test]
+    fn tick_reloads_files_changed_on_disk_and_says_so() {
+        let (dir, mut app) = app_with_files(&[("a.rs", "one\ntwo\n")]);
+        std::fs::write(dir.path().join("a.rs"), "one\ntwo\nthree\n").unwrap();
+        assert!(app.tick());
+        assert_eq!(
+            app.tabs[app.active].view.editor().buffer().to_text(),
+            "one\ntwo\nthree\n"
+        );
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("a.rs changed on disk: reloaded"),
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn discard_changes_command_reloads_the_active_file() {
+        let (_dir, mut app) = app_with_files(&[("a.rs", "one\ntwo\n")]);
+        type_str(&mut app, "x");
+        assert!(app.tabs[app.active].view.editor().is_modified());
+        app.run_command(Command::DiscardChanges);
+        assert!(!app.tabs[app.active].view.editor().is_modified());
+        assert_eq!(
+            app.tabs[app.active].view.editor().buffer().to_text(),
+            "one\ntwo\n"
+        );
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.starts_with("Discarded unsaved changes to a.rs"),
+            "{status}"
+        );
+        // It is an ordinary edit to undo.
+        app.run_command(Command::Undo);
+        assert_eq!(
+            app.tabs[app.active].view.editor().buffer().to_text(),
+            "xone\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn regaining_focus_checks_open_files_right_away() {
+        let (dir, mut app) = app_with_files(&[("a.rs", "one\ntwo\n")]);
+        // The first idle tick checks; after that, idle ticks wait for a
+        // hint or the interval.
+        app.tick();
+        std::fs::write(dir.path().join("a.rs"), "one\ntwo\nthree\n").unwrap();
+        assert!(app.handle_app_event(AppEvent::Terminal(Event::FocusGained)));
+        assert_eq!(
+            app.tabs[app.active].view.editor().buffer().to_text(),
+            "one\ntwo\nthree\n"
+        );
+        // Losing focus, and regaining it with nothing changed, need no
+        // redraw.
+        assert!(!app.handle_app_event(AppEvent::Terminal(Event::FocusLost)));
+        assert!(!app.handle_app_event(AppEvent::Terminal(Event::FocusGained)));
+    }
+
+    #[test]
+    fn idle_ticks_pick_up_a_change_from_the_watcher_or_the_interval() {
+        let (dir, mut app) = app_with_files(&[("a.rs", "one\ntwo\n")]);
+        app.tick();
+        std::fs::write(dir.path().join("a.rs"), "one\ntwo\nthree\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.tabs[app.active].view.editor().buffer().to_text() != "one\ntwo\nthree\n" {
+            assert!(Instant::now() < deadline, "change on disk never noticed");
+            std::thread::sleep(Duration::from_millis(50));
+            app.tick();
+        }
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("a.rs changed on disk: reloaded"),
+            "{status}"
+        );
     }
 }

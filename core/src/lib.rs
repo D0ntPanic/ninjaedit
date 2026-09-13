@@ -13,6 +13,7 @@ pub mod highlight_cache;
 pub mod indent;
 pub mod index;
 pub mod line_edit;
+pub mod merge;
 pub mod project;
 pub mod project_search;
 pub mod search;
@@ -22,13 +23,13 @@ pub mod syntax;
 pub mod terminal;
 pub mod text;
 
-pub use buffer::{BufferSnapshot, FileBuffer, LineEnding};
+pub use buffer::{BufferSnapshot, DiskChange, FileBuffer, LineEnding};
 pub use build::{
     BuildConfig, BuildRoot, BuildSystem, ConfigurationKey, DEFAULT_CMAKE_GENERATOR, Job, Selection,
     Step, TargetKey,
 };
 pub use diagnostics::{SourceLink, SourceLocation, find_source_links};
-pub use editor::{Cell, Editor, Movement, Position};
+pub use editor::{Cell, Editor, ExternalChange, Movement, Position};
 pub use highlight_cache::HighlightCache;
 pub use indent::Indentation;
 pub use index::{FileIndex, FileList, IndexEntry};

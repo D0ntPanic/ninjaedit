@@ -112,6 +112,9 @@ struct Shared {
     state: Mutex<State>,
     cond: Condvar,
     generation: AtomicU64,
+    /// Bumped by every filesystem event under the root (outside `.git`),
+    /// whether or not it changes the index; see [`FileIndex::activity`].
+    activity: AtomicU64,
 }
 
 enum Msg {
@@ -155,6 +158,7 @@ impl FileIndex {
             }),
             cond: Condvar::new(),
             generation: AtomicU64::new(0),
+            activity: AtomicU64::new(0),
         });
         let (tx, rx) = mpsc::channel();
 
@@ -232,6 +236,15 @@ impl FileIndex {
     /// can poll this cheaply to know when to refresh.
     pub fn generation(&self) -> u64 {
         self.shared.generation.load(Ordering::Acquire)
+    }
+
+    /// A counter that changes whenever anything happens to a file under
+    /// the root, including writes to file contents that don't affect the
+    /// index. A hint that open files may have changed on disk and are
+    /// worth checking, cheaper than checking them on a timer alone.
+    /// Activity inside `.git` doesn't count.
+    pub fn activity(&self) -> u64 {
+        self.shared.activity.load(Ordering::Acquire)
     }
 
     /// The entries of one indexed directory (directories first, then files,
@@ -413,12 +426,22 @@ impl Worker {
     }
 
     /// Returns false when the worker should shut down.
+    /// Whether a path is inside the root's `.git` directory, where
+    /// git's own activity is constant and never changes the tree.
+    fn in_git_dir(&self, path: &Path) -> bool {
+        path.strip_prefix(&self.shared.root_path)
+            .is_ok_and(|rel| rel.components().any(|c| c.as_os_str() == GIT_DIR))
+    }
+
     fn handle(&mut self, msg: Msg) -> bool {
         let event = match msg {
             Msg::Shutdown => return false,
             Msg::Fs(Err(_)) => return true,
             Msg::Fs(Ok(event)) => event,
         };
+        if event.paths.iter().any(|path| !self.in_git_dir(path)) {
+            self.shared.activity.fetch_add(1, Ordering::Release);
+        }
         // Content and metadata changes don't affect the index; name changes
         // (renames) and creations/removals do.
         match event.kind {
@@ -915,5 +938,20 @@ mod tests {
         );
         // But they remain in the full index, flagged as ignored.
         assert!(relative(index.files(true), &root).contains(&"src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn writing_a_file_bumps_the_activity_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("a.txt"), "one\n");
+        let index = FileIndex::new(root);
+        assert!(index.wait_for_full(WAIT));
+        // Let the scan's own activity, if any, settle.
+        std::thread::sleep(Duration::from_millis(300));
+        let before = index.activity();
+        // Rewriting contents doesn't change the index, but is activity.
+        write(&root.join("a.txt"), "one\ntwo\n");
+        assert!(eventually(|| index.activity() != before));
     }
 }

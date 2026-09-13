@@ -194,6 +194,16 @@ impl EditorView {
         self.follow_cursor = true;
     }
 
+    /// At the next render, bring the cursor into view the way a jump
+    /// does: centered vertically unless it's already on screen. For when
+    /// something other than the user has moved it, such as a merge of
+    /// changes from disk leaving it on a conflict.
+    pub fn reveal_cursor(&mut self) {
+        let cursor = self.editor.cursor();
+        self.jump = Some(cursor..cursor);
+        self.follow_cursor = true;
+    }
+
     /// First visible display column.
     #[cfg(test)]
     pub fn scroll_col(&self) -> usize {

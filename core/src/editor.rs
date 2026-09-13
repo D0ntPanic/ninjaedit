@@ -64,9 +64,28 @@
 //! [`Editor::next_match`] steps through the rest. In either state, moving
 //! the cursor or editing the text drops the search and its highlights;
 //! selecting a match through the search itself does not.
+//!
+//! Files changing on disk: other programs (a formatter, a coding agent, a
+//! `git checkout`) write to files while they are open here. The buffer
+//! remembers the file as it last read or saved it, and
+//! [`Editor::check_disk`], called periodically by the frontend, notices a
+//! change and brings it in. With no unsaved edits the buffer simply takes
+//! the new contents. With unsaved edits, the buffer's changes and the
+//! file's are merged three ways from the remembered contents, the way git
+//! merges branches (see the [`merge`](crate::merge) module); overlapping
+//! changes are left as conflict markers for the user to resolve. Either
+//! way the change lands as one ordinary undoable edit, so "I didn't want
+//! that" is just undo, and undo then save puts the buffer's own version
+//! back on disk. While nothing has been edited on top of a change from
+//! disk, a further change replaces it rather than piling on it: the
+//! buffer is always the user's version merged with the latest file, a
+//! conflict is one block that follows the file, and undo is still one
+//! step. The other way round, [`Editor::discard_changes`] reloads the
+//! file over any unsaved edits, and is undoable too.
 
-use crate::buffer::FileBuffer;
+use crate::buffer::{BufferSnapshot, DiskChange, FileBuffer};
 use crate::indent::{self, Indentation};
+use crate::merge;
 use crate::search::{Search, SearchStep};
 use crate::syntax::{Highlighter, Language, Token, TokenKind};
 use crate::text::{self, Grapheme};
@@ -290,6 +309,9 @@ pub struct Editor {
     /// valid for the buffer as it was when it began, so every edit drops
     /// it.
     search: Option<Search>,
+    /// The last change brought in from disk, while nothing has been edited
+    /// on top of it; see [`check_disk`](Self::check_disk).
+    external: Option<External>,
 }
 
 impl Editor {
@@ -314,6 +336,7 @@ impl Editor {
             pending: None,
             highlighter,
             search: None,
+            external: None,
         }
     }
 
@@ -948,6 +971,7 @@ impl Editor {
     ) {
         self.pending = None;
         self.search = None;
+        self.external = None;
         let before = self.state();
         let edit = Edit {
             offset: range.start,
@@ -1231,6 +1255,7 @@ impl Editor {
         let Some(entry) = self.undo.pop() else {
             return false;
         };
+        self.external = None;
         self.revert(&entry.edit);
         self.restore(entry.before);
         self.redo.push(entry);
@@ -1244,6 +1269,7 @@ impl Editor {
         let Some(entry) = self.redo.pop() else {
             return false;
         };
+        self.external = None;
         self.apply(&entry.edit);
         self.restore(entry.after);
         self.undo.push(entry);
@@ -1274,6 +1300,7 @@ impl Editor {
 
     fn mark_saved(&mut self) {
         self.save_point = Some(self.undo.len());
+        self.external = None;
         self.grouping = false;
         self.sync_modified();
     }
@@ -1293,6 +1320,222 @@ impl Editor {
         self.set_language(self.buffer.path().and_then(Language::from_path));
         Ok(())
     }
+
+    /// See whether something else has changed the buffer's file since it
+    /// was read or saved, and if so bring the change into the buffer; see
+    /// the [module documentation](self) and [`ExternalChange`]. Meant to be
+    /// called periodically. An error reading the file leaves the buffer
+    /// as it was.
+    pub fn check_disk(&mut self) -> io::Result<ExternalChange> {
+        let (previous, contents) = match self.buffer.check_disk()? {
+            DiskChange::Unchanged => return Ok(ExternalChange::None),
+            DiskChange::Missing => {
+                // The buffer is now the only copy: saving must write it
+                // even if nothing is edited.
+                self.save_point = None;
+                self.grouping = false;
+                self.sync_modified();
+                return Ok(ExternalChange::Deleted);
+            }
+            DiskChange::Changed { previous, contents } => (previous, contents),
+        };
+        // A change on top of an earlier one that nothing has been edited
+        // since replaces it: the earlier one is taken back out and the
+        // merge redone from the same ancestor, so that the buffer is
+        // always the user's version merged with the latest file, a
+        // conflict is one block rather than a conflict inside a conflict,
+        // and one undo still gets back to the user's version. This is the
+        // editor revising its own change, not an undo: the user's undo
+        // (see [`undo`](Self::undo)) drops `external`, so a change the
+        // user has undone stays undone and counts as their edit.
+        let previous = match self.external.take() {
+            Some(external)
+                if external.version == self.buffer.version()
+                    && external.depth == self.undo.len() =>
+            {
+                self.take_back_last();
+                external.base
+            }
+            _ => previous,
+        };
+        let remember = |editor: &mut Editor, base: Option<BufferSnapshot>| {
+            editor.external = Some(External {
+                base,
+                version: editor.buffer.version(),
+                depth: editor.undo.len(),
+            });
+        };
+        let base = previous
+            .as_ref()
+            .map(BufferSnapshot::to_bytes)
+            .unwrap_or_default();
+        let ours = self.buffer.to_bytes();
+        // Whether the user has anything of their own is judged against
+        // the ancestor, not the modified flag: after a take-back the flag
+        // can't tell, and a merge that happened to match the file left
+        // the buffer unmodified while the user's edit is still theirs.
+        if ours == base {
+            if self.replace_all(contents, None) {
+                remember(self, previous);
+            }
+            self.mark_saved_keeping_external();
+            return Ok(ExternalChange::Reloaded);
+        }
+        let Some(merged) = merge::merge(&base, &ours, &contents) else {
+            return Ok(ExternalChange::Unmerged);
+        };
+        let conflict = merged
+            .conflicts
+            .then(|| merge::first_conflict(&merged.content))
+            .flatten();
+        let saved = merged.content == contents;
+        if self.replace_all(merged.content, conflict) {
+            remember(self, previous);
+        }
+        if saved {
+            self.mark_saved_keeping_external();
+        }
+        Ok(if merged.conflicts {
+            ExternalChange::Conflicted
+        } else {
+            ExternalChange::Merged
+        })
+    }
+
+    /// Throw away unsaved edits by reloading the buffer's file, as one
+    /// undoable edit. Returns whether there was anything to discard; fails
+    /// if the buffer has no file or it can't be read.
+    pub fn discard_changes(&mut self) -> io::Result<bool> {
+        if let DiskChange::Missing = self.buffer.check_disk()? {
+            // As in `check_disk`: the buffer is the only copy now.
+            self.save_point = None;
+            self.sync_modified();
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the file no longer exists",
+            ));
+        }
+        let Some(snapshot) = self.buffer.disk_snapshot() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "buffer has no associated file",
+            ));
+        };
+        let contents = snapshot.to_bytes();
+        if contents == self.buffer.to_bytes() {
+            self.mark_saved();
+            return Ok(false);
+        }
+        self.replace_all(contents, None);
+        self.mark_saved();
+        Ok(true)
+    }
+
+    /// Replace the whole contents as one undoable edit, keeping the cursor
+    /// on the line it was on (as the diff between old and new says) unless
+    /// `cursor` names where to put it instead. Any selection is dropped.
+    /// Returns whether anything changed; nothing is recorded if not.
+    fn replace_all(&mut self, new: Vec<u8>, cursor: Option<usize>) -> bool {
+        let old = self.buffer.to_bytes();
+        if old == new {
+            return false;
+        }
+        let line = self.buffer.line_of_offset(self.cursor);
+        let column = self.cursor - self.buffer.offset_of_line(line);
+        let map = merge::LineMap::new(&old, &new);
+        // Record only the part that differs, so undo doesn't hold two
+        // copies of the file for a small change.
+        let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+        let suffix = old[prefix..]
+            .iter()
+            .rev()
+            .zip(new[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let range = prefix..old.len() - suffix;
+        let inserted = new[prefix..new.len() - suffix].to_vec();
+        self.commit_with_cursor(range, inserted, EditKind::Other, prefix, None);
+        let cursor = cursor.unwrap_or_else(|| {
+            let line = map.map(line).min(self.buffer.line_count() - 1);
+            let content = self.buffer.line_content_range(line);
+            content.start + column.min(content.len())
+        });
+        self.cursor = self.snap(cursor);
+        if let Some(entry) = self.undo.last_mut() {
+            entry.after = CursorState {
+                cursor: self.cursor,
+                anchor: None,
+            };
+        }
+        true
+    }
+
+    /// Take the newest undo entry back out of the buffer and the history,
+    /// as if it had never happened. Only for a change the editor made on
+    /// its own (one brought in from disk) that it is about to make
+    /// differently. The user's undo is [`undo`](Self::undo), which keeps
+    /// the entry for redo and counts as an edit.
+    fn take_back_last(&mut self) {
+        let Some(entry) = self.undo.pop() else {
+            return;
+        };
+        self.revert(&entry.edit);
+        self.restore(entry.before);
+        if self.save_point.is_some_and(|depth| depth > self.undo.len()) {
+            self.save_point = None;
+        }
+        self.sync_modified();
+    }
+
+    /// As [`mark_saved`](Self::mark_saved), for a change from disk that
+    /// left the buffer matching the file: the change stays remembered
+    /// so a further one can replace it.
+    fn mark_saved_keeping_external(&mut self) {
+        let external = self.external.take();
+        self.mark_saved();
+        self.external = external;
+    }
+}
+
+/// A change brought in from disk that nothing has been edited on top of,
+/// so that a further change from disk can replace it instead of piling
+/// on it; see [`Editor::check_disk`]. Dropped by any edit, undo, redo,
+/// or save.
+struct External {
+    /// The file as the buffer last loaded or saved it before the change:
+    /// the ancestor the merge was done from, kept so that the next is
+    /// done from the same one. `None` when the file didn't exist then.
+    base: Option<BufferSnapshot>,
+    /// The buffer version just after the change was brought in; any
+    /// edit, undo, or redo since moves it on.
+    version: u64,
+    /// The undo depth just after, so the entry to take back is known to
+    /// be the change's own.
+    depth: usize,
+}
+
+/// What [`Editor::check_disk`] found and did about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalChange {
+    /// The file is as the buffer last read or saved it.
+    None,
+    /// The file changed and the buffer had no unsaved edits, so it now
+    /// holds the file's new contents and counts as unmodified.
+    Reloaded,
+    /// The file changed and the buffer's unsaved edits have been merged
+    /// with the file's changes. The buffer is modified.
+    Merged,
+    /// As [`Merged`](Self::Merged), but some changes overlapped: the
+    /// buffer holds conflict markers around them, and the cursor is on
+    /// the first.
+    Conflicted,
+    /// The file changed but couldn't be merged with the buffer's unsaved
+    /// edits (one of them is binary). The buffer is left alone; saving
+    /// overwrites the file.
+    Unmerged,
+    /// The file was deleted or moved away. The buffer keeps its contents
+    /// and is modified; saving recreates the file.
+    Deleted,
 }
 
 impl UndoEntry {
@@ -2414,5 +2657,313 @@ mod tests {
         ed.undo();
         assert_eq!(text(&ed), "");
         assert!(!ed.can_undo());
+    }
+
+    // ----- Files changing on disk -----------------------------------------
+
+    fn file_editor(dir: &tempfile::TempDir, text: &str) -> (std::path::PathBuf, Editor) {
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, text).unwrap();
+        let editor = Editor::new(FileBuffer::open(&path).unwrap());
+        (path, editor)
+    }
+
+    #[test]
+    fn a_file_the_editor_wrote_itself_is_not_a_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "one\ntwo\n");
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::None);
+        type_str(&mut ed, "x");
+        ed.save().unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::None);
+        // Nor is a rewrite with the same contents.
+        std::fs::write(&path, "xone\ntwo\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::None);
+        assert!(!ed.is_modified());
+    }
+
+    #[test]
+    fn an_unmodified_buffer_reloads_and_undo_brings_the_old_contents_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "one\ntwo\nthree\n");
+        ed.go_to_line(2);
+        ed.move_cursor(Right);
+        std::fs::write(&path, "zero\none\ntwo\nthree\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Reloaded);
+        assert_eq!(text(&ed), "zero\none\ntwo\nthree\n");
+        assert!(!ed.is_modified());
+        // The cursor stays on the text it was on.
+        assert_eq!(ed.cursor_position(), Position { line: 3, column: 1 });
+        // Undo restores what was there, and saving puts it back on disk.
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "one\ntwo\nthree\n");
+        assert!(ed.is_modified());
+        assert_eq!(ed.cursor_position(), Position { line: 2, column: 1 });
+        ed.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nthree\n");
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::None);
+    }
+
+    #[test]
+    fn unsaved_edits_are_merged_with_changes_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "one\ntwo\nthree\nfour\n");
+        type_str(&mut ed, "> ");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Merged);
+        assert_eq!(text(&ed), "> one\ntwo\nthree\nfour\nfive\n");
+        assert!(ed.is_modified());
+        assert_eq!(ed.cursor_position(), Position { line: 0, column: 2 });
+        // Undo takes out what came from disk and leaves the buffer's own
+        // edit; typing afterwards doesn't join the merge's undo entry.
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "> one\ntwo\nthree\nfour\n");
+        assert!(ed.redo());
+        type_str(&mut ed, "!");
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "> one\ntwo\nthree\nfour\nfive\n");
+        ed.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "> one\ntwo\nthree\nfour\nfive\n"
+        );
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::None);
+    }
+
+    #[test]
+    fn overlapping_changes_leave_conflict_markers_with_the_cursor_on_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "one\ntwo\nthree\n");
+        ed.go_to_line(1);
+        type_str(&mut ed, "mine ");
+        std::fs::write(&path, "one\ntheirs two\nthree\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Conflicted);
+        let merged = text(&ed);
+        assert!(
+            merged.starts_with("one\n<<<<<<< editor\nmine two\n"),
+            "{merged}"
+        );
+        assert!(
+            merged.ends_with("=======\ntheirs two\n>>>>>>> disk\nthree\n"),
+            "{merged}"
+        );
+        assert_eq!(ed.cursor_position(), Position { line: 1, column: 0 });
+        assert!(ed.is_modified());
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "one\nmine two\nthree\n");
+        assert_eq!(ed.cursor_position(), Position { line: 1, column: 5 });
+    }
+
+    #[test]
+    fn the_same_edit_on_both_sides_leaves_the_buffer_unmodified() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "one\ntwo\n");
+        type_str(&mut ed, "x");
+        std::fs::write(&path, "xone\ntwo\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Merged);
+        assert_eq!(text(&ed), "xone\ntwo\n");
+        assert!(!ed.is_modified());
+    }
+
+    #[test]
+    fn a_binary_change_is_left_for_saving_to_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "one\n");
+        type_str(&mut ed, "x");
+        std::fs::write(&path, b"one\0\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Unmerged);
+        assert_eq!(text(&ed), "xone\n");
+        assert!(ed.is_modified());
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::None);
+        ed.save().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"xone\n");
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::None);
+    }
+
+    #[test]
+    fn a_deleted_file_leaves_the_buffer_modified_so_saving_recreates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "one\n");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Deleted);
+        assert!(ed.is_modified());
+        assert_eq!(text(&ed), "one\n");
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::None);
+        ed.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\n");
+        assert!(!ed.is_modified());
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::None);
+    }
+
+    #[test]
+    fn discard_changes_reloads_the_file_and_is_undoable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "one\ntwo\n");
+        assert!(!ed.discard_changes().unwrap());
+        type_str(&mut ed, "edit ");
+        assert!(ed.is_modified());
+        assert!(ed.discard_changes().unwrap());
+        assert_eq!(text(&ed), "one\ntwo\n");
+        assert!(!ed.is_modified());
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "edit one\ntwo\n");
+        assert!(ed.is_modified());
+        // Discarding picks up a newer version on disk.
+        std::fs::write(&path, "new\n").unwrap();
+        assert!(ed.discard_changes().unwrap());
+        assert_eq!(text(&ed), "new\n");
+        assert!(!ed.is_modified());
+        // Without a file there is nothing to reload.
+        assert!(editor("x").discard_changes().is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(ed.discard_changes().is_err());
+        assert!(ed.is_modified());
+    }
+
+    #[test]
+    fn a_second_change_from_disk_replaces_the_first_while_nothing_was_edited() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "one\ntwo\nthree\n");
+        ed.go_to_line(1);
+        type_str(&mut ed, "mine ");
+        std::fs::write(&path, "one\nfirst two\nthree\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Conflicted);
+        std::fs::write(&path, "one\nsecond two\nthree\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Conflicted);
+        // One conflict block, showing the latest file, not a conflict
+        // inside the earlier conflict.
+        let merged = text(&ed);
+        assert_eq!(merged.matches("<<<<<<<").count(), 1, "{merged}");
+        assert!(!merged.contains("first"), "{merged}");
+        assert!(
+            merged.ends_with("=======\nsecond two\n>>>>>>> disk\nthree\n"),
+            "{merged}"
+        );
+        assert_eq!(ed.cursor_position(), Position { line: 1, column: 0 });
+        // One undo is back to the user's own version, and redo returns.
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "one\nmine two\nthree\n");
+        assert!(ed.redo());
+        assert_eq!(text(&ed), merged);
+    }
+
+    #[test]
+    fn repeated_reloads_of_an_unmodified_buffer_undo_in_one_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "one\n");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Reloaded);
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Reloaded);
+        assert_eq!(text(&ed), "one\ntwo\nthree\n");
+        assert!(!ed.is_modified());
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "one\n");
+        assert!(ed.is_modified());
+        assert!(!ed.can_undo());
+        ed.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\n");
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::None);
+    }
+
+    #[test]
+    fn a_clean_merge_followed_by_a_conflict_gives_one_conflict_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "one\ntwo\nthree\n");
+        type_str(&mut ed, "> ");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Merged);
+        std::fs::write(&path, "first one\ntwo\nthree\nfour\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Conflicted);
+        let merged = text(&ed);
+        assert_eq!(merged.matches("<<<<<<<").count(), 1, "{merged}");
+        assert!(merged.starts_with("<<<<<<< editor\n> one\n"), "{merged}");
+        assert!(
+            merged.ends_with(">>>>>>> disk\ntwo\nthree\nfour\n"),
+            "{merged}"
+        );
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "> one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn an_undone_change_from_disk_counts_as_the_users_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "a\nb\nc\nd\ne\n");
+        ed.move_cursor(DocumentEnd);
+        type_str(&mut ed, "user\n");
+        std::fs::write(&path, "A\nb\nc\nd\ne\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Merged);
+        assert_eq!(text(&ed), "A\nb\nc\nd\ne\nuser\n");
+        // The user rejects the change from disk...
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "a\nb\nc\nd\ne\nuser\n");
+        // ...so the next change is merged with that rejection kept.
+        std::fs::write(&path, "A\nb\nC\nd\ne\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Merged);
+        assert_eq!(text(&ed), "a\nb\nC\nd\ne\nuser\n");
+    }
+
+    #[test]
+    fn an_edit_after_a_change_from_disk_keeps_the_next_one_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "one\ntwo\nthree\n");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Reloaded);
+        type_str(&mut ed, "x");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Merged);
+        assert_eq!(text(&ed), "xone\ntwo\nthree\nfour\nfive\n");
+        // Each step is its own undo entry: the edit in between stops the
+        // second change replacing the first.
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "xone\ntwo\nthree\nfour\n");
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "one\ntwo\nthree\nfour\n");
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "one\ntwo\nthree\n");
+        assert!(!ed.can_undo());
+    }
+
+    #[test]
+    fn saving_between_changes_from_disk_settles_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "one\ntwo\nthree\n");
+        type_str(&mut ed, "x");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Merged);
+        ed.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "xone\ntwo\nthree\nfour\n"
+        );
+        // A writer that didn't see the save overwrites it; the file is
+        // what counts, and undo is how to get the saved version back.
+        std::fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Reloaded);
+        assert_eq!(text(&ed), "one\ntwo\nthree\nfour\nfive\n");
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "xone\ntwo\nthree\nfour\n");
+        assert!(ed.is_modified());
+    }
+
+    #[test]
+    fn an_edit_the_file_matched_is_still_the_users_when_the_file_moves_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut ed) = file_editor(&dir, "one\ntwo\nthree\nfour\n");
+        type_str(&mut ed, "x");
+        // The file gains the same edit plus another: the merge matches
+        // the file exactly, so the buffer counts as unmodified.
+        std::fs::write(&path, "xone\ntwo\nthree\nFOUR\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Merged);
+        assert!(!ed.is_modified());
+        // The file then loses that edit again. It was the user's too, so
+        // it stays, merged with the file as it now is.
+        std::fs::write(&path, "one\ntwo\nthree\nFOUR\n").unwrap();
+        assert_eq!(ed.check_disk().unwrap(), ExternalChange::Merged);
+        assert_eq!(text(&ed), "xone\ntwo\nthree\nFOUR\n");
+        assert!(ed.is_modified());
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "xone\ntwo\nthree\nfour\n");
     }
 }
