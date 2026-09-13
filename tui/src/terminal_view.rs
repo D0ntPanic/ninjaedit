@@ -18,20 +18,42 @@
 //! terminals do. While the program is using the mouse itself (a
 //! full-screen program that turned mouse reporting on) the wheel is sent
 //! to it rather than scrolling the view.
+//!
+//! Source locations in the output (the file and line of a compiler's
+//! warning or error; see [`find_source_links`]) are drawn as links,
+//! underlined in the theme's link color, and [`link_at`] tells the
+//! application which one a click landed on so it can open the file.
+//! Links are found in the rows on screen each time they change, with a
+//! line the terminal wrapped scanned whole, so a location cut by the
+//! right edge is still one link.
+//!
+//! [`handle_key`]: TerminalView::handle_key
+//! [`link_at`]: TerminalView::link_at
 
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::terminal::{
     Color as TermColor, Key, Modifiers, MouseButton as TermButton, MouseEvent as TermMouse,
-    MouseEventKind as TermMouseKind, Style as TermStyle, Terminal, Underline,
+    MouseEventKind as TermMouseKind, Row, Style as TermStyle, Terminal, Underline,
 };
+use ninjaedit_core::{SourceLocation, find_source_links};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use std::ops::Range;
 
 /// Lines scrolled per mouse wheel notch when the view, not the program,
 /// is scrolling.
 const WHEEL_LINES: usize = 3;
+
+/// The part of a source link drawn on one screen row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinkSpan {
+    /// The screen row, and the screen columns along it.
+    y: u16,
+    x: Range<u16>,
+    location: SourceLocation,
+}
 
 pub struct TerminalView {
     terminal: Terminal,
@@ -44,6 +66,11 @@ pub struct TerminalView {
     dragging: Option<MouseButton>,
     /// The screen region the terminal was last drawn into.
     area: Rect,
+    /// The source links on screen at the last render, and what the
+    /// screen was (its generation, scroll offset, and area) when they
+    /// were found, so they are found again only when it changes.
+    links: Vec<LinkSpan>,
+    links_for: Option<(u64, usize, Rect)>,
 }
 
 impl TerminalView {
@@ -54,6 +81,8 @@ impl TerminalView {
             scrollback: 0,
             dragging: None,
             area: Rect::default(),
+            links: Vec::new(),
+            links_for: None,
         }
     }
 
@@ -219,6 +248,38 @@ impl TerminalView {
         self.scrollback
     }
 
+    // ----- Links ----------------------------------------------------------
+
+    /// The source location drawn as a link under screen position (`x`,
+    /// `y`) at the last render, for a click there to open. `None` while
+    /// the program is reading the mouse itself, since the click is its.
+    pub fn link_at(&self, x: u16, y: u16) -> Option<&SourceLocation> {
+        if self.terminal.reports_mouse() {
+            return None;
+        }
+        self.links
+            .iter()
+            .find(|span| span.y == y && span.x.contains(&x))
+            .map(|span| &span.location)
+    }
+
+    /// Find the source links in the rows now on screen, if the screen
+    /// has changed since they were last found.
+    fn refresh_links(&mut self, area: Rect) {
+        let key = (self.terminal.generation(), self.scrollback, area);
+        if self.links_for == Some(key) {
+            return;
+        }
+        let rows: Vec<&Row> = self
+            .terminal
+            .rows(self.scrollback)
+            .take(area.height as usize)
+            .collect();
+        let links = find_links(&rows, area);
+        self.links = links;
+        self.links_for = Some(key);
+    }
+
     // ----- Rendering ------------------------------------------------------
 
     /// Draw the terminal into `area`, resizing it to fit, and return where
@@ -280,6 +341,18 @@ impl TerminalView {
             }
         }
 
+        // Source locations in the output are links: underlined, in the
+        // theme's link color, over whatever the program drew.
+        self.refresh_links(area);
+        let link_style = Style::default()
+            .fg(theme.terminal_link)
+            .add_modifier(Modifier::UNDERLINED);
+        for span in &self.links {
+            for x in span.x.clone() {
+                buf[(x, span.y)].set_style(link_style);
+            }
+        }
+
         // The cursor shows only on the live screen, when the program has
         // it visible.
         if self.scrollback != 0 {
@@ -289,6 +362,74 @@ impl TerminalView {
             (cx < cols && cy < rows)
                 .then(|| ScreenPosition::new(area.x + cx as u16, area.y + cy as u16))
         })
+    }
+}
+
+/// The source links among `rows`, the screen's rows top to bottom, as
+/// spans in screen coordinates within `area`. Rows the terminal wrapped
+/// are joined with the rows after them and scanned as one line, and a
+/// link crossing the edge becomes one span per row.
+fn find_links(rows: &[&Row], area: Rect) -> Vec<LinkSpan> {
+    let cols = area.width as usize;
+    let mut spans = Vec::new();
+    let mut start = 0;
+    while start < rows.len() {
+        // The rows of one logical line: each wrapped row continues on
+        // the next.
+        let mut end = start;
+        while end + 1 < rows.len() && rows[end].wrapped {
+            end += 1;
+        }
+        // The line's text, and for each cell in it the byte it begins
+        // at and where it is on screen.
+        let mut text = String::new();
+        let mut cells: Vec<(usize, usize, usize)> = Vec::new(); // (byte, row, col)
+        for (row, line) in rows[start..=end].iter().enumerate() {
+            let mut col = 0;
+            for cell in &line.cells {
+                if col >= cols {
+                    break;
+                }
+                if !cell.spacer {
+                    cells.push((text.len(), start + row, col));
+                    text.push_str(&cell.text);
+                }
+                col += cell.width();
+            }
+        }
+        for link in find_source_links(&text) {
+            // The cells the link's bytes fall in, as one column range per
+            // row.
+            let mut current: Option<(usize, Range<usize>)> = None;
+            for &(byte, row, col) in &cells {
+                if !link.range.contains(&byte) {
+                    continue;
+                }
+                match &mut current {
+                    Some((r, range)) if *r == row => range.end = col + 1,
+                    _ => {
+                        if let Some((r, range)) = current.take() {
+                            spans.push(span(r, range, &link.location, area));
+                        }
+                        current = Some((row, col..col + 1));
+                    }
+                }
+            }
+            if let Some((r, range)) = current {
+                spans.push(span(r, range, &link.location, area));
+            }
+        }
+        start = end + 1;
+    }
+    spans
+}
+
+fn span(row: usize, cols: Range<usize>, location: &SourceLocation, area: Rect) -> LinkSpan {
+    let x = area.x + cols.start as u16..area.x + cols.end.min(area.width as usize) as u16;
+    LinkSpan {
+        y: area.y + row as u16,
+        x,
+        location: location.clone(),
     }
 }
 
@@ -545,6 +686,75 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(v.handle_mouse(wheel), b"\x1b[<64;5;3M");
+    }
+
+    #[test]
+    fn source_locations_are_links() {
+        let theme = theme();
+        let mut v = TerminalView::new(30, 5);
+        v.process(b"  --> src/main.rs:10:5\r\nnothing here\r\n");
+        let mut term = RatTerminal::new(TestBackend::new(30, 5)).unwrap();
+        term.draw(|f| {
+            v.render(f.area(), f.buffer_mut(), &theme);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // The location is underlined in the link color; the arrow before
+        // it and the text after it are not.
+        for x in 6..22 {
+            let cell = &buf[(x, 0)];
+            assert_eq!(cell.fg, theme.terminal_link, "column {x}");
+            assert!(cell.modifier.contains(Modifier::UNDERLINED), "column {x}");
+        }
+        assert_eq!(buf[(2, 0)].fg, theme.terminal_text);
+        assert!(!buf[(2, 0)].modifier.contains(Modifier::UNDERLINED));
+        assert!(!buf[(22, 0)].modifier.contains(Modifier::UNDERLINED));
+        assert!(!buf[(0, 1)].modifier.contains(Modifier::UNDERLINED));
+        let link = v.link_at(6, 0).expect("a link under the path");
+        assert_eq!(link.path, "src/main.rs");
+        assert_eq!((link.line, link.column), (10, Some(5)));
+        assert_eq!(v.link_at(2, 0), None, "the arrow isn't part of it");
+        assert_eq!(v.link_at(0, 1), None);
+    }
+
+    #[test]
+    fn a_link_wrapped_by_the_terminal_spans_both_rows() {
+        let theme = theme();
+        let mut v = view();
+        // 30 columns in a 20 column terminal: the path breaks across
+        // the edge.
+        v.process(b"--> src/some/long/path.rs:10:5\r\n");
+        let mut term = RatTerminal::new(TestBackend::new(20, 5)).unwrap();
+        term.draw(|f| {
+            v.render(f.area(), f.buffer_mut(), &theme);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        assert!(buf[(19, 0)].modifier.contains(Modifier::UNDERLINED));
+        assert!(buf[(0, 1)].modifier.contains(Modifier::UNDERLINED));
+        assert!(buf[(9, 1)].modifier.contains(Modifier::UNDERLINED));
+        assert!(!buf[(10, 1)].modifier.contains(Modifier::UNDERLINED));
+        let first = v.link_at(19, 0).expect("the first row");
+        let second = v.link_at(0, 1).expect("the second row");
+        assert_eq!(first, second);
+        assert_eq!(first.path, "src/some/long/path.rs");
+        assert_eq!(first.line, 10);
+    }
+
+    #[test]
+    fn links_are_the_programs_while_it_reads_the_mouse() {
+        let mut v = view();
+        v.process(b"  --> src/main.rs:10:5\r\n");
+        let mut term = RatTerminal::new(TestBackend::new(20, 5)).unwrap();
+        term.draw(|f| {
+            v.render(f.area(), f.buffer_mut(), &theme());
+        })
+        .unwrap();
+        assert!(v.link_at(6, 0).is_some());
+        v.process(b"\x1b[?1000h");
+        assert_eq!(v.link_at(6, 0), None);
+        v.process(b"\x1b[?1000l");
+        assert!(v.link_at(6, 0).is_some());
     }
 
     fn theme() -> Theme {

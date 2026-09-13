@@ -175,6 +175,25 @@ impl EditorView {
         self.follow_cursor = true;
     }
 
+    /// Move the cursor to a line and a character within it (both counted
+    /// from zero and clamped to what's there) and, at the next render,
+    /// bring it into view the way a jump does. For following a location
+    /// named outside the editor, such as a compiler error's.
+    pub fn go_to_line_column(&mut self, line: usize, column: usize) {
+        let buffer = self.editor.buffer();
+        let line = line.min(buffer.line_count().saturating_sub(1));
+        let content = buffer.line_content_range(line);
+        let text = buffer.line_text(line);
+        let byte = text
+            .char_indices()
+            .nth(column)
+            .map_or(text.len(), |(i, _)| i);
+        let offset = (content.start + byte).min(content.end);
+        self.editor.set_cursor(offset);
+        self.jump = Some(offset..offset);
+        self.follow_cursor = true;
+    }
+
     /// First visible display column.
     #[cfg(test)]
     pub fn scroll_col(&self) -> usize {

@@ -6,6 +6,7 @@
 
 pub mod buffer;
 pub mod build;
+pub mod diagnostics;
 pub mod editor;
 pub mod fuzzy;
 pub mod highlight_cache;
@@ -25,6 +26,7 @@ pub use buffer::{BufferSnapshot, FileBuffer, LineEnding};
 pub use build::{
     BuildConfig, BuildRoot, BuildSystem, ConfigurationKey, Job, Selection, Step, TargetKey,
 };
+pub use diagnostics::{SourceLink, SourceLocation, find_source_links};
 pub use editor::{Cell, Editor, Movement, Position};
 pub use highlight_cache::HighlightCache;
 pub use indent::Indentation;

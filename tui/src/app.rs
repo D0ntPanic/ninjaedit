@@ -130,7 +130,7 @@ use ninjaedit_core::search::literal_query;
 use ninjaedit_core::terminal::{Command, ExitStatus, Output, Session, SessionId};
 use ninjaedit_core::{
     BuildConfig, BuildRoot, Editor, Job, Project, ProjectKind, ProjectMatch, SearchStep, Settings,
-    Step, Storage,
+    SourceLocation, Step, Storage,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -298,6 +298,9 @@ pub struct App {
     /// The build directory and signature the running job's first step is
     /// configuring, to record once it succeeds.
     job_configure: Option<(PathBuf, String)>,
+    /// The directories the last job's commands ran in (and built in),
+    /// which the paths in their output are relative to.
+    job_dirs: Vec<PathBuf>,
     /// The status bar's configuration and target segments from the last
     /// render, to hit-test clicks.
     status_config_area: Rect,
@@ -405,6 +408,7 @@ impl App {
             job_title: String::new(),
             job_step: 0,
             job_configure: None,
+            job_dirs: Vec::new(),
             status_config_area: Rect::default(),
             status_target_area: Rect::default(),
             theme: Theme::default(),
@@ -977,6 +981,11 @@ impl App {
             Ok(job) => {
                 self.job_configure = configure;
                 self.start_job(job);
+                // A compiler run by CMake's build tool may name files
+                // relative to the build directory.
+                if let Some(dir) = self.build.cmake_build_dir(&root) {
+                    self.job_dirs.push(dir);
+                }
             }
             Err(err) => self.status = Some(err),
         }
@@ -1010,8 +1019,45 @@ impl App {
         tool.clear_screen();
         self.job_title = job.title;
         self.job_step = 0;
+        self.job_dirs.clear();
+        for step in &job.steps {
+            if let Some(dir) = step.command.current_dir_path()
+                && !self.job_dirs.iter().any(|d| d == dir)
+            {
+                self.job_dirs.push(dir.to_path_buf());
+            }
+        }
         self.pending_steps = job.steps;
         self.start_next_step();
+    }
+
+    /// Open the file a link in a tool's output names, at its line and
+    /// column, in the editor. The path is looked for where the last job's
+    /// commands ran and then in the project; a file found nowhere is
+    /// reported in the status bar.
+    fn open_source_location(&mut self, location: &SourceLocation) {
+        let root = self.project.root().to_path_buf();
+        let bases = self
+            .job_dirs
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(std::iter::once(root.as_path()));
+        let Some(path) = location.resolve(bases) else {
+            self.status = Some(format!("Could not find {}", location.path));
+            return;
+        };
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        self.enter_editor();
+        self.open_file(&path);
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if tab.path() != Some(&*path) {
+            return; // it couldn't be opened; the status bar says why
+        }
+        let column = location.column.unwrap_or(1);
+        tab.view
+            .go_to_line_column(location.line.saturating_sub(1), column.saturating_sub(1));
     }
 
     /// Start the next of the running job's steps, with a heading saying
@@ -1936,8 +1982,19 @@ impl App {
                 }
                 return;
             }
-            // The tool's terminal.
+            // The tool's terminal. A click on a source location in its
+            // output opens the file instead of going to the program.
             if self.tool_term_area.contains(at) {
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                    && let Some(location) = self
+                        .tool_pane
+                        .active()
+                        .and_then(|tool| tool.view().link_at(x, y))
+                        .cloned()
+                {
+                    self.open_source_location(&location);
+                    return;
+                }
                 if matches!(mouse.kind, MouseEventKind::Down(_)) {
                     self.focus = Focus::Tool;
                 }
@@ -3034,6 +3091,63 @@ mod tests {
             "a new job starts on a fresh screen: {text}"
         );
         assert!(app.tool_pane.is_visible(), "the output stays showing");
+    }
+
+    #[test]
+    fn clicking_a_location_in_the_output_opens_the_file_there() {
+        let (dir, mut app) = app_with_files(&[("src/main.rs", "fn main() {}\n")]);
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn f() {\n    let unused = 1;\n}\n",
+        )
+        .unwrap();
+        app.open_tool(ToolKind::Output);
+        assert_eq!(app.focus, Focus::Tool);
+        let tool = app.tool_pane.active_mut().unwrap();
+        tool.process(b"warning: unused variable: `unused`\r\n  --> src/lib.rs:2:9\r\n   |\r\n");
+        tool.process(b"  --> src/nope.rs:1:1\r\n");
+        let screen = draw(&mut app, 60, 20);
+        let (row, text) = screen
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.contains("src/lib.rs:2:9"))
+            .expect("the location on screen");
+        let column = text.find("src/lib.rs").unwrap() as u16;
+
+        // Clicking beside the link is an ordinary click in the tool.
+        click(&mut app, column.saturating_sub(3), row as u16);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.focus, Focus::Tool);
+
+        // Clicking the link opens the file at the line and column.
+        click(&mut app, column + 4, row as u16);
+        assert_eq!(app.tabs.len(), 2, "src/lib.rs opened in a new tab");
+        let tab = &app.tabs[app.active];
+        assert_eq!(
+            tab.path()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("lib.rs")
+        );
+        assert_eq!(
+            tab.view.editor().cursor_position(),
+            ninjaedit_core::Position { line: 1, column: 8 }
+        );
+        assert_eq!(app.focus, Focus::Editor, "ready to edit");
+        assert!(app.tool_pane.is_visible(), "the output stays showing");
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[2].contains("let unused = 1;"), "{screen:#?}");
+
+        // A location that exists nowhere is reported, not opened.
+        let (row, text) = screen
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.contains("src/nope.rs:1:1"))
+            .expect("the missing location on screen");
+        let column = text.find("src/nope.rs").unwrap() as u16;
+        click(&mut app, column, row as u16);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.status.as_deref(), Some("Could not find src/nope.rs"));
     }
 
     // The shell tool spawns a real process, so these are unix-only and

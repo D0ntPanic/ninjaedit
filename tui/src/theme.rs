@@ -23,9 +23,10 @@
 //! bar of the view without it is drawn with `unfocused-active-tab-text`
 //! and `unfocused-active-tab-background` rather than `active-tab-*`, so
 //! a theme decides how the focused view stands out. A terminal in the
-//! tool pane draws with `terminal-background` and `terminal-text`, and
-//! maps the sixteen ANSI colors through `terminal-black` ...
-//! `terminal-bright-white`.
+//! tool pane draws with `terminal-background` and `terminal-text`, maps
+//! the sixteen ANSI colors through `terminal-black` ...
+//! `terminal-bright-white`, and underlines the source locations in
+//! compiler output in `terminal-link`.
 //!
 //! A few colors are optional, such as `selection-text`: leaving one out
 //! (or setting it to `""`, to undo the default) means the interface falls
@@ -247,6 +248,9 @@ required {
     terminal_background => "terminal-background",
     /// Terminal text drawn in the default color.
     terminal_text => "terminal-text",
+    /// A file and line in a terminal's output that opens in the editor
+    /// when clicked, such as the location of a compiler error.
+    terminal_link => "terminal-link",
     // The sixteen ANSI colors a program in a terminal can ask for.
     terminal_black => "terminal-black",
     terminal_red => "terminal-red",

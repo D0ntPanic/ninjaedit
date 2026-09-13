@@ -37,6 +37,7 @@ unfocused-active-tab-text = "alt"
 # Terminals in the tool pane.
 terminal-background = "tool"
 terminal-text = "content"
+terminal-link = "blue"
 terminal-black = "light"
 terminal-red = "red"
 terminal-green = "green"
