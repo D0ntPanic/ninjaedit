@@ -367,7 +367,7 @@ impl TargetKey {
                 "Where the program runs, relative to the Cargo.toml's directory; blank for that directory"
             }
             (TargetKey::WorkingDirectory, BuildSystem::CMake) => {
-                "Where the program runs, relative to the CMakeLists.txt's directory; blank for the build directory"
+                "Where the program runs, relative to the CMakeLists.txt's directory; blank for that directory"
             }
             (TargetKey::Arguments, _) => "Command line arguments the program is run with",
             (TargetKey::Environment, _) => {
@@ -384,7 +384,7 @@ impl TargetKey {
             (TargetKey::CMakeTarget, _) => "all targets",
             (TargetKey::Executable, _) => "nothing to run",
             (TargetKey::WorkingDirectory, BuildSystem::Cargo) => "the Cargo.toml's directory",
-            (TargetKey::WorkingDirectory, BuildSystem::CMake) => "the build directory",
+            (TargetKey::WorkingDirectory, BuildSystem::CMake) => "the CMakeLists.txt's directory",
             (TargetKey::Arguments, _) | (TargetKey::Environment, _) => "none",
         }
     }
@@ -1454,7 +1454,7 @@ impl BuildConfig {
                 let build_dir = cmake_build_dir(project_root, root, configuration);
                 let executable = build_dir.join(&target.executable);
                 let working_dir = if target.working_directory.is_empty() {
-                    build_dir
+                    dir
                 } else {
                     dir.join(&target.working_directory)
                 };
@@ -3051,10 +3051,7 @@ mod tests {
             Path::new("/proj/native/cmake-build-debug/bin/tool").as_os_str()
         );
         assert_eq!(args(run), vec!["--fast"]);
-        assert_eq!(
-            run.current_dir_path(),
-            Some(Path::new("/proj/native/cmake-build-debug"))
-        );
+        assert_eq!(run.current_dir_path(), Some(Path::new("/proj/native")));
         assert_eq!(run.envs().len(), 2, "the configuration's and the target's");
         config
             .set_target_text(1, 1, TargetKey::WorkingDirectory, "data")
