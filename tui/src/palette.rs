@@ -165,10 +165,35 @@ impl Palette {
         palette
     }
 
-    /// Replace the searchable items, keeping the query.
+    /// Replace the searchable items, keeping the query and, as far as
+    /// possible, the highlighted row. The index refreshes while it fills
+    /// in (and whenever files change under a build), and resetting the
+    /// selection on each refresh would make the list impossible to
+    /// navigate. The highlighted item is found again in the new results
+    /// by its action and kept at the same row on screen; if it is gone,
+    /// the highlight stays at the same position in the list.
     pub fn set_items(&mut self, items: Vec<PaletteItem>) {
+        let previous = self
+            .results
+            .get(self.selected)
+            .map(|&index| self.items[index].action.clone());
+        let position = self.selected;
+        let offset = self.selected - self.first_visible;
         self.items = items;
         self.search();
+        let selected = previous
+            .and_then(|action| {
+                self.results
+                    .iter()
+                    .position(|&index| self.items[index].action == action)
+            })
+            .unwrap_or(position);
+        self.select(selected);
+        self.first_visible = self
+            .selected
+            .saturating_sub(offset)
+            .min(self.results.len().saturating_sub(self.visible_rows()));
+        self.select(self.selected);
     }
 
     pub fn set_hint(&mut self, hint: Option<String>) {
@@ -383,5 +408,85 @@ impl Palette {
             }
         }
         cursor
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_items(names: &[&str]) -> Vec<PaletteItem> {
+        names
+            .iter()
+            .map(|name| PaletteItem {
+                label: name.to_string(),
+                detail: String::new(),
+                search: name.to_string(),
+                shortcut: None,
+                action: PaletteAction::OpenFile(PathBuf::from(name)),
+            })
+            .collect()
+    }
+
+    fn selected_label(palette: &Palette) -> &str {
+        &palette.items[palette.results[palette.selected]].label
+    }
+
+    #[test]
+    fn refresh_keeps_the_highlighted_item() {
+        let names: Vec<String> = (0..30).map(|i| format!("file{i:02}.rs")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut palette = Palette::new("", file_items(&names));
+        palette.select(20);
+        assert_eq!(selected_label(&palette), "file20.rs");
+        let first_visible = palette.first_visible;
+
+        // The same files again, as when the index reports a change that
+        // didn't add or remove anything.
+        palette.set_items(file_items(&names));
+        assert_eq!(selected_label(&palette), "file20.rs");
+        assert_eq!(palette.first_visible, first_visible);
+
+        // Files inserted before the highlighted one move it down the list
+        // but keep it highlighted at the same row on screen.
+        let mut more = vec!["aaa.rs", "bbb.rs"];
+        more.extend(&names);
+        palette.set_items(file_items(&more));
+        assert_eq!(selected_label(&palette), "file20.rs");
+        assert_eq!(palette.selected, 22);
+        assert_eq!(palette.selected - palette.first_visible, 20 - first_visible);
+    }
+
+    #[test]
+    fn refresh_keeps_the_position_when_the_item_is_gone() {
+        let names: Vec<String> = (0..10).map(|i| format!("file{i}.rs")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut palette = Palette::new("", file_items(&names));
+        palette.select(4);
+
+        let remaining: Vec<&str> = names.iter().copied().filter(|n| *n != "file4.rs").collect();
+        palette.set_items(file_items(&remaining));
+        assert_eq!(palette.selected, 4);
+        assert_eq!(selected_label(&palette), "file5.rs");
+
+        // Fewer results than the highlighted row clamp to the last one.
+        palette.set_items(file_items(&names[..2]));
+        assert_eq!(palette.selected, 1);
+        assert_eq!(selected_label(&palette), "file1.rs");
+    }
+
+    #[test]
+    fn refresh_keeps_the_scroll_within_the_results() {
+        let names: Vec<String> = (0..30).map(|i| format!("file{i:02}.rs")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut palette = Palette::new("", file_items(&names));
+        palette.select(29);
+        assert_eq!(palette.first_visible, 30 - MAX_VISIBLE);
+
+        // Shrinking the list keeps the last page full rather than leaving
+        // blank rows under the highlight.
+        palette.set_items(file_items(&names[..15]));
+        assert_eq!(palette.selected, 14);
+        assert_eq!(palette.first_visible, 15 - MAX_VISIBLE);
     }
 }
