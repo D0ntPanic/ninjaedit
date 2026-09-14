@@ -169,7 +169,7 @@ impl Command {
             Command::Find => "Ctrl+F",
             Command::FindNext => "Ctrl+G",
             Command::SearchProject => "Ctrl+Shift+F",
-            Command::GoToLine => "Ctrl+L",
+            Command::GoToLine => "Ctrl+J",
             Command::Undo => "Ctrl+Z",
             Command::Redo => "Ctrl+Y",
             Command::Cut => "Ctrl+X",

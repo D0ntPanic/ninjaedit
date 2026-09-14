@@ -1,14 +1,15 @@
 //! Core logic backing the ninjaedit editor: project management, file
 //! indexing, file buffers, fuzzy search, the editor model, the build
-//! configuration, and the settings with the persistent storage they live
-//! in. The TUI layer in
-//! the `tui` crate builds on these types.
+//! configuration, the settings with the persistent storage they live
+//! in, and the project's git history. The TUI layer in the `tui` crate
+//! builds on these types.
 
 pub mod buffer;
 pub mod build;
 pub mod diagnostics;
 pub mod editor;
 pub mod fuzzy;
+pub mod git;
 pub mod highlight_cache;
 pub mod indent;
 pub mod index;

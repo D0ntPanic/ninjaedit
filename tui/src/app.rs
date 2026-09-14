@@ -32,7 +32,7 @@
 //! Ctrl+Shift+F. With no file open there is nothing to search locally,
 //! so Ctrl+F opens the project search right away.
 //!
-//! The go to line box (Ctrl+L) floats where the search box does, and
+//! The go to line box (Ctrl+J) floats where the search box does, and
 //! like it never shows at the same time as the palette. Enter moves the
 //! active tab's cursor to the start of the line typed, clamped to the
 //! first or last line when the number is out of range, and closes the box.
@@ -58,9 +58,19 @@
 //! so the view before this one is preselected and Ctrl+E, Enter goes
 //! back to it, whichever way the user came.
 //!
-//! The settings page and the build configuration page are the editor's
-//! modes: views that stand in for the editor and its tab bar in the
-//! upper part of the screen (the tool pane, if showing, stays below). A
+//! The settings page, the build configuration page, and the git log
+//! page are the editor's modes: views that stand in for the editor and
+//! its tab bar in the upper part of the screen (the tool pane, if
+//! showing, stays below). The git log (Ctrl+L, from the editor or after
+//! the prefix from a tool; see the `git_view` module) shows the
+//! project's history: the branches, the graph of every commit, and what
+//! the selected commit changed, with a tab for each submodule after
+//! the main repository's. It reads the repository afresh each time it
+//! is opened. On the page Ctrl+T picks one of its tabs rather than a
+//! file's, since the editor isn't showing. How its panes are sized, by
+//! dragging the rules between them, is kept per repository in the
+//! project's storage (`tui-git-log.toml`, the TUI's own file; see the
+//! `git_layout` module) and comes back next time. A
 //! mode is left by choosing the editor in the modes palette, by closing
 //! its tab, or by anything that brings a file to the front: opening one
 //! with Ctrl+O, switching to one with Ctrl+T, going to a project search
@@ -113,7 +123,8 @@
 //! editor instead, meaning what it means there: Ctrl+] Ctrl+P opens the
 //! command palette, Ctrl+E the modes palette, Ctrl+O the file search,
 //! Ctrl+T the tab search, Ctrl+F
-//! and Ctrl+Shift+F the searches, Ctrl+L the go to line box, Ctrl+Q
+//! and Ctrl+Shift+F the searches, Ctrl+J the go to line box, Ctrl+L the
+//! git log, Ctrl+Q
 //! quits, and Ctrl+, and Ctrl+. move the focus. So a file named in a
 //! build's output is a prefix and a few keys away without leaving the
 //! shell first; the overlay takes the keyboard while it is open, and
@@ -138,6 +149,8 @@ use crate::build_view::{self, BuildOutcome, BuildView, Node};
 use crate::clipboard::Clipboard;
 use crate::command::Command;
 use crate::editor_view::EditorView;
+use crate::git_layout;
+use crate::git_view::{self, GitLogTabs};
 use crate::goto_line::{GoToLineBox, GoToLineOutcome};
 use crate::palette::{Palette, PaletteAction, PaletteItem, PaletteOutcome};
 use crate::project_search::{ProjectSearchDialog, ProjectSearchOutcome};
@@ -190,6 +203,8 @@ enum Mode {
     Editor,
     Settings(SettingsView),
     Build(BuildView),
+    /// Boxed: the page is far bigger than the others.
+    GitLog(Box<GitLogTabs>),
 }
 
 /// One of the places the keyboard can be, as the modes palette lists
@@ -199,6 +214,7 @@ enum View {
     Editor,
     Settings,
     Build,
+    GitLog,
     Tool(ToolKind),
 }
 
@@ -208,7 +224,7 @@ impl View {
     fn all() -> impl Iterator<Item = View> {
         std::iter::once(View::Editor)
             .chain(ToolKind::ALL.into_iter().map(View::Tool))
-            .chain([View::Build, View::Settings])
+            .chain([View::GitLog, View::Build, View::Settings])
     }
 
     fn label(self) -> &'static str {
@@ -216,6 +232,7 @@ impl View {
             View::Editor => EDITOR_MODE_LABEL,
             View::Settings => settings_view::TITLE,
             View::Build => build_view::TITLE,
+            View::GitLog => git_view::TITLE,
             View::Tool(kind) => kind.name(),
         }
     }
@@ -225,6 +242,9 @@ impl View {
             View::Editor => "Edit the open files",
             View::Settings => "Change the editor's settings",
             View::Build => "Set up how the project is built and run",
+            View::GitLog => {
+                "Browse the project's git history: branches, commits, and their changes"
+            }
             View::Tool(kind) => kind.description(),
         }
     }
@@ -234,6 +254,7 @@ impl View {
     fn shortcut(self) -> Option<&'static str> {
         match self {
             View::Tool(ToolKind::Shell) => Some("Ctrl+`"),
+            View::GitLog => Some("Ctrl+L"),
             _ => None,
         }
     }
@@ -243,6 +264,7 @@ impl View {
             View::Editor => PaletteAction::FocusEditor,
             View::Settings => PaletteAction::OpenSettings,
             View::Build => PaletteAction::OpenBuildConfig,
+            View::GitLog => PaletteAction::OpenGitLog,
             View::Tool(kind) => PaletteAction::OpenTool(kind),
         }
     }
@@ -252,6 +274,7 @@ impl View {
 const DIVIDER_HEIGHT: u16 = 1;
 
 const TABS_PLACEHOLDER: &str = "Search open tabs";
+const REPOSITORIES_PLACEHOLDER: &str = "The project's repository or a submodule";
 const FILES_PLACEHOLDER: &str = "Search files in project";
 const MODES_PLACEHOLDER: &str = "Editor, a page, or a tool";
 const COMMANDS_PLACEHOLDER: &str = "Search commands and views";
@@ -269,7 +292,7 @@ const BUILD_HINT: &str =
 const OUTPUT_IDLE_HINT: &str =
     "Ctrl+B build · Ctrl+R run · Ctrl+D dismiss · Ctrl+E mode · Ctrl+P commands";
 /// What the status bar shows while the prefix waits for its key.
-const PREFIX_HINT: &str = "Ctrl+]  then Ctrl+ P commands · E mode · O file · T tab · F search · L line · B build · R run · Q quit · ] itself";
+const PREFIX_HINT: &str = "Ctrl+]  then Ctrl+ P commands · E mode · O file · T tab · F search · J line · L log · B build · R run · Q quit · ] itself";
 /// What the output tool shows before the first job.
 const OUTPUT_WELCOME: &str = "Ctrl+B builds and Ctrl+R runs the current target\r\n";
 /// How long a change to the search query waits for the search to finish,
@@ -711,6 +734,31 @@ impl App {
         self.close_search_box(true);
         self.goto_line = None;
         self.hide_project_search();
+        // On the git log page the tabs are its repositories, the shown
+        // one first so that Enter alone flips to the next.
+        if let Mode::GitLog(tabs) = &self.mode {
+            let active = tabs.active_index();
+            let order = std::iter::once(active).chain((0..tabs.len()).filter(|i| *i != active));
+            let titles: Vec<&str> = tabs.titles().collect();
+            let items = order
+                .map(|index| PaletteItem {
+                    label: titles[index].to_owned(),
+                    detail: if index == 0 {
+                        "The project's repository".to_owned()
+                    } else {
+                        "Submodule".to_owned()
+                    },
+                    search: titles[index].to_owned(),
+                    shortcut: None,
+                    action: PaletteAction::GitLogTab(index),
+                })
+                .collect();
+            let mut palette = Palette::new(REPOSITORIES_PLACEHOLDER, items);
+            palette.select(1);
+            self.palette = Some(palette);
+            self.palette_kind = PaletteKind::Other;
+            return;
+        }
         let mut order: Vec<usize> = (0..self.tabs.len()).collect();
         order.sort_by_key(|&index| std::cmp::Reverse(self.tabs[index].last_viewed));
         let items = order
@@ -936,6 +984,7 @@ impl App {
             Mode::Editor => View::Editor,
             Mode::Settings(_) => View::Settings,
             Mode::Build(_) => View::Build,
+            Mode::GitLog(_) => View::GitLog,
         }
     }
 
@@ -969,6 +1018,13 @@ impl App {
             PaletteAction::FocusEditor => self.enter_editor(),
             PaletteAction::OpenSettings => self.open_settings(),
             PaletteAction::OpenBuildConfig => self.open_build_config(),
+            PaletteAction::OpenGitLog => self.open_git_log(),
+            PaletteAction::GitLogTab(index) => {
+                if let Mode::GitLog(tabs) = &mut self.mode {
+                    tabs.set_active(index);
+                    self.focus = Focus::Editor;
+                }
+            }
             PaletteAction::OpenTool(kind) => self.open_tool(kind),
             PaletteAction::AddBuildRoot(path) => self.add_build_root(path),
             PaletteAction::SelectConfiguration { root, index } => {
@@ -1018,6 +1074,7 @@ impl App {
                 let outcome = view.commit_all(&mut self.build);
                 self.handle_build_outcome(outcome);
             }
+            Mode::GitLog(_) => {}
         }
     }
 
@@ -1063,6 +1120,29 @@ impl App {
         self.close_editor_overlays();
         if !matches!(self.mode, Mode::Build(_)) {
             self.mode = Mode::Build(BuildView::new(&self.build));
+        }
+        self.focus = Focus::Editor;
+    }
+
+    // ----- Git log --------------------------------------------------------
+
+    /// Ctrl+L: show the git log page in the editor's place and give it
+    /// the keyboard. Opening it again while it is up leaves it as it is;
+    /// leaving and coming back reads the repository afresh.
+    fn open_git_log(&mut self) {
+        self.close_editor_overlays();
+        if !matches!(self.mode, Mode::GitLog(_)) {
+            self.leave_mode();
+            // A layout file that can't be read is reported, and the
+            // defaults do; the next resize replaces it.
+            let layout = match git_layout::load(&self.project_storage) {
+                Ok(layout) => layout,
+                Err(err) => {
+                    self.status = Some(err.to_string());
+                    Default::default()
+                }
+            };
+            self.mode = Mode::GitLog(Box::new(GitLogTabs::new(self.project.root(), layout)));
         }
         self.focus = Focus::Editor;
     }
@@ -1532,7 +1612,7 @@ impl App {
 
     // ----- Go to line -----------------------------------------------------
 
-    /// Ctrl+L: open the go to line box over the active tab. Does nothing
+    /// Ctrl+J: open the go to line box over the active tab. Does nothing
     /// with the box already open, or with no tab to move around in.
     fn open_goto_line(&mut self) {
         if self.goto_line.is_some() || !matches!(self.mode, Mode::Editor) {
@@ -1990,7 +2070,8 @@ impl App {
             }
             KeyCode::Char('f') if self.search_box.is_some() => self.upgrade_search_to_project(),
             KeyCode::Char('f') => self.open_search_box(),
-            KeyCode::Char('l') => self.open_goto_line(),
+            KeyCode::Char('j') => self.open_goto_line(),
+            KeyCode::Char('l') => self.open_git_log(),
             KeyCode::Char('b') => self.build(),
             KeyCode::Char('r') => self.run(),
             _ => return false,
@@ -2047,6 +2128,11 @@ impl App {
     /// redrawing.
     pub fn tick(&mut self) -> bool {
         let mut redraw = self.check_open_files_if_due();
+        if let Mode::GitLog(tabs) = &mut self.mode
+            && tabs.poll()
+        {
+            redraw = true;
+        }
         if self.project_search_open
             && let Some(dialog) = &mut self.project_search
             && dialog.poll()
@@ -2145,6 +2231,8 @@ impl App {
             view.paste(text);
         } else if let Mode::Build(view) = &mut self.mode {
             view.paste(text);
+        } else if matches!(self.mode, Mode::GitLog(_)) {
+            // Nothing on the page takes text.
         } else if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.view.editor_mut().paste(text);
         }
@@ -2206,6 +2294,10 @@ impl App {
         if let Mode::Build(view) = &mut self.mode {
             let outcome = view.handle_key(key, &mut self.clipboard, &mut self.build);
             self.handle_build_outcome(outcome);
+            return;
+        }
+        if let Mode::GitLog(tabs) = &mut self.mode {
+            tabs.active().handle_key(key);
             return;
         }
 
@@ -2376,7 +2468,13 @@ impl App {
                 if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
                     match hit {
                         TabHit::Close(_) => self.enter_editor(),
-                        TabHit::Tab(_) => self.focus = Focus::Editor,
+                        TabHit::Tab(index) => {
+                            // The git log's tabs are its repositories.
+                            if let Mode::GitLog(tabs) = &mut self.mode {
+                                tabs.set_active(index);
+                            }
+                            self.focus = Focus::Editor;
+                        }
                     }
                 }
                 return;
@@ -2396,6 +2494,24 @@ impl App {
                     }
                     let outcome = view.handle_mouse(mouse, &mut self.build);
                     self.handle_build_outcome(outcome);
+                }
+                Mode::GitLog(tabs)
+                    if tabs
+                        .active_view()
+                        .is_some_and(|view| view.contains(x, y) || view.is_dragging()) =>
+                {
+                    if pressed {
+                        self.focus = Focus::Editor;
+                    }
+                    // A resize is kept in the project's storage.
+                    if tabs.handle_mouse(mouse)
+                        && let Err(err) = git_layout::save(&self.project_storage, tabs.layout())
+                    {
+                        self.status = Some(format!(
+                            "Could not save {}: {err}",
+                            self.project_storage.path(git_layout::LAYOUT_FILE).display()
+                        ));
+                    }
                 }
                 _ => {}
             }
@@ -2530,6 +2646,19 @@ impl App {
                 self.mode_tab_bar
                     .render(tab_area, buf, theme, &[label], 0, editor_focused);
                 cursor = view.render(self.editor_area, buf, theme, &self.build);
+            }
+            Mode::GitLog(tabs) => {
+                let labels: Vec<TabLabel> = tabs
+                    .titles()
+                    .map(|title| TabLabel {
+                        title: title.to_owned(),
+                        modified: false,
+                    })
+                    .collect();
+                let active = tabs.active_index();
+                self.mode_tab_bar
+                    .render(tab_area, buf, theme, &labels, active, editor_focused);
+                tabs.active().render(self.editor_area, buf, theme);
             }
         }
 
@@ -2681,9 +2810,10 @@ impl App {
             (target, theme.status_bar_position_text),
         ];
         let mode_hint = match &self.mode {
-            Mode::Editor => "",
-            Mode::Settings(_) => SETTINGS_HINT,
-            Mode::Build(_) => BUILD_HINT,
+            Mode::Editor => String::new(),
+            Mode::Settings(_) => SETTINGS_HINT.to_owned(),
+            Mode::Build(_) => BUILD_HINT.to_owned(),
+            Mode::GitLog(tabs) => tabs.hint(),
         };
         let left = match &self.status {
             _ if self.prefix.is_some() => PREFIX_HINT.to_owned(),
@@ -2695,7 +2825,7 @@ impl App {
                 Some(tool) => tool.title(),
                 None => String::new(),
             },
-            None if !in_editor => mode_hint.to_owned(),
+            None if !in_editor => mode_hint,
             None => match tab.and_then(Tab::path) {
                 Some(path) => self.display_path(path),
                 None => "Ctrl+O to open a file, Ctrl+Q to quit".to_owned(),
@@ -2784,10 +2914,11 @@ fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme, project: &Project) 
         ProjectKind::Project => ("open a project file", None),
         ProjectKind::Directory => ("open a file in this directory", Some(NOT_A_PROJECT)),
     };
-    let keys: [(&str, &str); 10] = [
+    let keys: [(&str, &str); 11] = [
         ("Ctrl+O", open_hint),
         ("Ctrl+Shift+F", "search in project files"),
         ("Ctrl+T", "switch between open tabs"),
+        ("Ctrl+L", "browse the git history"),
         ("Ctrl+`", "open a shell below the editor"),
         ("Ctrl+B", "build the current target"),
         ("Ctrl+R", "run the current target"),
@@ -2991,8 +3122,9 @@ mod tests {
         assert!(screen[3].contains(EDITOR_MODE_LABEL), "{screen:#?}");
         assert!(screen[4].contains("Shell"), "{screen:#?}");
         assert!(screen[5].contains("Output"), "{screen:#?}");
-        assert!(screen[6].contains(build_view::TITLE), "{screen:#?}");
-        assert!(screen[7].contains(settings_view::TITLE), "{screen:#?}");
+        assert!(screen[6].contains(git_view::TITLE), "{screen:#?}");
+        assert!(screen[7].contains(build_view::TITLE), "{screen:#?}");
+        assert!(screen[8].contains(settings_view::TITLE), "{screen:#?}");
         type_str(&mut app, "sett");
         press(&mut app, KeyCode::Enter);
         assert!(matches!(app.mode, Mode::Settings(_)));
@@ -3087,17 +3219,182 @@ mod tests {
         assert_eq!(app.tabs[app.active].title(), "b.txt");
 
         // The editor's own keys do nothing to the hidden tabs from the
-        // page: Ctrl+W closes no tab, Ctrl+L opens no box.
+        // page: Ctrl+W closes no tab, Ctrl+J opens no box.
         app.open_settings();
         ctrl(&mut app, 'w');
         assert_eq!(app.tabs.len(), 2);
-        ctrl(&mut app, 'l');
+        ctrl(&mut app, 'j');
         assert!(app.goto_line.is_none());
         // Closing the page's tab with the mouse leaves it too.
         let screen = draw(&mut app, 60, 20);
         let close = screen[0].chars().position(|c| c == '×').unwrap() as u16;
         click(&mut app, close, 0);
         assert!(matches!(app.mode, Mode::Editor));
+        drop(dir);
+    }
+
+    #[test]
+    fn ctrl_l_opens_the_git_log_page_and_leaving_brings_the_editor_back() {
+        let (dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        // Make the project a repository with one commit.
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("a.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        let first = repo
+            .commit(Some("HEAD"), &sig, &sig, "Say hi", &tree, &[])
+            .unwrap();
+        // And a submodule with a commit of its own.
+        let mut submodule = repo
+            .submodule("https://example.com/sub.git", Path::new("libs/sub"), true)
+            .unwrap();
+        {
+            let sub = submodule.open().unwrap();
+            std::fs::write(sub.workdir().unwrap().join("inner.txt"), "inner\n").unwrap();
+            let mut index = sub.index().unwrap();
+            index.add_path(Path::new("inner.txt")).unwrap();
+            index.write().unwrap();
+            let tree = sub.find_tree(index.write_tree().unwrap()).unwrap();
+            sub.commit(Some("HEAD"), &sig, &sig, "Inner commit", &tree, &[])
+                .unwrap();
+        }
+        submodule.add_finalize().unwrap();
+        let mut index = repo.index().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = repo.find_commit(first).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Add submodule", &tree, &[&parent])
+            .unwrap();
+
+        ctrl(&mut app, 'l');
+        assert!(matches!(app.mode, Mode::GitLog(_)));
+        assert_eq!(app.focus, Focus::Editor);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Mode::GitLog(tabs) = &app.mode
+            && tabs.is_loading()
+            && Instant::now() < deadline
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let screen = draw(&mut app, 100, 24);
+        assert!(screen[0].contains(git_view::TITLE), "{screen:#?}");
+        assert!(
+            screen[0].contains("libs/sub"),
+            "a tab per submodule: {screen:#?}"
+        );
+        assert!(screen.iter().any(|r| r.contains("Say hi")), "{screen:#?}");
+        assert!(
+            screen.iter().any(|r| r.contains("Description")),
+            "{screen:#?}"
+        );
+        assert!(screen[23].contains("Tab pane"), "{screen:#?}");
+        // Ctrl+L again leaves the page as it is; the editor's keys don't
+        // reach the hidden tab.
+        ctrl(&mut app, 'l');
+        assert!(matches!(app.mode, Mode::GitLog(_)));
+        ctrl(&mut app, 'j');
+        assert!(app.goto_line.is_none());
+        // Ctrl+T on the page lists its repositories, not the editor's
+        // tabs, with the submodule preselected; picking it shows the
+        // submodule's history on its tab.
+        ctrl(&mut app, 't');
+        let screen = draw(&mut app, 100, 24);
+        assert!(screen[3].contains(git_view::TITLE), "{screen:#?}");
+        assert!(screen[4].contains("libs/sub"), "{screen:#?}");
+        assert!(!screen.iter().any(|r| r.contains("a.txt")), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(&app.mode, Mode::GitLog(tabs) if tabs.active_index() == 1));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Mode::GitLog(tabs) = &app.mode
+            && tabs.is_loading()
+            && Instant::now() < deadline
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let screen = draw(&mut app, 100, 24);
+        assert!(
+            screen.iter().any(|r| r.contains("Inner commit")),
+            "{screen:#?}"
+        );
+        assert!(!screen.iter().any(|r| r.contains("Say hi")), "{screen:#?}");
+        // Clicking the main tab goes back to the project's history.
+        let x = screen[0].chars().position(|c| c == 'G').unwrap() as u16;
+        click(&mut app, x, 0);
+        assert!(matches!(&app.mode, Mode::GitLog(tabs) if tabs.active_index() == 0));
+        let screen = draw(&mut app, 100, 24);
+        assert!(screen.iter().any(|r| r.contains("Say hi")), "{screen:#?}");
+        // Dragging the rule under the log keeps the sizes in the
+        // project's storage, and they come back when the page is
+        // reopened.
+        let rule = match &app.mode {
+            Mode::GitLog(tabs) => tabs.active_view().unwrap().log_rule(),
+            _ => unreachable!(),
+        };
+        click(&mut app, rule.x + 3, rule.y);
+        mouse_at(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            rule.x + 3,
+            rule.y + 4,
+        );
+        mouse_at(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            rule.x + 3,
+            rule.y + 4,
+        );
+        let file = app
+            .project_storage
+            .read(git_layout::LAYOUT_FILE)
+            .unwrap()
+            .expect("kept");
+        assert!(
+            file.contains("[\".\"]") && file.contains("log = "),
+            "{file}"
+        );
+        assert!(
+            !file.contains("libs/sub"),
+            "only the resized repository: {file}"
+        );
+        let screen = draw(&mut app, 100, 24);
+        let moved = match &app.mode {
+            Mode::GitLog(tabs) => tabs.active_view().unwrap().log_rule(),
+            _ => unreachable!(),
+        };
+        assert_eq!(moved.y, rule.y + 4, "{screen:#?}");
+        // The modes palette brings the editor back.
+        ctrl(&mut app, 'e');
+        type_str(&mut app, EDITOR_MODE_LABEL);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Editor));
+        ctrl(&mut app, 'l');
+        draw(&mut app, 100, 24);
+        let restored = match &app.mode {
+            Mode::GitLog(tabs) => tabs.active_view().unwrap().log_rule(),
+            _ => unreachable!(),
+        };
+        assert_eq!(restored.y, rule.y + 4);
+        // The page is in the modes palette and the command palette with
+        // its key.
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "git log");
+        let screen = draw(&mut app, 100, 24);
+        assert!(
+            screen[3].contains(git_view::TITLE) && screen[3].contains("Ctrl+L"),
+            "{screen:#?}"
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::GitLog(_)));
+        // Ctrl+] Ctrl+L opens it from the shell too.
+        ctrl(&mut app, '`');
+        assert_eq!(app.focus, Focus::Tool);
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'l');
+        assert!(matches!(app.mode, Mode::GitLog(_)));
+        assert_eq!(app.focus, Focus::Editor);
         drop(dir);
     }
 
@@ -3996,7 +4293,7 @@ mod tests {
         assert_eq!(app.focus, Focus::Editor);
         assert_eq!(app.tabs[app.active].title(), "beta.rs");
 
-        // Ctrl+] Ctrl+L: the go to line box takes the keyboard from the
+        // Ctrl+] Ctrl+J: the go to line box takes the keyboard from the
         // shell, and Enter lands in the editor.
         ctrl(&mut app, ']');
         ctrl(&mut app, 't');
@@ -4005,7 +4302,7 @@ mod tests {
         ctrl(&mut app, ',');
         assert_eq!(app.focus, Focus::Tool);
         ctrl(&mut app, ']');
-        ctrl(&mut app, 'l');
+        ctrl(&mut app, 'j');
         assert!(app.goto_line.is_some());
         let screen = draw(&mut app, 40, 20);
         assert!(screen[1].contains('╭'), "{screen:#?}");
@@ -4191,7 +4488,7 @@ mod tests {
             .iter()
             .filter(|l| l.contains("Ctrl+"))
             .collect();
-        assert_eq!(rows.len(), 10, "{screen:#?}");
+        assert_eq!(rows.len(), 11, "{screen:#?}");
         // Every key starts in the same column, and so does every description.
         let key_column = rows[0].find("Ctrl+").unwrap();
         let description_column = rows[0].find("open a project file").unwrap();
@@ -4921,10 +5218,10 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_l_goes_to_a_line_clamped_to_the_file() {
+    fn ctrl_j_goes_to_a_line_clamped_to_the_file() {
         let text: String = (1..=50).map(|n| format!("line {n}\n")).collect();
         let (_dir, mut app) = app_with_files(&[("a.txt", &text)]);
-        ctrl(&mut app, 'l');
+        ctrl(&mut app, 'j');
         assert!(app.goto_line.is_some());
         let screen = draw(&mut app, 60, 12);
         assert!(screen[2].contains("Go to line"), "{screen:#?}");
@@ -4948,7 +5245,7 @@ mod tests {
         assert!(status.contains("Ln 30, Col 1"), "{screen:#?}");
 
         // Out of range numbers clamp to the ends of the file.
-        ctrl(&mut app, 'l');
+        ctrl(&mut app, 'j');
         type_str(&mut app, "9999");
         press(&mut app, KeyCode::Enter);
         assert_eq!(
@@ -4958,11 +5255,11 @@ mod tests {
                 column: 0
             }
         );
-        ctrl(&mut app, 'l');
+        ctrl(&mut app, 'j');
         type_str(&mut app, "0");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.tabs[0].view.editor().cursor(), 0);
-        ctrl(&mut app, 'l');
+        ctrl(&mut app, 'j');
         type_str(&mut app, "99999999999999999999999999");
         press(&mut app, KeyCode::Enter);
         assert_eq!(
@@ -4975,7 +5272,7 @@ mod tests {
 
         // Going to a line drops the selection.
         app.tabs[0].view.editor_mut().set_selection(0, 5);
-        ctrl(&mut app, 'l');
+        ctrl(&mut app, 'j');
         type_str(&mut app, " 2 ");
         press(&mut app, KeyCode::Enter);
         let editor = app.tabs[0].view.editor();
@@ -4986,7 +5283,7 @@ mod tests {
     #[test]
     fn go_to_line_box_wants_a_number_and_closes_like_the_search_box() {
         let (_dir, mut app) = app_with_files(&[("a.txt", "one\ntwo\nthree\n")]);
-        ctrl(&mut app, 'l');
+        ctrl(&mut app, 'j');
         // Enter with nothing, or with something other than a number,
         // keeps the box open and says why.
         press(&mut app, KeyCode::Enter);
@@ -5009,22 +5306,22 @@ mod tests {
 
         // A click outside the box closes it; the palette and the search
         // box replace it, and it replaces them.
-        ctrl(&mut app, 'l');
+        ctrl(&mut app, 'j');
         click(&mut app, 5, 6);
         assert!(app.goto_line.is_none());
-        ctrl(&mut app, 'l');
+        ctrl(&mut app, 'j');
         ctrl(&mut app, 't');
         assert!(app.goto_line.is_none() && app.palette.is_some());
-        ctrl(&mut app, 'l');
+        ctrl(&mut app, 'j');
         assert!(app.goto_line.is_some() && app.palette.is_none());
         ctrl(&mut app, 'f');
         assert!(app.goto_line.is_none() && app.search_box.is_some());
-        ctrl(&mut app, 'l');
+        ctrl(&mut app, 'j');
         assert!(app.goto_line.is_some() && app.search_box.is_none());
         assert!(app.tabs[0].view.editor().search().is_none());
-        // Ctrl+L with the box open leaves it as it is.
+        // Ctrl+J with the box open leaves it as it is.
         type_str(&mut app, "3");
-        ctrl(&mut app, 'l');
+        ctrl(&mut app, 'j');
         assert_eq!(app.goto_line.as_ref().unwrap().text(), "3");
         // Pasting goes into the box.
         app.handle_event(Event::Paste("1".to_owned()));
@@ -5032,7 +5329,7 @@ mod tests {
 
         // With no file open there is nothing to go to.
         let (_dir, mut app) = app_with_files(&[]);
-        ctrl(&mut app, 'l');
+        ctrl(&mut app, 'j');
         assert!(app.goto_line.is_none());
     }
 

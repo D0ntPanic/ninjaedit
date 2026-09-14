@@ -12,6 +12,8 @@ mod clipboard;
 mod command;
 mod editor_view;
 mod fields;
+mod git_layout;
+mod git_view;
 mod goto_line;
 mod input;
 mod palette;

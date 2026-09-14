@@ -270,6 +270,38 @@ required {
     terminal_bright_magenta => "terminal-bright-magenta",
     terminal_bright_cyan => "terminal-bright-cyan",
     terminal_bright_white => "terminal-bright-white",
+    /// The background of the selected row of a list on a page (the git
+    /// log's branches, commits, and files) while the list has the
+    /// keyboard. The row's text keeps its colors, so this should be
+    /// quiet enough to read them over, like the search's
+    /// `highlighted-find-result-background`.
+    list_selection_background => "list-selection-background",
+    /// The selected row of a list that doesn't have the keyboard: still
+    /// marked, but less brightly, so the focused list stands out.
+    unfocused_list_selection_background => "unfocused-list-selection-background",
+    // The git log page.
+    /// The commit HEAD is on, in the log, and the branch HEAD is on in
+    /// the sidebar; both are bold as well.
+    git_head_text => "git-head-text",
+    /// A local branch's name beside a commit.
+    git_branch_text => "git-branch-text",
+    /// A remote branch's name beside a commit.
+    git_remote_text => "git-remote-text",
+    /// A tag's name beside a commit.
+    git_tag_text => "git-tag-text",
+    /// A commit's abbreviated id.
+    git_hash_text => "git-hash-text",
+    /// A commit's author.
+    git_author_text => "git-author-text",
+    /// When a commit was made.
+    git_date_text => "git-date-text",
+    /// The background of a line a diff added, and the color of its
+    /// marker and of the count of added lines in the file list.
+    diff_added_background => "diff-added-background",
+    diff_added_text => "diff-added-text",
+    /// Likewise for a line a diff removed.
+    diff_removed_background => "diff-removed-background",
+    diff_removed_text => "diff-removed-text",
 }
 optional {
     /// Selected text in the editor. When set it replaces whatever color

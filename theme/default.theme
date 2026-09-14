@@ -60,6 +60,24 @@ terminal-bright-magenta = "magenta"
 terminal-bright-cyan = "light-cyan"
 terminal-bright-white = "#ffffff"
 
+# The selected row of a list on a page, with and without the keyboard.
+# Text keeps its colors over both.
+list-selection-background = "dark-blue"
+unfocused-list-selection-background = "dark-highlight"
+
+# The git log page: the labels beside commits, and the diff of a file.
+git-head-text = "orange"
+git-branch-text = "green"
+git-remote-text = "red"
+git-tag-text = "yellow"
+git-hash-text = "blue"
+git-author-text = "alt"
+git-date-text = "dimmed"
+diff-added-background = "dark-green"
+diff-added-text = "green"
+diff-removed-background = "dark-red"
+diff-removed-text = "red"
+
 # Syntax highlighting. A `*` prefix is bold, a `/` prefix is italic.
 # Kinds left unset use their parent kind's style (see the theme docs).
 syntax-comment = "alt"
@@ -111,8 +129,10 @@ alt = "#a0a0a0"
 dimmed = "#707070"
 dark-dimmed = "#404040"
 dark-grey = "#353535"
+dark-highlight = "#3c3c3c"
 dark-green = "#2d3f30"
 dark-indigo = "#2d3648"
+dark-red = "#472b30"
 green = "#a2d9af"
 light-green = "#c3e6bd"
 lavender = "#c4b5e6"

@@ -79,6 +79,12 @@ pub enum PaletteAction {
     /// Show the build configuration page in the editor's place and give
     /// it the keyboard.
     OpenBuildConfig,
+    /// Show the git log page in the editor's place and give it the
+    /// keyboard.
+    OpenGitLog,
+    /// Show one of the git log page's tabs: the project's repository or
+    /// a submodule, by index.
+    GitLogTab(usize),
     /// Show a tool in the pane below the editor, starting it if need be,
     /// and give it the keyboard.
     OpenTool(ToolKind),

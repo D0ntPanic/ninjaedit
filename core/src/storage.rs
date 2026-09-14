@@ -1,7 +1,9 @@
 //! Persistent storage: the directory where the editor keeps everything
 //! that outlives a run. Today that is the settings and each project's
 //! build configuration; worktrees, autosaves, and the like will live
-//! there too.
+//! there too. A frontend keeps its own files there as well, through
+//! [`read`](Storage::read) and [`write`](Storage::write), for what is
+//! its own affair: how it lays out a page, say.
 //!
 //! The directory is `~/.ninjaedit` unless a frontend (or a test) chooses
 //! another. [`Storage`] is little more than that path: each kind of thing

@@ -1,4 +1,4 @@
-//! The go to line box (Ctrl+L): a one-line input floating over the top of
+//! The go to line box (Ctrl+J): a one-line input floating over the top of
 //! the editor, like the search box, into which a line number is typed.
 //!
 //! The box only owns the number's text and its look. Enter hands the

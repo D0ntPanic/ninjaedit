@@ -8,6 +8,7 @@ code-fuzzy-match = "0.2.2"
 git2 = { version = "0.21.0", features = ["ssh", "https", "vendored-libgit2", "vendored-openssl"] }
 regex = "1.13.1"
 ignore = "0.4"
+jiff = "0.2"
 notify = "8"
 tempfile = "3"
 unicode-segmentation = "1.13.3"
