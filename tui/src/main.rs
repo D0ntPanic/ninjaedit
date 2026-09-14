@@ -7,9 +7,11 @@
 
 mod app;
 mod build_view;
+mod changes_view;
 mod clicks;
 mod clipboard;
 mod command;
+mod diff_pane;
 mod editor_view;
 mod fields;
 mod git_layout;

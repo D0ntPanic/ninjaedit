@@ -1,5 +1,7 @@
 //! What a commit changed: its message and the people behind it, the
-//! files it touched, and the diff of any one of them.
+//! files it touched, and the diff of any one of them; and the pieces
+//! the [`changes`](super::changes) module builds the same views of the
+//! working tree from.
 //!
 //! A commit is compared with its first parent (a merge shows what it
 //! brought in from the second, as `git show` does for the changes on
@@ -11,20 +13,26 @@
 //! whole (see the [`syntax`] module) so that every line of the diff,
 //! shown or expanded, is highlighted as it would be in the file.
 //!
+//! A [`FileDiff`] is built from a libgit2 patch and the [`Contents`] of
+//! each side, wherever they come from: a commit's blobs, the index's, or
+//! a file in the working directory.
+//!
 //! [`syntax`]: crate::syntax
 
 use super::history::CommitTime;
 use crate::syntax::{Language, Token, lex_text};
-use git2::{Delta, DiffFindOptions, DiffLineType, DiffOptions, Oid, Patch, Repository};
+use git2::{Delta, DiffFindOptions, DiffLineType, DiffOptions, FileMode, Oid, Patch, Repository};
 use std::path::Path;
 
 /// Files bigger than this aren't shown line by line.
 const MAX_FILE_SIZE: usize = 8 * 1024 * 1024;
 /// With more files changed than this, the lines gained and lost by
 /// each aren't counted: it would mean diffing them all up front.
-const STATS_LIMIT: usize = 500;
+pub(super) const STATS_LIMIT: usize = 500;
 /// The lines of context around each change, as git shows them.
-const CONTEXT_LINES: u32 = 3;
+pub(super) const CONTEXT_LINES: u32 = 3;
+/// How far into a file git looks for a NUL byte to call it binary.
+const BINARY_PROBE: usize = 8000;
 
 /// Who made a commit, and when.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,7 +42,7 @@ pub struct Person {
     pub time: CommitTime,
 }
 
-/// How a commit changed a file.
+/// How a commit, or the working tree, changed a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChangeKind {
     Added,
@@ -44,11 +52,16 @@ pub enum ChangeKind {
     Copied,
     /// A file became a symlink, or the other way round.
     TypeChanged,
+    /// A file in the working directory that git doesn't track yet.
+    Untracked,
+    /// A file a merge left in conflict, to be resolved and staged.
+    Conflicted,
     Other,
 }
 
 impl ChangeKind {
-    /// The letter git's `--name-status` uses for the change.
+    /// The letter git's `--name-status` uses for the change (`?` for an
+    /// untracked file and `U` for a conflict, as `git status` has them).
     pub fn letter(self) -> char {
         match self {
             ChangeKind::Added => 'A',
@@ -57,7 +70,9 @@ impl ChangeKind {
             ChangeKind::Renamed => 'R',
             ChangeKind::Copied => 'C',
             ChangeKind::TypeChanged => 'T',
-            ChangeKind::Other => '?',
+            ChangeKind::Untracked => '?',
+            ChangeKind::Conflicted => 'U',
+            ChangeKind::Other => '!',
         }
     }
 
@@ -69,23 +84,152 @@ impl ChangeKind {
             Delta::Renamed => ChangeKind::Renamed,
             Delta::Copied => ChangeKind::Copied,
             Delta::Typechange => ChangeKind::TypeChanged,
+            Delta::Untracked => ChangeKind::Untracked,
+            Delta::Conflicted => ChangeKind::Conflicted,
             _ => ChangeKind::Other,
         }
     }
 }
 
-/// One file a commit changed.
+/// One file a commit, or the working tree, changed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileChange {
     pub kind: ChangeKind,
-    /// The file's path after the commit, or before it for a deleted file.
+    /// The file's path after the change, or before it for a deleted file.
     pub path: String,
-    /// The path before the commit, when it differs (a rename or copy).
+    /// The path before the change, when it differs (a rename or copy).
     pub old_path: Option<String>,
     /// Lines added and removed, when counted (see [`STATS_LIMIT`]).
     pub additions: usize,
     pub deletions: usize,
     pub binary: bool,
+    /// Whether the "file" is a submodule: the change is to the commit
+    /// it points at, and there are no lines to show.
+    pub submodule: bool,
+}
+
+/// The file at `index` of a diff, as a [`FileChange`]; its lines are
+/// counted when `count_stats`, which means loading the patch.
+pub(super) fn file_change(
+    diff: &git2::Diff<'_>,
+    index: usize,
+    count_stats: bool,
+) -> Result<FileChange, git2::Error> {
+    let delta = diff.get_delta(index).expect("a delta of the diff");
+    let path = |file: git2::DiffFile<'_>| {
+        file.path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let new_path = path(delta.new_file());
+    let old_path = path(delta.old_file());
+    let kind = ChangeKind::from_delta(delta.status());
+    let (path, old_path) = match kind {
+        ChangeKind::Deleted => (old_path, None),
+        _ if old_path != new_path && !old_path.is_empty() => (new_path, Some(old_path)),
+        _ => (new_path, None),
+    };
+    let submodule = is_submodule(&delta);
+    let (additions, deletions, binary) = if count_stats && !submodule {
+        match Patch::from_diff(diff, index)? {
+            Some(patch) => {
+                let (_, additions, deletions) = patch.line_stats()?;
+                (additions, deletions, patch.delta().flags().is_binary())
+            }
+            None => (0, 0, delta.flags().is_binary()),
+        }
+    } else {
+        (0, 0, false)
+    };
+    Ok(FileChange {
+        kind,
+        path,
+        old_path,
+        additions,
+        deletions,
+        binary,
+        submodule,
+    })
+}
+
+/// Whether either side of a delta is a submodule's commit.
+fn is_submodule(delta: &git2::DiffDelta<'_>) -> bool {
+    delta.old_file().mode() == FileMode::Commit || delta.new_file().mode() == FileMode::Commit
+}
+
+/// Where the delta for `path` is in a diff limited to it: the pathspec
+/// may match more than the one file (a directory of the same name,
+/// say), so the delta wanted is the one at `path`.
+pub(super) fn delta_at(diff: &git2::Diff<'_>, path: &str) -> Result<usize, git2::Error> {
+    diff.deltas()
+        .position(|delta| {
+            let at = |file: git2::DiffFile<'_>| file.path() == Some(Path::new(path));
+            at(delta.new_file()) || (delta.status() == Delta::Deleted && at(delta.old_file()))
+        })
+        .ok_or_else(|| git2::Error::from_str("that file did not change"))
+}
+
+/// The bytes of one side of a file, with why they can't be shown line
+/// by line if they can't.
+pub(super) struct Contents {
+    pub bytes: Vec<u8>,
+    pub unshown: Option<Unshown>,
+}
+
+impl Contents {
+    /// Nothing: the side of an added or deleted file that isn't there.
+    pub(super) fn empty() -> Contents {
+        Contents {
+            bytes: Vec::new(),
+            unshown: None,
+        }
+    }
+
+    /// The bytes as read, called binary by git's rule: a NUL byte near
+    /// the start.
+    pub(super) fn from_bytes(bytes: Vec<u8>) -> Contents {
+        let probe = &bytes[..bytes.len().min(BINARY_PROBE)];
+        let unshown = if probe.contains(&0) {
+            Some(Unshown::Binary)
+        } else if bytes.len() > MAX_FILE_SIZE {
+            Some(Unshown::TooLarge)
+        } else {
+            None
+        };
+        Contents { bytes, unshown }
+    }
+}
+
+/// The contents of a diff's file as a blob of the repository, or
+/// nothing when the side doesn't exist.
+pub(super) fn blob_contents(
+    repo: &Repository,
+    file: git2::DiffFile<'_>,
+) -> Result<Contents, git2::Error> {
+    if !file.exists() || file.mode() == FileMode::Commit {
+        return Ok(Contents::empty());
+    }
+    let blob = repo.find_blob(file.id())?;
+    let unshown = if blob.is_binary() {
+        Some(Unshown::Binary)
+    } else if blob.size() > MAX_FILE_SIZE {
+        Some(Unshown::TooLarge)
+    } else {
+        None
+    };
+    Ok(Contents {
+        bytes: blob.content().to_vec(),
+        unshown,
+    })
+}
+
+/// The contents of a file in the working directory, or nothing when it
+/// isn't there (deleted, or a directory).
+pub(super) fn workdir_contents(path: &Path) -> Contents {
+    match std::fs::read(path) {
+        Ok(bytes) => Contents::from_bytes(bytes),
+        Err(_) => Contents::empty(),
+    }
 }
 
 /// A commit in full, with the files it changed.
@@ -112,39 +256,8 @@ pub fn commit_detail(repo: &Repository, id: Oid) -> Result<CommitDetail, git2::E
     let diff = tree_diff(repo, &commit, &[])?;
     let count = diff.deltas().len();
     let mut files = Vec::with_capacity(count);
-    for (index, delta) in diff.deltas().enumerate() {
-        let path = |file: git2::DiffFile<'_>| {
-            file.path()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        };
-        let new_path = path(delta.new_file());
-        let old_path = path(delta.old_file());
-        let kind = ChangeKind::from_delta(delta.status());
-        let (path, old_path) = match kind {
-            ChangeKind::Deleted => (old_path, None),
-            _ if old_path != new_path && !old_path.is_empty() => (new_path, Some(old_path)),
-            _ => (new_path, None),
-        };
-        let (additions, deletions, binary) = if count <= STATS_LIMIT {
-            match Patch::from_diff(&diff, index)? {
-                Some(patch) => {
-                    let (_, additions, deletions) = patch.line_stats()?;
-                    (additions, deletions, patch.delta().flags().is_binary())
-                }
-                None => (0, 0, delta.flags().is_binary()),
-            }
-        } else {
-            (0, 0, false)
-        };
-        files.push(FileChange {
-            kind,
-            path,
-            old_path,
-            additions,
-            deletions,
-            binary,
-        });
+    for index in 0..count {
+        files.push(file_change(&diff, index, count <= STATS_LIMIT)?);
     }
     let message = String::from_utf8_lossy(commit.message_bytes())
         .trim_end()
@@ -234,6 +347,9 @@ pub enum DiffRow {
 pub enum Unshown {
     Binary,
     TooLarge,
+    /// The "file" is a submodule: what changed is the commit it points
+    /// at.
+    Submodule,
 }
 
 struct Hunk {
@@ -285,60 +401,88 @@ pub fn file_diff(
     let mut paths = vec![path];
     paths.extend(old_path);
     let diff = tree_diff(repo, &commit, &paths)?;
-    // The pathspec may match more than the one file (a directory of the
-    // same name, say): the delta wanted is the one at `path`.
-    let index = diff
-        .deltas()
-        .position(|delta| {
-            let at = |file: git2::DiffFile<'_>| file.path() == Some(Path::new(path));
-            at(delta.new_file()) || (delta.status() == Delta::Deleted && at(delta.old_file()))
-        })
-        .ok_or_else(|| git2::Error::from_str("the commit did not change that file"))?;
+    let index = delta_at(&diff, path)
+        .map_err(|_| git2::Error::from_str("the commit did not change that file"))?;
     let delta = diff.get_delta(index).expect("found above");
     let kind = ChangeKind::from_delta(delta.status());
-    let language = Language::from_path(Path::new(path)).unwrap_or(Language::Plain);
-
-    let mut unshown = None;
-    let mut contents = |file: git2::DiffFile<'_>| -> Result<Vec<u8>, git2::Error> {
-        if !file.exists() {
-            return Ok(Vec::new());
-        }
-        let blob = repo.find_blob(file.id())?;
-        if blob.is_binary() {
-            unshown = Some(Unshown::Binary);
-        } else if blob.size() > MAX_FILE_SIZE {
-            unshown = unshown.or(Some(Unshown::TooLarge));
-        }
-        Ok(blob.content().to_vec())
-    };
-    let old_bytes = contents(delta.old_file())?;
-    let new_bytes = contents(delta.new_file())?;
-    let mut file = FileDiff {
-        kind,
-        path: path.to_owned(),
-        old_path: old_path.map(str::to_owned),
-        unshown,
-        language,
-        old_lines: Vec::new(),
-        new_lines: Vec::new(),
-        old_tokens: Vec::new(),
-        new_tokens: Vec::new(),
-        hunks: Vec::new(),
-        gaps: vec![Gap::default()],
-    };
-    if unshown.is_some() {
-        return Ok(file);
+    if is_submodule(&delta) {
+        return Ok(FileDiff::unshown(kind, path, old_path, Unshown::Submodule));
     }
-    let old_text = String::from_utf8_lossy(&old_bytes);
-    let new_text = String::from_utf8_lossy(&new_bytes);
-    file.old_lines = split_lines(&old_text);
-    file.new_lines = split_lines(&new_text);
-    if language != Language::Plain {
-        file.old_tokens = lex_text(language, &old_text);
-        file.new_tokens = lex_text(language, &new_text);
+    let old = blob_contents(repo, delta.old_file())?;
+    let new = blob_contents(repo, delta.new_file())?;
+    let patch = Patch::from_diff(&diff, index)?;
+    FileDiff::build(kind, path, old_path, &old, &new, patch.as_ref())
+}
+
+impl FileDiff {
+    /// A diff whose lines can't be shown, for the reason given.
+    pub(super) fn unshown(
+        kind: ChangeKind,
+        path: &str,
+        old_path: Option<&str>,
+        why: Unshown,
+    ) -> FileDiff {
+        FileDiff {
+            kind,
+            path: path.to_owned(),
+            old_path: old_path.map(str::to_owned),
+            unshown: Some(why),
+            language: Language::from_path(Path::new(path)).unwrap_or(Language::Plain),
+            old_lines: Vec::new(),
+            new_lines: Vec::new(),
+            old_tokens: Vec::new(),
+            new_tokens: Vec::new(),
+            hunks: Vec::new(),
+            gaps: vec![Gap::default()],
+        }
     }
 
-    if let Some(patch) = Patch::from_diff(&diff, index)? {
+    /// The diff of a file from the contents of both sides and the patch
+    /// between them (none when nothing changed line by line). Both
+    /// sides are lexed whole in the language of `path`.
+    pub(super) fn build(
+        kind: ChangeKind,
+        path: &str,
+        old_path: Option<&str>,
+        old: &Contents,
+        new: &Contents,
+        patch: Option<&Patch<'_>>,
+    ) -> Result<FileDiff, git2::Error> {
+        // A binary side rules: nothing of it can be shown at all.
+        let unshown = match (old.unshown, new.unshown) {
+            (Some(Unshown::Binary), _) | (_, Some(Unshown::Binary)) => Some(Unshown::Binary),
+            (Some(why), _) | (_, Some(why)) => Some(why),
+            (None, None) => None,
+        };
+        let language = Language::from_path(Path::new(path)).unwrap_or(Language::Plain);
+        let mut file = FileDiff {
+            kind,
+            path: path.to_owned(),
+            old_path: old_path.map(str::to_owned),
+            unshown,
+            language,
+            old_lines: Vec::new(),
+            new_lines: Vec::new(),
+            old_tokens: Vec::new(),
+            new_tokens: Vec::new(),
+            hunks: Vec::new(),
+            gaps: vec![Gap::default()],
+        };
+        if unshown.is_some() {
+            return Ok(file);
+        }
+        let old_text = String::from_utf8_lossy(&old.bytes);
+        let new_text = String::from_utf8_lossy(&new.bytes);
+        file.old_lines = split_lines(&old_text);
+        file.new_lines = split_lines(&new_text);
+        if language != Language::Plain {
+            file.old_tokens = lex_text(language, &old_text);
+            file.new_tokens = lex_text(language, &new_text);
+        }
+
+        let Some(patch) = patch else {
+            return Ok(file);
+        };
         for h in 0..patch.num_hunks() {
             let (hunk, count) = patch.hunk(h)?;
             let mut lines = Vec::with_capacity(count);
@@ -373,8 +517,8 @@ pub fn file_diff(
             });
             file.gaps.push(Gap::default());
         }
+        Ok(file)
     }
-    Ok(file)
 }
 
 /// The lines of a text, without their terminators; a final terminator

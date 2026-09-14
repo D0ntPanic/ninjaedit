@@ -85,6 +85,12 @@ pub enum PaletteAction {
     /// Show one of the git log page's tabs: the project's repository or
     /// a submodule, by index.
     GitLogTab(usize),
+    /// Show the changes page in the editor's place and give it the
+    /// keyboard, or scan the working tree again if it is showing.
+    OpenChanges,
+    /// Show one of the changes page's tabs: the project's repository or
+    /// a submodule with changes, by index.
+    ChangesTab(usize),
     /// Show a tool in the pane below the editor, starting it if need be,
     /// and give it the keyboard.
     OpenTool(ToolKind),

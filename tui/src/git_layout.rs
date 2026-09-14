@@ -1,18 +1,22 @@
-//! How the git log page's panes are sized, kept per repository in the
+//! How the git pages' panes are sized, kept per repository in the
 //! project's storage so that a layout dragged into shape comes back
-//! the next time the page opens. This is the TUI's own affair, not the
-//! core's: another frontend lays its page out its own way and keeps
-//! its own file, so this one is named for the TUI.
+//! the next time a page opens. This is the TUI's own affair, not the
+//! core's: another frontend lays its pages out its own way and keeps
+//! its own files, so these are named for the TUI.
 //!
-//! The sizes are shares rather than columns and rows: the sidebar's
-//! share of the page's width, the log's share of its height, and the
-//! file list's share of the width left beside the sidebar. A share
+//! The sizes are shares rather than columns and rows: on the git log
+//! page the sidebar's share of the page's width, the log's share of its
+//! height, and the file list's share of the width left beside the
+//! sidebar; on the changes page the file lists' share of the page's
+//! width, the commit box's share of its height, and the unstaged
+//! list's share of the height left to the lists. A share
 //! survives a change of terminal size, and a page with fewer columns
-//! to give simply gives fewer. Each repository the page shows (the
+//! to give simply gives fewer. Each repository a page shows (the
 //! project's own, under `.`, and each submodule under its path) has
-//! sizes of its own, since a submodule's history is a page of its own.
+//! sizes of its own, since a submodule's page is a page of its own.
 //!
-//! The file, `tui-git-log.toml`, has a table per repository:
+//! Each page has a file, `tui-git-log.toml` and `tui-git-changes.toml`,
+//! with a table per repository:
 //!
 //! ```toml
 //! ["."]
@@ -24,10 +28,10 @@
 //! log = 0.7
 //! ```
 //!
-//! A share left out is the page's default. The file is written by the
-//! editor, so it is read leniently: a share that isn't a number between
-//! zero and one is dropped rather than refused, and keys it doesn't
-//! know are ignored.
+//! A share left out is the page's default. The files are written by
+//! the editor, so they are read leniently: a share that isn't a number
+//! between zero and one is dropped rather than refused, and keys they
+//! don't know are ignored.
 
 use ninjaedit_core::Storage;
 use std::collections::BTreeMap;
@@ -35,13 +39,32 @@ use std::fmt;
 use std::io;
 use toml::{Table, Value};
 
-/// The file's name within a project's storage.
+/// The git log page's file within a project's storage.
 pub const LAYOUT_FILE: &str = "tui-git-log.toml";
+/// The changes page's file within a project's storage.
+pub const CHANGES_LAYOUT_FILE: &str = "tui-git-changes.toml";
 /// The key of the project's own repository.
 pub const MAIN_REPOSITORY: &str = ".";
 
-/// One repository's pane sizes, each a share of the space it divides;
-/// `None` leaves the page's default.
+/// One repository's pane sizes on a page: a share, or `None` for the
+/// page's default, under each of the page's names for them.
+pub trait Shares: Copy + Default + PartialEq {
+    /// The names of the shares, as the file has them.
+    const NAMES: &'static [&'static str];
+
+    /// The share by name.
+    fn get(&self, name: &str) -> Option<f32>;
+
+    /// The sizes from a share for each name.
+    fn from_fn(share: impl FnMut(&str) -> Option<f32>) -> Self;
+
+    /// Whether every size is the default.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The git log page's pane sizes.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PaneSizes {
     pub sidebar: Option<f32>,
@@ -49,14 +72,59 @@ pub struct PaneSizes {
     pub files: Option<f32>,
 }
 
-impl PaneSizes {
-    /// Whether every size is the default.
-    pub fn is_default(&self) -> bool {
-        *self == PaneSizes::default()
+impl Shares for PaneSizes {
+    const NAMES: &'static [&'static str] = &["sidebar", "log", "files"];
+
+    fn get(&self, name: &str) -> Option<f32> {
+        match name {
+            "sidebar" => self.sidebar,
+            "log" => self.log,
+            "files" => self.files,
+            _ => None,
+        }
+    }
+
+    fn from_fn(mut share: impl FnMut(&str) -> Option<f32>) -> PaneSizes {
+        PaneSizes {
+            sidebar: share("sidebar"),
+            log: share("log"),
+            files: share("files"),
+        }
     }
 }
 
-/// Why the layout file could not be read.
+/// The changes page's pane sizes: the file lists' share of the page's
+/// width, the commit box's share of the page's height, and the
+/// unstaged list's share of the lists' height.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ChangesSizes {
+    pub files: Option<f32>,
+    pub unstaged: Option<f32>,
+    pub commit: Option<f32>,
+}
+
+impl Shares for ChangesSizes {
+    const NAMES: &'static [&'static str] = &["files", "unstaged", "commit"];
+
+    fn get(&self, name: &str) -> Option<f32> {
+        match name {
+            "files" => self.files,
+            "unstaged" => self.unstaged,
+            "commit" => self.commit,
+            _ => None,
+        }
+    }
+
+    fn from_fn(mut share: impl FnMut(&str) -> Option<f32>) -> ChangesSizes {
+        ChangesSizes {
+            files: share("files"),
+            unstaged: share("unstaged"),
+            commit: share("commit"),
+        }
+    }
+}
+
+/// Why a layout file could not be read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayoutError(pub String);
 
@@ -68,16 +136,29 @@ impl fmt::Display for LayoutError {
 
 impl std::error::Error for LayoutError {}
 
-/// The pane sizes of every repository the page has been resized for.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct GitLogLayout {
-    repositories: BTreeMap<String, PaneSizes>,
+/// The pane sizes of every repository a page has been resized for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Layout<S> {
+    repositories: BTreeMap<String, S>,
 }
 
-impl GitLogLayout {
+/// The git log page's layout.
+pub type GitLogLayout = Layout<PaneSizes>;
+/// The changes page's layout.
+pub type GitChangesLayout = Layout<ChangesSizes>;
+
+impl<S> Default for Layout<S> {
+    fn default() -> Layout<S> {
+        Layout {
+            repositories: BTreeMap::new(),
+        }
+    }
+}
+
+impl<S: Shares> Layout<S> {
     /// The sizes for a repository, by its key; the defaults when none
     /// were kept.
-    pub fn get(&self, repository: &str) -> PaneSizes {
+    pub fn get(&self, repository: &str) -> S {
         self.repositories
             .get(repository)
             .copied()
@@ -85,7 +166,7 @@ impl GitLogLayout {
     }
 
     /// Keep a repository's sizes; all defaults forgets it.
-    pub fn set(&mut self, repository: &str, sizes: PaneSizes) {
+    pub fn set(&mut self, repository: &str, sizes: S) {
         if sizes.is_default() {
             self.repositories.remove(repository);
         } else {
@@ -99,33 +180,26 @@ impl GitLogLayout {
         self.repositories.is_empty()
     }
 
-    /// Parse the file's text. Only a file that isn't TOML at all, or
+    /// Parse a file's text. Only a file that isn't TOML at all, or
     /// whose entries aren't tables, is an error.
-    pub fn parse(text: &str) -> Result<GitLogLayout, LayoutError> {
+    pub fn parse(text: &str) -> Result<Layout<S>, LayoutError> {
         let table: Table = text
             .parse()
             .map_err(|err: toml::de::Error| LayoutError(err.message().to_owned()))?;
-        let mut layout = GitLogLayout::default();
+        let mut layout = Layout::default();
         for (key, value) in table {
             let Some(entry) = value.as_table() else {
                 return Err(LayoutError(format!(
                     "`{key}` must be a table of pane sizes"
                 )));
             };
-            let share = |name: &str| {
+            let sizes = S::from_fn(|name| {
                 entry
                     .get(name)
                     .and_then(share_of)
                     .filter(|share| (0.0..=1.0).contains(share))
-            };
-            layout.set(
-                &key,
-                PaneSizes {
-                    sidebar: share("sidebar"),
-                    log: share("log"),
-                    files: share("files"),
-                },
-            );
+            });
+            layout.set(&key, sizes);
         }
         Ok(layout)
     }
@@ -135,13 +209,9 @@ impl GitLogLayout {
         let mut table = Table::new();
         for (key, sizes) in &self.repositories {
             let mut entry = Table::new();
-            for (name, share) in [
-                ("sidebar", sizes.sidebar),
-                ("log", sizes.log),
-                ("files", sizes.files),
-            ] {
-                if let Some(share) = share {
-                    entry.insert(name.to_owned(), Value::Float(f64::from(share)));
+            for name in S::NAMES {
+                if let Some(share) = sizes.get(name) {
+                    entry.insert((*name).to_owned(), Value::Float(f64::from(share)));
                 }
             }
             table.insert(key.clone(), Value::Table(entry));
@@ -150,23 +220,24 @@ impl GitLogLayout {
     }
 }
 
-/// The layout kept in a project's storage; nothing kept when no pane
-/// has been resized yet.
-pub fn load(storage: &Storage) -> Result<GitLogLayout, LayoutError> {
-    let path = storage.path(LAYOUT_FILE);
+/// A page's layout as kept in a project's storage, in `file`; nothing
+/// kept when no pane has been resized yet.
+pub fn load<S: Shares>(storage: &Storage, file: &str) -> Result<Layout<S>, LayoutError> {
+    let path = storage.path(file);
     let text = storage
-        .read(LAYOUT_FILE)
+        .read(file)
         .map_err(|err| LayoutError(format!("could not read {}: {err}", path.display())))?;
     match text {
-        Some(text) => GitLogLayout::parse(&text)
-            .map_err(|err| LayoutError(format!("{}: {err}", path.display()))),
-        None => Ok(GitLogLayout::default()),
+        Some(text) => {
+            Layout::parse(&text).map_err(|err| LayoutError(format!("{}: {err}", path.display())))
+        }
+        None => Ok(Layout::default()),
     }
 }
 
-/// Keep the layout in a project's storage.
-pub fn save(storage: &Storage, layout: &GitLogLayout) -> io::Result<()> {
-    storage.write(LAYOUT_FILE, &layout.to_toml())
+/// Keep a page's layout in a project's storage, in `file`.
+pub fn save<S: Shares>(storage: &Storage, file: &str, layout: &Layout<S>) -> io::Result<()> {
+    storage.write(file, &layout.to_toml())
 }
 
 /// A share from a TOML number, integer or float.
@@ -220,6 +291,35 @@ mod tests {
     }
 
     #[test]
+    fn the_changes_page_has_sizes_of_its_own() {
+        let mut layout = GitChangesLayout::default();
+        layout.set(
+            MAIN_REPOSITORY,
+            ChangesSizes {
+                files: Some(0.4),
+                unstaged: None,
+                commit: Some(0.2),
+            },
+        );
+        let text = layout.to_toml();
+        assert!(text.contains("files = 0.4"), "{text}");
+        assert!(text.contains("commit = 0.2"), "{text}");
+        assert!(!text.contains("unstaged"), "{text}");
+        let parsed = GitChangesLayout::parse(&text).unwrap();
+        assert_eq!(parsed, layout);
+        // The log page's names mean nothing to it.
+        let parsed = GitChangesLayout::parse("[\".\"]\nlog = 0.5\nunstaged = 0.3\n").unwrap();
+        assert_eq!(
+            parsed.get(MAIN_REPOSITORY),
+            ChangesSizes {
+                files: None,
+                unstaged: Some(0.3),
+                commit: None,
+            }
+        );
+    }
+
+    #[test]
     fn the_file_is_read_leniently() {
         let layout = GitLogLayout::parse(
             "[\".\"]\nsidebar = 1\nlog = 1.5\nfiles = \"wide\"\ncolor = \"red\"\n\n[\"other\"]\n",
@@ -244,7 +344,7 @@ mod tests {
     fn the_layout_is_kept_in_a_projects_storage() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path().join("p"));
-        assert!(load(&storage).unwrap().is_empty());
+        assert!(load::<PaneSizes>(&storage, LAYOUT_FILE).unwrap().is_empty());
         let mut layout = GitLogLayout::default();
         layout.set(
             "libs/sub",
@@ -254,10 +354,26 @@ mod tests {
                 files: None,
             },
         );
-        save(&storage, &layout).unwrap();
-        assert_eq!(load(&storage).unwrap(), layout);
+        save(&storage, LAYOUT_FILE, &layout).unwrap();
+        assert_eq!(load(&storage, LAYOUT_FILE).unwrap(), layout);
+        // The changes page's file is another, so neither disturbs the
+        // other.
+        let mut changes = GitChangesLayout::default();
+        changes.set(
+            MAIN_REPOSITORY,
+            ChangesSizes {
+                files: Some(0.3),
+                unstaged: Some(0.6),
+                commit: None,
+            },
+        );
+        save(&storage, CHANGES_LAYOUT_FILE, &changes).unwrap();
+        assert_eq!(load(&storage, CHANGES_LAYOUT_FILE).unwrap(), changes);
+        assert_eq!(load(&storage, LAYOUT_FILE).unwrap(), layout);
         storage.write(LAYOUT_FILE, "[\".\"\n").unwrap();
-        let err = load(&storage).unwrap_err().to_string();
+        let err = load::<PaneSizes>(&storage, LAYOUT_FILE)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains(LAYOUT_FILE), "{err}");
     }
 }

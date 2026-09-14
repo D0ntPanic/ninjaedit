@@ -31,7 +31,10 @@
 //! blank for now; a debugger can later mark it with a red circle. The
 //! guide is a vertical line right against the text, showing where the
 //! text's left edge is; git line status can later replace the guide glyph
-//! on a line with a thin colored block.
+//! on a line with a thin colored block. A view embedded in a page (the
+//! changes page's commit message) can do without the gutter altogether
+//! (see [`EditorView::set_gutter`]): the text then starts at the left
+//! edge, and only the scrollbars remain around it.
 
 use crate::clicks::ClickTracker;
 use crate::clipboard::Clipboard;
@@ -94,7 +97,10 @@ pub struct EditorView {
     drag: Drag,
     /// Presses in the text, to notice a double-click.
     clicks: ClickTracker,
-    // Screen regions from the last render.
+    /// Whether the gutter (line numbers and the guide) is drawn.
+    show_gutter: bool,
+    // Screen regions from the last render. The gutter is zero-sized
+    // while hidden.
     gutter: Rect,
     text: Rect,
     vscroll: Rect,
@@ -122,12 +128,20 @@ impl EditorView {
             jump: None,
             drag: Drag::None,
             clicks: ClickTracker::default(),
+            show_gutter: true,
             gutter: Rect::default(),
             text: Rect::default(),
             vscroll: Rect::default(),
             hscroll: Rect::default(),
             hscroll_total: 0,
         }
+    }
+
+    /// Draw the gutter, with its line numbers and guide, or leave it
+    /// out so the text starts at the view's left edge, as an editor
+    /// embedded in a page wants.
+    pub fn set_gutter(&mut self, shown: bool) {
+        self.show_gutter = shown;
     }
 
     pub fn editor(&self) -> &Editor {
@@ -245,7 +259,11 @@ impl EditorView {
         buf.set_style(area, text_style);
         let line_count = self.editor.buffer().line_count();
         let number_width = digits(line_count) as u16;
-        let gutter_width = number_width + GUTTER_EXTRA;
+        let gutter_width = if self.show_gutter {
+            number_width + GUTTER_EXTRA
+        } else {
+            0
+        };
         // Gutter, at least one text column, and the vertical scrollbar.
         if area.width < gutter_width + 2 || area.height == 0 {
             return None;
@@ -336,10 +354,12 @@ impl EditorView {
 
         // The guide runs the full height of the view, past the end of the
         // file, since it marks the edge of the text area rather than a line.
-        let guide_x = self.text.x - 1;
-        let guide_style = text_style.fg(theme.gutter_guide);
-        for y in area.y..area.y + height {
-            buf.set_string(guide_x, y, GUIDE, guide_style);
+        if self.show_gutter {
+            let guide_x = self.text.x - 1;
+            let guide_style = text_style.fg(theme.gutter_guide);
+            for y in area.y..area.y + height {
+                buf.set_string(guide_x, y, GUIDE, guide_style);
+            }
         }
 
         let selection = self.editor.selection();
@@ -369,13 +389,15 @@ impl EditorView {
             let y = area.y + row as u16;
 
             // Line number, right-aligned after the breakpoint column.
-            let number = format!("{:>width$}", line + 1, width = number_width as usize);
-            let color = if line == cursor.line {
-                theme.active_line_number
-            } else {
-                theme.inactive_line_number
-            };
-            buf.set_string(area.x + 1, y, &number, text_style.fg(color));
+            if self.show_gutter {
+                let number = format!("{:>width$}", line + 1, width = number_width as usize);
+                let color = if line == cursor.line {
+                    theme.active_line_number
+                } else {
+                    theme.inactive_line_number
+                };
+                buf.set_string(area.x + 1, y, &number, text_style.fg(color));
+            }
 
             // The lines of a merge conflict are tinted by side, across
             // the whole text area; the text keeps its syntax colors.
@@ -798,4 +820,56 @@ fn line_width(cells: &[Cell]) -> usize {
 /// The number of decimal digits needed to show `n`.
 fn digits(n: usize) -> usize {
     n.max(1).ilog10() as usize + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ninjaedit_core::FileBuffer;
+
+    fn draw(
+        view: &mut EditorView,
+        width: u16,
+        height: u16,
+    ) -> (Vec<String>, Option<ScreenPosition>) {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        let cursor = view.render(area, &mut buf, &Theme::default());
+        let rows = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect();
+        (rows, cursor)
+    }
+
+    #[test]
+    fn the_gutter_can_be_left_out() {
+        let mut view = EditorView::new(Editor::new(FileBuffer::from_text("one\ntwo\n")));
+        let (rows, cursor) = draw(&mut view, 20, 3);
+        // With the gutter: the breakpoint column, the number, a space,
+        // and the guide before the text.
+        assert!(rows[0].starts_with(" 1 │one"), "{rows:#?}");
+        assert_eq!(cursor, Some(ScreenPosition::new(4, 0)));
+        // Without it the text starts at the edge, and a click there
+        // still lands in the text.
+        view.set_gutter(false);
+        let (rows, cursor) = draw(&mut view, 20, 3);
+        assert!(rows[0].starts_with("one "), "{rows:#?}");
+        assert!(rows[1].starts_with("two "), "{rows:#?}");
+        assert_eq!(cursor, Some(ScreenPosition::new(0, 0)));
+        view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            view.editor.cursor_position(),
+            Position { line: 1, column: 2 }
+        );
+        assert!(view.contains(0, 0));
+    }
 }

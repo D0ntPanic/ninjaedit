@@ -5,23 +5,27 @@
 //! around each change expandable, and the [`tree`] module arranges
 //! those files as a tree of directories. The [`submodules`] module
 //! lists a repository's submodules, each of which has a history of its
-//! own. Everything goes through libgit2, by way of the `git2` crate;
-//! nothing shells out to git.
+//! own. The [`changes`] module is the working tree: what is changed and
+//! not yet committed, staged or not, with staging, unstaging, and
+//! committing. Everything goes through libgit2, by way of the `git2`
+//! crate; nothing shells out to git.
 //!
-//! Nothing here changes the repository. Checking out, committing, and
-//! the rest of a git workflow will build on these views.
+//! Only the [`changes`] module changes the repository, and only its
+//! index and HEAD: nothing here touches the working directory's files.
 
+pub mod changes;
 pub mod diff;
 pub mod graph;
 pub mod history;
 pub mod submodules;
 pub mod tree;
 
+pub use changes::Changes;
 pub use diff::{
     ChangeKind, CommitDetail, DiffLine, DiffRow, FileChange, FileDiff, LineKind, Person, Side,
     Unshown,
 };
 pub use graph::{GraphCell, GraphRow, NODE, cells_for};
 pub use history::{Branch, Commit, CommitTime, History, Oid, RefKind, RefLabel, Remote, short_id};
-pub use submodules::{Submodule, submodules};
+pub use submodules::{Submodule, changed_submodules, has_uncommitted_changes, submodules};
 pub use tree::{Dir, Entry, FileTree, TreeRow};

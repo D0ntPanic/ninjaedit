@@ -7,7 +7,8 @@
 //! also where to learn the keys. The commands without one are for now
 //! and then: throwing away a build directory to configure from nothing
 //! is wanted when debugging a build, not by accident from a key beside
-//! another. Stepping between merge conflicts has no key either, but is
+//! another, and amending a commit is a choice to make on the changes
+//! page (where `m` makes it too). Stepping between merge conflicts has no key either, but is
 //! wanted several times in a row, so the palette puts the command it
 //! last ran at the top when it opens: Ctrl+P, Enter runs it again.
 //! The application runs them; this module only describes them.
@@ -42,6 +43,7 @@ pub enum Command {
     SelectTarget,
     DeleteBuildDir,
     DeleteAllBuildDirs,
+    ToggleAmend,
     SwitchView,
     NextView,
     PreviousView,
@@ -52,7 +54,7 @@ impl Command {
     /// Every command, in the order the palette lists them before
     /// anything is typed: files, searching, editing, building, views,
     /// and quitting last.
-    pub const ALL: [Command; 27] = [
+    pub const ALL: [Command; 28] = [
         Command::OpenFile,
         Command::SwitchTab,
         Command::Save,
@@ -76,6 +78,7 @@ impl Command {
         Command::SelectTarget,
         Command::DeleteBuildDir,
         Command::DeleteAllBuildDirs,
+        Command::ToggleAmend,
         Command::SwitchView,
         Command::NextView,
         Command::PreviousView,
@@ -108,6 +111,7 @@ impl Command {
             Command::SelectTarget => "Select build target",
             Command::DeleteBuildDir => "Delete build directory",
             Command::DeleteAllBuildDirs => "Delete all build directories",
+            Command::ToggleAmend => "Toggle amend",
             Command::SwitchView => "Switch view",
             Command::NextView => "Focus next view",
             Command::PreviousView => "Focus previous view",
@@ -152,6 +156,9 @@ impl Command {
             Command::DeleteAllBuildDirs => {
                 "Clean everything: delete what every configuration of every build root has built"
             }
+            Command::ToggleAmend => {
+                "On the changes page, make the commit replace the last one (git commit --amend), or follow it"
+            }
             Command::SwitchView => "Editor, a page, or a tool",
             Command::NextView => "Move the keyboard to the next view",
             Command::PreviousView => "Move the keyboard to the previous view",
@@ -188,7 +195,8 @@ impl Command {
             | Command::SelectConfiguration
             | Command::SelectTarget
             | Command::DeleteBuildDir
-            | Command::DeleteAllBuildDirs => return None,
+            | Command::DeleteAllBuildDirs
+            | Command::ToggleAmend => return None,
         })
     }
 }
