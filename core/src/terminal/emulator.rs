@@ -441,13 +441,17 @@ impl Inner {
     // ----- Scrolling ------------------------------------------------------
 
     /// Scroll the region up, keeping what scrolls off the top of the
-    /// primary screen when the region is the whole screen.
+    /// primary screen when the region starts at the top row. A region
+    /// that ends short of the bottom still keeps its history, as in
+    /// xterm: that is how programs like lldb pin a status line to the
+    /// bottom row while their output scrolls above it. Only a region
+    /// with fixed rows above it drops what it scrolls off.
     fn scroll_up(&mut self, count: usize) {
         let style = self.blank_style();
         let (top, bottom) = (self.scroll_top, self.scroll_bottom);
-        let whole = top == 0 && bottom == self.rows - 1;
+        let keeps = top == 0 && !self.alternate_active;
         let evicted = self.grid_mut().scroll_up(top, bottom, count, style);
-        if whole && !self.alternate_active {
+        if keeps {
             self.push_scrollback(evicted);
         }
     }
@@ -1654,6 +1658,23 @@ mod tests {
     }
 
     #[test]
+    fn region_from_the_top_row_keeps_scrollback() {
+        // lldb reserves the bottom row for a status line and scrolls
+        // its output in a region above it; that output must still be
+        // scrollable afterward.
+        let mut t = term(8, 4);
+        feed(&mut t, "\x1b[1;3r\x1b[4;1Hstatus\x1b[1;1H");
+        feed(&mut t, "a\r\nb\r\nc\r\nd\r\ne");
+        assert_eq!(screen(&t), ["c", "d", "e", "status"]);
+        assert_eq!(t.scrollback_len(), 2);
+        let back: Vec<String> = t.rows(2).map(Row::text).collect();
+        assert_eq!(back, ["a", "b", "c", "d"]);
+        // The alternate screen still keeps nothing.
+        feed(&mut t, "\x1b[?1049h\x1b[1;3r\x1b[3;1H\n\n");
+        assert_eq!(t.scrollback_len(), 2);
+    }
+
+    #[test]
     fn scroll_regions_and_line_insertion() {
         let mut t = term(4, 5);
         feed(&mut t, "a\r\nb\r\nc\r\nd\r\ne");
@@ -1661,7 +1682,11 @@ mod tests {
         assert_eq!(t.cursor_position(), (0, 0));
         feed(&mut t, "\x1b[4;1H\n");
         assert_eq!(screen(&t), ["a", "c", "d", "", "e"]);
-        assert_eq!(t.scrollback_len(), 0, "a region scroll keeps nothing");
+        assert_eq!(
+            t.scrollback_len(),
+            0,
+            "a region with fixed rows above it keeps nothing"
+        );
         feed(&mut t, "\x1b[2;1H\x1bM");
         assert_eq!(screen(&t), ["a", "", "c", "d", "e"]);
         feed(&mut t, "\x1b[3;1H\x1b[L");
