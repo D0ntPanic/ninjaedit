@@ -89,23 +89,26 @@
 //! keeping its place, and the status bar says what came of it: how
 //! many references changed, and any remote that couldn't be fetched.
 //! A fetch is for the shown tab's repository (a submodule's, on its
-//! tab); F5 during one does nothing.
+//! tab), and then for its submodules as git's on-demand recursion
+//! does: those a reference that came in points at a commit they don't
+//! have, and the one whose diff is on show if it couldn't find its
+//! commits. F5 during one does nothing.
 //!
 //! Beyond fetching, the page only looks at the repository: checking
 //! out a branch or commit will come later.
 
+use crate::commit_row::{CommitLine, commit_extent, draw_commit_line, lane_cap};
 use crate::diff_pane::{
     Button, HScroll, Piece, WHEEL_COLUMNS, WHEEL_LINES, clamp_between, content_background,
-    diff_extent, display_width, draw_cells, draw_pieces, fit_end, layout_cells, pieces_width,
-    render_diff, share_for, share_of, text_extent,
+    diff_extent, display_width, draw_cells, fit_end, layout_cells, render_diff, share_for,
+    share_of, text_extent,
 };
 use crate::git_layout::{GitLogLayout, MAIN_REPOSITORY, PaneSizes};
 use crate::palette::palette_background;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
-    ChangeKind, CommitDetail, Fetch, FileDiff, FileTree, History, NODE, Oid, RefKind, TreeRow,
-    cells_for, submodules,
+    ChangeKind, CommitDetail, Fetch, FileDiff, FileTree, History, Oid, TreeRow, submodules,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
@@ -132,10 +135,6 @@ const MIN_CONTENT_WIDTH: u16 = 16;
 /// part of the page.
 const MIN_FILES_WIDTH: u16 = 24;
 const MAX_FILES_WIDTH: u16 = 56;
-/// The graph takes at most this share of the log's width.
-const MAX_GRAPH_SHARE: usize = 3;
-/// The node of the commit HEAD is on.
-const HEAD_NODE: &str = "◉";
 const DESCRIPTION: &str = "Description";
 const NOT_A_REPOSITORY: &str = "Not a git repository";
 const NOT_INITIALIZED: &str = "Submodule not initialized";
@@ -683,7 +682,23 @@ impl GitLogView {
             self.notice = Some(self.no_history_message());
             return;
         };
-        match Fetch::start(history.git_dir()) {
+        // A submodule diff on show that couldn't find its commits
+        // names them, so that the fetch brings them whatever else says.
+        let wanted = match &self.content {
+            Some(Content::Diff(diff)) => diff
+                .submodule
+                .as_ref()
+                .map(|range| {
+                    range
+                        .missing
+                        .iter()
+                        .map(|id| (diff.path.clone(), *id))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        match Fetch::start(history.git_dir(), wanted) {
             Ok(fetch) => self.fetch = Some(fetch),
             Err(err) => self.notice = Some(format!("Could not fetch: {}", err.message())),
         }
@@ -714,6 +729,12 @@ impl GitLogView {
             Some(Err(why)) => format!("Could not fetch: {why}"),
             None => "Could not fetch: the fetch stopped".to_owned(),
         });
+        // A submodule's diff is read from the submodule's repository,
+        // which the fetch may have filled in: build it again. A file's
+        // diff keeps its revealed context.
+        if matches!(&self.content, Some(Content::Diff(diff)) if diff.submodule.is_some()) {
+            self.content = None;
+        }
         self.refresh();
         true
     }
@@ -1229,9 +1250,7 @@ impl GitLogView {
 
     /// How many lanes of the graph the log draws, at most.
     fn lane_cap(&self) -> usize {
-        (self.log_area.width as usize / MAX_GRAPH_SHARE)
-            .div_ceil(2)
-            .max(1)
+        lane_cap(self.log_area.width)
     }
 
     /// The columns the log's visible commits reach, from the first
@@ -1250,8 +1269,7 @@ impl GitLogView {
             .take(rows / 2)
             .map(|commit| {
                 let lanes = commit.graph.width().clamp(1, cap);
-                let (first, second) = commit_lines(commit, head == Some(commit.id), None);
-                cells_for(lanes) + 1 + pieces_width(&first).max(pieces_width(&second))
+                commit_extent(commit, head == Some(commit.id), lanes)
             })
             .max()
             .unwrap_or(0)
@@ -1958,7 +1976,6 @@ impl GitLogView {
         let max_lanes = self.lane_cap();
         let head = history.head();
         let selected_style = background.bg(self.selection_background(Pane::Log, theme));
-        let lane_colors = lane_palette(theme);
 
         for (index, commit) in commits
             .iter()
@@ -1980,46 +1997,17 @@ impl GitLogView {
             } else {
                 background
             };
-            // The graph, in the lanes' colors over the row's background.
+            // The graph, in the lanes' colors over the row's background,
+            // then line one: the references and the message, and line
+            // two: the author, the id, and the time. Both scroll
+            // sideways together, the graph staying put.
             let lanes = commit.graph.width().clamp(1, max_lanes);
-            let text_x = area.x + 1 + cells_for(lanes) as u16 + 1;
-            let text_width = area.right().saturating_sub(text_x) as usize;
-            let node_cells = commit.graph.node_cells(lanes);
-            let transition_cells = commit.graph.transition_cells(lanes);
-            for (k, cell) in node_cells.iter().enumerate() {
-                let x = area.x + 1 + k as u16;
-                let mut style = row_style;
-                if let Some(color) = cell.color {
-                    style = style.fg(lane_colors[color % lane_colors.len()]);
-                }
-                let glyph = if cell.node && is_head {
-                    style = style.add_modifier(Modifier::BOLD);
-                    HEAD_NODE
-                } else if cell.node {
-                    NODE
-                } else {
-                    cell.glyph
-                };
-                buf[(x, y0)].set_symbol(glyph).set_style(style);
+            for (y, line) in [(y0, CommitLine::Node), (y1, CommitLine::Transition)] {
+                let row = Rect::new(area.x + 1, y, area.width - 1, 1);
+                draw_commit_line(
+                    buf, row, commit, line, is_head, lanes, row_style, theme, scroll_col,
+                );
             }
-            for (k, cell) in transition_cells.iter().enumerate() {
-                let x = area.x + 1 + k as u16;
-                let mut style = row_style;
-                if let Some(color) = cell.color {
-                    style = style.fg(lane_colors[color % lane_colors.len()]);
-                }
-                buf[(x, y1)].set_symbol(cell.glyph).set_style(style);
-            }
-            if text_width == 0 {
-                continue;
-            }
-
-            // Line one: the references, then the message. Line two: the
-            // author, the id, and the time. Both scroll sideways
-            // together, the graph staying put.
-            let (first, second) = commit_lines(commit, is_head, Some((theme, row_style)));
-            draw_pieces(buf, text_x, y0, text_width, &first, scroll_col);
-            draw_pieces(buf, text_x, y1, text_width, &second, scroll_col);
         }
     }
 
@@ -2233,80 +2221,15 @@ fn date_line(label: &str, time: ninjaedit_core::git::CommitTime) -> String {
     }
 }
 
-/// The colors the graph's lanes cycle through.
-fn lane_palette(theme: &Theme) -> [Color; 8] {
-    [
-        theme.terminal_blue,
-        theme.terminal_green,
-        theme.terminal_yellow,
-        theme.terminal_magenta,
-        theme.terminal_cyan,
-        theme.terminal_red,
-        theme.terminal_bright_blue,
-        theme.terminal_bright_magenta,
-    ]
-}
-
-/// A commit's two lines of text: the references and the message, then
-/// the author, the id, and the time. Styled over `row_style` with the
-/// theme's colors when given (HEAD's row bold and in its color),
-/// otherwise plain, for measuring.
-fn commit_lines(
-    commit: &ninjaedit_core::git::Commit,
-    is_head: bool,
-    styles: Option<(&Theme, Style)>,
-) -> (Vec<Piece>, Vec<Piece>) {
-    let row_style = styles.map_or_else(Style::default, |(_, style)| style);
-    let colored = |pick: fn(&Theme) -> Color| match styles {
-        Some((theme, style)) => style.fg(pick(theme)),
-        None => row_style,
-    };
-    let mut first: Vec<Piece> = Vec::new();
-    for label in &commit.refs {
-        if label.is_head {
-            first.push(("HEAD → ".to_owned(), colored(|t| t.git_head_text)));
-        }
-        let color: fn(&Theme) -> Color = match label.kind {
-            RefKind::Branch => |t| t.git_branch_text,
-            RefKind::RemoteBranch => |t| t.git_remote_text,
-            RefKind::Tag => |t| t.git_tag_text,
-        };
-        let name = if label.kind == RefKind::Tag {
-            format!("tag: {}", label.name)
-        } else {
-            label.name.clone()
-        };
-        first.push((
-            format!("{name} "),
-            colored(color).add_modifier(Modifier::BOLD),
-        ));
-    }
-    let summary_style = if is_head {
-        colored(|t| t.git_head_text).add_modifier(Modifier::BOLD)
-    } else {
-        row_style
-    };
-    if !first.is_empty() {
-        first.push((" ".to_owned(), row_style));
-    }
-    first.push((commit.summary.clone(), summary_style));
-    let second = vec![
-        (commit.author.clone(), colored(|t| t.git_author_text)),
-        ("  ".to_owned(), row_style),
-        (commit.short_id(), colored(|t| t.git_hash_text)),
-        ("  ".to_owned(), row_style),
-        (commit.time.to_string(), colored(|t| t.git_date_text)),
-    ];
-    (first, second)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commit_row::HEAD_NODE;
     use crate::diff_pane::HSCROLL_SLACK;
     use crossterm::event::{KeyEventKind, KeyEventState};
     use git2::{Repository, Signature};
     use ninjaedit_core::TokenKind;
+    use ninjaedit_core::git::NODE;
     use std::fs;
     use std::time::Duration;
 
@@ -2536,6 +2459,170 @@ mod tests {
         let x = column_of(&screen[y as usize], "two");
         assert_eq!(buf[(x, y)].bg, theme.diff_added_background);
         assert_eq!(buf[(x, y)].fg, theme.syntax(TokenKind::Function).color);
+    }
+
+    /// A repository with a submodule at `sub` added at its first commit
+    /// and then bumped by two more: returns the bump and the
+    /// submodule's three commits, oldest first.
+    fn repo_with_submodule_bump() -> (tempfile::TempDir, Oid, Vec<Oid>) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let sig = Signature::now("Ann Author", "ann@example.com").unwrap();
+        let commit_parent = |message: &str| {
+            let mut index = repo.index().unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let head = repo.head().ok().and_then(|h| h.target());
+            let parents: Vec<git2::Commit<'_>> = head
+                .into_iter()
+                .map(|id| repo.find_commit(id).unwrap())
+                .collect();
+            let refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &refs)
+                .unwrap()
+        };
+        fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        repo.index().unwrap().add_path(Path::new("a.rs")).unwrap();
+        commit_parent("Base commit");
+        let mut submodule = repo
+            .submodule("https://example.com/sub.git", Path::new("sub"), true)
+            .unwrap();
+        let sub = submodule.open().unwrap();
+        let commit_sub = |name: &str, content: &str, message: &str| {
+            fs::write(sub.workdir().unwrap().join(name), content).unwrap();
+            let mut index = sub.index().unwrap();
+            index.add_path(Path::new(name)).unwrap();
+            index.write().unwrap();
+            let tree = sub.find_tree(index.write_tree().unwrap()).unwrap();
+            let head = sub.head().ok().and_then(|h| h.target());
+            let parents: Vec<git2::Commit<'_>> = head
+                .into_iter()
+                .map(|id| sub.find_commit(id).unwrap())
+                .collect();
+            let refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+            sub.commit(Some("HEAD"), &sig, &sig, message, &tree, &refs)
+                .unwrap()
+        };
+        let s1 = commit_sub("inner.txt", "one\n", "Inner commit");
+        submodule.add_finalize().unwrap();
+        commit_parent("Add submodule");
+        let s2 = commit_sub("inner.txt", "two\n", "Inner two");
+        let s3 = commit_sub("inner.txt", "three\n", "Inner three");
+        repo.index().unwrap().add_path(Path::new("sub")).unwrap();
+        let bump = commit_parent("Bump submodule");
+        (dir, bump, vec![s1, s2, s3])
+    }
+
+    #[test]
+    fn a_submodule_change_shows_its_commits_as_a_graph() {
+        let (dir, bump, subs) = repo_with_submodule_bump();
+        let mut view = view(&dir);
+        view.jump_to(bump);
+        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Down));
+        let screen = draw(&mut view, 100, 30);
+        row_with(&screen, "M sub");
+        // The content pane: the heading, then the submodule's commits
+        // from the new one down to the old, the new one drawn as HEAD.
+        let content_x = view.content_area.x as usize;
+        let content_y = view.content_area.y as usize;
+        let content = move |row: &str| row.chars().skip(content_x).collect::<String>();
+        let heading = content(row_with(&screen, "Submodule sub: "));
+        assert_eq!(
+            heading.trim(),
+            format!(
+                "Submodule sub: {} → {}",
+                ninjaedit_core::git::short_id(subs[0]),
+                ninjaedit_core::git::short_id(subs[2])
+            )
+        );
+        let rows: Vec<String> = screen.iter().map(|r| content(r)).collect();
+        let at = |rows: &[String], text: &str| {
+            rows.iter()
+                .position(|r| r.contains(text))
+                .unwrap_or_else(|| panic!("no {text:?} in {rows:#?}"))
+        };
+        let (three, two, one) = (
+            at(&rows, "Inner three"),
+            at(&rows, "Inner two"),
+            at(&rows, "Inner commit"),
+        );
+        assert!(three < two && two < one, "{rows:#?}");
+        assert_eq!(three, at(&rows, "Submodule sub: ") + 1);
+        assert_eq!(at(&rows, "Submodule sub: "), content_y);
+        assert!(rows[three].contains(HEAD_NODE), "{rows:#?}");
+        assert!(
+            rows[two].contains(NODE) && !rows[two].contains(HEAD_NODE),
+            "{rows:#?}"
+        );
+        assert!(rows[one].contains(NODE), "{rows:#?}");
+        assert!(rows[three + 1].contains("Ann Author"), "{rows:#?}");
+        assert!(
+            rows[three + 1].contains(&ninjaedit_core::git::short_id(subs[2])),
+            "{rows:#?}"
+        );
+        // The new commit's message is in HEAD's color, bold, as in
+        // the log; the old one's is plain.
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::default();
+        view.render(area, &mut buf, &theme);
+        let cell_at = |row: usize, text: &str| {
+            let x = column_of(&screen[row], text);
+            buf[(x, row as u16)].clone()
+        };
+        let new = cell_at(three, "Inner three");
+        assert_eq!(new.fg, theme.git_head_text);
+        assert!(new.modifier.contains(Modifier::BOLD));
+        let old = cell_at(one, "Inner commit");
+        assert_ne!(old.fg, theme.git_head_text);
+        assert!(!old.modifier.contains(Modifier::BOLD));
+        // In a pane too small for all of it, the pane scrolls by rows:
+        // one down puts the new commit's node line at the top; and
+        // sideways, the text moving and the graph staying put.
+        view.handle_key(key(KeyCode::Tab));
+        view.handle_key(key(KeyCode::Down));
+        let screen = draw(&mut view, 60, 10);
+        assert!(view.content_area.height < 7, "{:?}", view.content_area);
+        let small_x = view.content_area.x as usize;
+        let small_y = view.content_area.y as usize;
+        let top = screen[small_y].chars().skip(small_x).collect::<String>();
+        assert!(
+            top.contains(HEAD_NODE) && top.contains("Inner three"),
+            "{screen:#?}"
+        );
+        view.handle_key(key(KeyCode::Right));
+        let screen = draw(&mut view, 60, 10);
+        let scrolled = screen[small_y].chars().skip(small_x).collect::<String>();
+        assert_eq!(column_of(&scrolled, HEAD_NODE), column_of(&top, HEAD_NODE));
+        assert_eq!(
+            column_of(&scrolled, "Inner three") + WHEEL_COLUMNS as u16,
+            column_of(&top, "Inner three"),
+            "{screen:#?}"
+        );
+
+        // The commit that added the submodule shows just the commit
+        // it was added at.
+        let added = view
+            .history
+            .as_ref()
+            .unwrap()
+            .commits()
+            .iter()
+            .find(|c| c.summary == "Add submodule")
+            .unwrap()
+            .id;
+        view.jump_to(added);
+        // Back from the content pane to the files pane, and down past
+        // .gitmodules to it.
+        view.handle_key(key(KeyCode::Left));
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Down));
+        let screen = draw(&mut view, 100, 30);
+        let rows: Vec<String> = screen.iter().map(|r| content(r)).collect();
+        assert!(rows.iter().any(|r| r.contains("added at ")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("Inner commit")), "{rows:#?}");
+        assert!(!rows.iter().any(|r| r.contains("Inner two")), "{rows:#?}");
     }
 
     #[test]
@@ -3298,6 +3385,109 @@ mod tests {
             screen.iter().any(|r| r.contains("Upstream since")),
             "{screen:#?}"
         );
+    }
+
+    #[test]
+    fn f5_fetches_the_submodule_for_a_diff_missing_its_commit() {
+        // Upstream: a repository with a submodule whose URL is its own
+        // directory, and a clone of it with the submodule cloned too.
+        let upstream = tempfile::tempdir().unwrap();
+        let up = Repository::init(upstream.path()).unwrap();
+        commit_on_head(&upstream, "a.txt", "a\n", "First");
+        let sub_url = upstream.path().join("sub");
+        let mut declared = up
+            .submodule(sub_url.to_str().unwrap(), Path::new("sub"), true)
+            .unwrap();
+        let up_sub = declared.open().unwrap();
+        let commit_sub = |name: &str, content: &str, message: &str| {
+            fs::write(up_sub.workdir().unwrap().join(name), content).unwrap();
+            let mut index = up_sub.index().unwrap();
+            index.add_path(Path::new(name)).unwrap();
+            index.write().unwrap();
+            let tree = up_sub.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = Signature::now("Sub Author", "sub@example.com").unwrap();
+            let head = up_sub.head().ok().and_then(|h| h.target());
+            let parents: Vec<git2::Commit<'_>> = head
+                .into_iter()
+                .map(|id| up_sub.find_commit(id).unwrap())
+                .collect();
+            let refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+            up_sub
+                .commit(Some("HEAD"), &sig, &sig, message, &tree, &refs)
+                .unwrap()
+        };
+        commit_sub("s.txt", "one\n", "Sub one");
+        declared.add_finalize().unwrap();
+        let commit_gitlink = |message: &str| {
+            let mut index = up.index().unwrap();
+            index.add_path(Path::new("sub")).unwrap();
+            index.write().unwrap();
+            let tree = up.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = Signature::now("Ann Author", "ann@example.com").unwrap();
+            let head = up.head().unwrap().peel_to_commit().unwrap();
+            up.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&head])
+                .unwrap()
+        };
+        commit_gitlink("Add sub");
+        let dir = tempfile::tempdir().unwrap();
+        let local = Repository::clone(upstream.path().to_str().unwrap(), dir.path()).unwrap();
+        local
+            .find_submodule("sub")
+            .unwrap()
+            .update(true, None)
+            .unwrap();
+
+        // Upstream moves the submodule on. Fetched without recursing,
+        // the clone has the bump but its submodule doesn't have the
+        // commit, and the bump's diff of the submodule says so.
+        let s2 = commit_sub("s.txt", "two\n", "Sub two");
+        let bump = commit_gitlink("Bump sub");
+        local
+            .config()
+            .unwrap()
+            .set_str("fetch.recurseSubmodules", "false")
+            .unwrap();
+        let mut view = view(&dir);
+        view.handle_key(key(KeyCode::F(5)));
+        wait(&mut view);
+        assert_eq!(
+            view.take_notice().as_deref(),
+            Some("Fetched origin: 1 ref updated")
+        );
+        view.jump_to(bump);
+        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Down));
+        let screen = draw(&mut view, 110, 30);
+        row_with(&screen, "M sub");
+        let row = row_with(&screen, "is not in the submodule's repository");
+        assert!(
+            row.contains(&format!("Commit {}", ninjaedit_core::git::short_id(s2))),
+            "{row}"
+        );
+        assert!(!screen.iter().any(|r| r.contains("Sub two")), "{screen:#?}");
+
+        // On demand again, F5 fetches the submodule as well, and the
+        // diff on show fills in with the commits.
+        local
+            .config()
+            .unwrap()
+            .set_str("fetch.recurseSubmodules", "on-demand")
+            .unwrap();
+        view.handle_key(key(KeyCode::F(5)));
+        wait(&mut view);
+        let notice = view.take_notice().unwrap();
+        assert!(
+            notice.starts_with("Fetched origin: up to date · sub: Fetched origin: "),
+            "{notice}"
+        );
+        let screen = draw(&mut view, 110, 30);
+        assert!(
+            !screen.iter().any(|r| r.contains("not in the submodule")),
+            "{screen:#?}"
+        );
+        assert!(row_with(&screen, "Sub two").contains(HEAD_NODE));
+        assert!(row_with(&screen, "Sub one").contains(NODE));
+        assert_eq!(view.selected_commit(), Some(bump));
     }
 
     #[test]

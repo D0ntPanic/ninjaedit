@@ -5,10 +5,12 @@
 //! around each change expandable, and the [`tree`] module arranges
 //! those files as a tree of directories. The [`submodules`] module
 //! lists a repository's submodules, each of which has a history of its
-//! own. The [`changes`] module is the working tree: what is changed and
+//! own, and the commits of one that a change to it moved over. The [`changes`] module is the working tree: what is changed and
 //! not yet committed, staged or not, with staging, unstaging, and
 //! committing. The [`fetch`] module brings the remote-tracking
-//! references up to date from the remotes, as `git fetch` does.
+//! references up to date from the remotes, as `git fetch` does, and
+//! those of the submodules that need it, as `git fetch`'s on-demand
+//! recursion does.
 //! Everything goes through libgit2, by way of the `git2` crate; nothing
 //! shells out to git.
 //!
@@ -32,5 +34,8 @@ pub use diff::{
 pub use fetch::{Fetch, FetchReport};
 pub use graph::{GraphCell, GraphRow, NODE, cells_for};
 pub use history::{Branch, Commit, CommitTime, History, Oid, RefKind, RefLabel, Remote, short_id};
-pub use submodules::{Submodule, changed_submodules, has_uncommitted_changes, submodules};
+pub use submodules::{
+    RANGE_LIMIT, Submodule, SubmoduleRange, changed_submodules, has_uncommitted_changes,
+    submodule_range, submodules,
+};
 pub use tree::{Dir, Entry, FileTree, TreeRow};

@@ -1876,8 +1876,10 @@ fn counts_of(file: &FileChange) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commit_row::HEAD_NODE;
     use crossterm::event::{KeyEventKind, KeyEventState};
     use git2::{Repository, Signature};
+    use ninjaedit_core::git::NODE;
     use std::fs;
     use std::time::Duration;
 
@@ -2132,6 +2134,75 @@ mod tests {
         let screen = draw(&mut view, 100, 30);
         assert!(row_with(&screen, CLEAN).len() > width);
         assert_eq!(head_message(&dir), "Change things\n\nA body, with the why.");
+    }
+
+    #[test]
+    fn a_submodule_change_shows_its_commits_as_a_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        configure_user(&repo);
+        commit_files(&repo, &[("a.rs", "fn main() {}\n")], "Base");
+        let mut submodule = repo
+            .submodule("https://example.com/sub.git", Path::new("sub"), true)
+            .unwrap();
+        let sub = submodule.open().unwrap();
+        configure_user(&sub);
+        let s1 = commit_files(&sub, &[("inner.txt", "one\n")], "Inner commit");
+        submodule.add_finalize().unwrap();
+        commit_files(&repo, &[], "Add submodule");
+
+        // A change inside the submodule leaves the parent at the same
+        // commit: nothing to graph, and a note saying where the change
+        // is.
+        fs::write(dir.path().join("sub").join("inner.txt"), "dirty\n").unwrap();
+        let mut view = view(&dir);
+        let screen = draw(&mut view, 100, 30);
+        assert!(
+            row_with(&screen, "M sub").contains("submodule"),
+            "{screen:#?}"
+        );
+        let heading = row_with(&screen, "Submodule sub: ");
+        assert!(
+            heading.contains(&format!("{} → {}", short_id(s1), short_id(s1))),
+            "{heading}"
+        );
+        assert!(row_with(&screen, "Still at this commit").contains("inside the submodule"));
+
+        // Committed inside the submodule, the parent's unstaged change
+        // is the move to the new commit, drawn as HEAD.
+        let s2 = commit_files(&sub, &[("inner.txt", "two\n")], "Inner two");
+        view.refresh();
+        settle(&mut view);
+        let screen = draw(&mut view, 100, 30);
+        let heading = row_with(&screen, "Submodule sub: ");
+        assert!(
+            heading.contains(&format!("{} → {}", short_id(s1), short_id(s2))),
+            "{heading}"
+        );
+        let two = row_with(&screen, "Inner two");
+        assert!(two.contains(HEAD_NODE), "{two}");
+        let one = row_with(&screen, "Inner commit");
+        assert!(one.contains(NODE) && !one.contains(HEAD_NODE), "{one}");
+        assert!(
+            screen.iter().any(|r| r.contains(&short_id(s2))),
+            "{screen:#?}"
+        );
+        assert!(!screen.iter().any(|r| r.contains("Still at this commit")));
+
+        // Staged, the same range shows against HEAD; Down from the
+        // now empty unstaged list goes to it.
+        press(&mut view, KeyCode::Char(' '));
+        settle(&mut view);
+        press(&mut view, KeyCode::Down);
+        let screen = draw(&mut view, 100, 30);
+        assert!(
+            row_with(&screen, "Submodule sub: ").contains(&short_id(s2)),
+            "{screen:#?}"
+        );
+        assert!(
+            row_with(&screen, "Inner two").contains(HEAD_NODE),
+            "{screen:#?}"
+        );
     }
 
     #[test]

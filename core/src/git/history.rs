@@ -359,7 +359,7 @@ impl History {
 /// with their branches, and for every commit the labels to show beside
 /// it.
 #[allow(clippy::type_complexity)]
-fn collect_refs(
+pub(super) fn collect_refs(
     repo: &Repository,
     head_branch: Option<&str>,
 ) -> Result<(Vec<Branch>, Vec<Remote>, HashMap<Oid, Vec<RefLabel>>), git2::Error> {
@@ -485,19 +485,8 @@ fn walk(git_dir: PathBuf, mut labels: HashMap<Oid, Vec<RefLabel>>, sender: Sende
         for id in revwalk {
             let id = id?;
             let commit = repo.find_commit(id)?;
-            let parents: Vec<Oid> = commit.parent_ids().collect();
-            let info = PendingCommit {
-                id,
-                summary: commit
-                    .summary_bytes()
-                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-                    .unwrap_or_default(),
-                author: commit.author().name().unwrap_or("").to_owned(),
-                time: commit.author().when().into(),
-                parents: parents.clone(),
-                refs: labels.remove(&id).unwrap_or_default(),
-            };
-            if let Some(row) = layout.push(id, &parents) {
+            let info = PendingCommit::read(&commit, labels.remove(&id).unwrap_or_default());
+            if let Some(row) = layout.push(id, &info.parents) {
                 let done = pending.take().expect("a row finishes a pushed commit");
                 batch.push(done.finish(row));
             }
@@ -525,17 +514,33 @@ fn walk(git_dir: PathBuf, mut labels: HashMap<Oid, Vec<RefLabel>>, sender: Sende
 }
 
 /// A commit read from the repository, waiting for its graph row.
-struct PendingCommit {
+pub(super) struct PendingCommit {
     id: Oid,
     summary: String,
     author: String,
     time: CommitTime,
-    parents: Vec<Oid>,
+    pub(super) parents: Vec<Oid>,
     refs: Vec<RefLabel>,
 }
 
 impl PendingCommit {
-    fn finish(self, graph: GraphRow) -> Commit {
+    /// Read what the log shows of a commit, with the references that
+    /// label it.
+    pub(super) fn read(commit: &git2::Commit<'_>, refs: Vec<RefLabel>) -> PendingCommit {
+        PendingCommit {
+            id: commit.id(),
+            summary: commit
+                .summary_bytes()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default(),
+            author: commit.author().name().unwrap_or("").to_owned(),
+            time: commit.author().when().into(),
+            parents: commit.parent_ids().collect(),
+            refs,
+        }
+    }
+
+    pub(super) fn finish(self, graph: GraphRow) -> Commit {
         Commit {
             id: self.id,
             summary: self.summary,

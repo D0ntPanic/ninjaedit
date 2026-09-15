@@ -11,6 +11,12 @@
 //! upward, ▼ from the change above it downward, or all of them; the
 //! page hit-tests clicks against the [`Button`]s the render records.
 //!
+//! A submodule's diff has no lines: it is the graph of the submodule's
+//! commits the change moved over, drawn as the log draws its commits
+//! (see the `commit_row` module), the commit the submodule now points
+//! at styled as HEAD is in the log, under a line saying which commit
+//! it moved from and to.
+//!
 //! [`HScroll`] is the sideways scrolling of a pane, with the editor's
 //! rules (see `EditorView`): the limit is set by the longest line
 //! visible now plus a little slack, not by the longest line there is,
@@ -20,9 +26,12 @@
 //! text drawn end to end ([`draw_pieces`]), and the small sums the
 //! pages' layouts are made of.
 
+use crate::commit_row::{CommitLine, commit_extent, draw_commit_line, lane_cap};
 use crate::palette::palette_background;
 use crate::theme::Theme;
-use ninjaedit_core::git::{ChangeKind, DiffRow, FileDiff, LineKind, Unshown};
+use ninjaedit_core::git::{
+    ChangeKind, Commit, DiffRow, FileDiff, LineKind, RANGE_LIMIT, SubmoduleRange, Unshown, short_id,
+};
 use ninjaedit_core::{Token, TokenKind, text};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -175,8 +184,18 @@ pub(crate) fn text_extent(lines: &[Piece], scroll: usize, rows: usize) -> usize 
 }
 
 /// The widest of `rows` rows of a diff from `scroll`; the gap rows
-/// don't scroll and don't count.
+/// don't scroll and don't count. A submodule's rows are its commits'
+/// (see [`render_submodule`]), measured with the graph at full width.
 pub(crate) fn diff_extent(diff: &FileDiff, rows: &[DiffRow], scroll: usize, count: usize) -> usize {
+    if let Some(range) = &diff.submodule {
+        return submodule_rows(range)
+            .iter()
+            .skip(scroll)
+            .take(count)
+            .map(|row| submodule_row_extent(diff, range, row, usize::MAX))
+            .max()
+            .unwrap_or(0);
+    }
     rows.iter()
         .skip(scroll)
         .take(count)
@@ -220,6 +239,9 @@ pub(crate) fn render_diff(
     let background = content_background(theme);
     let dim = background.fg(theme.command_palette_result_context_text);
     let height = area.height as usize;
+    if let Some(range) = &diff.submodule {
+        return render_submodule(diff, range, area, buf, theme, scroll, h);
+    }
     if let Some(unshown) = diff.unshown {
         let message = match unshown {
             Unshown::Binary => "Binary file",
@@ -364,6 +386,164 @@ pub(crate) fn render_diff(
     }
     let bar = if show_bar {
         Rect::new(text_x, area.bottom() - 1, text_width, 1)
+    } else {
+        Rect::default()
+    };
+    h.render(extent, capacity, bar, buf, theme);
+    DiffDrawn {
+        rows: rows.len(),
+        shown,
+        scroll,
+    }
+}
+
+/// One row of a submodule's diff.
+enum SubmoduleRow<'a> {
+    /// The line saying from which commit to which.
+    Heading,
+    Note(String),
+    Commit(&'a Commit, CommitLine),
+}
+
+/// The rows of a submodule's diff: the heading, a note when there are
+/// no commits to show, and two rows a commit.
+fn submodule_rows(range: &SubmoduleRange) -> Vec<SubmoduleRow<'_>> {
+    let mut rows = vec![SubmoduleRow::Heading];
+    if let Some(error) = &range.error {
+        rows.push(SubmoduleRow::Note(error.clone()));
+    } else if range.commits.is_empty() && range.old.is_some() && range.old == range.new {
+        rows.push(SubmoduleRow::Note(
+            "Still at this commit: the changes are inside the submodule, on its tab".to_owned(),
+        ));
+    }
+    for commit in &range.commits {
+        rows.push(SubmoduleRow::Commit(commit, CommitLine::Node));
+        rows.push(SubmoduleRow::Commit(commit, CommitLine::Transition));
+    }
+    if range.truncated {
+        rows.push(SubmoduleRow::Note(format!(
+            "⋯ only the newest {RANGE_LIMIT} commits are shown"
+        )));
+    }
+    rows
+}
+
+/// The heading of a submodule's diff: which commit it moved from and
+/// to. Styled as `(dim, hash)` when given, plain for measuring.
+fn submodule_heading(
+    diff: &FileDiff,
+    range: &SubmoduleRange,
+    styles: Option<(Style, Style)>,
+) -> Vec<Piece> {
+    let (dim, hash) = styles.unwrap_or_default();
+    let mut pieces = vec![(format!("Submodule {}: ", diff.path), dim)];
+    match (range.old, range.new) {
+        (Some(old), Some(new)) => {
+            pieces.push((short_id(old), hash));
+            pieces.push((" → ".to_owned(), dim));
+            pieces.push((short_id(new), hash));
+        }
+        (None, Some(new)) => {
+            pieces.push(("added at ".to_owned(), dim));
+            pieces.push((short_id(new), hash));
+        }
+        (Some(old), None) => {
+            pieces.push(("removed at ".to_owned(), dim));
+            pieces.push((short_id(old), hash));
+        }
+        (None, None) => pieces.push(("the commit it points at changed".to_owned(), dim)),
+    }
+    pieces
+}
+
+/// The columns a row of a submodule's diff reaches, its graph drawn
+/// at most `max_lanes` wide.
+fn submodule_row_extent(
+    diff: &FileDiff,
+    range: &SubmoduleRange,
+    row: &SubmoduleRow<'_>,
+    max_lanes: usize,
+) -> usize {
+    match row {
+        SubmoduleRow::Heading => pieces_width(&submodule_heading(diff, range, None)),
+        SubmoduleRow::Note(note) => display_width(note),
+        SubmoduleRow::Commit(commit, _) => commit_extent(
+            commit,
+            range.new == Some(commit.id),
+            commit.graph.width().clamp(1, max_lanes),
+        ),
+    }
+}
+
+/// Draw a submodule's diff: the commits it moved over, as a graph like
+/// the log's with the commit it now points at styled as HEAD, under a
+/// line saying from which commit to which. The graph gets at most a
+/// share of the width, as in the log, and stays put while the text
+/// scrolls sideways.
+fn render_submodule(
+    diff: &FileDiff,
+    range: &SubmoduleRange,
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+    scroll: usize,
+    h: &mut HScroll,
+) -> DiffDrawn {
+    let background = content_background(theme);
+    let dim = background.fg(theme.command_palette_result_context_text);
+    let hash = background.fg(theme.git_hash_text);
+    let height = area.height as usize;
+    let rows = submodule_rows(range);
+    let max_lanes = lane_cap(area.width - 1);
+    // The sideways scrollbar takes the last row; see `render_diff`.
+    let capacity = area.width as usize - 1;
+    let mut show_bar = false;
+    let mut shown;
+    let mut scroll = scroll;
+    let mut extent;
+    loop {
+        shown = height - usize::from(show_bar);
+        scroll = scroll.min(rows.len().saturating_sub(shown));
+        extent = rows
+            .iter()
+            .skip(scroll)
+            .take(shown)
+            .map(|row| submodule_row_extent(diff, range, row, max_lanes))
+            .max()
+            .unwrap_or(0);
+        let needed = h.needs_bar(extent, capacity) && height > 1;
+        if needed && !show_bar {
+            show_bar = true;
+            continue;
+        }
+        break;
+    }
+    for (index, row) in rows.iter().skip(scroll).take(shown).enumerate() {
+        let row_area = Rect::new(area.x + 1, area.y + index as u16, area.width - 1, 1);
+        match row {
+            SubmoduleRow::Heading => {
+                let pieces = submodule_heading(diff, range, Some((dim, hash)));
+                draw_pieces(buf, row_area.x, row_area.y, capacity, &pieces, h.col);
+            }
+            SubmoduleRow::Note(note) => {
+                let pieces = [(note.clone(), dim)];
+                draw_pieces(buf, row_area.x, row_area.y, capacity, &pieces, h.col);
+            }
+            SubmoduleRow::Commit(commit, line) => draw_commit_line(
+                buf,
+                row_area,
+                commit,
+                *line,
+                range.new == Some(commit.id),
+                commit.graph.width().clamp(1, max_lanes),
+                background,
+                theme,
+                h.col,
+            ),
+        }
+    }
+    let bar = if show_bar {
+        Rect::new(area.x + 1, area.bottom() - 1, area.width - 1, 1)
     } else {
         Rect::default()
     };

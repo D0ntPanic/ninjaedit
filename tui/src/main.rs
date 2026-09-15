@@ -11,6 +11,7 @@ mod changes_view;
 mod clicks;
 mod clipboard;
 mod command;
+mod commit_row;
 mod diff_pane;
 mod editor_view;
 mod fields;

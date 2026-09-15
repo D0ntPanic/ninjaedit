@@ -15,11 +15,14 @@
 //!
 //! A [`FileDiff`] is built from a libgit2 patch and the [`Contents`] of
 //! each side, wherever they come from: a commit's blobs, the index's, or
-//! a file in the working directory.
+//! a file in the working directory. A submodule has no lines: its diff
+//! carries the submodule's commits the change moved over instead (see
+//! the [`submodules`](super::submodules) module).
 //!
 //! [`syntax`]: crate::syntax
 
 use super::history::CommitTime;
+use super::submodules::{SubmoduleRange, submodule_range};
 use crate::syntax::{Language, Token, lex_text};
 use git2::{Delta, DiffFindOptions, DiffLineType, DiffOptions, FileMode, Oid, Patch, Repository};
 use std::path::Path;
@@ -155,6 +158,32 @@ pub(super) fn file_change(
 /// Whether either side of a delta is a submodule's commit.
 fn is_submodule(delta: &git2::DiffDelta<'_>) -> bool {
     delta.old_file().mode() == FileMode::Commit || delta.new_file().mode() == FileMode::Commit
+}
+
+/// The commit a side of a delta points at, when the side is a
+/// submodule: none when it isn't there, or is a file.
+pub(super) fn gitlink(file: git2::DiffFile<'_>) -> Option<Oid> {
+    (file.exists() && file.mode() == FileMode::Commit).then(|| file.id())
+}
+
+/// The diff of a submodule, whose "lines" are the commits it moved
+/// over, from the two sides of its delta.
+pub(super) fn submodule_diff(
+    repo: &Repository,
+    kind: ChangeKind,
+    path: &str,
+    old_path: Option<&str>,
+    delta: &git2::DiffDelta<'_>,
+) -> FileDiff {
+    let range = submodule_range(
+        repo,
+        path,
+        gitlink(delta.old_file()),
+        gitlink(delta.new_file()),
+    );
+    let mut diff = FileDiff::unshown(kind, path, old_path, Unshown::Submodule);
+    diff.submodule = Some(range);
+    diff
 }
 
 /// Where the delta for `path` is in a diff limited to it: the pathspec
@@ -379,6 +408,9 @@ pub struct FileDiff {
     pub old_path: Option<String>,
     /// Set when the lines can't be shown.
     pub unshown: Option<Unshown>,
+    /// For a submodule, the commits the change moved it over, which
+    /// are shown in place of lines.
+    pub submodule: Option<SubmoduleRange>,
     language: Language,
     old_lines: Vec<String>,
     new_lines: Vec<String>,
@@ -406,7 +438,7 @@ pub fn file_diff(
     let delta = diff.get_delta(index).expect("found above");
     let kind = ChangeKind::from_delta(delta.status());
     if is_submodule(&delta) {
-        return Ok(FileDiff::unshown(kind, path, old_path, Unshown::Submodule));
+        return Ok(submodule_diff(repo, kind, path, old_path, &delta));
     }
     let old = blob_contents(repo, delta.old_file())?;
     let new = blob_contents(repo, delta.new_file())?;
@@ -427,6 +459,7 @@ impl FileDiff {
             path: path.to_owned(),
             old_path: old_path.map(str::to_owned),
             unshown: Some(why),
+            submodule: None,
             language: Language::from_path(Path::new(path)).unwrap_or(Language::Plain),
             old_lines: Vec::new(),
             new_lines: Vec::new(),
@@ -460,6 +493,7 @@ impl FileDiff {
             path: path.to_owned(),
             old_path: old_path.map(str::to_owned),
             unshown,
+            submodule: None,
             language,
             old_lines: Vec::new(),
             new_lines: Vec::new(),

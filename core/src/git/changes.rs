@@ -350,14 +350,6 @@ impl Changes {
     /// against the index (or nothing, for an untracked file). A
     /// conflicted file is shown against our side of the merge.
     pub fn unstaged_diff(&self, change: &FileChange) -> Result<FileDiff, git2::Error> {
-        if change.submodule {
-            return Ok(FileDiff::unshown(
-                change.kind,
-                &change.path,
-                None,
-                Unshown::Submodule,
-            ));
-        }
         if change.kind == ChangeKind::Conflicted {
             return self.conflict_diff(change);
         }
@@ -366,6 +358,17 @@ impl Changes {
         let diff = self.repo.diff_index_to_workdir(None, Some(&mut options))?;
         let index = diff::delta_at(&diff, &change.path)?;
         let delta = diff.get_delta(index).expect("found above");
+        if change.submodule {
+            // The index's commit against the submodule's HEAD, which
+            // libgit2 puts on the working directory's side.
+            return Ok(diff::submodule_diff(
+                &self.repo,
+                change.kind,
+                &change.path,
+                None,
+                &delta,
+            ));
+        }
         let old = diff::blob_contents(&self.repo, delta.old_file())?;
         let new = diff::workdir_contents(&self.workdir.join(&change.path));
         let patch = Patch::from_diff(&diff, index)?;
@@ -386,14 +389,6 @@ impl Changes {
     /// The diff of a staged change: the index against HEAD (or HEAD's
     /// parent, when amending).
     pub fn staged_diff(&self, change: &FileChange) -> Result<FileDiff, git2::Error> {
-        if change.submodule {
-            return Ok(FileDiff::unshown(
-                change.kind,
-                &change.path,
-                change.old_path.as_deref(),
-                Unshown::Submodule,
-            ));
-        }
         let base_tree = self.base_commit().and_then(|commit| commit.tree().ok());
         let mut options = DiffOptions::new();
         options
@@ -409,6 +404,15 @@ impl Changes {
         find_renames(&mut diff)?;
         let index = diff::delta_at(&diff, &change.path)?;
         let delta = diff.get_delta(index).expect("found above");
+        if change.submodule {
+            return Ok(diff::submodule_diff(
+                &self.repo,
+                change.kind,
+                &change.path,
+                change.old_path.as_deref(),
+                &delta,
+            ));
+        }
         let old = diff::blob_contents(&self.repo, delta.old_file())?;
         let new = diff::blob_contents(&self.repo, delta.new_file())?;
         let patch = Patch::from_diff(&diff, index)?;
@@ -973,6 +977,15 @@ mod tests {
         assert!(changes.unstaged()[0].submodule);
         let diff = changes.unstaged_diff(&changes.unstaged()[0]).unwrap();
         assert_eq!(diff.unshown, Some(Unshown::Submodule));
+        // Still at the same commit: the change is inside the submodule,
+        // so there are no commits to list.
+        let first_inner = sub.head().unwrap().target().unwrap();
+        let range = diff.submodule.as_ref().unwrap();
+        assert_eq!(
+            (range.old, range.new),
+            (Some(first_inner), Some(first_inner))
+        );
+        assert!(range.commits.is_empty());
 
         // Commit inside the submodule, from its own page.
         let mut inner = Changes::open_repository(sub.workdir().unwrap()).unwrap();
@@ -996,12 +1009,28 @@ mod tests {
         settle(&mut changes);
         assert!(changes.changed_submodules().is_empty());
         assert_eq!(listed(changes.unstaged()), [('M', "libs/sub", 0, 0)]);
+        // Unstaged: the index's commit to the submodule's HEAD.
+        let diff = changes.unstaged_diff(&changes.unstaged()[0]).unwrap();
+        let range = diff.submodule.as_ref().unwrap();
+        assert_eq!(
+            (range.old, range.new),
+            (Some(first_inner), Some(inner_commit))
+        );
+        let names: Vec<&str> = range.commits.iter().map(|c| c.summary.as_str()).collect();
+        assert_eq!(names, ["Inner change", "Inner commit"]);
         changes.stage(["libs/sub"]).unwrap();
         settle(&mut changes);
         assert_eq!(listed(changes.staged()), [('M', "libs/sub", 0, 0)]);
         assert!(changes.unstaged().is_empty());
+        // Staged: HEAD's commit to the index's.
         let diff = changes.staged_diff(&changes.staged()[0]).unwrap();
         assert_eq!(diff.unshown, Some(Unshown::Submodule));
+        let range = diff.submodule.as_ref().unwrap();
+        assert_eq!(
+            (range.old, range.new),
+            (Some(first_inner), Some(inner_commit))
+        );
+        assert_eq!(range.commits.len(), 2);
         let id = changes.commit("Update submodule").unwrap();
         settle(&mut changes);
         assert!(changes.is_clean());
