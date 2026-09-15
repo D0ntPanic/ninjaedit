@@ -1255,7 +1255,8 @@ impl GitLogView {
 
     /// The columns the log's visible commits reach, from the first
     /// column after its left edge to the end of the longest of their
-    /// lines: `rows` rows from `scroll`, two a commit.
+    /// lines: `rows` rows from `scroll`, two a commit, an odd last row
+    /// showing the first line of one more.
     fn log_extent(&self, scroll: usize, rows: usize) -> usize {
         let Some(history) = &self.history else {
             return 0;
@@ -1266,7 +1267,7 @@ impl GitLogView {
             .commits()
             .iter()
             .skip(scroll)
-            .take(rows / 2)
+            .take(rows.div_ceil(2))
             .map(|commit| {
                 let lanes = commit.graph.width().clamp(1, cap);
                 commit_extent(commit, head == Some(commit.id), lanes)
@@ -1928,17 +1929,21 @@ impl GitLogView {
             buf.set_stringn(area.x + 1, area.y, message, area.width as usize, dim);
             return;
         }
-        // Two rows a commit; an odd last row stays blank. The sideways
-        // scrollbar, when needed, takes the last row, which can change
-        // which commits are visible and so whether it is needed: lay
-        // out again with the row taken, and settle there.
+        // Two rows a commit. An odd last row shows the first line of
+        // the next commit, as a scroll area would, but only whole
+        // commits count for scrolling: at the end of the log the last
+        // commit is shown whole and the odd row stays blank. The
+        // sideways scrollbar, when needed, takes the last row, which
+        // can change which commits are visible and so whether it is
+        // needed: lay out again with the row taken, and settle there.
         let full_height = area.height as usize;
         let capacity = area.width as usize - 1;
         let mut show_bar = false;
+        let mut rows;
         let mut visible;
         let mut extent;
         loop {
-            let rows = full_height - usize::from(show_bar);
+            rows = full_height - usize::from(show_bar);
             visible = (rows / 2).max(1);
             self.log_scroll = self.log_scroll.min(commits.len().saturating_sub(visible));
             if self.reveal_log {
@@ -1948,7 +1953,7 @@ impl GitLogView {
                     self.log_scroll = self.selected + 1 - visible;
                 }
             }
-            extent = self.log_extent(self.log_scroll, visible * 2);
+            extent = self.log_extent(self.log_scroll, rows);
             let needed = self.log_h.needs_bar(extent, capacity) && full_height > 2;
             if needed && !show_bar {
                 show_bar = true;
@@ -1957,7 +1962,7 @@ impl GitLogView {
             break;
         }
         self.reveal_log = false;
-        self.log_rows = visible * 2;
+        self.log_rows = rows;
         let scroll_col = self.log_h.col;
         let bar = if show_bar {
             Rect::new(area.x + 1, area.bottom() - 1, area.width - 1, 1)
@@ -1981,18 +1986,21 @@ impl GitLogView {
             .iter()
             .enumerate()
             .skip(self.log_scroll)
-            .take(visible)
+            .take(rows.div_ceil(2))
         {
             let row = index - self.log_scroll;
             let y0 = area.y + (row * 2) as u16;
-            let y1 = y0 + 1;
-            if y1 >= area.bottom() {
+            // The commit past the last whole one shows only its first
+            // line, and no line goes under the scrollbar.
+            let bottom = area.bottom() - u16::from(show_bar);
+            if y0 >= bottom {
                 break;
             }
+            let height = 2.min(bottom - y0);
             let is_head = head == Some(commit.id);
             let is_selected = index == self.selected;
             let row_style = if is_selected {
-                buf.set_style(Rect::new(area.x, y0, area.width, 2), selected_style);
+                buf.set_style(Rect::new(area.x, y0, area.width, height), selected_style);
                 selected_style
             } else {
                 background
@@ -2002,7 +2010,8 @@ impl GitLogView {
             // two: the author, the id, and the time. Both scroll
             // sideways together, the graph staying put.
             let lanes = commit.graph.width().clamp(1, max_lanes);
-            for (y, line) in [(y0, CommitLine::Node), (y1, CommitLine::Transition)] {
+            let lines = [CommitLine::Node, CommitLine::Transition];
+            for (y, line) in (y0..y0 + height).zip(lines) {
                 let row = Rect::new(area.x + 1, y, area.width - 1, 1);
                 draw_commit_line(
                     buf, row, commit, line, is_head, lanes, row_style, theme, scroll_col,
@@ -2909,6 +2918,48 @@ mod tests {
         let a = commit(&[("l.rs", &format!("{long_line}\n"))], &message, &[]);
         commit(&[("s.rs", "fn s() {}\n")], "Short", &[a]);
         (dir, message)
+    }
+
+    #[test]
+    fn an_odd_last_row_of_the_log_shows_the_next_commits_first_line() {
+        // Five rows: two whole commits and the first line of a third,
+        // as a scroll area would show it, rather than a blank row.
+        let (dir, _) = repo_with_history();
+        let mut view = view(&dir);
+        view.log_share = Some(share_for(5, 40));
+        let screen = draw(&mut view, 100, 40);
+        assert_eq!(view.log_area.height, 5, "{screen:#?}");
+        assert!(screen[0].contains("Merge side into main"), "{screen:#?}");
+        assert!(screen[1].contains("Ann Author"), "{screen:#?}");
+        assert!(screen[2].contains("On "), "{screen:#?}");
+        assert!(screen[3].contains("Ann Author"), "{screen:#?}");
+        assert!(screen[4].contains("On "), "{screen:#?}");
+        assert!(!screen[4].contains("Ann Author"), "{screen:#?}");
+        // The rule below the log is untouched.
+        assert!(
+            screen[5].starts_with("─") || screen[5].contains("├"),
+            "{screen:#?}"
+        );
+        // Scrolling to the end shows the last commit whole, the odd
+        // row blank below it, since only whole commits scroll.
+        view.handle_key(key(KeyCode::End));
+        let screen = draw(&mut view, 100, 40);
+        assert_eq!(view.log_scroll, 2, "{screen:#?}");
+        assert!(screen[2].contains("Base commit"), "{screen:#?}");
+        assert!(screen[3].contains("Ann Author"), "{screen:#?}");
+        let log_x = view.log_area.x as usize;
+        let odd_row: String = screen[4].chars().skip(log_x).collect();
+        assert_eq!(odd_row.trim(), "", "{screen:#?}");
+        // The partly shown commit can be clicked, which reveals it whole.
+        view.handle_key(key(KeyCode::Home));
+        draw(&mut view, 100, 40);
+        let log = view.log_area;
+        click(&mut view, log.x + 5, log.y + 4);
+        let screen = draw(&mut view, 100, 40);
+        assert_eq!(view.selected, 2, "{screen:#?}");
+        assert_eq!(view.log_scroll, 1, "{screen:#?}");
+        assert!(screen[2].contains("On "), "{screen:#?}");
+        assert!(screen[4].contains("Base commit"), "{screen:#?}");
     }
 
     #[test]
