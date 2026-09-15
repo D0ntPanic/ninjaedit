@@ -3527,6 +3527,8 @@ mod tests {
         );
         press(&mut app, KeyCode::Char('a'));
         settle(&mut app);
+        // Tab round the staged list and the diff to the commit box.
+        press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
         type_str(&mut app, "Inner change");

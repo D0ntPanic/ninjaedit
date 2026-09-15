@@ -12,21 +12,26 @@
 //! as the git log lists a commit's files (see the core crate's
 //! `git::tree` module), each file with the letter `git status` gives
 //! its change and how many lines it gained and lost, and each directory
-//! with the sums. Under them is the commit box: a line saying where the
-//! commit goes (`Commit to main`, `Merge into main`, `Amend on main`,
-//! or the conflicts that stand in the way) with the amend toggle at
-//! its right, and
-//! the message in an editor of its own, with every line and key the
-//! file editor has, since a message is a summary line and then as much
-//! as the change needs explaining. The rest of the page is the diff of
-//! the selected file, drawn as on the git log page (see the `diff_pane`
-//! module): an unstaged file against the index, a staged one against
-//! HEAD, and a conflicted one against our side of the merge, so the
-//! conflict markers and the other side's lines show as additions. A
-//! selected directory shows what is under it, with the counts.
+//! with the sums. The rest of the page is the diff of the selected
+//! file, drawn as on the git log page (see the `diff_pane` module): an
+//! unstaged file against the index, a staged one against HEAD, and a
+//! conflicted one against our side of the merge, so the conflict
+//! markers and the other side's lines show as additions. A selected
+//! directory shows what is under it, with the counts. Under the diff
+//! is the commit box: a line saying where the commit goes (`Commit to
+//! main`, `Merge into main`, `Amend on main`, or the conflicts that
+//! stand in the way) with the amend toggle at its right, and the
+//! message in an editor of its own, with every line and key the file
+//! editor has, since a message is a summary line and then as much as
+//! the change needs explaining. The box sits under the diff rather
+//! than under the lists so that it is as wide as the code being
+//! reviewed: the lists are kept narrow to leave the diff room, and a
+//! message's lines want the room too. On a page too narrow for a diff
+//! the box goes under the lists.
 //!
 //! The keyboard is in one pane at a time; Tab and Shift+Tab move it
-//! round, and clicking a pane moves it there. In a list ↑ and ↓ move
+//! round (the lists, the diff, the commit box), and clicking a pane
+//! moves it there. In a list ↑ and ↓ move
 //! between rows, running on from the end of the unstaged list into
 //! the staged one and from there into the commit box; ← and → fold and
 //! unfold a directory (← on a file goes to its directory); Space
@@ -52,10 +57,10 @@
 //! the commit is made.
 //!
 //! The rules between the panes drag to resize them: the file lists'
-//! right edge, the rule between the two lists, and the rule above the
-//! commit box. The sizes are kept per repository in the project's
-//! storage (see the `git_layout` module) once a drag ends. The diff is
-//! the larger side to start with.
+//! right edge, the rule between the two lists, and the rule between
+//! the diff and the commit box. The sizes are kept per repository in
+//! the project's storage (see the `git_layout` module) once a drag
+//! ends. The diff is the larger side to start with.
 //!
 //! The working tree is scanned when the page opens and again after
 //! every stage, unstage, and commit; the scan runs on a worker thread
@@ -101,6 +106,8 @@ const MAX_FILES_WIDTH: u16 = 60;
 const MIN_CONTENT_WIDTH: u16 = 16;
 /// The least a list keeps: its heading and one row.
 const MIN_LIST_HEIGHT: u16 = 2;
+/// The least the diff keeps above the commit box.
+const MIN_CONTENT_HEIGHT: u16 = 5;
 /// The commit box's height: the rule above it, its heading, and the
 /// message's rows, at least one; and how many rows it starts with.
 const MIN_COMMIT_HEIGHT: u16 = 3;
@@ -131,21 +138,23 @@ enum Pane {
 }
 
 impl Pane {
+    /// The pane after this one: down the lists, then the diff, then
+    /// the commit box under it.
     fn next(self) -> Pane {
         match self {
             Pane::Unstaged => Pane::Staged,
-            Pane::Staged => Pane::Commit,
-            Pane::Commit => Pane::Content,
-            Pane::Content => Pane::Unstaged,
+            Pane::Staged => Pane::Content,
+            Pane::Content => Pane::Commit,
+            Pane::Commit => Pane::Unstaged,
         }
     }
 
     fn previous(self) -> Pane {
         match self {
-            Pane::Unstaged => Pane::Content,
+            Pane::Unstaged => Pane::Commit,
             Pane::Staged => Pane::Unstaged,
-            Pane::Commit => Pane::Staged,
-            Pane::Content => Pane::Commit,
+            Pane::Content => Pane::Staged,
+            Pane::Commit => Pane::Content,
         }
     }
 }
@@ -173,7 +182,7 @@ enum Divider {
     Files,
     /// Between the unstaged and the staged list.
     Lists,
-    /// Above the commit box.
+    /// Between the diff and the commit box.
     Commit,
 }
 
@@ -1268,18 +1277,31 @@ impl ChangesView {
     }
 
     /// The commit box's height (its rule included) for the page's
-    /// height: its share, within what leaves the lists their minimum;
-    /// none on a page too short for all three.
+    /// height: its share, within what leaves what is above it (the
+    /// diff, or on a narrow page the lists) its minimum; none on a
+    /// page too short for both.
     fn commit_height_for(&self, height: u16) -> u16 {
         let lists_min = MIN_LIST_HEIGHT + 1 + MIN_LIST_HEIGHT;
-        if height < lists_min + MIN_COMMIT_HEIGHT {
+        let above_min = MIN_CONTENT_HEIGHT.max(lists_min);
+        if height < above_min + MIN_COMMIT_HEIGHT {
             return 0;
         }
         let wanted = match self.commit_share {
             Some(share) => share_of(height, share),
             None => DEFAULT_COMMIT_HEIGHT,
         };
-        clamp_between(wanted, MIN_COMMIT_HEIGHT, height - lists_min)
+        clamp_between(wanted, MIN_COMMIT_HEIGHT, height - above_min)
+    }
+
+    /// The file lists' height for the page's size: the whole height,
+    /// unless the page is too narrow for a diff, in which case the
+    /// commit box is under the lists and takes its share of it.
+    fn lists_height_for(&self, width: u16, height: u16) -> u16 {
+        if self.files_width_for(width) < width {
+            height
+        } else {
+            height - self.commit_height_for(height)
+        }
     }
 
     /// The unstaged list's height for the lists' height: its share,
@@ -1308,7 +1330,9 @@ impl ChangesView {
                 self.files_share = Some(share_for(settled, width));
             }
             Divider::Lists => {
-                let height = (self.area.height - self.commit_height_for(self.area.height)).max(1);
+                let height = self
+                    .lists_height_for(self.area.width, self.area.height)
+                    .max(1);
                 self.unstaged_share = Some(share_for(y.saturating_sub(self.area.y), height));
                 let settled = self.unstaged_height_for(height);
                 self.unstaged_share = Some(share_for(settled, height));
@@ -1512,45 +1536,60 @@ impl ChangesView {
         }
         self.ensure_content();
 
-        // The lists and the commit box down the left, the diff on the
-        // right; rules between them.
+        // The lists down the left, the diff and the commit box under
+        // it down the right; rules between them. A page too narrow for
+        // a diff is all lists, with the commit box under them.
         let rule = background.fg(theme.gutter_guide);
         let files_width = self.files_width_for(area.width);
-        if files_width < area.width {
+        let has_content = files_width < area.width;
+        let commit_height = self.commit_height_for(area.height);
+        let lists_height = self.lists_height_for(area.width, area.height);
+        let (commit_x, commit_width) = if has_content {
+            let x = area.x + files_width + 1;
+            (x, area.right() - x)
+        } else {
+            (area.x, files_width)
+        };
+        if has_content {
             let x = area.x + files_width;
             self.files_rule = Rect::new(x, area.y, 1, area.height);
             for y in area.y..area.bottom() {
                 buf[(x, y)].set_symbol("│").set_style(rule);
             }
-            let content_x = x + 1;
-            self.content_area = Rect::new(content_x, area.y, area.right() - content_x, area.height);
+            self.content_area =
+                Rect::new(commit_x, area.y, commit_width, area.height - commit_height);
         }
-        let horizontal_rule = |buf: &mut Buffer, y: u16| {
-            for x in area.x..area.x + files_width {
+        // A horizontal rule across a column, joined to the vertical
+        // rule beside it (crossing it when a rule from the other side
+        // meets it on the same row).
+        let horizontal_rule = |buf: &mut Buffer, y: u16, x: u16, width: u16, junction: &str| {
+            for x in x..x + width {
                 buf[(x, y)].set_symbol("─").set_style(rule);
             }
-            if files_width < area.width {
-                buf[(area.x + files_width, y)]
-                    .set_symbol("┤")
-                    .set_style(rule);
+            if has_content {
+                let cell = &mut buf[(area.x + files_width, y)];
+                let symbol = if cell.symbol() == "│" {
+                    junction
+                } else {
+                    "┼"
+                };
+                cell.set_symbol(symbol).set_style(rule);
             }
         };
-        let commit_height = self.commit_height_for(area.height);
-        let lists_height = area.height - commit_height;
         let unstaged_height = self.unstaged_height_for(lists_height);
         self.unstaged_area = Rect::new(area.x, area.y, files_width, unstaged_height);
         if unstaged_height < lists_height {
             let y = area.y + unstaged_height;
             self.lists_rule = Rect::new(area.x, y, files_width, 1);
-            horizontal_rule(buf, y);
+            horizontal_rule(buf, y, area.x, files_width, "┤");
             self.staged_area =
                 Rect::new(area.x, y + 1, files_width, area.y + lists_height - (y + 1));
         }
         if commit_height > 0 {
-            let y = area.y + lists_height;
-            self.commit_rule = Rect::new(area.x, y, files_width, 1);
-            horizontal_rule(buf, y);
-            self.commit_area = Rect::new(area.x, y + 1, files_width, commit_height - 1);
+            let y = area.bottom() - commit_height;
+            self.commit_rule = Rect::new(commit_x, y, commit_width, 1);
+            horizontal_rule(buf, y, commit_x, commit_width, "├");
+            self.commit_area = Rect::new(commit_x, y + 1, commit_width, commit_height - 1);
         }
 
         self.render_list(List::Unstaged, buf, theme);
@@ -1873,8 +1912,7 @@ impl ChangesView {
 }
 
 /// An editor for the commit message, holding `text`: the file editor
-/// without its gutter, since line numbers mean nothing in a message
-/// and the box is narrow.
+/// without its gutter, since line numbers mean nothing in a message.
 fn message_editor(text: &str) -> EditorView {
     let mut view = EditorView::new(Editor::new(FileBuffer::from_text(text)));
     view.set_gutter(false);
@@ -2045,6 +2083,15 @@ mod tests {
             .collect()
     }
 
+    /// The right column of the screen, past the rule at `x`, trimmed.
+    fn right_column(screen: &[String], x: usize) -> Vec<String> {
+        screen
+            .iter()
+            .map(|row| row.chars().skip(x + 1).collect::<String>())
+            .map(|row| row.trim_end().to_owned())
+            .collect()
+    }
+
     fn head_message(dir: &tempfile::TempDir) -> String {
         let repo = Repository::open(dir.path()).unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
@@ -2065,16 +2112,28 @@ mod tests {
         assert!(left[3].starts_with(" ? c.txt"), "{left:#?}");
         let staged = left.iter().position(|r| r == " Staged changes").unwrap();
         assert_eq!(left[staged + 1].trim(), "none");
-        let heading = left
+        // The commit box is under the diff, as wide as it, so that a
+        // message has the room the code does; its heading has the
+        // amend toggle at the right.
+        let right = right_column(&screen, width);
+        let heading = right
             .iter()
             .position(|r| r.starts_with(" Commit to "))
-            .unwrap_or_else(|| panic!("{left:#?}"));
-        assert!(left[heading].ends_with(AMEND_OFF), "{left:#?}");
+            .unwrap_or_else(|| panic!("{right:#?}"));
+        assert!(right[heading].ends_with(AMEND_OFF), "{right:#?}");
+        assert!(right[heading - 1].starts_with('─'), "{right:#?}");
+        assert!(
+            !left.iter().any(|r| r.starts_with(" Commit to ")),
+            "{left:#?}"
+        );
+        assert_eq!(view.commit_area.x, view.content_area.x);
+        assert_eq!(view.commit_area.width, view.content_area.width);
+        assert_eq!(view.commit_area.bottom(), 30);
         // The message editor under it, with no gutter: no line number,
         // only its scrollbar at the right edge.
         assert!(
-            left[heading + 1].trim_end_matches('█').trim().is_empty(),
-            "{left:#?}"
+            right[heading + 1].trim_end_matches('█').trim().is_empty(),
+            "{right:#?}"
         );
         // The diff on the right is the larger side, and follows the
         // selection: a.rs's unstaged change against the index.
@@ -2394,10 +2453,12 @@ mod tests {
         let width = view.files_rule.x as usize;
         let left = left_column(&screen, width);
         assert!(left.iter().any(|r| r.starts_with(" M b.txt")), "{left:#?}");
+        let right = right_column(&screen, width);
         assert!(
-            left.iter()
+            right
+                .iter()
                 .any(|r| r.starts_with(" Commit to ") && r.ends_with(AMEND_OFF)),
-            "{left:#?}"
+            "{right:#?}"
         );
         // `m` turns amending on: the last commit's files are staged
         // against its parent, the heading says so, and its message is
@@ -2409,10 +2470,12 @@ mod tests {
         settle(&mut view);
         let screen = draw(&mut view, 100, 30);
         let left = left_column(&screen, width);
+        let right = right_column(&screen, width);
         assert!(
-            left.iter()
+            right
+                .iter()
                 .any(|r| r.starts_with(" Amend on ") && r.ends_with(AMEND_ON)),
-            "{left:#?}"
+            "{right:#?}"
         );
         let staged = left
             .iter()
@@ -2439,6 +2502,9 @@ mod tests {
         settle(&mut view);
         assert_eq!(view.files(List::Staged).len(), 2);
         assert_eq!(view.files(List::Unstaged)[0].kind, ChangeKind::Untracked);
+        // Tab goes round the diff to the commit box.
+        press(&mut view, KeyCode::Tab);
+        assert_eq!(view.pane, Pane::Content);
         press(&mut view, KeyCode::Tab);
         assert_eq!(view.pane, Pane::Commit);
         press(&mut view, KeyCode::End);
@@ -2465,11 +2531,12 @@ mod tests {
         );
         // Amending is off again, and the box is empty.
         assert_eq!(view.message_text(), "");
-        let left = left_column(&draw(&mut view, 100, 30), width);
+        let right = right_column(&draw(&mut view, 100, 30), width);
         assert!(
-            left.iter()
+            right
+                .iter()
                 .any(|r| r.starts_with(" Commit to ") && r.ends_with(AMEND_OFF)),
-            "{left:#?}"
+            "{right:#?}"
         );
         // Clicking the toggle turns it on; a message the user has typed
         // is left alone by the toggle, and off again drops the offered
@@ -2487,7 +2554,6 @@ mod tests {
         assert_eq!(view.message_text(), "Mine");
         ctrl(&mut view, 'a');
         press(&mut view, KeyCode::Backspace);
-        press(&mut view, KeyCode::Tab);
         press(&mut view, KeyCode::Tab);
         assert_eq!(view.pane, Pane::Unstaged);
         press(&mut view, KeyCode::Char('m'));
@@ -2529,9 +2595,10 @@ mod tests {
         let left = left_column(&screen, width);
         assert!(left[1].starts_with(" U f.txt"), "{left:#?}");
         assert!(left[1].ends_with("conflict"), "{left:#?}");
+        let right = right_column(&screen, width);
         assert!(
-            left.iter().any(|r| r.starts_with(" Resolve 1 conflict")),
-            "{left:#?}"
+            right.iter().any(|r| r.starts_with(" Resolve 1 conflict")),
+            "{right:#?}"
         );
         // The merge's whole message is put in the box; the diff shows
         // the markers against our side.
@@ -2569,9 +2636,10 @@ mod tests {
         let screen = draw(&mut view, 100, 30);
         let left = left_column(&screen, width);
         assert!(left.iter().any(|r| r.starts_with(" M f.txt")), "{left:#?}");
+        let right = right_column(&screen, width);
         assert!(
-            left.iter().any(|r| r.starts_with(" Merge into ")),
-            "{left:#?}"
+            right.iter().any(|r| r.starts_with(" Merge into ")),
+            "{right:#?}"
         );
         let outcome = ctrl(&mut view, 's');
         assert!(
@@ -2583,10 +2651,10 @@ mod tests {
         assert_eq!(head.parent_count(), 2);
         assert_eq!(head.message().unwrap(), "Merge branch 'side'\n\nDetails.");
         assert_eq!(repo.state(), git2::RepositoryState::Clean);
-        let left = left_column(&draw(&mut view, 100, 30), width);
+        let right = right_column(&draw(&mut view, 100, 30), width);
         assert!(
-            left.iter().any(|r| r.starts_with(" Commit to ")),
-            "{left:#?}"
+            right.iter().any(|r| r.starts_with(" Commit to ")),
+            "{right:#?}"
         );
     }
 
@@ -2629,7 +2697,8 @@ mod tests {
         let widened = view.files_rule.x;
         drag(&mut view, (widened, 5), (rule.x, 5));
         // The unstaged list grows downward, the staged one keeping its
-        // minimum; the commit box stays at the bottom.
+        // minimum; the lists have the whole height, the commit box
+        // being under the diff.
         let lists = view.lists_rule;
         let unstaged = view.unstaged_area.height;
         drag(
@@ -2642,11 +2711,16 @@ mod tests {
         drag(&mut view, (lists.x + 3, lists.y + 5), (lists.x + 3, 200));
         draw(&mut view, 120, 40);
         assert_eq!(view.staged_area.height, MIN_LIST_HEIGHT);
+        assert_eq!(view.staged_area.bottom(), 40);
         assert_eq!(view.commit_area.bottom(), 40);
-        // The commit box grows upward at the lists' expense, and no
-        // further than leaves them their minimums.
+        assert_eq!(view.commit_rule.x, view.content_area.x);
+        assert_eq!(view.commit_rule.right(), 120);
+        // The commit box grows upward at the diff's expense, and no
+        // further than leaves the diff its minimum; the lists are not
+        // touched.
         let commit = view.commit_rule;
         let box_height = view.commit_area.height;
+        let content_height = view.content_area.height;
         drag(
             &mut view,
             (commit.x + 3, commit.y),
@@ -2655,10 +2729,12 @@ mod tests {
         draw(&mut view, 120, 40);
         assert_eq!(view.commit_area.height, box_height + 4);
         assert_eq!(view.commit_rule.y, commit.y - 4);
+        assert_eq!(view.content_area.height, content_height - 4);
         drag(&mut view, (commit.x + 3, commit.y - 4), (commit.x + 3, 0));
         draw(&mut view, 120, 40);
-        assert_eq!(view.unstaged_area.height, MIN_LIST_HEIGHT);
+        assert_eq!(view.content_area.height, MIN_CONTENT_HEIGHT);
         assert_eq!(view.staged_area.height, MIN_LIST_HEIGHT);
+        assert_eq!(view.unstaged_area.bottom(), 40 - 1 - MIN_LIST_HEIGHT);
         let top = view.commit_rule.y;
         drag(&mut view, (commit.x + 3, top), (commit.x + 3, commit.y));
         draw(&mut view, 120, 40);
@@ -2685,7 +2761,8 @@ mod tests {
         assert_eq!(view.pane, Pane::Unstaged);
         assert_eq!(view.unstaged.selected, 2);
         let message_row = view.commit_area.y + 1;
-        click(&mut view, 8, message_row);
+        let message_x = view.commit_area.x + 8;
+        click(&mut view, message_x, message_row);
         assert_eq!(view.pane, Pane::Commit);
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
