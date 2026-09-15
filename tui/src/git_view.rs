@@ -2148,13 +2148,16 @@ impl GitLogView {
                 self.content_rows = lines.len();
                 let capacity = area.width as usize - 1;
                 // The scrollbar takes the last row; see `render_log`.
+                // Clamp the scroll asked for afresh on each pass, as
+                // `render_diff` does, so the last row is reachable once
+                // the bar takes a row.
+                let wanted = self.content_scroll;
                 let mut show_bar = false;
                 let mut shown;
                 let mut extent;
                 loop {
                     shown = height - usize::from(show_bar);
-                    self.content_scroll =
-                        self.content_scroll.min(lines.len().saturating_sub(shown));
+                    self.content_scroll = wanted.min(lines.len().saturating_sub(shown));
                     extent = text_extent(&lines, self.content_scroll, shown);
                     let needed = self.content_h.needs_bar(extent, capacity) && height > 1;
                     if needed && !show_bar {
@@ -3051,6 +3054,49 @@ mod tests {
         let screen = draw(&mut view, 100, 30);
         assert!(screen.iter().any(|r| r.contains("Parents:")), "{screen:#?}");
         assert!(!screen[content_bottom].contains('█'), "{screen:#?}");
+    }
+
+    #[test]
+    fn the_last_line_of_a_diff_shows_above_its_scrollbar() {
+        // A diff taller than the pane whose last line is too long to
+        // fit: at the end, the scrollbar takes the pane's last row and
+        // the diff's last line is in the row above it.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let sig = Signature::now("T", "t@example.com").unwrap();
+        let mut body: String = (0..60).map(|i| format!("line {i}\n")).collect();
+        body.push_str(&format!("let last = \"{}\"; // LAST\n", "a".repeat(120)));
+        fs::write(dir.path().join("t.rs"), body).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("t.rs")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Tall", &tree, &[])
+            .unwrap();
+        let mut view = view(&dir);
+        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter));
+        assert_eq!(view.pane, Pane::Content);
+        view.handle_key(key(KeyCode::End));
+        let screen = draw(&mut view, 100, 30);
+        let content_bottom = view.content_area.bottom() as usize - 1;
+        assert!(screen[content_bottom].contains('█'), "{screen:#?}");
+        assert!(
+            screen[content_bottom - 1].contains("+ let last"),
+            "{screen:#?}"
+        );
+        assert_eq!(view.content_scroll + view.content_shown, view.content_rows);
+        // Scrolling down a line at a time gets there too.
+        view.handle_key(key(KeyCode::Home));
+        for _ in 0..100 {
+            view.handle_key(key(KeyCode::Down));
+        }
+        let screen = draw(&mut view, 100, 30);
+        assert!(
+            screen[content_bottom - 1].contains("+ let last"),
+            "{screen:#?}"
+        );
     }
 
     #[test]

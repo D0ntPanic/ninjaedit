@@ -288,13 +288,17 @@ pub(crate) fn render_diff(
     let text_width = area.right() - text_x;
     // The sideways scrollbar takes the last row; see `render_log`.
     let capacity = text_width as usize;
+    // Clamp the scroll asked for afresh on each pass: the first pass
+    // clamps it for the full height, and once the bar takes a row the
+    // last row of the diff has to be reachable again.
+    let wanted = scroll;
     let mut show_bar = false;
     let mut shown;
-    let mut scroll = scroll;
+    let mut scroll;
     let mut extent;
     loop {
         shown = height - usize::from(show_bar);
-        scroll = scroll.min(rows.len().saturating_sub(shown));
+        scroll = wanted.min(rows.len().saturating_sub(shown));
         extent = diff_extent(diff, &rows, scroll, shown);
         let needed = h.needs_bar(extent, capacity) && height > 1;
         if needed && !show_bar {
@@ -497,13 +501,17 @@ fn render_submodule(
     let max_lanes = lane_cap(area.width - 1);
     // The sideways scrollbar takes the last row; see `render_diff`.
     let capacity = area.width as usize - 1;
+    // Clamp the scroll asked for afresh on each pass: the first pass
+    // clamps it for the full height, and once the bar takes a row the
+    // last row of the diff has to be reachable again.
+    let wanted = scroll;
     let mut show_bar = false;
     let mut shown;
-    let mut scroll = scroll;
+    let mut scroll;
     let mut extent;
     loop {
         shown = height - usize::from(show_bar);
-        scroll = scroll.min(rows.len().saturating_sub(shown));
+        scroll = wanted.min(rows.len().saturating_sub(shown));
         extent = rows
             .iter()
             .skip(scroll)

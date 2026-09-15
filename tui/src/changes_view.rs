@@ -1792,13 +1792,16 @@ impl ChangesView {
                 self.content_rows = lines.len();
                 let capacity = area.width as usize - 1;
                 // The scrollbar takes the last row; see `render_diff`.
+                // Clamp the scroll asked for afresh on each pass, as
+                // `render_diff` does, so the last row is reachable once
+                // the bar takes a row.
+                let wanted = self.content_scroll;
                 let mut show_bar = false;
                 let mut shown;
                 let mut extent;
                 loop {
                     shown = height - usize::from(show_bar);
-                    self.content_scroll =
-                        self.content_scroll.min(lines.len().saturating_sub(shown));
+                    self.content_scroll = wanted.min(lines.len().saturating_sub(shown));
                     extent = text_extent(lines, self.content_scroll, shown);
                     let needed = self.content_h.needs_bar(extent, capacity) && height > 1;
                     if needed && !show_bar {

@@ -297,13 +297,18 @@ impl EditorView {
         // away. The second layout is final even if the lines it shows would
         // fit without the scrollbar, since going back and forth would never
         // settle.
+        // Each layout starts from the scroll position as it was, since
+        // the first one clamps it for the full height and the second
+        // has to be able to reach the last line with a row fewer.
         let full_height = area.height as usize;
+        let wanted_scroll_line = self.scroll_line;
         let mut show_hscroll = false;
         let mut height;
         let mut lines: Vec<Vec<Cell>>;
         let mut max_width;
         loop {
             height = full_height - usize::from(show_hscroll);
+            self.scroll_line = wanted_scroll_line;
             match reveal {
                 Some(Reveal::Cursor(target)) => self.scroll_to_line(target.line, height),
                 Some(Reveal::Match(target, _)) => {
@@ -559,11 +564,22 @@ impl EditorView {
     }
 
     /// The furthest the view can scroll down: the last line at the bottom.
+    /// Measured for the view's full height, and then, when the lines at
+    /// the bottom would need the horizontal scrollbar, for the row fewer
+    /// it leaves; the last render's height alone would stop a row short
+    /// of the end when the bar appears only once the end is in view.
     fn max_scroll_line(&self) -> usize {
-        self.editor
-            .buffer()
-            .line_count()
-            .saturating_sub(self.text.height.max(1) as usize)
+        let line_count = self.editor.buffer().line_count();
+        let full_height = (self.text.height + self.hscroll.height).max(1) as usize;
+        let max = line_count.saturating_sub(full_height);
+        let text_width = self.text.width as usize;
+        let needs_bar = self.scroll_col > 0
+            || (max..line_count).any(|line| self.editor.line_width(line) > text_width);
+        if needs_bar && full_height > 1 {
+            line_count.saturating_sub(full_height - 1)
+        } else {
+            max
+        }
     }
 
     fn scroll_by(&mut self, lines: isize) {

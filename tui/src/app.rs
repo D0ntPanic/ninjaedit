@@ -5152,6 +5152,40 @@ mod tests {
     }
 
     #[test]
+    fn the_last_line_shows_above_the_horizontal_scrollbar() {
+        // A file taller than the view whose last line is too long to
+        // fit: scrolled to the end without moving the cursor, the
+        // scrollbar takes the last row and the last line sits above it.
+        let mut text: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        text.push_str(&format!("last {}", "x".repeat(60)));
+        let (_dir, mut app) = app_with_files(&[("a.txt", &text)]);
+        draw(&mut app, 30, 12);
+        let wheel = |app: &mut App, kind| {
+            app.handle_event(Event::Mouse(MouseEvent {
+                kind,
+                column: 8,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            }));
+        };
+        for _ in 0..30 {
+            wheel(&mut app, MouseEventKind::ScrollDown);
+        }
+        let screen = draw(&mut app, 30, 12);
+        // Rows 1..=9 are text, row 10 the horizontal scrollbar.
+        assert!(
+            screen[10].contains('─') || screen[10].contains('█'),
+            "{screen:#?}"
+        );
+        assert!(screen[9].contains("last"), "{screen:#?}");
+        // The view can't be scrolled any further, and the rows stay put
+        // on a redraw.
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        let again = draw(&mut app, 30, 12);
+        assert_eq!(again, screen);
+    }
+
+    #[test]
     fn paging_through_long_lines_keeps_the_full_height() {
         // Every line overflows a 30-column view, so the horizontal scrollbar
         // is always needed. Paging down must not shrink the editor.
