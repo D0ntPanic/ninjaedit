@@ -49,6 +49,12 @@ use ratatui::text::Span;
 pub const TITLE: &str = "Build Configuration";
 /// The tag on the current configuration and target in the tree.
 const CURRENT_TAG: &str = "current";
+/// After the Targets heading of a root whose targets are still being
+/// found.
+const FINDING_TAG: &str = "(finding…)";
+/// The note under that heading.
+const FINDING_NOTE: &str =
+    "The project is still being looked through; the targets found will appear here";
 /// The widest a field gets.
 const MAX_FIELD_WIDTH: u16 = 76;
 /// The tree pane's width, within these bounds, as a share of the page.
@@ -130,6 +136,9 @@ impl Node {
         match self {
             Node::Root(_) => root.map(|r| r.label()).unwrap_or_default(),
             Node::Configurations(_) => "Configurations".to_owned(),
+            Node::Targets(_) if root.is_some_and(|r| r.is_pending()) => {
+                format!("Targets {FINDING_TAG}")
+            }
             Node::Targets(_) => "Targets".to_owned(),
             Node::Configuration(_, i) => root
                 .and_then(|r| r.configurations().get(i))
@@ -273,6 +282,39 @@ impl BuildView {
         self.rebuild_fields(config);
     }
 
+    /// Discovery brought in a root's targets (see
+    /// [`BuildConfig::apply_discovery`]): the rows move, since
+    /// discovered targets go ahead of the user's own, and `moved` says
+    /// where each of the root's targets went by its old index, `None`
+    /// for one that is gone. The selection and the fields being edited
+    /// follow their target, edits and all.
+    pub fn targets_moved(&mut self, root: usize, moved: &[Option<usize>], config: &BuildConfig) {
+        let follow = |node: Option<Node>| match node {
+            Some(Node::Target(r, i)) if r == root => {
+                moved.get(i).copied().flatten().map(|i| Node::Target(r, i))
+            }
+            other => other,
+        };
+        let selected = follow(self.selected_node());
+        self.fields_node = follow(self.fields_node);
+        self.confirm_remove = follow(self.confirm_remove);
+        self.rebuild_nodes(config);
+        self.selected = selected
+            .and_then(|node| self.nodes.iter().position(|n| *n == node))
+            .unwrap_or(self.selected)
+            .min(self.nodes.len().saturating_sub(1));
+        // The fields of a configuration or target still there stay as
+        // typed; anything else is shown afresh, the Targets heading's
+        // note included.
+        let keep = matches!(
+            self.fields_node,
+            Some(Node::Configuration(..) | Node::Target(..))
+        ) && self.fields_node == selected;
+        if !keep {
+            self.rebuild_fields(config);
+        }
+    }
+
     /// Show the configuration as it now is, after the application
     /// changed it: the tree's rows and the fields' values.
     pub fn refresh(&mut self, config: &BuildConfig) {
@@ -412,13 +454,17 @@ impl BuildView {
                 self.lines
                     .push(Line::Text("Ctrl+N adds a configuration".to_owned()));
             }
-            (Node::Targets(_), _) => {
+            (Node::Targets(r), _) => {
                 self.lines.push(Line::Heading("Targets".to_owned()));
                 self.lines.push(Line::Blank);
                 self.lines.push(Line::Text(
                     "What this root builds and runs; the current one is what Ctrl+B and Ctrl+R use"
                         .to_owned(),
                 ));
+                if config.root(r).is_some_and(|root| root.is_pending()) {
+                    self.lines.push(Line::Blank);
+                    self.lines.push(Line::Text(FINDING_NOTE.to_owned()));
+                }
                 self.lines.push(Line::Blank);
                 self.lines
                     .push(Line::Text("Ctrl+N adds a target".to_owned()));
@@ -1425,6 +1471,83 @@ mod tests {
         assert_eq!(
             press(&mut view, &mut config, KeyCode::Delete),
             BuildOutcome::Continue
+        );
+    }
+
+    #[test]
+    fn targets_found_later_move_the_rows_but_not_the_selection_or_its_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "add_executable(demo demo.c)\nadd_executable(tool tool.c)\n",
+        )
+        .unwrap();
+        let mut config = BuildConfig::default();
+        let root = BuildRoot::pending("CMakeLists.txt").unwrap();
+        let discovery = root.discovery(dir.path());
+        config.add_root(root).unwrap();
+        let mine = config.add_target(0).unwrap();
+        let mut view = BuildView::new(&config);
+        let screen = draw(&mut view, &config, 100, 30);
+        assert!(
+            screen.iter().any(|r| r.contains("Targets (finding…)")),
+            "{screen:#?}"
+        );
+        view.select(Node::Targets(0), &config);
+        let screen = draw(&mut view, &config, 100, 30);
+        assert!(
+            screen
+                .iter()
+                .any(|r| r.contains("still being looked through")),
+            "{screen:#?}"
+        );
+        // Start renaming the user's own target, without applying.
+        view.select(Node::Target(0, mine), &config);
+        press(&mut view, &mut config, KeyCode::Enter);
+        ctrl(&mut view, &mut config, 'a');
+        type_str(&mut view, &mut config, "renamed");
+        assert_eq!(view.text(0), "renamed");
+
+        // Discovery puts demo and tool ahead of it.
+        let before: Vec<String> = config.roots()[0]
+            .targets()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        config.apply_discovery(discovery.run(None));
+        let targets = config.roots()[0].targets();
+        let moved: Vec<Option<usize>> = before
+            .iter()
+            .map(|name| targets.iter().position(|t| t.name == *name))
+            .collect();
+        assert_eq!(moved, vec![Some(0), Some(3)]);
+        view.targets_moved(0, &moved, &config);
+        assert_eq!(view.selected_node(), Some(Node::Target(0, 3)));
+        assert!(!view.in_tree());
+        assert_eq!(view.text(0), "renamed", "the edit is kept");
+        assert_eq!(
+            press(&mut view, &mut config, KeyCode::Enter),
+            BuildOutcome::Changed
+        );
+        assert_eq!(config.roots()[0].targets()[3].name, "renamed");
+        let screen = draw(&mut view, &config, 100, 30);
+        assert!(!screen.iter().any(|r| r.contains("finding")), "{screen:#?}");
+        assert!(screen.iter().any(|r| r.contains("demo")), "{screen:#?}");
+
+        // With the heading selected, its note goes away with the mark.
+        let root = BuildRoot::pending("CMakeLists.txt").unwrap();
+        let discovery = root.discovery(dir.path());
+        let mut fresh = BuildConfig::default();
+        fresh.add_root(root).unwrap();
+        let mut view = BuildView::new(&fresh);
+        view.select(Node::Targets(0), &fresh);
+        fresh.apply_discovery(discovery.run(None));
+        view.targets_moved(0, &[Some(0)], &fresh);
+        assert_eq!(view.selected_node(), Some(Node::Targets(0)));
+        let screen = draw(&mut view, &fresh, 100, 30);
+        assert!(
+            !screen.iter().any(|r| r.contains("still being looked")),
+            "{screen:#?}"
         );
     }
 

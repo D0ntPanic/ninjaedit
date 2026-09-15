@@ -178,12 +178,13 @@ use crate::tool::{Tool, ToolKind, ToolPane};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ninjaedit_core::build::{NO_ROOT_MESSAGE, root_candidates};
+use ninjaedit_core::build::root_candidates;
 use ninjaedit_core::search::literal_query;
 use ninjaedit_core::terminal::{ExitStatus, Output, Session, SessionId};
 use ninjaedit_core::{
-    BuildConfig, BuildRoot, ConflictStep, Editor, ExternalChange, Job, Project, ProjectKind,
-    ProjectMatch, SearchStep, Selection, Settings, SourceLocation, Step, Storage,
+    BuildConfig, BuildRoot, ConflictStep, Discovery, DiscoveryResult, Editor, ExternalChange, Job,
+    Project, ProjectKind, ProjectMatch, SearchStep, Selection, Settings, SourceLocation, Step,
+    Storage,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -192,7 +193,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 /// Everything the event loop reacts to: input from the terminal and the
@@ -306,6 +307,12 @@ const REPOSITORIES_PLACEHOLDER: &str = "The project's repository or a submodule"
 const FILES_PLACEHOLDER: &str = "Search files in project";
 const MODES_PLACEHOLDER: &str = "Editor, a page, or a tool";
 const COMMANDS_PLACEHOLDER: &str = "Search commands and views";
+/// The note in a palette that lists targets while some are still being
+/// found.
+const DISCOVERY_HINT: &str = "finding targets…";
+/// How long a discovery thread waits for the file index before walking
+/// the tree itself.
+const DISCOVERY_INDEX_WAIT: Duration = Duration::from_secs(600);
 const ADD_ROOT_PLACEHOLDER: &str = "Add a Cargo.toml or CMakeLists.txt as a build root";
 const CONFIGURATION_PLACEHOLDER: &str = "Build configuration to use";
 const TARGET_PLACEHOLDER: &str = "Target to build and run";
@@ -339,9 +346,12 @@ const SEARCH_WRAPPED: &str =
 enum PaletteKind {
     /// The file search, which needs refreshing as the index fills in.
     Files,
-    /// The command palette, which remembers what it ran.
+    /// The command palette, which remembers what it ran, and lists a
+    /// run entry per target, so it fills in as targets are found.
     Commands,
-    /// Tabs, modes, build roots, configurations, or targets.
+    /// The target search, which likewise fills in as targets are found.
+    Targets,
+    /// Tabs, modes, build roots, or configurations.
     Other,
 }
 
@@ -406,6 +416,10 @@ pub struct App {
     /// render, to hit-test clicks.
     status_config_area: Rect,
     status_target_area: Rect,
+    /// What the threads finding roots' targets report back, taken in
+    /// by [`tick`](Self::tick); see [`start_discoveries`](Self::start_discoveries).
+    discoveries: Receiver<DiscoveryResult>,
+    discovery_tx: Sender<DiscoveryResult>,
     theme: Theme,
     /// What the upper part of the screen shows.
     mode: Mode,
@@ -495,20 +509,21 @@ impl App {
         // Likewise the build configuration; with none saved yet the
         // project's own root files are found.
         let project_storage = storage.project(&project);
-        let build = match project_storage.load_build_config() {
-            Ok(Some(mut build)) => {
-                // The file holds what the user changed; the project has
-                // the rest of the targets.
-                build.sync_discovered(project.root());
-                build
-            }
-            Ok(None) => BuildConfig::discover(project.root()),
+        let mut build = match project_storage.load_build_config() {
+            Ok(Some(build)) => build,
+            Ok(None) => BuildConfig::find_roots(project.root()),
             Err(err) => {
                 status = Some(err.to_string());
-                BuildConfig::discover(project.root())
+                BuildConfig::find_roots(project.root())
             }
         };
-        App {
+        // The file holds what the user changed; the project has the rest
+        // of the targets, found on threads of their own since a big tree
+        // takes seconds to look through, and the editor should be up
+        // before then.
+        let discoveries = build.request_discovery(project.root());
+        let (discovery_tx, discovery_rx) = mpsc::channel();
+        let app = App {
             index_generation: project.index().generation(),
             file_activity: 0,
             last_file_check: None,
@@ -525,6 +540,8 @@ impl App {
             job_dirs: Vec::new(),
             status_config_area: Rect::default(),
             status_target_area: Rect::default(),
+            discoveries: discovery_rx,
+            discovery_tx,
             theme: Theme::default(),
             mode: Mode::Editor,
             git_log: None,
@@ -557,7 +574,113 @@ impl App {
             content_area: Rect::default(),
             dragging_divider: false,
             prefix: None,
+        };
+        app.start_discoveries(discoveries);
+        app
+    }
+
+    // ----- Finding targets -------------------------------------------------
+
+    /// Find the targets of roots pending discovery, each on a thread of
+    /// its own; the results come back through `discoveries` and are
+    /// taken in by [`tick`](Self::tick). A project's index has the
+    /// project's files already, or will shortly, which saves walking
+    /// the tree again; a directory opened on its own has no such list,
+    /// and the tree under the root is walked.
+    fn start_discoveries(&self, discoveries: Vec<Discovery>) {
+        for discovery in discoveries {
+            let index = self.project.index();
+            let files = index.is_recursive().then(|| index.file_list());
+            let tx = self.discovery_tx.clone();
+            let name = format!("discovery {}", discovery.path().display());
+            let _ = std::thread::Builder::new().name(name).spawn(move || {
+                let files = files
+                    .filter(|list| list.wait_for_primary(DISCOVERY_INDEX_WAIT))
+                    .map(|list| list.files(false));
+                let _ = tx.send(discovery.run(files.as_deref()));
+            });
         }
+    }
+
+    /// Take in whatever the discovery threads have found since the last
+    /// time. Returns whether anything came in.
+    fn take_discoveries(&mut self) -> bool {
+        let mut any = false;
+        while let Ok(result) = self.discoveries.try_recv() {
+            any |= self.take_discovery(result);
+        }
+        if any {
+            self.refresh_target_palettes();
+        }
+        any
+    }
+
+    /// Take in one discovery's result. The build page follows its
+    /// targets: discovered targets go ahead of the user's own, so the
+    /// rows move, and the fields being edited must stay with their
+    /// target.
+    fn take_discovery(&mut self, result: DiscoveryResult) -> bool {
+        let Some(root) = self.build.root_at(result.path()) else {
+            return false;
+        };
+        let before: Vec<String> = self.build.roots()[root]
+            .targets()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        if self.build.apply_discovery(result).is_none() {
+            return false;
+        }
+        let targets = self.build.roots()[root].targets();
+        let moved: Vec<Option<usize>> = before
+            .iter()
+            .map(|name| targets.iter().position(|t| t.name == *name))
+            .collect();
+        if let Mode::Build(view) = &mut self.mode {
+            view.targets_moved(root, &moved, &self.build);
+        }
+        true
+    }
+
+    /// Give a palette that lists targets the targets as they now are.
+    fn refresh_target_palettes(&mut self) {
+        let items = match self.palette_kind {
+            PaletteKind::Commands => self.command_items(),
+            PaletteKind::Targets => self.target_items().0,
+            PaletteKind::Files | PaletteKind::Other => return,
+        };
+        if let Some(mut palette) = self.palette.take() {
+            palette.set_items(items);
+            self.refresh_discovery_hint(&mut palette);
+            self.palette = Some(palette);
+        }
+    }
+
+    /// A note in a palette that lists targets while some are still to
+    /// be found.
+    fn refresh_discovery_hint(&self, palette: &mut Palette) {
+        let hint = self
+            .build
+            .is_discovering()
+            .then(|| DISCOVERY_HINT.to_owned());
+        palette.set_hint(hint);
+    }
+
+    /// Wait for every root's targets to be found and take them in, as
+    /// tests that look at targets must.
+    #[cfg(test)]
+    pub fn wait_for_discovery(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.build.is_discovering() {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            match self.discoveries.recv_timeout(timeout) {
+                Ok(result) => {
+                    self.take_discovery(result);
+                }
+                Err(_) => panic!("discovery did not finish"),
+            }
+        }
+        self.refresh_target_palettes();
     }
 
     pub fn should_quit(&self) -> bool {
@@ -835,19 +958,31 @@ impl App {
         self.palette_kind = PaletteKind::Files;
     }
 
+    /// Every file in the project, in the index's order: each directory's
+    /// files by name, then its subdirectories likewise. (The index is
+    /// asked for the list afresh, and this runs again whenever it
+    /// changes while the palette is up, so on a project of hundreds of
+    /// thousands of files it is worth keeping cheap: no sorting, and
+    /// the three strings each entry needs and no more.)
     fn file_items(&self) -> Vec<PaletteItem> {
-        let mut paths = self.project.index().files(false);
-        paths.sort();
-        paths
+        self.project
+            .index()
+            .files(false)
             .into_iter()
             .map(|path| {
                 let relative = self.display_path(&path);
+                let label = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let detail = relative
+                    .strip_suffix(label.as_str())
+                    .map(|dir| dir.trim_end_matches(std::path::MAIN_SEPARATOR))
+                    .unwrap_or_default()
+                    .to_owned();
                 PaletteItem {
-                    label: path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    detail: parent_of(&relative),
+                    label,
+                    detail,
                     search: relative,
                     shortcut: None,
                     action: PaletteAction::OpenFile(path),
@@ -901,6 +1036,15 @@ impl App {
         self.close_search_box(true);
         self.goto_line = None;
         self.hide_project_search();
+        let mut palette = Palette::new(COMMANDS_PLACEHOLDER, self.command_items());
+        self.refresh_discovery_hint(&mut palette);
+        self.palette = Some(palette);
+        self.palette_kind = PaletteKind::Commands;
+    }
+
+    /// The command palette's entries; see
+    /// [`open_command_palette`](Self::open_command_palette).
+    fn command_items(&self) -> Vec<PaletteItem> {
         let commands = Command::ALL.into_iter().map(|command| PaletteItem {
             label: command.label().to_owned(),
             detail: command.description().to_owned(),
@@ -927,9 +1071,7 @@ impl App {
             let item = items.remove(index);
             items.insert(0, item);
         }
-        let palette = Palette::new(COMMANDS_PLACEHOLDER, items);
-        self.palette = Some(palette);
-        self.palette_kind = PaletteKind::Commands;
+        items
     }
 
     /// The command palette's "Run <target>" entries: one for each
@@ -1346,12 +1488,14 @@ impl App {
     /// Add a root file (relative to the project) with its defaults and
     /// the targets found under it, and select it on the page.
     fn add_build_root(&mut self, path: PathBuf) {
-        let Some(root) = BuildRoot::discover(self.project.root(), &path) else {
+        let Some(root) = BuildRoot::pending(&path) else {
             self.status = Some(format!("{} is not a build root file", path.display()));
             return;
         };
+        let discovery = root.discovery(self.project.root());
         match self.build.add_root(root) {
             Ok(index) => {
+                self.start_discoveries(vec![discovery]);
                 if let Mode::Build(view) = &mut self.mode {
                     view.select(Node::Root(index), &self.build);
                 }
@@ -1396,6 +1540,17 @@ impl App {
         self.close_search_box(true);
         self.goto_line = None;
         self.hide_project_search();
+        let (items, selected) = self.target_items();
+        let mut palette = Palette::new(TARGET_PLACEHOLDER, items);
+        palette.select(selected);
+        self.refresh_discovery_hint(&mut palette);
+        self.palette = Some(palette);
+        self.palette_kind = PaletteKind::Targets;
+    }
+
+    /// The target palette's entries, and which of them is the current
+    /// target.
+    fn target_items(&self) -> (Vec<PaletteItem>, usize) {
         let current = self.build.current();
         let mut items = Vec::new();
         let mut selected = 0;
@@ -1417,10 +1572,7 @@ impl App {
                 });
             }
         }
-        let mut palette = Palette::new(TARGET_PLACEHOLDER, items);
-        palette.select(selected);
-        self.palette = Some(palette);
-        self.palette_kind = PaletteKind::Other;
+        (items, selected)
     }
 
     // ----- Building and running -------------------------------------------
@@ -1447,10 +1599,11 @@ impl App {
 
     fn start_current_job(&mut self, run: bool) {
         self.commit_build_page();
-        match self.build.current() {
-            Some(selection) => self.start_selected_job(selection, run),
-            // There is no selection only with no roots.
-            None => self.status = Some(NO_ROOT_MESSAGE.to_owned()),
+        // There is no selection only with no roots; and one whose target
+        // is still being looked for would build the wrong thing.
+        match self.build.current_for_job() {
+            Ok(selection) => self.start_selected_job(selection, run),
+            Err(message) => self.status = Some(message),
         }
     }
 
@@ -2258,6 +2411,7 @@ impl App {
     /// redrawing.
     pub fn tick(&mut self) -> bool {
         let mut redraw = self.check_open_files_if_due();
+        redraw |= self.take_discoveries();
         let polled = match &mut self.mode {
             Mode::GitLog(tabs) => {
                 let polled = tabs.poll();
@@ -2978,11 +3132,32 @@ impl App {
             .current_configuration()
             .map(|(_, c)| format!(" {} ", c.name))
             .unwrap_or_default();
+        // While the current root's targets are still being found, the
+        // target is the name the file had, or whatever stands in, with
+        // an ellipsis to say so.
+        let finding = self
+            .build
+            .current_configuration()
+            .is_some_and(|(root, _)| root.is_pending());
         let mut target = self
             .build
-            .current_target()
-            .map(|(_, t)| format!("▸ {} ", t.name))
-            .unwrap_or_default();
+            .pending_target()
+            .map(str::to_owned)
+            .or_else(|| self.build.current_target().map(|(_, t)| t.name.clone()))
+            .map(|name| {
+                if finding {
+                    format!("▸ {name}… ")
+                } else {
+                    format!("▸ {name} ")
+                }
+            })
+            .unwrap_or_else(|| {
+                if finding {
+                    "▸ … ".to_owned()
+                } else {
+                    String::new()
+                }
+            });
         let width_of = |text: &str| Span::raw(text).width() as u16;
         let position_width = position.as_deref().map_or(0, width_of);
         // Drop the build segments when there's no room for them beside
@@ -3213,6 +3388,7 @@ mod tests {
         let (events, _events_rx) = std::sync::mpsc::channel();
         let storage = Storage::new(dir.path().join(".storage"));
         let mut app = App::new(Project::open(dir.path()).unwrap(), storage, events);
+        app.wait_for_discovery();
         for (name, _) in files {
             app.open_file(dir.path().join(name));
         }
@@ -4003,7 +4179,43 @@ mod tests {
         std::fs::write(dir.path().join("c/Cargo.toml"), "[package]\nname = \"c\"\n").unwrap();
         let (events, _events_rx) = std::sync::mpsc::channel();
         let storage = Storage::new(dir.path().join(".storage"));
-        let again = App::new(Project::open(dir.path()).unwrap(), storage, events);
+        let mut again = App::new(Project::open(dir.path()).unwrap(), storage, events);
+        // Until the project has been looked through again, the targets
+        // are the file's, the one it named as current is shown with a
+        // mark, the palettes say so, and a build waits rather than
+        // building whatever stands in.
+        assert!(again.build.is_discovering());
+        let screen = draw(&mut again, 80, 20);
+        assert!(screen[19].contains("▸ a… "), "{screen:#?}");
+        ctrl(&mut again, 'b');
+        let status = again.status.take().unwrap_or_default();
+        assert!(
+            status.contains("Still finding") && status.contains('a'),
+            "{status}"
+        );
+        assert!(again.pending_steps.is_empty());
+        let column = column_of(&screen[19], "▸ a");
+        click(&mut again, column, 19);
+        let screen = draw(&mut again, 80, 20);
+        assert!(screen[2].contains(TARGET_PLACEHOLDER), "{screen:#?}");
+        assert!(
+            screen.iter().any(|r| r.contains(DISCOVERY_HINT)),
+            "{screen:#?}"
+        );
+        again.wait_for_discovery();
+        assert!(!again.build.is_discovering());
+        let screen = draw(&mut again, 80, 20);
+        assert!(
+            !screen.iter().any(|r| r.contains(DISCOVERY_HINT)),
+            "{screen:#?}"
+        );
+        assert!(
+            screen[3].contains(" a ") && screen[4].contains(" c "),
+            "{screen:#?}"
+        );
+        press(&mut again, KeyCode::Esc);
+        let screen = draw(&mut again, 80, 20);
+        assert!(screen[19].contains("▸ a "), "{screen:#?}");
         let names: Vec<(String, bool)> = again.build.roots()[0]
             .targets()
             .iter()
@@ -4111,6 +4323,7 @@ mod tests {
         type_str(&mut app, "cmake");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.build.roots().len(), 2);
+        app.wait_for_discovery();
         let root = &app.build.roots()[1];
         assert_eq!(root.label(), "native/CMakeLists.txt");
         assert_eq!(root.targets()[1].name, "demo");
@@ -6038,7 +6251,8 @@ mod tests {
         }
         let (events, _events_rx) = std::sync::mpsc::channel();
         let storage = Storage::new(dir.path().join(".storage"));
-        let app = App::new(Project::open(dir.path()).unwrap(), storage, events);
+        let mut app = App::new(Project::open(dir.path()).unwrap(), storage, events);
+        app.wait_for_discovery();
         (dir, app)
     }
 

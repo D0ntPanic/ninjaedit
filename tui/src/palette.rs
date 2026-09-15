@@ -213,10 +213,13 @@ impl Palette {
     }
 
     fn search(&mut self) {
-        let candidates = self.items.iter().map(|item| (&item.label, &item.search));
-        self.results = fuzzy::rank_labeled(candidates, self.query.text())
+        let candidates: Vec<(&str, &str)> = self
+            .items
+            .iter()
+            .map(|item| (item.label.as_str(), item.search.as_str()))
+            .collect();
+        self.results = fuzzy::rank_labeled_top(&candidates, self.query.text(), MAX_RESULTS)
             .into_iter()
-            .take(MAX_RESULTS)
             .map(|ranked| ranked.index)
             .collect();
         self.selected = 0;

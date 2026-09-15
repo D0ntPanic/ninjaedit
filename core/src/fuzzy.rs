@@ -7,6 +7,11 @@
 use code_fuzzy_match::FuzzyMatcher;
 use std::cmp::Reverse;
 
+/// Below this many candidates [`rank_labeled_top`] ranks on the calling
+/// thread; above it the work is split across the machine's cores, at
+/// least this many candidates each.
+const CANDIDATES_PER_THREAD: usize = 8192;
+
 /// One ranked search result: the index of the candidate and its score
 /// (higher is better).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +87,73 @@ pub fn rank_labeled<S: AsRef<str>>(
     results.into_iter().map(|(r, _)| r).collect()
 }
 
+/// The best `limit` of [`rank_labeled`]'s results, in its order, for a
+/// list that is shown a page at a time: a palette wants its top rows,
+/// not every match sorted. The candidates are ranked on every core
+/// when there are enough of them to be worth it (a project of hundreds
+/// of thousands of files takes a good fraction of a second on one), and
+/// only the best `limit` are sorted.
+pub fn rank_labeled_top(candidates: &[(&str, &str)], query: &str, limit: usize) -> Vec<Ranked> {
+    if query.is_empty() {
+        return (0..candidates.len().min(limit))
+            .map(|index| Ranked { index, score: 0 })
+            .collect();
+    }
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(candidates.len() / CANDIDATES_PER_THREAD)
+        .max(1);
+    // Each match as (score, text length, index): the sort key, with the
+    // index keeping ties in the original order.
+    let mut matches: Vec<(Reverse<usize>, usize, usize)> = if threads == 1 {
+        rank_labeled_part(candidates, query, 0)
+    } else {
+        let chunk = candidates.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            let parts: Vec<_> = candidates
+                .chunks(chunk)
+                .enumerate()
+                .map(|(i, part)| scope.spawn(move || rank_labeled_part(part, query, i * chunk)))
+                .collect();
+            parts
+                .into_iter()
+                .flat_map(|part| part.join().expect("ranking thread panicked"))
+                .collect()
+        })
+    };
+    if matches.len() > limit {
+        matches.select_nth_unstable(limit);
+        matches.truncate(limit);
+    }
+    matches.sort_unstable();
+    matches
+        .into_iter()
+        .map(|(Reverse(score), _, index)| Ranked { index, score })
+        .collect()
+}
+
+/// [`rank_labeled`]'s matches for part of a candidate list, unsorted,
+/// with `offset` added to each index.
+fn rank_labeled_part(
+    candidates: &[(&str, &str)],
+    query: &str,
+    offset: usize,
+) -> Vec<(Reverse<usize>, usize, usize)> {
+    let mut matcher = FuzzyMatcher::new();
+    candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (label, text))| {
+            let score = if let Some(score) = matcher.fuzzy_match(label, query) {
+                score + LABEL_MATCH_BONUS
+            } else {
+                matcher.fuzzy_match(text, query)?
+            };
+            Some((Reverse(score), text.len(), offset + index))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +219,35 @@ mod tests {
         );
         // An empty query keeps the original order, even for longer paths.
         assert_eq!(labeled(&files, ""), files);
+    }
+
+    #[test]
+    fn the_top_results_are_the_first_of_the_full_ranking() {
+        // Enough candidates to be ranked on several threads, with ties
+        // and near-ties everywhere.
+        let paths: Vec<String> = (0..CANDIDATES_PER_THREAD * 3)
+            .map(|i| match i % 7 {
+                0 => format!("core/function{}.cpp", i % 13),
+                1 => format!("tests/test_function{}.py", i % 5),
+                2 => format!("ui/other{i}.cpp"),
+                3 => "core/function.cpp".to_owned(),
+                4 => format!("arch/{}/src/function.rs", i % 11),
+                5 => format!("docs/notes{i}.txt"),
+                _ => format!("core/function/undo{}.cpp", i % 3),
+            })
+            .collect();
+        let candidates: Vec<(&str, &str)> = paths
+            .iter()
+            .map(|p| (p.rsplit('/').next().unwrap(), p.as_str()))
+            .collect();
+        for query in ["function", "fn", "core/undo", "zzz", "other7"] {
+            let full = rank_labeled(candidates.iter().copied(), query);
+            for limit in [0, 1, 25, 1000, usize::MAX] {
+                let top = rank_labeled_top(&candidates, query, limit);
+                assert_eq!(top, full[..full.len().min(limit)], "{query} {limit}");
+            }
+        }
+        let top = rank_labeled_top(&candidates, "", 3);
+        assert_eq!(top.iter().map(|r| r.index).collect::<Vec<_>>(), [0, 1, 2]);
     }
 }

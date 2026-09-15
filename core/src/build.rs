@@ -25,9 +25,17 @@
 //! Targets found by looking at the project (a manifest's packages, a
 //! CMake tree's executables) are **discovered** targets, and the project
 //! stays their source of truth: discovery runs again every time the
-//! configuration is loaded ([`BuildConfig::sync_discovered`]), so a
-//! package added to the workspace shows up by itself and one taken out
-//! goes away. The file records only what the user did to them: a
+//! configuration is loaded, so a package added to the workspace shows up
+//! by itself and one taken out goes away. Looking at a big project takes
+//! a while (every `CMakeLists.txt` in the tree is read), so discovery is
+//! a piece of work a frontend runs on a thread of its own: a root
+//! **pending** discovery has only what the file gave it and what costs
+//! nothing to know (a CMake root's `All`), [`BuildConfig::request_discovery`]
+//! hands out the work, [`Discovery::run`] does it anywhere, and
+//! [`BuildConfig::apply_discovery`] takes the result in, with the current
+//! target kept by name across the change. A frontend that would rather
+//! wait has [`BuildConfig::sync_discovered`] and [`BuildConfig::discover`],
+//! which do it all on the spot. The file records only what the user did to them: a
 //! discovered target with its default options isn't written at all, one
 //! whose options were changed is written with its origin so the changes
 //! survive, and one whose source has since gone keeps the changes as an
@@ -70,7 +78,7 @@ use crate::settings::Settings;
 use crate::terminal::Command;
 use regex::Regex;
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -148,6 +156,15 @@ impl BuildSystem {
     }
 
     /// The configurations a fresh root of this system starts with.
+    /// The targets a root of this system has before the project is
+    /// looked at, because they cost nothing to know: CMake's `All`.
+    fn instant_targets(self) -> Vec<Target> {
+        match self {
+            BuildSystem::Cargo => Vec::new(),
+            BuildSystem::CMake => vec![cmake_all_target()],
+        }
+    }
+
     pub fn default_configurations(self) -> Vec<Configuration> {
         match self {
             BuildSystem::Cargo => vec![
@@ -569,6 +586,9 @@ pub struct BuildRoot {
     /// on, when discovery has an opinion (a Cargo package with a
     /// binary); the first target otherwise.
     preferred: Option<String>,
+    /// Whether a discovery has been asked for and not yet applied: the
+    /// targets are what the file and the seed gave, with more to come.
+    pending: bool,
 }
 
 impl BuildRoot {
@@ -582,35 +602,72 @@ impl BuildRoot {
             targets: Vec::new(),
             discovered: Vec::new(),
             preferred: None,
+            pending: false,
         }
     }
 
-    /// A root at `path` (relative to `project_root`) with the system's
-    /// default configurations and the targets found in the tree: a
-    /// Cargo root's packages, or a CMake root's executables. Returns
-    /// `None` if `path` isn't named like a root file.
-    pub fn discover(project_root: &Path, path: impl Into<PathBuf>) -> Option<BuildRoot> {
+    /// A root at `path` (relative to the project root) with the system's
+    /// default configurations, waiting for its targets to be found: it
+    /// has only those that cost nothing to know (a CMake root's `All`)
+    /// until a [`Discovery`] for it is run and applied. Returns `None`
+    /// if `path` isn't named like a root file.
+    pub fn pending(path: impl Into<PathBuf>) -> Option<BuildRoot> {
         let path = path.into();
         let system = BuildSystem::of_file(&path)?;
         let mut root = BuildRoot::new(system, path);
         root.configurations = system.default_configurations();
+        root.apply_discovered(Discovered {
+            targets: system.instant_targets(),
+            preferred: None,
+        });
+        root.pending = true;
+        Some(root)
+    }
+
+    /// A root at `path` (relative to `project_root`) with the system's
+    /// default configurations and the targets found in the tree: a
+    /// Cargo root's packages, or a CMake root's executables, found on
+    /// this thread. Returns `None` if `path` isn't named like a root
+    /// file.
+    pub fn discover(project_root: &Path, path: impl Into<PathBuf>) -> Option<BuildRoot> {
+        let mut root = BuildRoot::pending(path)?;
         root.sync_discovered(project_root);
         Some(root)
     }
 
-    /// Look at the project again and bring the targets up to date with
-    /// what is there: a newly found target is added with its defaults,
-    /// a found one already in the list is kept as it is (changes,
-    /// disabling, and all), and one no longer found goes away if it was
-    /// never changed or was disabled, and otherwise stays as an ordinary
-    /// target with its changes. Discovered targets come first, in the
-    /// order they are found; the user's own follow in their order.
+    /// Whether a discovery has been asked for and hasn't reported yet,
+    /// so the targets are not all there.
+    pub fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    /// The work of finding this root's targets, to run on any thread;
+    /// see [`Discovery`].
+    pub fn discovery(&self, project_root: &Path) -> Discovery {
+        Discovery {
+            path: self.path.clone(),
+            system: self.system,
+            file: project_root.join(&self.path),
+        }
+    }
+
+    /// Look at the project again, on this thread, and bring the targets
+    /// up to date with what is there; see
+    /// [`apply_discovered`](Self::apply_discovered).
     pub fn sync_discovered(&mut self, project_root: &Path) {
-        let file = project_root.join(&self.path);
-        let found = match self.system {
-            BuildSystem::Cargo => cargo_targets(&file),
-            BuildSystem::CMake => cmake_targets(&file),
-        };
+        let found = self.discovery(project_root).run(None).found;
+        self.apply_discovered(found);
+    }
+
+    /// Bring the targets up to date with what discovery found: a newly
+    /// found target is added with its defaults, a found one already in
+    /// the list is kept as it is (changes, disabling, and all), and one
+    /// no longer found goes away if it was never changed or was
+    /// disabled, and otherwise stays as an ordinary target with its
+    /// changes. Discovered targets come first, in the order they are
+    /// found; the user's own follow in their order.
+    fn apply_discovered(&mut self, found: Discovered) {
+        self.pending = false;
         self.discovered = found.targets;
         self.preferred = found.preferred;
         let mut existing = std::mem::take(&mut self.targets);
@@ -838,16 +895,25 @@ pub struct BuildConfig {
 impl BuildConfig {
     /// The configuration a project starts with: a root for the
     /// `Cargo.toml` and the `CMakeLists.txt` at the top of the project,
-    /// whichever exist, with their defaults.
-    pub fn discover(project_root: &Path) -> BuildConfig {
+    /// whichever exist, with their defaults and their targets pending
+    /// discovery (see [`request_discovery`](Self::request_discovery)).
+    pub fn find_roots(project_root: &Path) -> BuildConfig {
         let mut config = BuildConfig::default();
         for system in BuildSystem::ALL {
             if project_root.join(system.file_name()).is_file()
-                && let Some(root) = BuildRoot::discover(project_root, system.file_name())
+                && let Some(root) = BuildRoot::pending(system.file_name())
             {
                 let _ = config.add_root(root);
             }
         }
+        config
+    }
+
+    /// [`find_roots`](Self::find_roots) with the targets found on this
+    /// thread.
+    pub fn discover(project_root: &Path) -> BuildConfig {
+        let mut config = BuildConfig::find_roots(project_root);
+        config.sync_discovered(project_root);
         config
     }
 
@@ -900,6 +966,8 @@ impl BuildConfig {
                     .get(current.root)
                     .and_then(|r| r.targets.get(current.target))
                     .map(|t| t.name.clone());
+                // Whatever name was waited for belonged to the old root.
+                self.pending_target = None;
                 name.and_then(|name| new_root.targets.iter().position(|t| t.name == name))
                     .unwrap_or(0)
             }
@@ -922,6 +990,8 @@ impl BuildConfig {
         };
         let before = self.current;
         self.current = Some(selection);
+        // A choice made now outranks the name the file was waiting for.
+        self.pending_target = None;
         self.current != before
     }
 
@@ -1264,6 +1334,24 @@ impl BuildConfig {
         self.current.ok_or_else(|| NO_ROOT_MESSAGE.to_owned())
     }
 
+    /// The current selection as a build or run needs it: `Err` with no
+    /// roots, and while discovery is still to find the target the file
+    /// named as current, since the one standing in for it until then
+    /// would build the wrong thing.
+    pub fn current_for_job(&self) -> Result<Selection, String> {
+        let selection = self.current_selection()?;
+        if let Some(name) = &self.pending_target
+            && let Some(root) = self.roots.get(selection.root)
+            && root.pending
+        {
+            return Err(format!(
+                "Still finding the targets of {}: {name} hasn't turned up yet",
+                root.label()
+            ));
+        }
+        Ok(selection)
+    }
+
     /// A selection's root, configuration, and target, or why there
     /// aren't all three.
     fn parts(&self, selection: Selection) -> Result<(&BuildRoot, &Configuration, &Target), String> {
@@ -1275,10 +1363,13 @@ impl BuildConfig {
             .configurations
             .get(selection.configuration)
             .ok_or_else(|| format!("{} has no configuration to build with", root.label()))?;
-        let target = root
-            .targets
-            .get(selection.target)
-            .ok_or_else(|| format!("{} has no target to build", root.label()))?;
+        let target = root.targets.get(selection.target).ok_or_else(|| {
+            if root.pending {
+                format!("Still finding the targets of {}", root.label())
+            } else {
+                format!("{} has no target to build", root.label())
+            }
+        })?;
         if target.disabled {
             return Err(format!(
                 "{} is disabled: enable it on the build configuration page, or pick another target",
@@ -1318,7 +1409,7 @@ impl BuildConfig {
         configure: bool,
         settings: &Settings,
     ) -> Result<Job, String> {
-        self.build_job_for(self.current_selection()?, project_root, configure, settings)
+        self.build_job_for(self.current_for_job()?, project_root, configure, settings)
     }
 
     /// The commands that build a selection's target with its
@@ -1393,7 +1484,7 @@ impl BuildConfig {
         configure: bool,
         settings: &Settings,
     ) -> Result<Job, String> {
-        self.run_job_for(self.current_selection()?, project_root, configure, settings)
+        self.run_job_for(self.current_for_job()?, project_root, configure, settings)
     }
 
     /// The commands that build and then run a selection's target with
@@ -1530,20 +1621,82 @@ impl BuildConfig {
     /// which holds only what the user changed. The current target stays
     /// the same target, by name, through any reordering.
     pub fn sync_discovered(&mut self, project_root: &Path) {
-        let current_name = self
-            .pending_target
-            .take()
-            .or_else(|| self.current_target().map(|(_, t)| t.name.clone()));
-        for root in &mut self.roots {
-            root.sync_discovered(project_root);
+        for discovery in self.request_discovery(project_root) {
+            self.apply_discovery(discovery.run(None));
         }
-        if let (Some(current), Some(name)) = (&mut self.current, current_name)
-            && let Some(root) = self.roots.get(current.root)
-            && let Some(index) = root.targets.iter().position(|t| t.name == name)
+    }
+
+    /// Ask for every root's targets to be found again: each root is
+    /// pending from here until its result comes back through
+    /// [`apply_discovery`](Self::apply_discovery). The work is returned
+    /// to be run wherever suits, one piece per root, in root order.
+    pub fn request_discovery(&mut self, project_root: &Path) -> Vec<Discovery> {
+        self.roots
+            .iter_mut()
+            .map(|root| {
+                root.pending = true;
+                root.discovery(project_root)
+            })
+            .collect()
+    }
+
+    /// Whether any root is still waiting for its targets to be found.
+    pub fn is_discovering(&self) -> bool {
+        self.roots.iter().any(|root| root.pending)
+    }
+
+    /// The current target's name as the file had it, while discovery is
+    /// still to find it: what a frontend should show as current in the
+    /// meantime, since the target standing in until then is arbitrary.
+    pub fn pending_target(&self) -> Option<&str> {
+        let current = self.current?;
+        let root = self.roots.get(current.root)?;
+        root.pending
+            .then_some(self.pending_target.as_deref())
+            .flatten()
+    }
+
+    /// The index of the root at a path (relative to the project).
+    pub fn root_at(&self, path: &Path) -> Option<usize> {
+        self.roots.iter().position(|root| root.path == path)
+    }
+
+    /// Take in what a discovery found, bringing its root's targets up to
+    /// date (see [`BuildRoot::sync_discovered`]). The current target
+    /// stays the same target by name, or becomes the one the file named
+    /// if that has now turned up; a root that had no target yet starts
+    /// on the one discovery prefers. Returns the root's index, or
+    /// `None` for a root that has since been removed.
+    pub fn apply_discovery(&mut self, result: DiscoveryResult) -> Option<usize> {
+        let index = self.root_at(&result.path)?;
+        let current_name = match self.current {
+            Some(current) if current.root == index => self
+                .pending_target
+                .take()
+                .or_else(|| self.current_target().map(|(_, t)| t.name.clone())),
+            _ => None,
+        };
+        let root = &mut self.roots[index];
+        let had_target = root
+            .targets
+            .get(self.current.map_or(0, |c| c.target))
+            .is_some();
+        root.apply_discovered(result.found);
+        if let Some(current) = &mut self.current
+            && current.root == index
         {
-            current.target = index;
+            match current_name {
+                Some(name) => {
+                    if let Some(target) = root.targets.iter().position(|t| t.name == name) {
+                        current.target = target;
+                    }
+                }
+                None if !had_target => current.target = root.default_target(),
+                None => {}
+            }
         }
         self.settle_selection();
+        Some(index)
     }
 
     /// Read a build configuration file. Keys the editor doesn't know are
@@ -1616,8 +1769,14 @@ impl BuildConfig {
             if let Some(c) = root.configurations.get(current.configuration) {
                 t.insert("configuration".to_owned(), Value::String(c.name.clone()));
             }
-            if let Some(target) = root.targets.get(current.target) {
-                t.insert("target".to_owned(), Value::String(target.name.clone()));
+            // While discovery is still to find the target the file
+            // named, that name stands rather than the stand-in's.
+            let target = self
+                .pending_target
+                .clone()
+                .or_else(|| root.targets.get(current.target).map(|t| t.name.clone()));
+            if let Some(target) = target {
+                t.insert("target".to_owned(), Value::String(target));
             }
             table.insert("current".to_owned(), Value::Table(t));
         }
@@ -1968,9 +2127,61 @@ pub fn parse_environment(text: &str) -> Result<Vec<(String, String)>, String> {
 
 /// What discovery found under a root: the targets, and which of them a
 /// fresh root should start on, if discovery has an opinion.
+#[derive(Clone, Debug)]
 struct Discovered {
     targets: Vec<Target>,
     preferred: Option<String>,
+}
+
+/// The work of finding a root's targets by looking at the project,
+/// which for a CMake root means reading every `CMakeLists.txt` under it
+/// and for a big tree takes a while. Handed out by
+/// [`BuildRoot::discovery`] and [`BuildConfig::request_discovery`], run
+/// on whatever thread suits with [`run`](Self::run), and the result
+/// taken in with [`BuildConfig::apply_discovery`].
+#[derive(Clone, Debug)]
+pub struct Discovery {
+    /// The root's path relative to the project: its identity.
+    path: PathBuf,
+    system: BuildSystem,
+    /// The root file, absolute.
+    file: PathBuf,
+}
+
+impl Discovery {
+    /// The root this is for, relative to the project.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Look at the project. `files` is the project's file list where one
+    /// is at hand (the file index's, with ignored files left out), which
+    /// saves walking the tree again; without it the tree under the root
+    /// is walked here.
+    pub fn run(self, files: Option<&[PathBuf]>) -> DiscoveryResult {
+        let found = match self.system {
+            BuildSystem::Cargo => cargo_targets(&self.file),
+            BuildSystem::CMake => cmake_targets(&self.file, files),
+        };
+        DiscoveryResult {
+            path: self.path,
+            found,
+        }
+    }
+}
+
+/// What a [`Discovery`] found, for [`BuildConfig::apply_discovery`].
+#[derive(Clone, Debug)]
+pub struct DiscoveryResult {
+    path: PathBuf,
+    found: Discovered,
+}
+
+impl DiscoveryResult {
+    /// The root this is for, relative to the project.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 /// The targets for a Cargo root: one per package the manifest names,
@@ -2212,15 +2423,17 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
 /// executable declared in the tree's `CMakeLists.txt` files, each set
 /// to run that executable from where its directory puts it in the build
 /// directory.
-fn cmake_targets(lists: &Path) -> Discovered {
-    let mut targets = vec![Target {
-        name: "All".to_owned(),
-        auto: Some(ALL_TARGET_ID.to_owned()),
-        ..Target::default()
-    }];
+fn cmake_targets(lists: &Path, project_files: Option<&[PathBuf]>) -> Discovered {
+    let mut targets = vec![cmake_all_target()];
     let dir = lists.parent().unwrap_or(Path::new(""));
-    let mut files = Vec::new();
-    collect_cmake_lists(dir, dir, &mut files);
+    let files = match project_files {
+        Some(project_files) => cmake_lists_among(dir, project_files),
+        None => {
+            let mut files = Vec::new();
+            collect_cmake_lists(dir, dir, &mut files);
+            files
+        }
+    };
     let mut seen = HashSet::new();
     for (relative, file) in files {
         let Ok(text) = fs::read_to_string(&file) else {
@@ -2250,37 +2463,81 @@ fn cmake_targets(lists: &Path) -> Discovered {
     }
 }
 
-/// Every `CMakeLists.txt` under `dir`, as (directory relative to `root`,
-/// file path), the top one first and the rest in path order. Build
-/// directories and hidden directories are left out.
-fn collect_cmake_lists(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf)>) {
-    let file = dir.join("CMakeLists.txt");
-    if file.is_file() {
-        let relative = dir.strip_prefix(root).unwrap_or(dir).to_path_buf();
-        out.push((relative, file));
+/// The target for everything a CMake root builds.
+fn cmake_all_target() -> Target {
+    Target {
+        name: "All".to_owned(),
+        auto: Some(ALL_TARGET_ID.to_owned()),
+        ..Target::default()
     }
+}
+
+/// Whether a directory is left out of the search for `CMakeLists.txt`
+/// files: build directories and hidden ones.
+fn skipped_dir(name: &OsStr) -> bool {
+    let name = name.as_encoded_bytes();
+    name.starts_with(b".")
+        || name.starts_with(CMAKE_BUILD_DIR_PREFIX.as_bytes())
+        || name == b"build"
+        || name == b"target"
+}
+
+/// Every `CMakeLists.txt` under `dir`, as (directory relative to `dir`,
+/// file path), the top one first and the rest in path order. Build
+/// directories and hidden directories are left out, and symbolic links
+/// aren't followed. Each entry costs one directory listing and nothing
+/// more: on a tree of tens of thousands of directories, a stat for each
+/// entry is most of the time.
+fn collect_cmake_lists(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf)>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
-    let mut children: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .filter(|path| {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            !name.starts_with('.')
-                && !name.starts_with(CMAKE_BUILD_DIR_PREFIX)
-                && name != "build"
-                && name != "target"
-        })
-        .collect();
+    let mut children: Vec<PathBuf> = Vec::new();
+    let mut has_lists = false;
+    for entry in entries.flatten() {
+        // The entry's own type: a symbolic link is neither, so a link
+        // cycle can't trap the walk.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name();
+        if file_type.is_dir() {
+            if !skipped_dir(&name) {
+                children.push(entry.path());
+            }
+        } else if file_type.is_file() && name == BuildSystem::CMake.file_name() {
+            has_lists = true;
+        }
+    }
+    if has_lists {
+        let relative = dir.strip_prefix(root).unwrap_or(dir).to_path_buf();
+        out.push((relative, dir.join(BuildSystem::CMake.file_name())));
+    }
     children.sort();
     for child in children {
         collect_cmake_lists(root, &child, out);
     }
+}
+
+/// The `CMakeLists.txt` files under `dir` among a project's files, as
+/// [`collect_cmake_lists`] would list them.
+fn cmake_lists_among(dir: &Path, files: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
+    let mut out: Vec<(PathBuf, PathBuf)> = files
+        .iter()
+        .filter(|file| {
+            file.file_name()
+                .is_some_and(|name| name == BuildSystem::CMake.file_name())
+        })
+        .filter_map(|file| {
+            let relative = file.parent()?.strip_prefix(dir).ok()?;
+            let skipped = relative
+                .components()
+                .any(|component| skipped_dir(component.as_os_str()));
+            (!skipped).then(|| (relative.to_path_buf(), file.clone()))
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// The names of the executables a `CMakeLists.txt` declares with
@@ -2603,6 +2860,32 @@ mod tests {
                 ("helper", "helper", "tools/helper"),
             ]
         );
+
+        // A root pending discovery has `All` before anything is looked
+        // at; given the project's files, as the index lists them, the
+        // discovery finds the same targets without walking the tree.
+        let pending = BuildRoot::pending("CMakeLists.txt").unwrap();
+        assert!(pending.is_pending());
+        assert_eq!(pending.targets().len(), 1);
+        assert_eq!(pending.targets()[0].name, "All");
+        let files: Vec<PathBuf> = [
+            "tools/helper.c",
+            "tools/CMakeLists.txt",
+            "cmake-build-debug/CMakeLists.txt",
+            ".hidden/CMakeLists.txt",
+            "CMakeLists.txt",
+        ]
+        .iter()
+        .map(|f| root.join(f))
+        .collect();
+        let result = pending.discovery(root).run(Some(&files));
+        assert_eq!(result.path(), Path::new("CMakeLists.txt"));
+        let mut from_files = BuildConfig::default();
+        from_files.add_root(pending).unwrap();
+        assert!(from_files.is_discovering());
+        assert_eq!(from_files.apply_discovery(result), Some(0));
+        assert!(!from_files.is_discovering());
+        assert_eq!(from_files.roots()[0].targets(), cmake.targets());
     }
 
     #[test]
@@ -3461,6 +3744,65 @@ mod tests {
             BuildConfig::parse(&BuildConfig::default().to_toml()).unwrap(),
             BuildConfig::default()
         );
+    }
+
+    #[test]
+    fn a_root_pending_discovery_waits_for_the_target_the_file_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\"]\n",
+        );
+        write(&root.join("a/Cargo.toml"), "[package]\nname = \"a\"\n");
+        write(&root.join("b/Cargo.toml"), "[package]\nname = \"b\"\n");
+        let mut config = BuildConfig::discover(root);
+        assert!(config.select_target(0, 1));
+        let text = config.to_toml();
+        assert!(text.contains("target = \"b\""), "{text}");
+
+        // Loaded again, the file's target isn't among the targets yet:
+        // the name is kept, shown as current, and written back as it
+        // was, and a build waits rather than building the stand-in.
+        let mut config = BuildConfig::parse(&text).unwrap();
+        let discoveries = config.request_discovery(root);
+        assert_eq!(discoveries.len(), 1);
+        assert_eq!(discoveries[0].path(), Path::new("Cargo.toml"));
+        assert!(config.is_discovering());
+        assert!(config.roots()[0].is_pending());
+        assert!(config.roots()[0].targets().is_empty());
+        assert_eq!(config.pending_target(), Some("b"));
+        let err = config.current_for_job().unwrap_err();
+        assert!(err.contains("Still finding") && err.contains('b'), "{err}");
+        assert!(config.build_job(root, false, &Settings::default()).is_err());
+        assert!(config.to_toml().contains("target = \"b\""));
+        // Then it turns up.
+        let result = discoveries.into_iter().next().unwrap().run(None);
+        assert_eq!(config.apply_discovery(result), Some(0));
+        assert!(!config.is_discovering());
+        assert_eq!(config.pending_target(), None);
+        assert_eq!(config.current_target().unwrap().1.name, "b");
+        assert!(config.current_for_job().is_ok());
+
+        // A target picked meanwhile outranks the name from the file,
+        // and stays current by name as the found ones go ahead of it.
+        let mut config = BuildConfig::parse(&text).unwrap();
+        let discoveries = config.request_discovery(root);
+        assert_eq!(config.add_target(0), Some(0));
+        // Already the stand-in, so nothing moves; but it is chosen now.
+        assert!(!config.select_target(0, 0));
+        assert_eq!(config.pending_target(), None);
+        assert!(config.current_for_job().is_ok());
+        config.apply_discovery(discoveries.into_iter().next().unwrap().run(None));
+        assert_eq!(config.current().unwrap().target, 2);
+        assert_eq!(config.current_target().unwrap().1.name, "New target");
+
+        // A result for a root that is gone is dropped.
+        let mut config = BuildConfig::parse(&text).unwrap();
+        let discoveries = config.request_discovery(root);
+        config.remove_root(0);
+        let result = discoveries.into_iter().next().unwrap().run(None);
+        assert_eq!(config.apply_discovery(result), None);
     }
 
     #[test]

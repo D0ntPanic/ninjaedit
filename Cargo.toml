@@ -3,3 +3,6 @@ resolver = "3"
 members = ["core", "tui"]
 default-members = ["tui"]
 
+
+[profile.dev.package.code-fuzzy-match]
+opt-level = 3
