@@ -27,11 +27,16 @@
 //!
 //! Every action ([`stage`](Changes::stage), [`unstage`](Changes::unstage),
 //! and [`commit`](Changes::commit)) changes the repository on the
-//! caller's thread and starts a new scan, so the lists follow. So does
-//! [`refresh`](Changes::refresh), for when something else changed the
-//! working tree: a file saved in the editor, a `git` command in a shell.
-//! A scan started while one is running replaces it; the old one's
-//! result is dropped.
+//! caller's thread and updates the lists right away with what it did:
+//! staging and unstaging compare just the files they touched again,
+//! which is quick however big the tree, and a commit empties the
+//! staged list. A scan then starts to confirm the lists and catch
+//! anything else; while it runs, [`is_confirming`](Changes::is_confirming)
+//! tells a frontend it needn't say it is waiting. [`refresh`](Changes::refresh)
+//! starts a scan too, for when something else changed the working
+//! tree: a file saved in the editor, a `git` command in a shell. A
+//! scan started while one is running replaces it; the old one's result
+//! is dropped.
 //!
 //! The diff of a change is read on demand, on the caller's thread, by
 //! [`Changes::unstaged_diff`] and [`Changes::staged_diff`], as a
@@ -44,8 +49,9 @@ use super::diff::{
 };
 use super::submodules::{Submodule, changed_submodules};
 use git2::{
-    Delta, DiffFindOptions, DiffOptions, ErrorCode, Oid, Patch, Repository, RepositoryState,
+    Delta, DiffFindOptions, DiffOptions, ErrorCode, Oid, Patch, Repository, RepositoryState, Tree,
 };
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -91,6 +97,9 @@ pub struct Changes {
     receiver: Option<Receiver<Scanned>>,
     generation: u64,
     loading: bool,
+    /// Whether the running scan follows an action the lists already
+    /// show the result of.
+    confirming: bool,
     error: Option<String>,
 }
 
@@ -130,6 +139,7 @@ impl Changes {
             receiver: None,
             generation: 0,
             loading: false,
+            confirming: false,
             error: None,
         };
         changes.refresh();
@@ -144,6 +154,16 @@ impl Changes {
     /// Scan the working tree again. A scan already running is
     /// superseded: its result is dropped when it arrives.
     pub fn refresh(&mut self) {
+        self.scan(false);
+    }
+
+    /// Scan the working tree to confirm what an action left the lists
+    /// showing.
+    fn confirm(&mut self) {
+        self.scan(true);
+    }
+
+    fn scan(&mut self, confirming: bool) {
         self.generation += 1;
         let generation = self.generation;
         let (sender, receiver) = mpsc::channel();
@@ -159,10 +179,12 @@ impl Changes {
             Ok(_) => {
                 self.receiver = Some(receiver);
                 self.loading = true;
+                self.confirming = confirming;
             }
             Err(err) => {
                 self.receiver = None;
                 self.loading = false;
+                self.confirming = false;
                 self.error = Some(err.to_string());
             }
         }
@@ -195,6 +217,7 @@ impl Changes {
         if disconnected {
             if self.loading {
                 self.loading = false;
+                self.confirming = false;
                 self.error = Some("the scan of the working tree stopped".to_owned());
                 changed = true;
             }
@@ -205,6 +228,7 @@ impl Changes {
 
     fn apply(&mut self, result: Result<Snapshot, String>) {
         self.loading = false;
+        self.confirming = false;
         match result {
             Ok(snapshot) => {
                 self.unstaged = snapshot.unstaged;
@@ -242,6 +266,12 @@ impl Changes {
     /// Whether a scan is running.
     pub fn is_loading(&self) -> bool {
         self.loading
+    }
+
+    /// Whether the running scan only confirms what the lists already
+    /// show after an action, so that nothing is being waited for.
+    pub fn is_confirming(&self) -> bool {
+        self.loading && self.confirming
     }
 
     /// Why the last scan failed, if it did.
@@ -475,8 +505,9 @@ impl Changes {
         &mut self,
         paths: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), git2::Error> {
+        let paths: Vec<&str> = paths.into_iter().collect();
         let mut index = self.repo.index()?;
-        for path in paths {
+        for &path in &paths {
             if fs::symlink_metadata(self.workdir.join(path)).is_ok() {
                 index.add_path(Path::new(path))?;
             } else {
@@ -484,7 +515,8 @@ impl Changes {
             }
         }
         index.write()?;
-        self.refresh();
+        self.rescan(&paths);
+        self.confirm();
         Ok(())
     }
 
@@ -501,12 +533,62 @@ impl Changes {
         &mut self,
         paths: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), git2::Error> {
+        let paths: Vec<&str> = paths.into_iter().collect();
         {
             let base = self.base_commit().map(|commit| commit.into_object());
-            self.repo.reset_default(base.as_ref(), paths)?;
+            self.repo.reset_default(base.as_ref(), &paths)?;
         }
-        self.refresh();
+        self.rescan(&paths);
+        self.confirm();
         Ok(())
+    }
+
+    /// Compare just `paths` again, on this thread, and put what they
+    /// are now in place of what the lists had for them: the outcome of
+    /// staging or unstaging them, before a scan of the whole tree
+    /// confirms it. Failing that, the lists wait for the scan.
+    fn rescan(&mut self, paths: &[&str]) {
+        let Ok((staged, unstaged, icase)) = self.compare(paths) else {
+            return;
+        };
+        let touched: HashSet<&str> = paths.iter().copied().collect();
+        let untouched = |change: &FileChange| {
+            !touched.contains(change.path.as_str())
+                && !change
+                    .old_path
+                    .as_deref()
+                    .is_some_and(|path| touched.contains(path))
+        };
+        // Keep the order a scan lists in, which follows the case rule
+        // of the index, so that the confirming scan changes nothing.
+        let key = |change: &FileChange| -> Vec<u8> {
+            if icase {
+                change.path.to_ascii_lowercase().into_bytes()
+            } else {
+                change.path.clone().into_bytes()
+            }
+        };
+        for (list, fresh) in [(&mut self.staged, staged), (&mut self.unstaged, unstaged)] {
+            list.retain(untouched);
+            list.extend(fresh);
+            list.sort_by_cached_key(key);
+        }
+        self.conflicts = count_conflicts(&self.unstaged);
+    }
+
+    /// The staged and unstaged changes of `paths` as they are now, with
+    /// their lines counted unless the lists are too long for that, and
+    /// whether the lists are ordered ignoring case.
+    fn compare(
+        &self,
+        paths: &[&str],
+    ) -> Result<(Vec<FileChange>, Vec<FileChange>, bool), git2::Error> {
+        let base_tree = self.base_commit().and_then(|commit| commit.tree().ok());
+        let diff = index_diff(&self.repo, base_tree.as_ref(), paths)?;
+        let staged = list_changes(&diff, staged_delta, self.staged.len() <= STATS_LIMIT)?;
+        let diff = workdir_diff(&self.repo, paths)?;
+        let unstaged = list_changes(&diff, |_| true, self.unstaged.len() <= STATS_LIMIT)?;
+        Ok((staged, unstaged, diff.is_sorted_icase()))
     }
 
     /// Unstage every staged change of the last scan.
@@ -594,7 +676,14 @@ impl Changes {
         }
         // An amended commit is made; the next one follows it.
         self.amend = false;
-        self.refresh();
+        // The commit holds what was staged, and is now what a commit
+        // would replace.
+        self.staged.clear();
+        self.unborn = false;
+        self.merging = false;
+        self.merge_message = None;
+        self.head_message = Some(message.to_owned());
+        self.confirm();
         Ok(id)
     }
 }
@@ -611,6 +700,54 @@ fn workdir_options() -> DiffOptions {
         .show_untracked_content(true)
         .include_typechange(true);
     options
+}
+
+/// Limit a diff to `paths`, taken literally; none means every path.
+fn limit_to(options: &mut DiffOptions, paths: &[&str]) {
+    if paths.is_empty() {
+        return;
+    }
+    options.disable_pathspec_match(true);
+    for path in paths {
+        options.pathspec(path);
+    }
+}
+
+/// The diff the staged list is built from: the index against
+/// `base_tree` (HEAD's, or its parent's when amending; none on an
+/// unborn branch), with renames found.
+fn index_diff<'r>(
+    repo: &'r Repository,
+    base_tree: Option<&Tree<'_>>,
+    paths: &[&str],
+) -> Result<git2::Diff<'r>, git2::Error> {
+    let mut options = DiffOptions::new();
+    options.context_lines(CONTEXT_LINES);
+    limit_to(&mut options, paths);
+    let mut diff = repo.diff_tree_to_index(base_tree, None, Some(&mut options))?;
+    find_renames(&mut diff)?;
+    Ok(diff)
+}
+
+/// The diff the unstaged list is built from: the working directory
+/// against the index.
+fn workdir_diff<'r>(repo: &'r Repository, paths: &[&str]) -> Result<git2::Diff<'r>, git2::Error> {
+    let mut options = workdir_options();
+    limit_to(&mut options, paths);
+    repo.diff_index_to_workdir(None, Some(&mut options))
+}
+
+/// Whether a file of the index diff belongs in the staged list: a
+/// conflict is shown unstaged, to be resolved.
+fn staged_delta(delta: Delta) -> bool {
+    delta != Delta::Conflicted
+}
+
+fn count_conflicts(unstaged: &[FileChange]) -> usize {
+    unstaged
+        .iter()
+        .filter(|change| change.kind == ChangeKind::Conflicted)
+        .count()
 }
 
 fn find_renames(diff: &mut git2::Diff<'_>) -> Result<(), git2::Error> {
@@ -659,19 +796,11 @@ fn snapshot(workdir: &Path, amend: bool) -> Result<Snapshot, git2::Error> {
         None => None,
     };
 
-    let mut options = DiffOptions::new();
-    options.context_lines(CONTEXT_LINES);
-    let mut diff = repo.diff_tree_to_index(base_tree.as_ref(), None, Some(&mut options))?;
-    find_renames(&mut diff)?;
-    let staged = list_changes(&diff, |delta| delta != Delta::Conflicted)?;
-
-    let mut options = workdir_options();
-    let diff = repo.diff_index_to_workdir(None, Some(&mut options))?;
-    let unstaged = list_changes(&diff, |_| true)?;
-    let conflicts = unstaged
-        .iter()
-        .filter(|change| change.kind == ChangeKind::Conflicted)
-        .count();
+    let diff = index_diff(&repo, base_tree.as_ref(), &[])?;
+    let staged = list_changes(&diff, staged_delta, diff.deltas().len() <= STATS_LIMIT)?;
+    let diff = workdir_diff(&repo, &[])?;
+    let unstaged = list_changes(&diff, |_| true, diff.deltas().len() <= STATS_LIMIT)?;
+    let conflicts = count_conflicts(&unstaged);
 
     let merging = repo.state() == RepositoryState::Merge;
     let merge_message = if merging {
@@ -698,18 +827,18 @@ fn snapshot(workdir: &Path, amend: bool) -> Result<Snapshot, git2::Error> {
 }
 
 /// The files of a diff whose status `keep` accepts, with their lines
-/// counted unless there are too many of them.
+/// counted when `stats` (see [`STATS_LIMIT`]).
 fn list_changes(
     diff: &git2::Diff<'_>,
     keep: impl Fn(Delta) -> bool,
+    stats: bool,
 ) -> Result<Vec<FileChange>, git2::Error> {
-    let count = diff.deltas().len();
     let mut changes = Vec::new();
     for (index, delta) in diff.deltas().enumerate() {
         if !keep(delta.status()) {
             continue;
         }
-        let stats = count <= STATS_LIMIT && delta.status() != Delta::Conflicted;
+        let stats = stats && delta.status() != Delta::Conflicted;
         changes.push(diff::file_change(diff, index, stats)?);
     }
     Ok(changes)
@@ -729,6 +858,36 @@ mod tests {
 
     fn settle(changes: &mut Changes) {
         assert!(changes.wait(Duration::from_secs(10)), "the scan finished");
+    }
+
+    /// Settle the scan that follows an action, checking that the lists
+    /// showed its outcome before the scan and that the scan only
+    /// confirms them.
+    fn confirmed(changes: &mut Changes) {
+        assert!(changes.is_confirming(), "the scan confirms an action");
+        let owned = |changes: &[FileChange]| -> Vec<(char, String, usize, usize)> {
+            listed(changes)
+                .into_iter()
+                .map(|(kind, path, added, removed)| (kind, path.to_owned(), added, removed))
+                .collect()
+        };
+        let before = (
+            owned(changes.staged()),
+            owned(changes.unstaged()),
+            changes.conflict_count(),
+            changes.is_merging(),
+            changes.head_message().map(str::to_owned),
+        );
+        settle(changes);
+        assert!(!changes.is_confirming());
+        let after = (
+            owned(changes.staged()),
+            owned(changes.unstaged()),
+            changes.conflict_count(),
+            changes.is_merging(),
+            changes.head_message().map(str::to_owned),
+        );
+        assert_eq!(before, after, "the scan confirmed what the action showed");
     }
 
     fn listed(changes: &[FileChange]) -> Vec<(char, &str, usize, usize)> {
@@ -815,7 +974,7 @@ mod tests {
         // Stage two of them: they move lists, and the staged diff is
         // against HEAD.
         changes.stage(["a.rs", "gone.txt"]).unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert_eq!(
             listed(changes.unstaged()),
             [('?', "dir/inner.txt", 1, 0), ('?', "new.txt", 1, 0)]
@@ -841,24 +1000,24 @@ mod tests {
 
         // Unstage one; stage all; unstage all; stage all again.
         changes.unstage(["gone.txt"]).unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert_eq!(listed(changes.staged()), [('M', "a.rs", 1, 0)]);
         assert!(changes.unstaged().iter().any(|c| c.path == "gone.txt"));
         changes.stage_all().unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert!(changes.unstaged().is_empty());
         assert_eq!(changes.staged().len(), 4);
         changes.unstage_all().unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert!(changes.staged().is_empty());
         assert_eq!(changes.unstaged().len(), 4);
         changes.stage_all().unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
 
         // Commit: the tree is clean, and HEAD moved on from the base.
         assert!(changes.commit("   ").is_err());
         let id = changes.commit("Change things\n").unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert!(changes.is_clean());
         let commit = repo.repo.find_commit(id).unwrap();
         assert_eq!(commit.message().unwrap(), "Change things");
@@ -881,14 +1040,14 @@ mod tests {
             [('?', "new.txt", 3, 0), ('D', "old.txt", 0, 3)]
         );
         changes.stage(["new.txt", "old.txt"]).unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert_eq!(listed(changes.staged()), [('R', "new.txt", 0, 0)]);
         assert_eq!(changes.staged()[0].old_path.as_deref(), Some("old.txt"));
         let diff = changes.staged_diff(&changes.staged()[0]).unwrap();
         assert_eq!(diff.kind, ChangeKind::Renamed);
         assert!(!diff.has_hunks());
         changes.unstage_all().unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert!(changes.staged().is_empty());
         assert_eq!(changes.unstaged().len(), 2);
     }
@@ -937,12 +1096,12 @@ mod tests {
         settle(&mut changes);
         assert_eq!(listed(changes.unstaged()), [('U', "f.txt", 0, 0)]);
         changes.stage(["f.txt"]).unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert_eq!(changes.conflict_count(), 0);
         assert_eq!(listed(changes.staged()), [('M', "f.txt", 1, 1)]);
         assert!(changes.unstaged().is_empty());
         let id = changes.commit("Merge branch 'side'").unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         let commit = repo.repo.find_commit(id).unwrap();
         let parents: Vec<Oid> = commit.parent_ids().collect();
         assert_eq!(parents, vec![ours, theirs]);
@@ -1019,7 +1178,7 @@ mod tests {
         let names: Vec<&str> = range.commits.iter().map(|c| c.summary.as_str()).collect();
         assert_eq!(names, ["Inner change", "Inner commit"]);
         changes.stage(["libs/sub"]).unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert_eq!(listed(changes.staged()), [('M', "libs/sub", 0, 0)]);
         assert!(changes.unstaged().is_empty());
         // Staged: HEAD's commit to the index's.
@@ -1032,7 +1191,7 @@ mod tests {
         );
         assert_eq!(range.commits.len(), 2);
         let id = changes.commit("Update submodule").unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert!(changes.is_clean());
         let tree = repo.repo.find_commit(id).unwrap().tree().unwrap();
         let entry = tree.get_path(Path::new("libs/sub")).unwrap();
@@ -1068,7 +1227,7 @@ mod tests {
         // to the parent's version (none), so it turns up unstaged.
         fs::write(repo.path().join("b.txt"), "bee\n").unwrap();
         changes.stage(["b.txt"]).unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert_eq!(
             listed(changes.staged()),
             [
@@ -1078,7 +1237,7 @@ mod tests {
             ]
         );
         changes.unstage(["c.txt"]).unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert_eq!(
             listed(changes.staged()),
             [('M', "a.txt", 1, 0), ('M', "b.txt", 1, 1)]
@@ -1087,7 +1246,7 @@ mod tests {
         // The commit replaces HEAD: same parent, new tree and message,
         // and amending is off again.
         let id = changes.commit("Add two and bee").unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert_ne!(id, head);
         assert!(!changes.is_amending());
         let commit = repo.repo.find_commit(id).unwrap();
@@ -1120,11 +1279,11 @@ mod tests {
         assert_eq!(listed(changes.unstaged()), [('?', "first.txt", 1, 0)]);
         assert!(changes.commit("Nothing staged").is_err());
         changes.stage_all().unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert_eq!(listed(changes.staged()), [('A', "first.txt", 1, 0)]);
         // Unstaging from an unborn branch empties the index again.
         changes.unstage_all().unwrap();
-        settle(&mut changes);
+        confirmed(&mut changes);
         assert!(changes.staged().is_empty());
         assert_eq!(listed(changes.unstaged()), [('?', "first.txt", 1, 0)]);
         let dir = tempfile::tempdir().unwrap();

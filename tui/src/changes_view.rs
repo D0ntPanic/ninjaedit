@@ -682,8 +682,17 @@ impl ChangesView {
         if !changes.poll() {
             return false;
         }
-        // The lists are new: rebuild the trees, and show the selected
-        // file afresh, since it may have changed too.
+        self.follow_lists();
+        true
+    }
+
+    /// The lists are new, from a scan or an action: rebuild the trees,
+    /// and show the selected file afresh, since it may have changed
+    /// too.
+    fn follow_lists(&mut self) {
+        let Some(changes) = &self.changes else {
+            return;
+        };
         self.unstaged.rebuild(changes.unstaged());
         self.staged.rebuild(changes.staged());
         self.content = None;
@@ -694,7 +703,14 @@ impl ChangesView {
         if let Some(message) = merge_message {
             self.offer_message(message);
         }
-        true
+    }
+
+    /// Whether a scan is running whose result is being waited for: not
+    /// one that only confirms what an action left the lists showing.
+    fn scanning(&self) -> bool {
+        self.changes
+            .as_ref()
+            .is_some_and(|changes| changes.is_loading() && !changes.is_confirming())
     }
 
     /// Put text in the message box on the page's own account, unless
@@ -738,9 +754,10 @@ impl ChangesView {
             Pane::Commit => COMMIT_HINT,
             Pane::Content => CONTENT_HINT,
         };
-        match &self.changes {
-            Some(changes) if changes.is_loading() => format!("{SCANNING} · {pane}"),
-            _ => pane.to_owned(),
+        if self.scanning() {
+            format!("{SCANNING} · {pane}")
+        } else {
+            pane.to_owned()
         }
     }
 
@@ -836,9 +853,10 @@ impl ChangesView {
         let Some(changes) = &self.changes else {
             return;
         };
+        let scanning = self.scanning();
         self.content = Some(match self.selected_row() {
             None => Content::Message(
-                if changes.is_loading() && changes.is_clean() {
+                if scanning && changes.is_clean() {
                     SCANNING
                 } else if changes.is_clean() {
                     CLEAN
@@ -977,7 +995,10 @@ impl ChangesView {
         self.acted = true;
         self.content = None;
         match result {
-            Ok(()) => ChangesOutcome::Continue,
+            Ok(()) => {
+                self.follow_lists();
+                ChangesOutcome::Continue
+            }
             Err(err) => ChangesOutcome::Notice(format!(
                 "Could not {} {what}: {}",
                 if list == List::Unstaged {
@@ -1023,9 +1044,9 @@ impl ChangesView {
         match changes.commit(&message) {
             Ok(id) => {
                 self.acted = true;
-                self.content = None;
                 self.message = message_editor("");
                 self.auto_message = None;
+                self.follow_lists();
                 let summary = message.trim().lines().next().unwrap_or("").to_owned();
                 let verb = if amended { "Amended" } else { "Committed" };
                 ChangesOutcome::Notice(format!("{verb} {} {summary}", short_id(id)))
@@ -1564,7 +1585,7 @@ impl ChangesView {
             .add_modifier(Modifier::BOLD);
         let dim = background.fg(theme.command_palette_result_context_text);
         let count = self.files(list).len();
-        let loading = self.changes.as_ref().is_some_and(Changes::is_loading);
+        let loading = self.scanning();
         let title = if count > 0 {
             format!("{heading_text} ({count})")
         } else {
@@ -2090,13 +2111,24 @@ mod tests {
         assert!(screen.iter().any(|r| r.contains("+ c")), "{screen:#?}");
         assert!(view.hint().contains("Space unstage"));
         // Space unstages it again; `a` in the unstaged list stages all.
+        // The lists show the outcome before the scan confirms it, with
+        // no word of waiting.
         press(&mut view, KeyCode::Char(' '));
+        assert!(view.is_loading());
+        assert!(view.files(List::Staged).is_empty());
+        assert_eq!(view.files(List::Unstaged).len(), 3);
+        assert!(!view.hint().contains(SCANNING), "{}", view.hint());
         settle(&mut view);
         assert!(view.files(List::Staged).is_empty());
         assert_eq!(view.files(List::Unstaged).len(), 3);
         press(&mut view, KeyCode::Up);
         assert_eq!(view.pane, Pane::Unstaged);
         press(&mut view, KeyCode::Char('a'));
+        assert!(view.files(List::Unstaged).is_empty());
+        assert_eq!(view.files(List::Staged).len(), 3);
+        let screen = draw(&mut view, 100, 30);
+        assert!(row_with(&screen, NO_UNSTAGED).len() > width, "{screen:#?}");
+        assert!(!screen.iter().any(|r| r.contains(SCANNING)), "{screen:#?}");
         settle(&mut view);
         assert!(view.files(List::Unstaged).is_empty());
         assert_eq!(view.files(List::Staged).len(), 3);
@@ -2132,8 +2164,10 @@ mod tests {
             "{outcome:?}"
         );
         assert!(view.take_acted());
-        settle(&mut view);
         assert_eq!(view.message_text(), "");
+        let screen = draw(&mut view, 100, 30);
+        assert!(row_with(&screen, CLEAN).len() > width, "{screen:#?}");
+        settle(&mut view);
         let screen = draw(&mut view, 100, 30);
         assert!(row_with(&screen, CLEAN).len() > width);
         assert_eq!(head_message(&dir), "Change things\n\nA body, with the why.");
