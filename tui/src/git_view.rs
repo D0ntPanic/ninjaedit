@@ -81,8 +81,18 @@
 //! as the page opens. A repository that wasn't one when the page was
 //! opened (`git init` since) shows its history once refreshed.
 //!
-//! The page only looks at the repository: checking out a branch or
-//! commit will come later.
+//! F5 fetches: what `git fetch --all` does (see the core crate's
+//! `git::fetch` module), bringing every remote's branches and tags up
+//! to date, in the background, with the status bar saying which remote
+//! is being fetched meanwhile. Nothing is merged or checked out. Once
+//! the fetch is done the page refreshes as it does when coming back,
+//! keeping its place, and the status bar says what came of it: how
+//! many references changed, and any remote that couldn't be fetched.
+//! A fetch is for the shown tab's repository (a submodule's, on its
+//! tab); F5 during one does nothing.
+//!
+//! Beyond fetching, the page only looks at the repository: checking
+//! out a branch or commit will come later.
 
 use crate::diff_pane::{
     Button, HScroll, Piece, WHEEL_COLUMNS, WHEEL_LINES, clamp_between, content_background,
@@ -94,8 +104,8 @@ use crate::palette::palette_background;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
-    ChangeKind, CommitDetail, FileDiff, FileTree, History, NODE, Oid, RefKind, TreeRow, cells_for,
-    submodules,
+    ChangeKind, CommitDetail, Fetch, FileDiff, FileTree, History, NODE, Oid, RefKind, TreeRow,
+    cells_for, submodules,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
@@ -131,11 +141,13 @@ const NOT_A_REPOSITORY: &str = "Not a git repository";
 const NOT_INITIALIZED: &str = "Submodule not initialized";
 const NO_COMMITS: &str = "No commits yet";
 const NO_BRANCHES: &str = "none";
-const SIDEBAR_HINT: &str = "↑↓ branch · Enter go to · ←→ fold remote · Tab pane · Ctrl+E leave";
-const LOG_HINT: &str = "↑↓ commit · Enter files · ←→ sideways · Tab pane · Ctrl+E leave";
-const FILES_HINT: &str = "↑↓ file · Enter view · ←→ fold/unfold · Tab pane · Ctrl+E leave";
+const SIDEBAR_HINT: &str =
+    "↑↓ branch · Enter go to · ←→ fold remote · F5 fetch · Tab pane · Ctrl+E leave";
+const LOG_HINT: &str = "↑↓ commit · Enter files · ←→ sideways · F5 fetch · Tab pane · Ctrl+E leave";
+const FILES_HINT: &str =
+    "↑↓ file · Enter view · ←→ fold/unfold · F5 fetch · Tab pane · Ctrl+E leave";
 const CONTENT_HINT: &str =
-    "↑↓ scroll · ←→ sideways · ▲▼ buttons expand context · Tab pane · Ctrl+E leave";
+    "↑↓ scroll · ←→ sideways · ▲▼ buttons expand context · F5 fetch · Tab pane · Ctrl+E leave";
 
 /// Which pane has the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,6 +401,15 @@ impl GitLogTabs {
         self.active_view().map(GitLogView::hint).unwrap_or_default()
     }
 
+    /// What the status bar is to say, once: how the shown page's fetch
+    /// went, when one has finished since the last time this was asked.
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.tabs[self.active]
+            .view
+            .as_mut()
+            .and_then(GitLogView::take_notice)
+    }
+
     #[cfg(test)]
     pub fn is_loading(&self) -> bool {
         self.active_view().is_some_and(GitLogView::is_loading)
@@ -407,6 +428,10 @@ pub struct GitLogView {
     /// The history being read again in the background, which replaces
     /// `history` once its walk is done; see [`refresh`](Self::refresh).
     pending: Option<History>,
+    /// A fetch under way (F5); the page refreshes once it is done.
+    fetch: Option<Fetch>,
+    /// What the status bar is to say, once: how a fetch went.
+    notice: Option<String>,
     pane: Pane,
     side_rows: Vec<SideRow>,
     /// Which remotes are folded up; all of them to start with.
@@ -501,6 +526,8 @@ impl GitLogView {
             history: None,
             error: None,
             pending: None,
+            fetch: None,
+            notice: None,
             pane: Pane::Log,
             side_rows: Vec::new(),
             collapsed: Vec::new(),
@@ -612,7 +639,8 @@ impl GitLogView {
     /// Take in commits the walk has produced, and the refresh's once
     /// it is done. Returns whether the page needs redrawing.
     pub fn poll(&mut self) -> bool {
-        let refreshed = self.poll_refresh();
+        let fetched = self.poll_fetch();
+        let refreshed = self.poll_refresh() || fetched;
         let Some(history) = &mut self.history else {
             return refreshed;
         };
@@ -640,6 +668,53 @@ impl GitLogView {
             self.pending_jump = None;
             self.select_commit(position);
         }
+        true
+    }
+
+    /// F5: fetch every remote of the repository, in the background;
+    /// see the core crate's `git::fetch` module. The page refreshes
+    /// once the fetch is done, and the status bar says how it went. A
+    /// fetch already under way is left to finish.
+    pub fn fetch(&mut self) {
+        if self.fetch.is_some() {
+            return;
+        }
+        let Some(history) = &self.history else {
+            self.notice = Some(self.no_history_message());
+            return;
+        };
+        match Fetch::start(history.git_dir()) {
+            Ok(fetch) => self.fetch = Some(fetch),
+            Err(err) => self.notice = Some(format!("Could not fetch: {}", err.message())),
+        }
+    }
+
+    /// Why there is no history, as the page says it in place of one.
+    fn no_history_message(&self) -> String {
+        match &self.error {
+            Some(error) if error == NOT_INITIALIZED => error.clone(),
+            Some(error) if !error.is_empty() => format!("{NOT_A_REPOSITORY}: {error}"),
+            _ => NOT_A_REPOSITORY.to_owned(),
+        }
+    }
+
+    /// Take in what the fetch has reported, and once it is done say
+    /// how it went and read the repository again. Returns whether
+    /// anything changed.
+    fn poll_fetch(&mut self) -> bool {
+        let Some(fetch) = &mut self.fetch else {
+            return false;
+        };
+        let changed = fetch.poll();
+        if !fetch.is_done() {
+            return changed;
+        }
+        self.notice = Some(match self.fetch.take().and_then(Fetch::outcome) {
+            Some(Ok(report)) => report.summary(),
+            Some(Err(why)) => format!("Could not fetch: {why}"),
+            None => "Could not fetch: the fetch stopped".to_owned(),
+        });
+        self.refresh();
         true
     }
 
@@ -751,13 +826,25 @@ impl GitLogView {
             Pane::Files => FILES_HINT,
             Pane::Content => CONTENT_HINT,
         };
-        match (&self.history, &self.pending) {
-            (Some(history), _) if history.is_loading() => {
+        match (&self.history, &self.pending, &self.fetch) {
+            (Some(history), _, _) if history.is_loading() => {
                 format!("loading {} commits… · {pane}", history.commits().len())
             }
-            (_, Some(fresh)) => format!("refreshing {} commits… · {pane}", fresh.commits().len()),
+            (_, Some(fresh), _) => {
+                format!("refreshing {} commits… · {pane}", fresh.commits().len())
+            }
+            (_, _, Some(fetch)) => match fetch.current() {
+                Some(remote) => format!("fetching {remote}… · {pane}"),
+                None => format!("fetching… · {pane}"),
+            },
             _ => pane.to_owned(),
         }
+    }
+
+    /// What the status bar is to say, once: how a fetch went, when one
+    /// has finished since the last time this was asked.
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.notice.take()
     }
 
     /// The selected commit's id, if any.
@@ -766,10 +853,12 @@ impl GitLogView {
         self.selected_id()
     }
 
-    /// Whether the walk, or a refresh's, is still going.
+    /// Whether the walk, or a refresh's, or a fetch is still going.
     #[cfg(test)]
     pub fn is_loading(&self) -> bool {
-        self.history.as_ref().is_some_and(History::is_loading) || self.pending.is_some()
+        self.history.as_ref().is_some_and(History::is_loading)
+            || self.pending.is_some()
+            || self.fetch.is_some()
     }
 
     /// Where the rule under the log was drawn.
@@ -1212,6 +1301,10 @@ impl GitLogView {
                 self.pane = self.pane.previous();
                 return;
             }
+            KeyCode::F(5) => {
+                self.fetch();
+                return;
+            }
             _ => {}
         }
         match self.pane {
@@ -1633,11 +1726,7 @@ impl GitLogView {
             return;
         }
         if self.history.is_none() {
-            let message = match &self.error {
-                Some(error) if error == NOT_INITIALIZED => error.clone(),
-                Some(error) if !error.is_empty() => format!("{NOT_A_REPOSITORY}: {error}"),
-                _ => NOT_A_REPOSITORY.to_owned(),
-            };
+            let message = self.no_history_message();
             let dim = background.fg(theme.command_palette_result_context_text);
             buf.set_stringn(
                 area.x + 2,
@@ -3132,6 +3221,104 @@ mod tests {
         view.refresh();
         wait(&mut view);
         assert_eq!(view.side_rows[view.side_selected], SideRow::Branch(0));
+    }
+
+    /// A repository of one commit, `Local`, with `repo_with_history`'s
+    /// as its `origin` (by path, so a fetch needs no network).
+    fn repo_with_upstream() -> (tempfile::TempDir, tempfile::TempDir, Vec<Oid>) {
+        let (upstream, ids) = repo_with_history();
+        let dir = tempfile::tempdir().unwrap();
+        Repository::init(dir.path()).unwrap();
+        commit_on_head(&dir, "l.txt", "local\n", "Local");
+        Repository::open(dir.path())
+            .unwrap()
+            .remote("origin", upstream.path().to_str().unwrap())
+            .unwrap();
+        (dir, upstream, ids)
+    }
+
+    #[test]
+    fn f5_fetches_the_remotes_and_refreshes_keeping_the_place() {
+        let (dir, upstream, ids) = repo_with_upstream();
+        let [_a, _b, _s, m] = ids[..] else { panic!() };
+        let mut view = view(&dir);
+        let local = view.selected_commit().unwrap();
+        draw(&mut view, 110, 24);
+        // Into the files pane, so that there is a place to keep.
+        view.handle_key(key(KeyCode::Enter));
+        assert_eq!(view.pane, Pane::Files);
+        let screen = draw(&mut view, 110, 24);
+        assert!(
+            !screen.iter().any(|r| r.contains("Merge side into main")),
+            "{screen:#?}"
+        );
+
+        // F5: the fetch is under way, and the page says so; the
+        // upstream's branches and tags come in, and the page refreshes
+        // where it was, with what came of it for the status bar.
+        view.handle_key(key(KeyCode::F(5)));
+        assert!(view.hint().contains("fetching"), "{}", view.hint());
+        wait(&mut view);
+        assert!(!view.hint().contains("fetching"), "{}", view.hint());
+        let notice = view.take_notice().unwrap();
+        // origin's two branches and its tag.
+        assert_eq!(notice, "Fetched origin: 3 refs updated");
+        assert_eq!(view.take_notice(), None);
+        assert_eq!(view.selected_commit(), Some(local));
+        assert_eq!(view.pane, Pane::Files);
+        let screen = draw(&mut view, 110, 24);
+        assert!(screen.iter().any(|r| r.contains("▸ origin")), "{screen:#?}");
+        assert!(
+            screen.iter().any(|r| r.contains("Merge side into main")),
+            "{screen:#?}"
+        );
+        assert!(view.history.as_ref().unwrap().position(m).is_some());
+        // The local branch and HEAD are where they were.
+        assert_eq!(view.history.as_ref().unwrap().head(), Some(local));
+
+        // Again, with nothing new upstream: up to date.
+        view.handle_key(key(KeyCode::F(5)));
+        wait(&mut view);
+        assert_eq!(
+            view.take_notice().as_deref(),
+            Some("Fetched origin: up to date")
+        );
+        // A commit upstream is fetched and shown.
+        commit_on_head(&upstream, "u.txt", "up\n", "Upstream since");
+        view.handle_key(key(KeyCode::F(5)));
+        wait(&mut view);
+        assert_eq!(
+            view.take_notice().as_deref(),
+            Some("Fetched origin: 1 ref updated")
+        );
+        view.handle_key(key(KeyCode::Left));
+        view.handle_key(key(KeyCode::Home));
+        let screen = draw(&mut view, 110, 24);
+        assert!(
+            screen.iter().any(|r| r.contains("Upstream since")),
+            "{screen:#?}"
+        );
+    }
+
+    #[test]
+    fn f5_without_remotes_or_a_repository_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        Repository::init(dir.path()).unwrap();
+        commit_on_head(&dir, "l.txt", "local\n", "Local");
+        let mut view = view(&dir);
+        view.handle_key(key(KeyCode::F(5)));
+        wait(&mut view);
+        assert_eq!(
+            view.take_notice().as_deref(),
+            Some("No remotes to fetch from")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = GitLogView::new(dir.path());
+        view.handle_key(key(KeyCode::F(5)));
+        assert!(!view.is_loading());
+        let notice = view.take_notice().unwrap();
+        assert!(notice.starts_with(NOT_A_REPOSITORY), "{notice}");
     }
 
     #[test]

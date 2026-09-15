@@ -2259,7 +2259,14 @@ impl App {
     pub fn tick(&mut self) -> bool {
         let mut redraw = self.check_open_files_if_due();
         let polled = match &mut self.mode {
-            Mode::GitLog(tabs) => tabs.poll(),
+            Mode::GitLog(tabs) => {
+                let polled = tabs.poll();
+                // A fetch that finished says how it went.
+                if let Some(notice) = tabs.take_notice() {
+                    self.status = Some(notice);
+                }
+                polled
+            }
             Mode::Changes(tabs) => tabs.poll(),
             _ => false,
         };

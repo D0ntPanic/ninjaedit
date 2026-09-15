@@ -232,6 +232,12 @@ impl History {
         })
     }
 
+    /// The repository's git directory (`.git`, or the directory of a
+    /// bare repository), to open it again elsewhere.
+    pub fn git_dir(&self) -> &Path {
+        self.repo.path()
+    }
+
     /// The local branches, in name order.
     pub fn branches(&self) -> &[Branch] {
         &self.branches

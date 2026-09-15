@@ -7,14 +7,18 @@
 //! lists a repository's submodules, each of which has a history of its
 //! own. The [`changes`] module is the working tree: what is changed and
 //! not yet committed, staged or not, with staging, unstaging, and
-//! committing. Everything goes through libgit2, by way of the `git2`
-//! crate; nothing shells out to git.
+//! committing. The [`fetch`] module brings the remote-tracking
+//! references up to date from the remotes, as `git fetch` does.
+//! Everything goes through libgit2, by way of the `git2` crate; nothing
+//! shells out to git.
 //!
-//! Only the [`changes`] module changes the repository, and only its
-//! index and HEAD: nothing here touches the working directory's files.
+//! Only the [`changes`] and [`fetch`] modules change the repository,
+//! and only its index, HEAD, and remote-tracking references: nothing
+//! here touches the working directory's files or a local branch.
 
 pub mod changes;
 pub mod diff;
+pub mod fetch;
 pub mod graph;
 pub mod history;
 pub mod submodules;
@@ -25,6 +29,7 @@ pub use diff::{
     ChangeKind, CommitDetail, DiffLine, DiffRow, FileChange, FileDiff, LineKind, Person, Side,
     Unshown,
 };
+pub use fetch::{Fetch, FetchReport};
 pub use graph::{GraphCell, GraphRow, NODE, cells_for};
 pub use history::{Branch, Commit, CommitTime, History, Oid, RefKind, RefLabel, Remote, short_id};
 pub use submodules::{Submodule, changed_submodules, has_uncommitted_changes, submodules};
