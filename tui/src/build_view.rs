@@ -39,7 +39,7 @@ use crate::fields::{FieldKey, Fields, wrap_words};
 use crate::palette::palette_background;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ninjaedit_core::{BuildConfig, BuildSystem, ConfigurationKey, TargetKey};
+use ninjaedit_core::{BuildConfig, BuildSystem, ConfigurationKey, TargetKey, Variable};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
 use ratatui::style::{Modifier, Style};
@@ -57,6 +57,18 @@ const FINDING_NOTE: &str =
     "The project is still being looked through; the targets found will appear here";
 /// The widest a field gets.
 const MAX_FIELD_WIDTH: u16 = 76;
+
+/// A line on the `${VARIABLE}`s the fields below can use, from core's
+/// list of them: "${PROJECT_DIR} is the project directory,
+/// ${BUILD_ROOT_DIR} is ..., and ${OUTPUT_DIR} is ...".
+fn variables_note() -> String {
+    let parts: Vec<String> = Variable::ALL
+        .iter()
+        .map(|v| format!("${{{}}} is {}", v.name(), v.description()))
+        .collect();
+    let (last, rest) = parts.split_last().expect("there are variables");
+    format!("In the fields below, {}, and {last}", rest.join(", "))
+}
 /// The tree pane's width, within these bounds, as a share of the page.
 const MIN_TREE_WIDTH: u16 = 22;
 const MAX_TREE_WIDTH: u16 = 40;
@@ -395,6 +407,8 @@ impl BuildView {
                 self.lines
                     .push(Line::Heading(format!("{} configuration", system.name())));
                 self.lines.push(Line::Blank);
+                self.lines.push(Line::Text(variables_note()));
+                self.lines.push(Line::Blank);
                 for key in system.configuration_keys() {
                     texts.push((
                         key.name().to_owned(),
@@ -424,6 +438,8 @@ impl BuildView {
                     }));
                     self.lines.push(Line::Blank);
                 }
+                self.lines.push(Line::Text(variables_note()));
+                self.lines.push(Line::Blank);
                 for key in system.target_keys() {
                     texts.push((
                         key.name().to_owned(),

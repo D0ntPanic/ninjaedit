@@ -26,8 +26,8 @@ pub mod text;
 
 pub use buffer::{BufferSnapshot, DiskChange, FileBuffer, LineEnding};
 pub use build::{
-    BuildConfig, BuildRoot, BuildSystem, ConfigurationKey, DEFAULT_CMAKE_GENERATOR, Discovery,
-    DiscoveryResult, Job, Selection, Step, TargetKey,
+    BuildConfig, BuildRoot, BuildSystem, ConfigurationKey, DEFAULT_CMAKE_GENERATOR, Directories,
+    Discovery, DiscoveryResult, Job, Selection, Step, TargetKey, Variable,
 };
 pub use diagnostics::{SourceLink, SourceLocation, find_source_links};
 pub use editor::{Cell, ConflictStep, Editor, ExternalChange, Movement, Position};

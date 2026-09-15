@@ -51,6 +51,17 @@
 //! the generator from the settings (Ninja unless changed), except where
 //! a configuration's own configure arguments name one with `-G`.
 //!
+//! The free-text options (arguments, environment, working directory,
+//! executable) can name the directories a build works with, which
+//! differ by configuration and so can't be typed as paths:
+//! `${PROJECT_DIR}` is the project's top, `${BUILD_ROOT_DIR}` the
+//! directory the root's `Cargo.toml` or `CMakeLists.txt` is in, and
+//! `${OUTPUT_DIR}` the directory the configuration builds into: the
+//! CMake build directory, or for Cargo the profile's directory under
+//! `target`. Each is replaced with the absolute path when a job is put
+//! together, after the text is split into arguments, so a path with a
+//! space in it stays one argument. See [`Variable`].
+//!
 //! The project has a **current** configuration and target, the ones a
 //! build (Ctrl+B) and a run (Ctrl+R) use. Both belong to one root; picking
 //! a configuration from another root brings the target along. Any other
@@ -283,16 +294,16 @@ impl ConfigurationKey {
                 "CMAKE_BUILD_TYPE: Debug, Release, RelWithDebInfo, or MinSizeRel; blank to leave unset"
             }
             (ConfigurationKey::ConfigureArgs, _) => {
-                "Added to the cmake configure command: -DOPTION=value, -G, and the like"
+                "Added to the cmake configure command: -DOPTION=value, -G, and the like; ${OUTPUT_DIR} and the other directories expand"
             }
             (ConfigurationKey::BuildArgs, BuildSystem::Cargo) => {
-                "Added to every cargo build and cargo run: --features, -j, and the like"
+                "Added to every cargo build and cargo run: --features, -j, and the like; ${OUTPUT_DIR} and the other directories expand"
             }
             (ConfigurationKey::BuildArgs, BuildSystem::CMake) => {
-                "Added to cmake --build: -j, --verbose, and the like"
+                "Added to cmake --build: -j, --verbose, and the like; ${OUTPUT_DIR} and the other directories expand"
             }
             (ConfigurationKey::Environment, _) => {
-                "Variables set while building, as NAME=value pairs separated by spaces"
+                "Variables set while building, as NAME=value pairs separated by spaces; ${OUTPUT_DIR} and the other directories expand"
             }
         }
     }
@@ -378,17 +389,19 @@ impl TargetKey {
                 "The target for cmake --build; blank builds every target"
             }
             (TargetKey::Executable, _) => {
-                "The program Ctrl+R runs, relative to the build directory"
+                "The program Ctrl+R runs, relative to the build directory; ${PROJECT_DIR} and the other directories expand"
             }
             (TargetKey::WorkingDirectory, BuildSystem::Cargo) => {
-                "Where the program runs, relative to the Cargo.toml's directory; blank for that directory"
+                "Where the program runs, relative to the Cargo.toml's directory; blank for that directory; ${OUTPUT_DIR} and the other directories expand"
             }
             (TargetKey::WorkingDirectory, BuildSystem::CMake) => {
-                "Where the program runs, relative to the CMakeLists.txt's directory; blank for that directory"
+                "Where the program runs, relative to the CMakeLists.txt's directory; blank for that directory; ${OUTPUT_DIR} and the other directories expand"
             }
-            (TargetKey::Arguments, _) => "Command line arguments the program is run with",
+            (TargetKey::Arguments, _) => {
+                "Command line arguments the program is run with; ${OUTPUT_DIR} and the other directories expand"
+            }
             (TargetKey::Environment, _) => {
-                "Variables set while the program runs, as NAME=value pairs separated by spaces"
+                "Variables set while the program runs, as NAME=value pairs separated by spaces; ${OUTPUT_DIR} and the other directories expand"
             }
         }
     }
@@ -1243,7 +1256,7 @@ impl BuildConfig {
     /// Surrounding spaces are dropped. Returns whether the option
     /// changed, or why the text was refused: a blank or duplicate name,
     /// arguments with an unclosed quote, an environment entry without
-    /// its `=`.
+    /// its `=`, a `${VARIABLE}` that isn't one of the [`Variable`]s.
     pub fn set_configuration_text(
         &mut self,
         root: usize,
@@ -1262,9 +1275,11 @@ impl BuildConfig {
             }
             ConfigurationKey::ConfigureArgs | ConfigurationKey::BuildArgs => {
                 split_args(text)?;
+                check_variables(text)?;
             }
             ConfigurationKey::Environment => {
                 parse_environment(text)?;
+                check_variables(text)?;
             }
             ConfigurationKey::Profile | ConfigurationKey::BuildType => {}
         }
@@ -1308,15 +1323,16 @@ impl BuildConfig {
             }
             TargetKey::Arguments => {
                 split_args(text)?;
+                check_variables(text)?;
             }
             TargetKey::Environment => {
                 parse_environment(text)?;
+                check_variables(text)?;
             }
-            TargetKey::Package
-            | TargetKey::Binary
-            | TargetKey::CMakeTarget
-            | TargetKey::Executable
-            | TargetKey::WorkingDirectory => {}
+            TargetKey::Executable | TargetKey::WorkingDirectory => {
+                check_variables(text)?;
+            }
+            TargetKey::Package | TargetKey::Binary | TargetKey::CMakeTarget => {}
         }
         let target = r.targets.get_mut(index).ok_or("no such target")?;
         let field = target.text_mut(key);
@@ -1397,6 +1413,18 @@ impl BuildConfig {
             .then(|| cmake_build_dir(project_root, root, configuration))
     }
 
+    /// The directories a selection's configuration works with: what its
+    /// `${PROJECT_DIR}`, `${BUILD_ROOT_DIR}`, and `${OUTPUT_DIR}` expand
+    /// to, if the selection exists.
+    pub fn directories_for(
+        &self,
+        project_root: &Path,
+        selection: Selection,
+    ) -> Option<Directories> {
+        let (root, configuration) = self.configuration_for(selection)?;
+        Some(Directories::new(project_root, root, configuration))
+    }
+
     /// The commands that build the current target with the current
     /// configuration. For CMake, `configure` says whether to run the
     /// configure step before the build; a frontend passes `true` until
@@ -1423,6 +1451,7 @@ impl BuildConfig {
         settings: &Settings,
     ) -> Result<Job, String> {
         let (root, configuration, target) = self.parts(selection)?;
+        let dirs = Directories::new(project_root, root, configuration);
         let mut job = Job {
             title: format!("Build {} ({})", target.name, configuration.name),
             steps: Vec::new(),
@@ -1433,7 +1462,7 @@ impl BuildConfig {
                 for arg in cargo_target_args(target) {
                     command = command.arg(arg);
                 }
-                for arg in split_args(&configuration.build_args)? {
+                for arg in expanded_args(&configuration.build_args, &dirs)? {
                     command = command.arg(arg);
                 }
                 job.steps.push(Step {
@@ -1462,10 +1491,10 @@ impl BuildConfig {
                 if !target.cmake_target.is_empty() {
                     command = command.arg("--target").arg(&target.cmake_target);
                 }
-                for arg in split_args(&configuration.build_args)? {
+                for arg in expanded_args(&configuration.build_args, &dirs)? {
                     command = command.arg(arg);
                 }
-                command = with_environment(command, &configuration.environment)?;
+                command = with_environment(command, &configuration.environment, &dirs)?;
                 job.steps.push(Step {
                     description: format!("Building {}", target.name),
                     command,
@@ -1500,7 +1529,8 @@ impl BuildConfig {
         settings: &Settings,
     ) -> Result<Job, String> {
         let (root, configuration, target) = self.parts(selection)?;
-        let dir = root_dir(project_root, root);
+        let dirs = Directories::new(project_root, root, configuration);
+        let working_dir = working_dir(target, &dirs)?;
         match root.system {
             BuildSystem::Cargo => {
                 let mut command = cargo_command(project_root, root, configuration, "run")?
@@ -1509,22 +1539,17 @@ impl BuildConfig {
                 for arg in cargo_target_args(target) {
                     command = command.arg(arg);
                 }
-                for arg in split_args(&configuration.build_args)? {
+                for arg in expanded_args(&configuration.build_args, &dirs)? {
                     command = command.arg(arg);
                 }
-                let arguments = split_args(&target.arguments)?;
+                let arguments = expanded_args(&target.arguments, &dirs)?;
                 if !arguments.is_empty() {
                     command = command.arg("--");
                     for arg in arguments {
                         command = command.arg(arg);
                     }
                 }
-                command = with_environment(command, &target.environment)?;
-                let working_dir = if target.working_directory.is_empty() {
-                    dir
-                } else {
-                    dir.join(&target.working_directory)
-                };
+                command = with_environment(command, &target.environment, &dirs)?;
                 Ok(Job {
                     title: format!("Run {} ({})", target.name, configuration.name),
                     steps: vec![Step {
@@ -1542,19 +1567,13 @@ impl BuildConfig {
                 }
                 let mut job = self.build_job_for(selection, project_root, configure, settings)?;
                 job.title = format!("Run {} ({})", target.name, configuration.name);
-                let build_dir = cmake_build_dir(project_root, root, configuration);
-                let executable = build_dir.join(&target.executable);
-                let working_dir = if target.working_directory.is_empty() {
-                    dir
-                } else {
-                    dir.join(&target.working_directory)
-                };
+                let executable = dirs.output_dir.join(dirs.expand(&target.executable)?);
                 let mut command = Command::new(&executable).current_dir(working_dir);
-                for arg in split_args(&target.arguments)? {
+                for arg in expanded_args(&target.arguments, &dirs)? {
                     command = command.arg(arg);
                 }
-                command = with_environment(command, &configuration.environment)?;
-                command = with_environment(command, &target.environment)?;
+                command = with_environment(command, &configuration.environment, &dirs)?;
+                command = with_environment(command, &target.environment, &dirs)?;
                 job.steps.push(Step {
                     description: format!("Running {}", target.name),
                     command,
@@ -1935,7 +1954,14 @@ pub struct Job {
 
 /// The directory a root's file is in, absolute.
 fn root_dir(project_root: &Path, root: &BuildRoot) -> PathBuf {
-    project_root.join(root.directory())
+    let directory = root.directory();
+    if directory.as_os_str().is_empty() {
+        // Joining an empty path leaves a trailing separator behind,
+        // which would show in an expanded ${BUILD_ROOT_DIR}.
+        project_root.to_path_buf()
+    } else {
+        project_root.join(directory)
+    }
 }
 
 fn cmake_build_dir(
@@ -1997,7 +2023,30 @@ fn cargo_command(
         "release" => command = command.arg("--release"),
         profile => command = command.arg("--profile").arg(profile),
     }
-    with_environment(command, &configuration.environment)
+    let dirs = Directories::new(project_root, root, configuration);
+    with_environment(command, &configuration.environment, &dirs)
+}
+
+/// The directory Cargo puts a profile's output in under `target`: the
+/// built-in profiles have their own names for it, a custom profile uses
+/// its own name.
+fn cargo_profile_dir(profile: &str) -> &str {
+    match profile {
+        "" | "dev" | "test" => "debug",
+        "release" | "bench" => "release",
+        profile => profile,
+    }
+}
+
+/// The directory a target runs in: its working directory under the
+/// root's, or the root's directory when it has none.
+fn working_dir(target: &Target, dirs: &Directories) -> Result<PathBuf, String> {
+    Ok(if target.working_directory.is_empty() {
+        dirs.build_root_dir.clone()
+    } else {
+        dirs.build_root_dir
+            .join(dirs.expand(&target.working_directory)?)
+    })
 }
 
 /// The arguments that pick a target's package and binary.
@@ -2034,17 +2083,158 @@ fn cmake_configure_command(
     if !configuration.build_type.is_empty() {
         command = command.arg(format!("-DCMAKE_BUILD_TYPE={}", configuration.build_type));
     }
-    for arg in split_args(&configuration.configure_args)? {
+    let dirs = Directories::new(project_root, root, configuration);
+    for arg in expanded_args(&configuration.configure_args, &dirs)? {
         command = command.arg(arg);
     }
-    with_environment(command, &configuration.environment)
+    with_environment(command, &configuration.environment, &dirs)
 }
 
-fn with_environment(mut command: Command, environment: &str) -> Result<Command, String> {
+/// The command with `environment`'s variables set, each value with its
+/// `${VARIABLE}`s expanded.
+fn with_environment(
+    mut command: Command,
+    environment: &str,
+    dirs: &Directories,
+) -> Result<Command, String> {
     for (name, value) in parse_environment(environment)? {
-        command = command.env(name, value);
+        command = command.env(name, dirs.expand(&value)?);
     }
     Ok(command)
+}
+
+/// `text` split into arguments, each with its `${VARIABLE}`s expanded.
+fn expanded_args(text: &str, dirs: &Directories) -> Result<Vec<String>, String> {
+    split_args(text)?
+        .iter()
+        .map(|arg| dirs.expand(arg))
+        .collect()
+}
+
+// ----- Variables ------------------------------------------------------------
+
+/// A directory the free-text options can name as `${NAME}`, expanded
+/// to the absolute path when a job is put together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Variable {
+    /// `${PROJECT_DIR}`: the project's top directory.
+    ProjectDir,
+    /// `${BUILD_ROOT_DIR}`: the directory the root's `Cargo.toml` or
+    /// `CMakeLists.txt` is in.
+    BuildRootDir,
+    /// `${OUTPUT_DIR}`: the directory the configuration builds into: a
+    /// CMake configuration's build directory, or for Cargo the profile's
+    /// directory under `target` beside the manifest.
+    OutputDir,
+}
+
+impl Variable {
+    pub const ALL: [Variable; 3] = [
+        Variable::ProjectDir,
+        Variable::BuildRootDir,
+        Variable::OutputDir,
+    ];
+
+    /// The name between the braces.
+    pub fn name(self) -> &'static str {
+        match self {
+            Variable::ProjectDir => "PROJECT_DIR",
+            Variable::BuildRootDir => "BUILD_ROOT_DIR",
+            Variable::OutputDir => "OUTPUT_DIR",
+        }
+    }
+
+    /// A few words on what the variable expands to.
+    pub fn description(self) -> &'static str {
+        match self {
+            Variable::ProjectDir => "the project directory",
+            Variable::BuildRootDir => "the directory the Cargo.toml or CMakeLists.txt is in",
+            Variable::OutputDir => "the directory the configuration builds into",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Variable> {
+        Variable::ALL.into_iter().find(|v| v.name() == name)
+    }
+}
+
+/// The directories a configuration works with, absolute: what each
+/// [`Variable`] expands to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Directories {
+    pub project_dir: PathBuf,
+    pub build_root_dir: PathBuf,
+    pub output_dir: PathBuf,
+}
+
+impl Directories {
+    fn new(project_root: &Path, root: &BuildRoot, configuration: &Configuration) -> Directories {
+        let build_root_dir = root_dir(project_root, root);
+        let output_dir = match root.system {
+            BuildSystem::Cargo => build_root_dir
+                .join("target")
+                .join(cargo_profile_dir(&configuration.profile)),
+            BuildSystem::CMake => cmake_build_dir(project_root, root, configuration),
+        };
+        Directories {
+            project_dir: project_root.to_path_buf(),
+            build_root_dir,
+            output_dir,
+        }
+    }
+
+    /// The path a variable expands to.
+    pub fn get(&self, variable: Variable) -> &Path {
+        match variable {
+            Variable::ProjectDir => &self.project_dir,
+            Variable::BuildRootDir => &self.build_root_dir,
+            Variable::OutputDir => &self.output_dir,
+        }
+    }
+
+    /// `text` with each `${VARIABLE}` replaced by its path, or why it
+    /// can't be: a name that isn't a variable's, or a `${` without its
+    /// `}`.
+    pub fn expand(&self, text: &str) -> Result<String, String> {
+        expand_variables(text, |variable| {
+            self.get(variable).to_string_lossy().into_owned()
+        })
+    }
+}
+
+/// Check that every `${VARIABLE}` in `text` names a [`Variable`],
+/// without expanding it.
+pub fn check_variables(text: &str) -> Result<(), String> {
+    expand_variables(text, |_| String::new()).map(|_| ())
+}
+
+fn expand_variables(text: &str, value: impl Fn(Variable) -> String) -> Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            return Err(format!("${{ without its }} in {text}"));
+        };
+        let name = &after[..end];
+        match Variable::from_name(name) {
+            Some(variable) => out.push_str(&value(variable)),
+            None => {
+                let names: Vec<String> = Variable::ALL
+                    .iter()
+                    .map(|v| format!("${{{}}}", v.name()))
+                    .collect();
+                return Err(format!(
+                    "${{{name}}} isn't a variable: the variables are {}",
+                    names.join(", ")
+                ));
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// Split a command line into arguments the way a shell would, less the
@@ -3235,6 +3425,160 @@ mod tests {
             .build_job(project, false, &Settings::default())
             .unwrap();
         assert_eq!(args(&job.steps[0].command)[1..3], ["--profile", "bench"]);
+    }
+
+    #[test]
+    fn variables_expand_to_the_configuration_directories() {
+        let mut config = two_roots();
+        let project = Path::new("/proj");
+
+        // CMake: the output directory is the configuration's build directory.
+        config.select_target(1, 1);
+        config
+            .set_configuration_text(
+                1,
+                0,
+                ConfigurationKey::ConfigureArgs,
+                "-DINSTALL=${OUTPUT_DIR}/install",
+            )
+            .unwrap();
+        config
+            .set_configuration_text(1, 0, ConfigurationKey::Environment, "SRC=${BUILD_ROOT_DIR}")
+            .unwrap();
+        config
+            .set_target_text(
+                1,
+                1,
+                TargetKey::Arguments,
+                "--data \"${PROJECT_DIR}/my data\"",
+            )
+            .unwrap();
+        config
+            .set_target_text(1, 1, TargetKey::WorkingDirectory, "${OUTPUT_DIR}/bin")
+            .unwrap();
+        config
+            .set_target_text(1, 1, TargetKey::Environment, "OUT=${OUTPUT_DIR}")
+            .unwrap();
+        config
+            .set_target_text(1, 1, TargetKey::Executable, "${PROJECT_DIR}/wrapper")
+            .unwrap();
+        assert_eq!(
+            config.directories_for(project, config.current().unwrap()),
+            Some(Directories {
+                project_dir: PathBuf::from("/proj"),
+                build_root_dir: PathBuf::from("/proj/native"),
+                output_dir: PathBuf::from("/proj/native/cmake-build-debug"),
+            })
+        );
+        let job = config.run_job(project, true, &Settings::default()).unwrap();
+        let configure = &job.steps[0].command;
+        assert!(
+            args(configure)
+                .iter()
+                .any(|a| a == "-DINSTALL=/proj/native/cmake-build-debug/install")
+        );
+        assert_eq!(
+            configure.envs(),
+            &[(OsString::from("SRC"), OsString::from("/proj/native"))]
+        );
+        let run = &job.steps[2].command;
+        assert_eq!(run.program(), "/proj/wrapper");
+        assert_eq!(
+            args(run),
+            vec!["--data", "/proj/my data"],
+            "a variable expands after splitting, so a space in its path stays in one argument"
+        );
+        assert_eq!(
+            run.current_dir_path(),
+            Some(Path::new("/proj/native/cmake-build-debug/bin"))
+        );
+        assert_eq!(
+            run.envs(),
+            &[
+                (OsString::from("SRC"), OsString::from("/proj/native")),
+                (
+                    OsString::from("OUT"),
+                    OsString::from("/proj/native/cmake-build-debug")
+                )
+            ]
+        );
+
+        // Cargo: the output directory is the profile's under target.
+        config.select_configuration(0, 1);
+        config.select_target(0, 0);
+        config
+            .set_target_text(
+                0,
+                0,
+                TargetKey::Arguments,
+                "${OUTPUT_DIR} ${BUILD_ROOT_DIR}",
+            )
+            .unwrap();
+        let job = config
+            .run_job(project, false, &Settings::default())
+            .unwrap();
+        let run_args = args(&job.steps[0].command);
+        assert_eq!(
+            &run_args[run_args.len() - 2..],
+            ["/proj/target/release", "/proj"]
+        );
+        config
+            .set_configuration_text(0, 1, ConfigurationKey::Profile, "bench")
+            .unwrap();
+        let job = config
+            .run_job(project, false, &Settings::default())
+            .unwrap();
+        assert!(
+            args(&job.steps[0].command)
+                .iter()
+                .any(|a| a == "/proj/target/release")
+        );
+        config
+            .set_configuration_text(0, 1, ConfigurationKey::Profile, "fast")
+            .unwrap();
+        let job = config
+            .run_job(project, false, &Settings::default())
+            .unwrap();
+        assert!(
+            args(&job.steps[0].command)
+                .iter()
+                .any(|a| a == "/proj/target/fast")
+        );
+        config.select_configuration(0, 0);
+        let job = config
+            .run_job(project, false, &Settings::default())
+            .unwrap();
+        assert!(
+            args(&job.steps[0].command)
+                .iter()
+                .any(|a| a == "/proj/target/debug")
+        );
+
+        // Text that isn't a variable is refused when typed, and a file
+        // that has it is refused when a job is made from it.
+        assert_eq!(
+            config
+                .set_target_text(0, 0, TargetKey::Arguments, "${OUTPUT_DR}")
+                .unwrap_err(),
+            "${OUTPUT_DR} isn't a variable: the variables are ${PROJECT_DIR}, ${BUILD_ROOT_DIR}, ${OUTPUT_DIR}"
+        );
+        assert_eq!(
+            config
+                .set_target_text(0, 0, TargetKey::WorkingDirectory, "${OUTPUT_DIR")
+                .unwrap_err(),
+            "${ without its } in ${OUTPUT_DIR"
+        );
+        assert!(
+            config
+                .set_target_text(0, 0, TargetKey::Arguments, "a $HOME ${}")
+                .is_err()
+        );
+        config.roots[0].targets[0].arguments = "${NOPE}".to_owned();
+        assert!(
+            config
+                .run_job(project, false, &Settings::default())
+                .is_err()
+        );
     }
 
     #[test]
