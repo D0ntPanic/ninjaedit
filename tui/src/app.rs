@@ -65,12 +65,17 @@
 //! the prefix from a tool; see the `git_view` module) shows the
 //! project's history: the branches, the graph of every commit, and what
 //! the selected commit changed, with a tab for each submodule after
-//! the main repository's. It reads the repository afresh each time it
-//! is opened. On the page Ctrl+T picks one of its tabs rather than a
-//! file's, since the editor isn't showing. How its panes are sized, by
-//! dragging the rules between them, is kept per repository in the
-//! project's storage (`tui-git-log.toml`, the TUI's own file; see the
-//! `git_layout` module) and comes back next time. The changes page
+//! the main repository's. Left for the editor or another mode, the
+//! page is kept as it was and Ctrl+L brings it back to the same
+//! commit and file, reading the repository again in the background
+//! (as Ctrl+L does while it is showing), since a commit may have been
+//! made meanwhile; the fresh history takes the old one's place once it
+//! is read, keeping the place wherever it still makes sense (see the
+//! `git_view` module). On the page Ctrl+T picks one of its tabs rather
+//! than a file's, since the editor isn't showing. How its panes are
+//! sized, by dragging the rules between them, is kept per repository
+//! in the project's storage (`tui-git-log.toml`, the TUI's own file;
+//! see the `git_layout` module) and comes back next time. The changes page
 //! (Ctrl+U; see the `changes_view` module) is the working tree's
 //! uncommitted changes, unstaged and staged, with the diff of each,
 //! for staging them (a file or a whole directory at once) and
@@ -404,6 +409,10 @@ pub struct App {
     theme: Theme,
     /// What the upper part of the screen shows.
     mode: Mode,
+    /// The git log page while another mode or the editor is showing,
+    /// kept as it was left so that Ctrl+L brings it back to the same
+    /// place; see [`open_git_log`](Self::open_git_log).
+    git_log: Option<Box<GitLogTabs>>,
     /// The tab bar drawn in place of the editor's while a mode is up,
     /// with the mode's one tab.
     mode_tab_bar: TabBar,
@@ -518,6 +527,7 @@ impl App {
             status_target_area: Rect::default(),
             theme: Theme::default(),
             mode: Mode::Editor,
+            git_log: None,
             mode_tab_bar: TabBar::default(),
             view_history: Vec::new(),
             last_view: View::Editor,
@@ -1117,7 +1127,8 @@ impl App {
                 let outcome = view.commit_all(&mut self.build);
                 self.handle_build_outcome(outcome);
             }
-            Mode::GitLog(_) | Mode::Changes(_) => {}
+            Mode::GitLog(tabs) => self.git_log = Some(tabs),
+            Mode::Changes(_) => {}
         }
     }
 
@@ -1170,22 +1181,42 @@ impl App {
     // ----- Git log --------------------------------------------------------
 
     /// Ctrl+L: show the git log page in the editor's place and give it
-    /// the keyboard. Opening it again while it is up leaves it as it is;
-    /// leaving and coming back reads the repository afresh.
+    /// the keyboard. The page is kept when it is left, and comes back
+    /// as it was: the same commit and file selected. Coming back, or
+    /// Ctrl+L while it is up, reads the repository again in the
+    /// background, since a commit may have been made or a branch
+    /// fetched meanwhile; what the page shows changes only once the
+    /// history is read, and keeps its place where it can.
     fn open_git_log(&mut self) {
         self.close_editor_overlays();
-        if !matches!(self.mode, Mode::GitLog(_)) {
-            self.leave_mode();
-            // A layout file that can't be read is reported, and the
-            // defaults do; the next resize replaces it.
-            let layout = match git_layout::load(&self.project_storage, git_layout::LAYOUT_FILE) {
-                Ok(layout) => layout,
-                Err(err) => {
-                    self.status = Some(err.to_string());
-                    Default::default()
-                }
-            };
-            self.mode = Mode::GitLog(Box::new(GitLogTabs::new(self.project.root(), layout)));
+        match &mut self.mode {
+            Mode::GitLog(tabs) => tabs.refresh(),
+            _ => {
+                self.leave_mode();
+                let tabs = match self.git_log.take() {
+                    Some(mut tabs) => {
+                        tabs.refresh();
+                        tabs
+                    }
+                    None => {
+                        // A layout file that can't be read is reported,
+                        // and the defaults do; the next resize replaces
+                        // it.
+                        let layout = match git_layout::load(
+                            &self.project_storage,
+                            git_layout::LAYOUT_FILE,
+                        ) {
+                            Ok(layout) => layout,
+                            Err(err) => {
+                                self.status = Some(err.to_string());
+                                Default::default()
+                            }
+                        };
+                        Box::new(GitLogTabs::new(self.project.root(), layout))
+                    }
+                };
+                self.mode = Mode::GitLog(tabs);
+            }
         }
         self.focus = Focus::Editor;
     }
@@ -3745,6 +3776,87 @@ mod tests {
         assert!(matches!(app.mode, Mode::GitLog(_)));
         assert_eq!(app.focus, Focus::Editor);
         drop(dir);
+    }
+
+    #[test]
+    fn the_git_log_comes_back_as_it_was_left_and_refreshes_behind_it() {
+        let (dir, mut app) = app_with_files(&[("a.txt", "hello\n")]);
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        let commit = |name: &str, content: &str, message: &str| {
+            std::fs::write(dir.path().join(name), content).unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new(name)).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit<'_>> = repo
+                .head()
+                .ok()
+                .and_then(|head| head.target())
+                .map(|id| repo.find_commit(id).unwrap())
+                .into_iter()
+                .collect();
+            let refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &refs)
+                .unwrap()
+        };
+        let first = commit("a.txt", "hello\n", "Say hello");
+        commit("b.txt", "there\n", "Say there");
+        let wait = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Mode::GitLog(tabs) = &app.mode
+                && tabs.is_loading()
+                && Instant::now() < deadline
+            {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let selected = |app: &App| match &app.mode {
+            Mode::GitLog(tabs) => tabs.active_view().unwrap().selected_commit(),
+            _ => unreachable!(),
+        };
+        ctrl(&mut app, 'l');
+        wait(&mut app);
+        // Down to the first commit, into its files, and its one file.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Down);
+        let screen = draw(&mut app, 100, 24);
+        assert_eq!(selected(&app), Some(first));
+        assert!(screen.iter().any(|r| r.contains("a.txt")), "{screen:#?}");
+        assert!(screen.iter().any(|r| r.contains("hello")), "{screen:#?}");
+        // Leave for the editor; a commit is made meanwhile; come back.
+        ctrl(&mut app, 'e');
+        type_str(&mut app, EDITOR_MODE_LABEL);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Editor));
+        commit("c.txt", "more\n", "Say more");
+        ctrl(&mut app, 'l');
+        assert!(matches!(&app.mode, Mode::GitLog(tabs) if tabs.is_loading()));
+        // The page is as it was left while the repository is read
+        // again behind it, and says so.
+        let screen = draw(&mut app, 100, 24);
+        assert_eq!(selected(&app), Some(first));
+        assert!(screen.iter().any(|r| r.contains("hello")), "{screen:#?}");
+        assert!(
+            !screen.iter().any(|r| r.contains("Say more")),
+            "{screen:#?}"
+        );
+        assert!(screen[23].contains("refreshing"), "{screen:#?}");
+        // Read: the new commit is in the log, the place kept.
+        wait(&mut app);
+        let screen = draw(&mut app, 100, 24);
+        assert_eq!(selected(&app), Some(first));
+        assert!(screen.iter().any(|r| r.contains("Say more")), "{screen:#?}");
+        assert!(screen.iter().any(|r| r.contains("hello")), "{screen:#?}");
+        assert!(!screen[23].contains("refreshing"), "{screen:#?}");
+        // Ctrl+L on the page reads the repository again too.
+        ctrl(&mut app, 'l');
+        assert!(matches!(&app.mode, Mode::GitLog(tabs) if tabs.is_loading()));
+        assert_eq!(selected(&app), Some(first));
+        wait(&mut app);
+        assert_eq!(selected(&app), Some(first));
     }
 
     #[test]

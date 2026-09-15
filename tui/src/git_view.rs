@@ -66,6 +66,21 @@
 //! page picks a tab, as it picks a file tab in the editor. A submodule
 //! that hasn't been initialized has a tab too, which says so.
 //!
+//! The page is kept when it is left (for the editor, or another
+//! mode) and comes back as it was: the same commit selected, the same
+//! file open in it, the log scrolled to the same place. Coming back
+//! (or Ctrl+L while it is showing) reads the repository again, since
+//! a commit may have been made or a branch fetched meanwhile, but in
+//! the background: a second history is opened and walked while the
+//! page goes on showing the first, and takes its place only once the
+//! walk is done, keeping the place wherever it makes sense. The
+//! selected commit is found again by its id, and the log scrolled so
+//! it stays on the same row; the sidebar's selection and which remotes
+//! are unfolded are kept by name. A commit that is gone (its branch
+//! reset, or deleted and the commit unreachable) gives way to HEAD,
+//! as the page opens. A repository that wasn't one when the page was
+//! opened (`git init` since) shows its history once refreshed.
+//!
 //! The page only looks at the repository: checking out a branch or
 //! commit will come later.
 
@@ -172,6 +187,16 @@ impl SideRow {
     }
 }
 
+/// A selectable sidebar row by name, to find it again once the
+/// branches have changed under it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SideKey {
+    Branch(String),
+    Remote(String),
+    /// The remote's name, then the branch's.
+    RemoteBranch(String, String),
+}
+
 /// A rule between panes that can be dragged to resize them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Divider {
@@ -201,12 +226,17 @@ struct GitTab {
     /// rather than whatever repository contains it.
     submodule: bool,
     view: Option<GitLogView>,
+    /// Whether the page, if opened, is to read its repository again
+    /// the next time it is shown: the tabs were refreshed while it
+    /// was hidden.
+    stale: bool,
 }
 
 /// The git log page's tabs: the project's repository first, then each
 /// of its submodules, nested ones included, by path. A submodule's page
 /// is opened the first time its tab is shown, with the pane sizes kept
-/// for it.
+/// for it. A refresh reads the submodules again and refreshes the shown
+/// page; the other opened pages refresh when next shown.
 pub struct GitLogTabs {
     tabs: Vec<GitTab>,
     active: usize,
@@ -236,18 +266,51 @@ impl GitLogTabs {
             workdir: root.to_path_buf(),
             submodule: false,
             view: Some(main),
+            stale: false,
         }];
         tabs.extend(submodules(root).into_iter().map(|submodule| GitTab {
             title: submodule.path,
             workdir: submodule.workdir,
             submodule: true,
             view: None,
+            stale: false,
         }));
         GitLogTabs {
             tabs,
             active: 0,
             layout,
         }
+    }
+
+    /// Read the repository again, in the background: the shown page
+    /// refreshes now (see [`GitLogView::refresh`]), the other opened
+    /// pages when next shown. The tabs follow the submodules as they
+    /// are now, keeping the pages of those still there; a shown tab
+    /// whose submodule is gone gives way to the main repository's.
+    pub fn refresh(&mut self) {
+        let root = self.tabs[0].workdir.clone();
+        let shown = self.tabs[self.active].title.clone();
+        let mut old: Vec<GitTab> = self.tabs.drain(1..).collect();
+        for submodule in submodules(&root) {
+            let view = old
+                .iter()
+                .position(|tab| tab.title == submodule.path)
+                .and_then(|index| old.remove(index).view);
+            self.tabs.push(GitTab {
+                title: submodule.path,
+                workdir: submodule.workdir,
+                submodule: true,
+                view,
+                stale: true,
+            });
+        }
+        self.tabs[0].stale = true;
+        self.active = self
+            .tabs
+            .iter()
+            .position(|tab| tab.title == shown)
+            .unwrap_or(0);
+        self.active();
     }
 
     /// The pane sizes of every repository, to keep.
@@ -289,10 +352,16 @@ impl GitLogTabs {
         }
     }
 
-    /// The shown tab's page.
+    /// The shown tab's page, opened if this is its first showing and
+    /// refreshed if it is due one.
     pub fn active(&mut self) -> &mut GitLogView {
         let tab = &mut self.tabs[self.active];
         let sizes = self.layout.get(tab.key());
+        if std::mem::take(&mut tab.stale)
+            && let Some(view) = &mut tab.view
+        {
+            view.refresh();
+        }
         tab.view.get_or_insert_with(|| {
             let mut view = if tab.submodule {
                 GitLogView::for_repository(&tab.workdir)
@@ -327,9 +396,17 @@ impl GitLogTabs {
 }
 
 pub struct GitLogView {
+    /// Where the repository was opened from, and whether as exactly
+    /// that directory (a submodule's) rather than whatever repository
+    /// contains it, so a refresh opens it the same way.
+    root: PathBuf,
+    exact: bool,
     history: Option<History>,
     /// Why there is no history: the project isn't in a repository.
     error: Option<String>,
+    /// The history being read again in the background, which replaces
+    /// `history` once its walk is done; see [`refresh`](Self::refresh).
+    pending: Option<History>,
     pane: Pane,
     side_rows: Vec<SideRow>,
     /// Which remotes are folded up; all of them to start with.
@@ -399,25 +476,31 @@ impl GitLogView {
     /// A page for the repository containing `root`, with its walk
     /// started.
     pub fn new(root: &Path) -> GitLogView {
-        GitLogView::from_history(History::open(root).map_err(|err| err.message().to_owned()))
+        GitLogView::from_root(root, false)
     }
 
     /// A page for the repository whose working directory is `root`
     /// itself: a submodule's. One that isn't initialized says so.
     pub fn for_repository(root: &Path) -> GitLogView {
-        GitLogView::from_history(
-            History::open_repository(root).map_err(|_| NOT_INITIALIZED.to_owned()),
-        )
+        GitLogView::from_root(root, true)
     }
 
-    fn from_history(history: Result<History, String>) -> GitLogView {
-        let (history, error) = match history {
-            Ok(history) => (Some(history), None),
-            Err(message) => (None, Some(message)),
-        };
+    /// Open the repository as the page was opened, and start its walk.
+    fn open_history(root: &Path, exact: bool) -> Result<History, String> {
+        if exact {
+            History::open_repository(root).map_err(|_| NOT_INITIALIZED.to_owned())
+        } else {
+            History::open(root).map_err(|err| err.message().to_owned())
+        }
+    }
+
+    fn from_root(root: &Path, exact: bool) -> GitLogView {
         let mut view = GitLogView {
-            history,
-            error,
+            root: root.to_path_buf(),
+            exact,
+            history: None,
+            error: None,
+            pending: None,
             pane: Pane::Log,
             side_rows: Vec::new(),
             collapsed: Vec::new(),
@@ -458,26 +541,82 @@ impl GitLogView {
             files_rule: Rect::default(),
             buttons: Vec::new(),
         };
-        if let Some(history) = &view.history {
-            view.collapsed = vec![true; history.remotes().len()];
-        }
-        view.rebuild_side_rows();
-        view.side_selected = view
+        view.install(GitLogView::open_history(root, exact));
+        view
+    }
+
+    /// Show a history (or the lack of one) from the start, as the page
+    /// opens: the sidebar's remotes folded, its first branch selected,
+    /// the log at its top until the walk reaches HEAD.
+    fn install(&mut self, history: Result<History, String>) {
+        let (history, error) = match history {
+            Ok(history) => (Some(history), None),
+            Err(message) => (None, Some(message)),
+        };
+        self.history = history;
+        self.error = error;
+        self.pending = None;
+        self.collapsed = self
+            .history
+            .as_ref()
+            .map_or_else(Vec::new, |history| vec![true; history.remotes().len()]);
+        self.rebuild_side_rows();
+        self.side_selected = self
             .side_rows
             .iter()
             .position(|row| row.selectable())
             .unwrap_or(0);
-        view.poll();
-        view
+        self.side_scroll = 0;
+        self.reveal_side = true;
+        self.selected = 0;
+        self.log_scroll = 0;
+        self.log_h.col = 0;
+        self.head_shown = false;
+        self.pending_jump = None;
+        self.reset_detail();
+        self.poll();
     }
 
-    /// Take in commits the walk has produced. Returns whether the page
-    /// needs redrawing.
+    /// Forget the selected commit's detail and everything shown of it,
+    /// to be read again for whatever commit is selected.
+    fn reset_detail(&mut self) {
+        self.detail = None;
+        self.detail_of = None;
+        self.file_tree = FileTree::default();
+        self.dirs_collapsed.clear();
+        self.file_rows.clear();
+        self.file_selected = 0;
+        self.files_scroll = 0;
+        self.content = None;
+        self.content_scroll = 0;
+        self.content_h.col = 0;
+    }
+
+    /// Read the repository again, without disturbing what the page
+    /// shows: a fresh history is opened and walked in the background,
+    /// and replaces the one shown once the walk is done (see
+    /// [`poll`](Self::poll)), keeping the place where it makes sense.
+    /// A refresh started while one is under way supersedes it. With no
+    /// history to show (the directory wasn't a repository, or a
+    /// submodule wasn't initialized) there is no place to keep, so
+    /// whatever opens now shows from the start; and a repository that
+    /// can't be opened any more says so in place of the history.
+    pub fn refresh(&mut self) {
+        let fresh = GitLogView::open_history(&self.root, self.exact);
+        match (&self.history, fresh) {
+            (Some(_), Ok(fresh)) => self.pending = Some(fresh),
+            (None, fresh @ Ok(_)) | (_, fresh @ Err(_)) => self.install(fresh),
+        }
+    }
+
+    /// Take in commits the walk has produced, and the refresh's once
+    /// it is done. Returns whether the page needs redrawing.
     pub fn poll(&mut self) -> bool {
+        let refreshed = self.poll_refresh();
         let Some(history) = &mut self.history else {
-            return false;
+            return refreshed;
         };
-        if !history.poll() {
+        if !history.poll() && !refreshed {
             return false;
         }
         // The log opens at HEAD: select it as soon as it is walked,
@@ -504,6 +643,106 @@ impl GitLogView {
         true
     }
 
+    /// Take in what the refresh's walk has produced, and once it is
+    /// done put its history in place of the one shown. Returns whether
+    /// anything changed.
+    fn poll_refresh(&mut self) -> bool {
+        let Some(fresh) = &mut self.pending else {
+            return false;
+        };
+        let changed = fresh.poll();
+        if fresh.is_loading() {
+            return changed;
+        }
+        if let Some(fresh) = self.pending.take() {
+            self.replace_history(fresh);
+        }
+        true
+    }
+
+    /// Show a refreshed history in place of the one shown, keeping the
+    /// place: the selected commit, found again by its id, on the same
+    /// row of the log, with its detail (a commit's content doesn't
+    /// change) and whatever is shown of it; the sidebar's selection and
+    /// unfolded remotes, by name. A selected commit that is gone gives
+    /// way to HEAD, as the page opens; a sidebar selection that is gone
+    /// to the first branch.
+    fn replace_history(&mut self, fresh: History) {
+        let selected = self.selected_id();
+        let offset = self.selected.saturating_sub(self.log_scroll);
+        let side_selected = self.side_key(self.side_selected);
+        let unfolded: Vec<String> = self
+            .history
+            .as_ref()
+            .map(|history| {
+                history
+                    .remotes()
+                    .iter()
+                    .enumerate()
+                    .filter(|(r, _)| !self.collapsed.get(*r).copied().unwrap_or(true))
+                    .map(|(_, remote)| remote.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let position = selected.and_then(|id| fresh.position(id));
+        self.collapsed = fresh
+            .remotes()
+            .iter()
+            .map(|remote| !unfolded.contains(&remote.name))
+            .collect();
+        self.history = Some(fresh);
+        self.error = None;
+        self.rebuild_side_rows();
+        self.side_selected = (0..self.side_rows.len())
+            .find(|index| side_selected.is_some() && self.side_key(*index) == side_selected)
+            .or_else(|| self.side_rows.iter().position(|row| row.selectable()))
+            .unwrap_or(0);
+        self.reveal_side = true;
+
+        match position {
+            Some(position) => {
+                self.selected = position;
+                self.log_scroll = position.saturating_sub(offset);
+                self.head_shown = true;
+            }
+            None => {
+                self.selected = 0;
+                self.log_scroll = 0;
+                self.head_shown = false;
+                self.reset_detail();
+            }
+        }
+        self.reveal_log = true;
+    }
+
+    /// The selected commit's id, if any.
+    fn selected_id(&self) -> Option<Oid> {
+        self.history
+            .as_ref()
+            .and_then(|h| h.commits().get(self.selected))
+            .map(|c| c.id)
+    }
+
+    /// What a sidebar row is, by name rather than by index, so it can
+    /// be found again after the branches change: a local branch, a
+    /// remote, or a remote's branch.
+    fn side_key(&self, index: usize) -> Option<SideKey> {
+        let history = self.history.as_ref()?;
+        match self.side_rows.get(index)? {
+            SideRow::Branch(b) => Some(SideKey::Branch(history.branches().get(*b)?.name.clone())),
+            SideRow::Remote(r) => Some(SideKey::Remote(history.remotes().get(*r)?.name.clone())),
+            SideRow::RemoteBranch(r, b) => {
+                let remote = history.remotes().get(*r)?;
+                Some(SideKey::RemoteBranch(
+                    remote.name.clone(),
+                    remote.branches.get(*b)?.name.clone(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
     /// What the status bar shows for the page.
     pub fn hint(&self) -> String {
         let pane = match self.pane {
@@ -512,10 +751,11 @@ impl GitLogView {
             Pane::Files => FILES_HINT,
             Pane::Content => CONTENT_HINT,
         };
-        match &self.history {
-            Some(history) if history.is_loading() => {
+        match (&self.history, &self.pending) {
+            (Some(history), _) if history.is_loading() => {
                 format!("loading {} commits… · {pane}", history.commits().len())
             }
+            (_, Some(fresh)) => format!("refreshing {} commits… · {pane}", fresh.commits().len()),
             _ => pane.to_owned(),
         }
     }
@@ -523,15 +763,13 @@ impl GitLogView {
     /// The selected commit's id, if any.
     #[cfg(test)]
     pub fn selected_commit(&self) -> Option<Oid> {
-        self.history
-            .as_ref()
-            .and_then(|h| h.commits().get(self.selected))
-            .map(|c| c.id)
+        self.selected_id()
     }
 
+    /// Whether the walk, or a refresh's, is still going.
     #[cfg(test)]
     pub fn is_loading(&self) -> bool {
-        self.history.as_ref().is_some_and(History::is_loading)
+        self.history.as_ref().is_some_and(History::is_loading) || self.pending.is_some()
     }
 
     /// Where the rule under the log was drawn.
@@ -2731,5 +2969,186 @@ mod tests {
         let screen = draw(&mut view, 60, 10);
         assert!(screen[1].contains(NOT_A_REPOSITORY), "{screen:#?}");
         assert!(!view.poll());
+    }
+
+    /// Poll until the walk, and any refresh, is done.
+    fn wait(view: &mut GitLogView) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while view.is_loading() && std::time::Instant::now() < deadline {
+            view.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!view.is_loading());
+    }
+
+    /// Commit a file on top of HEAD, as `repo_with_history` commits.
+    fn commit_on_head(dir: &tempfile::TempDir, name: &str, content: &str, message: &str) -> Oid {
+        let repo = Repository::open(dir.path()).unwrap();
+        fs::write(dir.path().join(name), content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(name)).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = Signature::new(
+            "Ann Author",
+            "ann@example.com",
+            &git2::Time::new(1_700_001_000, 0),
+        )
+        .unwrap();
+        let parents: Vec<git2::Commit<'_>> = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|id| repo.find_commit(id).unwrap())
+            .into_iter()
+            .collect();
+        let refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &refs)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_place_and_takes_in_new_commits() {
+        let (dir, ids) = repo_with_history();
+        let mut view = view(&dir);
+        let [_a, b, _s, _m] = ids[..] else { panic!() };
+        // A log two commits tall, so that where it is scrolled to
+        // matters.
+        view.set_sizes(PaneSizes {
+            sidebar: None,
+            log: Some(0.2),
+            files: None,
+        });
+        draw(&mut view, 110, 24);
+        // Down twice to On main, scrolled onto the log's second row;
+        // into its files, and the diff of its one file.
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Down));
+        assert_eq!(view.selected_commit(), Some(b));
+        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Down));
+        let screen = draw(&mut view, 110, 24);
+        let row = screen.iter().position(|r| r.contains("On main")).unwrap();
+        assert!(row_with(&screen, "a.rs").contains("+1"), "{screen:#?}");
+        assert!(screen.iter().any(|r| r.contains("two();")), "{screen:#?}");
+        assert!(!view.hint().contains("refreshing"));
+
+        // A commit made meanwhile. Until the refresh is done, the page
+        // is as it was, and says it is refreshing.
+        commit_on_head(&dir, "n.txt", "new\n", "After the merge");
+        view.refresh();
+        assert!(view.is_loading());
+        assert!(view.hint().contains("refreshing"), "{}", view.hint());
+        let screen = draw(&mut view, 110, 24);
+        assert_eq!(view.selected_commit(), Some(b));
+        assert!(
+            !screen.iter().any(|r| r.contains("After the merge")),
+            "{screen:#?}"
+        );
+        assert!(screen[row].contains("On main"), "{screen:#?}");
+
+        // Done: the same commit on the same row, its file still shown.
+        wait(&mut view);
+        assert!(!view.hint().contains("refreshing"), "{}", view.hint());
+        let screen = draw(&mut view, 110, 24);
+        assert_eq!(view.selected_commit(), Some(b));
+        assert_eq!(view.history.as_ref().unwrap().commits().len(), 5);
+        assert!(screen[row].contains("On main"), "{screen:#?}");
+        assert_eq!(view.pane, Pane::Files);
+        assert!(row_with(&screen, "a.rs").contains("+1"), "{screen:#?}");
+        assert!(screen.iter().any(|r| r.contains("two();")), "{screen:#?}");
+        // The new commit is at the top of the log.
+        view.handle_key(key(KeyCode::Left));
+        view.handle_key(key(KeyCode::Home));
+        let screen = draw(&mut view, 110, 24);
+        assert!(
+            screen.iter().any(|r| r.contains("After the merge")),
+            "{screen:#?}"
+        );
+    }
+
+    #[test]
+    fn a_refresh_whose_selected_commit_is_gone_goes_to_head() {
+        let (dir, ids) = repo_with_history();
+        let mut view = view(&dir);
+        let [_a, b, _s, m] = ids[..] else { panic!() };
+        draw(&mut view, 110, 24);
+        assert_eq!(view.selected_commit(), Some(m));
+        // Reset main to On main and drop the remote branch: the merge
+        // is unreachable.
+        let repo = Repository::open(dir.path()).unwrap();
+        let main = repo.head().unwrap().shorthand().unwrap().to_owned();
+        repo.reference(&format!("refs/heads/{main}"), b, true, "reset")
+            .unwrap();
+        repo.find_reference(&format!("refs/remotes/origin/{main}"))
+            .unwrap()
+            .delete()
+            .unwrap();
+        view.refresh();
+        wait(&mut view);
+        let screen = draw(&mut view, 110, 24);
+        assert_eq!(view.selected_commit(), Some(b));
+        assert!(
+            !screen.iter().any(|r| r.contains("Merge side into main")),
+            "{screen:#?}"
+        );
+        // The detail is the new selection's.
+        assert!(row_with(&screen, "a.rs").contains("+1"), "{screen:#?}");
+        assert!(!screen.iter().any(|r| r.contains("s.txt")), "{screen:#?}");
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_sidebar_by_name() {
+        let (dir, ids) = repo_with_history();
+        let mut view = view(&dir);
+        let [a, ..] = ids[..] else { panic!() };
+        draw(&mut view, 110, 24);
+        // In the sidebar: unfold origin, and select `side`.
+        view.handle_key(key(KeyCode::BackTab));
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Down));
+        assert_eq!(view.side_rows[view.side_selected], SideRow::Remote(0));
+        view.handle_key(key(KeyCode::Right));
+        view.handle_key(key(KeyCode::Up));
+        assert_eq!(view.side_rows[view.side_selected], SideRow::Branch(1));
+        // A branch sorting before `side` and a remote sorting before
+        // `origin` appear.
+        let repo = Repository::open(dir.path()).unwrap();
+        repo.branch("aaa", &repo.find_commit(a).unwrap(), false)
+            .unwrap();
+        repo.remote("backup", "https://example.com/b.git").unwrap();
+        view.refresh();
+        wait(&mut view);
+        let screen = draw(&mut view, 110, 24);
+        assert_eq!(view.side_rows[view.side_selected], SideRow::Branch(2));
+        assert_eq!(view.collapsed, vec![true, false]);
+        assert!(screen.iter().any(|r| r.contains("▸ backup")), "{screen:#?}");
+        assert!(screen.iter().any(|r| r.contains("▾ origin")), "{screen:#?}");
+        // The selected branch gone, the first is selected instead.
+        repo.find_branch("side", git2::BranchType::Local)
+            .unwrap()
+            .delete()
+            .unwrap();
+        view.refresh();
+        wait(&mut view);
+        assert_eq!(view.side_rows[view.side_selected], SideRow::Branch(0));
+    }
+
+    #[test]
+    fn a_directory_made_a_repository_shows_its_history_when_refreshed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = GitLogView::new(dir.path());
+        let screen = draw(&mut view, 60, 10);
+        assert!(screen[1].contains(NOT_A_REPOSITORY), "{screen:#?}");
+        Repository::init(dir.path()).unwrap();
+        let first = commit_on_head(&dir, "f.txt", "first\n", "First commit");
+        view.refresh();
+        wait(&mut view);
+        let screen = draw(&mut view, 60, 10);
+        assert_eq!(view.selected_commit(), Some(first));
+        assert!(
+            screen.iter().any(|r| r.contains("First commit")),
+            "{screen:#?}"
+        );
     }
 }
