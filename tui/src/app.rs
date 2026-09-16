@@ -2601,7 +2601,7 @@ impl App {
             return;
         }
         if let Mode::GitLog(tabs) = &mut self.mode {
-            tabs.active().handle_key(key);
+            tabs.handle_key(key);
             return;
         }
         if let Mode::Changes(tabs) = &mut self.mode {

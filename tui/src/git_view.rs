@@ -46,11 +46,11 @@
 //! End to the ends), ← and → scroll the messages sideways (← at the
 //! left edge goes back to the sidebar), and Enter moves on to the
 //! files. In the files ↑ and ↓ choose what the right pane shows,
-//! Enter or → on a file moves into it, ← on a file goes to its
-//! directory, and ← at the top of the tree goes back to the log. In the
-//! diff the arrows scroll, Page Up and Page Down by a screenful, and ←
-//! goes back to the files when nothing is scrolled sideways. The wheel
-//! scrolls whichever pane it is over, sideways too.
+//! Enter, → or a double-click on a file moves into it, ← on a file
+//! goes to its directory, and ← at the top of the tree goes back to
+//! the log. In the diff the arrows scroll, Page Up and Page Down by a
+//! screenful, and ← goes back to the files when nothing is scrolled
+//! sideways. The wheel scrolls whichever pane it is over, sideways too.
 //!
 //! The log and the content pane scroll sideways as the editor does
 //! (see `EditorView`): only as far as the longest line on screen now
@@ -65,6 +65,15 @@
 //! page of its own, opened the first time it is shown. Ctrl+T on the
 //! page picks a tab, as it picks a file tab in the editor. A submodule
 //! that hasn't been initialized has a tab too, which says so.
+//!
+//! A commit that moves a submodule on lists it among its files, and
+//! Enter or a double-click on it goes to the commit the submodule now
+//! points at, on the submodule's tab, so that its commits can be
+//! reviewed there; the tab's log walks to it if it hasn't yet. A
+//! submodule the commit removed has no commit to go to, one with no
+//! tab (no longer a submodule, or inside one that isn't initialized)
+//! can't be shown, and one whose commit no branch or tag reaches any
+//! more isn't in the log: the status bar says which.
 //!
 //! The page is kept when it is left (for the editor, or another
 //! mode) and comes back as it was: the same commit selected, the same
@@ -97,6 +106,7 @@
 //! Beyond fetching, the page only looks at the repository: checking
 //! out a branch or commit will come later.
 
+use crate::clicks::ClickTracker;
 use crate::commit_row::{CommitLine, commit_extent, draw_commit_line, lane_cap};
 use crate::diff_pane::{
     Button, HScroll, Piece, WHEEL_COLUMNS, WHEEL_LINES, clamp_between, content_background,
@@ -108,7 +118,8 @@ use crate::palette::palette_background;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
-    ChangeKind, CommitDetail, Fetch, FileDiff, FileTree, History, Oid, TreeRow, submodules,
+    ChangeKind, CommitDetail, Fetch, FileDiff, FileTree, History, Oid, TreeRow, short_id,
+    submodules,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
@@ -228,6 +239,18 @@ enum Content {
     Failed(String),
 }
 
+/// What a page asks of its tabs when Enter or a double-click lands on
+/// a submodule among a commit's files: to show a commit of the
+/// submodule on the submodule's own tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SubmoduleJump {
+    /// The submodule's path, from the page's repository.
+    path: String,
+    /// The commit to go to: the one the submodule points at after the
+    /// change.
+    id: Oid,
+}
+
 /// One repository's tab of the git log: the main repository or a
 /// submodule, with its page once it has been shown.
 struct GitTab {
@@ -329,9 +352,17 @@ impl GitLogTabs {
         &self.layout
     }
 
-    /// Give the shown page a mouse event. Returns whether the page's
-    /// pane sizes changed (a drag of a rule ended), in which case the
-    /// layout is worth keeping.
+    /// Give the shown page a key, and go where it asks (see
+    /// [`follow_submodule`](Self::follow_submodule)).
+    pub fn handle_key(&mut self, key: KeyEvent) {
+        self.active().handle_key(key);
+        self.follow_submodule();
+    }
+
+    /// Give the shown page a mouse event, and go where it asks (see
+    /// [`follow_submodule`](Self::follow_submodule)). Returns whether
+    /// the page's pane sizes changed (a drag of a rule ended), in
+    /// which case the layout is worth keeping.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
         let active = self.active;
         let resized = self.active().handle_mouse(mouse);
@@ -342,7 +373,37 @@ impl GitLogTabs {
                 self.layout.set(&key, sizes);
             }
         }
+        self.follow_submodule();
         resized
+    }
+
+    /// Show the commit of a submodule the shown page asks for, on the
+    /// submodule's tab: Enter or a double-click on a submodule among a
+    /// commit's files goes to the commit it now points at. The tab is
+    /// named by the submodule's path from the main repository, which
+    /// for a submodule of a submodule is the shown tab's path and then
+    /// its own. A submodule with no tab (no longer one, or inside one
+    /// that isn't initialized) can't be shown, and the status bar says
+    /// so.
+    fn follow_submodule(&mut self) {
+        let Some(jump) = self.active().take_submodule_jump() else {
+            return;
+        };
+        let tab = &self.tabs[self.active];
+        let title = if tab.submodule {
+            format!("{}/{}", tab.title, jump.path)
+        } else {
+            jump.path.clone()
+        };
+        match self.tabs.iter().position(|tab| tab.title == title) {
+            Some(index) => {
+                self.active = index;
+                self.active().go_to(jump.id);
+            }
+            None => self
+                .active()
+                .set_notice(format!("No tab for submodule {}", jump.path)),
+        }
     }
 
     /// The tabs' titles, in order: the page's name, then each
@@ -494,6 +555,11 @@ pub struct GitLogView {
     files_rule: Rect,
     /// The expand buttons drawn in the content pane, to hit-test clicks.
     buttons: Vec<(Rect, Button)>,
+    /// Presses in the file list, to notice a double-click.
+    clicks: ClickTracker,
+    /// A commit of a submodule to show on the submodule's tab, asked
+    /// for and not yet taken (see [`take_submodule_jump`](Self::take_submodule_jump)).
+    submodule_jump: Option<SubmoduleJump>,
 }
 
 impl GitLogView {
@@ -566,6 +632,8 @@ impl GitLogView {
             log_rule: Rect::default(),
             files_rule: Rect::default(),
             buttons: Vec::new(),
+            clicks: ClickTracker::default(),
+            submodule_jump: None,
         };
         view.install(GitLogView::open_history(root, exact));
         view
@@ -644,8 +712,9 @@ impl GitLogView {
             return refreshed;
         };
         if !history.poll() && !refreshed {
-            return false;
+            return self.settle_jump();
         }
+        let history = self.history.as_ref().expect("polled just above");
         // The log opens at HEAD: select it as soon as it is walked,
         // unless the user has already moved.
         let head = history.head();
@@ -667,6 +736,27 @@ impl GitLogView {
             self.pending_jump = None;
             self.select_commit(position);
         }
+        self.settle_jump();
+        true
+    }
+
+    /// Give up a commit to go to that the walk, now done, didn't reach:
+    /// no branch or tag reaches it, so it isn't in the log, and the
+    /// status bar says so. Returns whether that happened.
+    fn settle_jump(&mut self) -> bool {
+        let Some(id) = self.pending_jump else {
+            return false;
+        };
+        let walked = self.pending.is_none()
+            && self
+                .history
+                .as_ref()
+                .is_some_and(|history| !history.is_loading());
+        if !walked {
+            return false;
+        }
+        self.pending_jump = None;
+        self.notice = Some(format!("Commit {} is not in the log", short_id(id)));
         true
     }
 
@@ -862,10 +952,31 @@ impl GitLogView {
         }
     }
 
-    /// What the status bar is to say, once: how a fetch went, when one
-    /// has finished since the last time this was asked.
+    /// What the status bar is to say, once: how a fetch went, or why
+    /// a commit couldn't be gone to, when either has happened since
+    /// the last time this was asked.
     pub fn take_notice(&mut self) -> Option<String> {
         self.notice.take()
+    }
+
+    fn set_notice(&mut self, notice: String) {
+        self.notice = Some(notice);
+    }
+
+    /// The commit of a submodule the page asks to have shown on the
+    /// submodule's tab, when Enter or a double-click has asked for one
+    /// since the last time this was asked.
+    fn take_submodule_jump(&mut self) -> Option<SubmoduleJump> {
+        self.submodule_jump.take()
+    }
+
+    /// Go to a commit in the log, with the keyboard there: now if the
+    /// walk has reached it, otherwise when it does; if the walk ends
+    /// without it, the status bar says so.
+    fn go_to(&mut self, id: Oid) {
+        self.pane = Pane::Log;
+        self.jump_to(id);
+        self.settle_jump();
     }
 
     /// The selected commit's id, if any.
@@ -978,6 +1089,46 @@ impl GitLogView {
                 self.reveal_files = true;
             }
             None => self.select_dir(dir),
+        }
+    }
+
+    /// Enter or a double-click on a file of the list: move into its
+    /// diff, or for a submodule ask for the commit it now points at to
+    /// be shown on the submodule's tab (see
+    /// [`GitLogTabs::follow_submodule`]). A submodule the commit
+    /// removed points at nothing after it, and the status bar says so.
+    fn open_selected_file(&mut self) {
+        let Some(TreeRow::File { file, .. }) = self.selected_file_row() else {
+            return;
+        };
+        let is_submodule = self
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.files.get(file))
+            .is_some_and(|file| file.submodule);
+        if !is_submodule {
+            self.pane = Pane::Content;
+            return;
+        }
+        // The submodule's diff carries the commits it moved over.
+        self.ensure_content();
+        match &self.content {
+            Some(Content::Diff(diff)) => match diff.submodule.as_ref().and_then(|r| r.new) {
+                Some(id) => {
+                    self.submodule_jump = Some(SubmoduleJump {
+                        path: diff.path.clone(),
+                        id,
+                    });
+                }
+                None => {
+                    self.notice = Some(format!(
+                        "Submodule {} was removed: no commit to go to",
+                        diff.path
+                    ));
+                }
+            },
+            Some(Content::Failed(why)) => self.notice = Some(why.clone()),
+            _ => {}
         }
     }
 
@@ -1413,7 +1564,10 @@ impl GitLogView {
                 Some(TreeRow::Dir { dir, collapsed, .. }) => {
                     self.set_dir_collapsed(dir, !collapsed);
                 }
-                _ if key.code == KeyCode::Enter => self.pane = Pane::Content,
+                Some(TreeRow::File { .. }) if key.code == KeyCode::Enter => {
+                    self.open_selected_file();
+                }
+                None if key.code == KeyCode::Enter => self.pane = Pane::Content,
                 _ => {}
             },
             KeyCode::Right => match row {
@@ -1673,13 +1827,19 @@ impl GitLogView {
                     }
                     Pane::Files => {
                         let row = self.files_scroll + (mouse.row - self.files_area.y) as usize;
+                        let presses = self.clicks.press(mouse.column, mouse.row);
                         if row < self.file_row_count() {
                             self.select_file(row);
-                            // A directory folds or unfolds when clicked.
-                            if let Some(TreeRow::Dir { dir, collapsed, .. }) =
-                                self.selected_file_row()
-                            {
-                                self.set_dir_collapsed(dir, !collapsed);
+                            match self.selected_file_row() {
+                                // A directory folds or unfolds when clicked.
+                                Some(TreeRow::Dir { dir, collapsed, .. }) => {
+                                    self.set_dir_collapsed(dir, !collapsed);
+                                }
+                                // A file opens on a double-click, as on Enter.
+                                Some(TreeRow::File { .. }) if presses == 2 => {
+                                    self.open_selected_file();
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -2635,6 +2795,144 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("added at ")), "{rows:#?}");
         assert!(rows.iter().any(|r| r.contains("Inner commit")), "{rows:#?}");
         assert!(!rows.iter().any(|r| r.contains("Inner two")), "{rows:#?}");
+    }
+
+    /// Poll the shown tab until its walk, and any refresh, is done.
+    fn wait_tabs(tabs: &mut GitLogTabs) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while tabs.is_loading() && std::time::Instant::now() < deadline {
+            tabs.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!tabs.is_loading());
+    }
+
+    /// The row of the file list that lists the file at `path` of the
+    /// selected commit, as drawn: the description is row 0.
+    fn file_row_of(view: &GitLogView, path: &str) -> usize {
+        let files = &view.detail.as_ref().unwrap().files;
+        view.file_rows
+            .iter()
+            .position(|row| matches!(row, TreeRow::File { file, .. } if files[*file].path == path))
+            .unwrap_or_else(|| panic!("no row for {path}"))
+            + 1
+    }
+
+    #[test]
+    fn enter_or_a_double_click_on_a_submodule_goes_to_its_commit_on_its_tab() {
+        let (dir, bump, subs) = repo_with_submodule_bump();
+        let mut tabs = GitLogTabs::new(dir.path(), GitLogLayout::default());
+        wait_tabs(&mut tabs);
+        assert_eq!(tabs.active().selected_commit(), Some(bump));
+        // The bump's files are Description and then `sub`: Enter on
+        // the submodule shows the submodule's tab, at the commit the
+        // bump moved it to, with the keyboard in the log.
+        tabs.handle_key(key(KeyCode::Tab));
+        tabs.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            file_row_of(tabs.active(), "sub"),
+            tabs.active().file_selected
+        );
+        tabs.handle_key(key(KeyCode::Enter));
+        assert_eq!(tabs.active_index(), 1);
+        wait_tabs(&mut tabs);
+        let view = tabs.active();
+        assert_eq!(view.selected_commit(), Some(subs[2]));
+        assert_eq!(view.pane, Pane::Log);
+        let screen = draw(view, 100, 24);
+        assert!(
+            screen.iter().any(|r| r.contains("Inner three")),
+            "{screen:#?}"
+        );
+        assert!(tabs.take_notice().is_none());
+
+        // Back on the main tab, the commit that added the submodule
+        // (and `.gitmodules` with it): a double-click on `sub` goes to
+        // the commit it was added at.
+        tabs.set_active(0);
+        tabs.handle_key(key(KeyCode::Left));
+        assert_eq!(tabs.active().pane, Pane::Log);
+        tabs.handle_key(key(KeyCode::Down));
+        let view = tabs.active();
+        assert_eq!(
+            view.history.as_ref().unwrap().commits()[view.selected].summary,
+            "Add submodule"
+        );
+        draw(view, 100, 24);
+        let files = view.files_area;
+        let (x, y) = (files.x + 2, files.y + file_row_of(view, "sub") as u16);
+        tabs.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+        // One click only selects it.
+        assert_eq!(tabs.active_index(), 0);
+        assert_eq!(
+            file_row_of(tabs.active(), "sub"),
+            tabs.active().file_selected
+        );
+        tabs.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(tabs.active_index(), 1);
+        wait_tabs(&mut tabs);
+        assert_eq!(tabs.active().selected_commit(), Some(subs[0]));
+        assert_eq!(tabs.active().pane, Pane::Log);
+
+        // A double-click on an ordinary file moves into its diff, as
+        // Enter does.
+        tabs.set_active(0);
+        tabs.handle_key(key(KeyCode::Left));
+        tabs.handle_key(key(KeyCode::Down));
+        let view = tabs.active();
+        assert_eq!(
+            view.history.as_ref().unwrap().commits()[view.selected].summary,
+            "Base commit"
+        );
+        draw(view, 100, 24);
+        let files = view.files_area;
+        let y = files.y + file_row_of(view, "a.rs") as u16;
+        for _ in 0..2 {
+            tabs.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: files.x + 2,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert_eq!(tabs.active_index(), 0);
+        assert_eq!(tabs.active().pane, Pane::Content);
+
+        // The submodule's branch moved back so that the bump's commit
+        // is reachable from nothing: once the tab has read the
+        // repository again, going to it says it isn't in the log.
+        let sub = Repository::open(dir.path().join("sub")).unwrap();
+        let branch = sub.head().unwrap().name().unwrap().to_owned();
+        sub.reference(&branch, subs[1], true, "back").unwrap();
+        tabs.set_active(1);
+        tabs.refresh();
+        wait_tabs(&mut tabs);
+        tabs.set_active(0);
+        wait_tabs(&mut tabs);
+        tabs.handle_key(key(KeyCode::Tab));
+        tabs.handle_key(key(KeyCode::Tab));
+        assert_eq!(tabs.active().pane, Pane::Log);
+        tabs.handle_key(key(KeyCode::Home));
+        tabs.handle_key(key(KeyCode::Enter));
+        tabs.handle_key(key(KeyCode::Down));
+        tabs.handle_key(key(KeyCode::Enter));
+        assert_eq!(tabs.active_index(), 1);
+        wait_tabs(&mut tabs);
+        assert_eq!(
+            tabs.take_notice().as_deref(),
+            Some(format!("Commit {} is not in the log", short_id(subs[2])).as_str())
+        );
+        assert_ne!(tabs.active().selected_commit(), Some(subs[2]));
     }
 
     #[test]
