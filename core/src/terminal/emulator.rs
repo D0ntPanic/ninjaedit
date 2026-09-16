@@ -371,11 +371,14 @@ impl Terminal {
         }
     }
 
-    /// The text from one cell of the history to another, both included,
-    /// as a copy of it should read. Rows that were one line before the
-    /// terminal wrapped it are joined back together; other rows end in a
-    /// line break, with the blanks at their end dropped. A wide character
-    /// selected by either of its cells appears once.
+    /// The text from one boundary of the history up to another, as a
+    /// copy of it should read: the cells from `start` to just before
+    /// `end`, so that a stretch from the start of one line to the start
+    /// of the next is that line with its line break. Rows that were one
+    /// line before the terminal wrapped it are joined back together;
+    /// other rows end in a line break, with the blanks at their end
+    /// dropped, as are those at the end of the last row however it was
+    /// cut. A wide character reached by either of its cells appears once.
     pub fn text_between(&self, start: Point, end: Point) -> String {
         let mut text = String::new();
         for number in start.line..=end.line {
@@ -389,7 +392,7 @@ impl Terminal {
                 continue;
             };
             let from = if number == start.line { start.col } else { 0 };
-            let to = if last { end.col + 1 } else { usize::MAX };
+            let to = if last { end.col } else { usize::MAX };
             let mut line = String::new();
             for (col, cell) in row.cells.iter().enumerate() {
                 if cell.spacer || col + cell.width() <= from || col >= to {
@@ -398,11 +401,8 @@ impl Terminal {
                 line.push_str(&cell.text);
             }
             // Blanks at the end of a row are padding, not text, unless
-            // the row wraps onto the next (then they're inside the line)
-            // or the selection stops short of the row's end (then they
-            // were chosen).
-            let cut_short = last && end.col + 1 < row.cells.len();
-            if !(row.wrapped || cut_short) {
+            // the row wraps onto the next, where they're inside the line.
+            if !row.wrapped || last {
                 let keep = line.trim_end_matches(' ').len();
                 line.truncate(keep);
             }
@@ -2131,17 +2131,23 @@ mod tests {
         let p = Point::new;
         // The whole history: the wrapped line is joined, the trailing
         // blanks of "hi  " go, the blank line stays.
-        assert_eq!(t.text_between(p(0, 0), p(4, 4)), "abcdefg\nhi\n\n한글x");
-        // From inside the wrapped row.
-        assert_eq!(t.text_between(p(0, 3), p(1, 0)), "def");
-        // Stopping short of a row's end keeps the blanks that were chosen.
-        assert_eq!(t.text_between(p(2, 0), p(2, 3)), "hi  ");
+        assert_eq!(t.text_between(p(0, 0), p(4, 5)), "abcdefg\nhi\n\n한글x");
+        // Up to the start of the line after: the same with a line break.
+        assert_eq!(t.text_between(p(0, 0), p(5, 0)), "abcdefg\nhi\n\n한글x\n");
+        // Whole lines, from the start of one to the start of another.
+        assert_eq!(t.text_between(p(1, 0), p(3, 0)), "fg\nhi\n");
+        // From inside the wrapped row, stopping before the "g".
+        assert_eq!(t.text_between(p(0, 3), p(1, 1)), "def");
+        // One cell is one character.
+        assert_eq!(t.text_between(p(2, 1), p(2, 2)), "i");
+        // The last line's trailing blanks go however it was cut.
         assert_eq!(t.text_between(p(2, 0), p(2, 4)), "hi");
-        // Either cell of a wide character gives it once, and the
-        // spacer's column alone gives it too.
+        assert_eq!(t.text_between(p(2, 0), p(2, 5)), "hi");
+        // Reaching either cell of a wide character gives it once.
         assert_eq!(t.text_between(p(4, 0), p(4, 1)), "한");
-        assert_eq!(t.text_between(p(4, 1), p(4, 2)), "한글");
-        assert_eq!(t.text_between(p(4, 3), p(4, 4)), "글x");
+        assert_eq!(t.text_between(p(4, 1), p(4, 3)), "한글");
+        assert_eq!(t.text_between(p(4, 2), p(4, 4)), "글");
+        assert_eq!(t.text_between(p(4, 3), p(4, 5)), "글x");
         // Lines past the history add nothing.
         assert_eq!(t.text_between(p(4, 4), p(9, 0)), "x\n\n\n\n\n");
         assert_eq!(t.text_between(p(20, 0), p(20, 0)), "");

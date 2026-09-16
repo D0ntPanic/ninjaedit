@@ -5176,7 +5176,7 @@ mod tests {
         };
         // The shell isn't reading the mouse, so a drag selects and the
         // release copies, says so, and leaves nothing selected.
-        drag(&mut app, (x, y), (x + 5, y + 1));
+        drag(&mut app, (x, y), (x + 6, y + 1));
         assert_eq!(app.clipboard.get().as_deref(), Some("hello world\nsecond"));
         assert_eq!(
             app.status.as_deref(),
@@ -5189,7 +5189,7 @@ mod tests {
         // A program reading the mouse gets the drag instead.
         app.status = None;
         app.tool_pane.tools_mut()[0].process(b"\x1b[?1000h");
-        drag(&mut app, (x + 6, y), (x + 10, y));
+        drag(&mut app, (x + 6, y), (x + 11, y));
         assert_eq!(
             app.clipboard.get().as_deref(),
             Some("hello world\nsecond"),
@@ -5201,7 +5201,7 @@ mod tests {
         // selects, and the press spends the prefix.
         ctrl(&mut app, ']');
         assert!(app.prefix.is_some());
-        drag(&mut app, (x + 6, y), (x + 10, y));
+        drag(&mut app, (x + 6, y), (x + 11, y));
         assert_eq!(app.prefix, None);
         assert_eq!(app.clipboard.get().as_deref(), Some("world"));
         assert_eq!(

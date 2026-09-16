@@ -19,7 +19,11 @@
 //! full-screen program that turned mouse reporting on) the wheel is sent
 //! to it rather than scrolling the view.
 //!
-//! Dragging the left button over the output selects text to copy. The
+//! Dragging the left button over the output selects text to copy, with
+//! the editor's reckoning: the pointer marks the boundary to the left of
+//! the cell it's on, so dragging from the start of one line to the start
+//! of the next selects that line, break and all, and dragging across one
+//! cell selects one character. The
 //! host terminal's own Shift+drag can't do this, since it knows nothing
 //! of the scrollback here, so the view does it whenever the program isn't
 //! reading the mouse, and also when it is but the user has escaped to the
@@ -83,9 +87,6 @@ pub struct TerminalView {
     /// The text being selected with the mouse, from the press until the
     /// release that copies it.
     selection: Option<Selection>,
-    /// Whether the selection's head has left the cell it was pressed on:
-    /// a press and release in place is a click, not a selection.
-    selection_moved: bool,
     /// Lines to scroll each tick while the pointer is dragging a
     /// selection past the top (positive, into the scrollback) or the
     /// bottom (negative) of the view; zero while it's inside.
@@ -109,7 +110,6 @@ impl TerminalView {
             scrollback: 0,
             dragging: None,
             selection: None,
-            selection_moved: false,
             autoscroll: 0,
             copied: None,
             area: Rect::default(),
@@ -176,7 +176,6 @@ impl TerminalView {
     /// it was made on is wiped.
     pub fn clear_selection(&mut self) {
         self.selection = None;
-        self.selection_moved = false;
         self.autoscroll = 0;
     }
 
@@ -280,7 +279,6 @@ impl TerminalView {
             MouseEventKind::ScrollDown => self.scroll_by(-(WHEEL_LINES as isize)),
             MouseEventKind::Down(MouseButton::Left) => {
                 self.selection = Some(Selection::new(self.point_at(mouse.column, mouse.row)));
-                self.selection_moved = false;
                 self.autoscroll = 0;
             }
             _ => {}
@@ -324,19 +322,22 @@ impl TerminalView {
         self.terminal.top_line(self.scrollback)
     }
 
-    /// The cell of the history under a screen position, with a position
-    /// outside the view clamped to its nearest edge.
+    /// The boundary of the history at a screen position: the left edge
+    /// of the cell there, or the end of the row for a position past the
+    /// right edge, with a position above or below the view clamped to its
+    /// nearest row.
     fn point_at(&self, x: u16, y: u16) -> Point {
         let (cols, rows) = self.terminal.size();
-        let col = (x.saturating_sub(self.area.x) as usize).min(cols.saturating_sub(1));
+        let col = (x.saturating_sub(self.area.x) as usize).min(cols);
         let row = (y.saturating_sub(self.area.y) as usize).min(rows.saturating_sub(1));
         Point::new(self.top_line() + row, col)
     }
 
-    /// Extend the selection to the pointer. Past the top or bottom of the
-    /// view the selection reaches the end of the row at that edge and the
-    /// view starts scrolling that way, one line per row the pointer is
-    /// past the edge, now and on each tick until it comes back.
+    /// Extend the selection to the pointer. Past the top of the view the
+    /// selection reaches the start of the top row, past the bottom the
+    /// end of the bottom row, and the view starts scrolling that way, one
+    /// line per row the pointer is past the edge, now and on each tick
+    /// until it comes back.
     fn drag_selection(&mut self, x: u16, y: u16) {
         self.autoscroll = if y < self.area.y {
             (self.area.y - y) as isize
@@ -351,9 +352,6 @@ impl TerminalView {
         }
         let point = self.point_at(x, y);
         if let Some(selection) = &mut self.selection {
-            if point != selection.anchor() {
-                self.selection_moved = true;
-            }
             selection.extend(point);
         }
     }
@@ -370,17 +368,15 @@ impl TerminalView {
         }
         let before = (self.scrollback, selection);
         self.scroll_by(self.autoscroll);
-        let (cols, rows) = self.terminal.size();
+        let rows = self.terminal.size().1;
+        // Below the bottom row is the start of the line after it, which
+        // takes the bottom row whole, break and all.
         let head = if self.autoscroll > 0 {
             Point::new(self.top_line(), 0)
         } else {
-            Point::new(
-                self.top_line() + rows.saturating_sub(1),
-                cols.saturating_sub(1),
-            )
+            Point::new(self.top_line() + rows, 0)
         };
         selection.extend(head);
-        self.selection_moved |= head != selection.anchor();
         self.selection = Some(selection);
         (self.scrollback, selection) != before
     }
@@ -391,15 +387,14 @@ impl TerminalView {
         self.autoscroll_step()
     }
 
-    /// End the selection at the button's release: its text, if the
-    /// pointer moved and there is any, is left for the application to
-    /// copy, and the highlight goes.
+    /// End the selection at the button's release: its text, if there is
+    /// any, is left for the application to copy, and the highlight goes.
     fn finish_selection(&mut self) {
         self.autoscroll = 0;
         let Some(selection) = self.selection.take() else {
             return;
         };
-        if !self.selection_moved {
+        if selection.is_empty() {
             return;
         }
         let text = self
@@ -984,12 +979,12 @@ mod tests {
         let down = MouseEventKind::Down(MouseButton::Left);
         let drag = MouseEventKind::Drag(MouseButton::Left);
         let up = MouseEventKind::Up(MouseButton::Left);
-        // Press on "two" and drag to the "r" of "four".
+        // Press on "two" and drag to just after the "r" of "four".
         assert!(v.handle_mouse(mouse(down, 4, 0), false).is_empty());
         assert!(v.is_selecting());
         assert!(v.is_dragging());
         assert_eq!(v.take_copied(), None);
-        v.handle_mouse(mouse(drag, 3, 2), false);
+        v.handle_mouse(mouse(drag, 4, 2), false);
         // The selection is highlighted: the tail of the first row, all of
         // the middle one, and the head of the last.
         let buf = render_in(&mut v, 20, 5, area);
@@ -1006,7 +1001,7 @@ mod tests {
         // Text keeps its color over the highlight.
         assert_eq!(buf[(4, 0)].fg, theme.terminal_text);
         // The release copies and deselects.
-        v.handle_mouse(mouse(up, 3, 2), false);
+        v.handle_mouse(mouse(up, 4, 2), false);
         assert!(!v.is_selecting());
         assert!(!v.is_dragging());
         assert_eq!(v.take_copied().as_deref(), Some("two\nthree\nfour"));
@@ -1014,10 +1009,30 @@ mod tests {
         let buf = render_in(&mut v, 20, 5, area);
         assert_eq!(buf[(0, 1)].bg, theme.terminal_background);
         // Dragging backwards selects the same text.
-        v.handle_mouse(mouse(down, 3, 2), false);
+        v.handle_mouse(mouse(down, 4, 2), false);
         v.handle_mouse(mouse(drag, 4, 0), false);
         v.handle_mouse(mouse(up, 4, 0), false);
         assert_eq!(v.take_copied().as_deref(), Some("two\nthree\nfour"));
+        // From the start of a line to the start of a later one takes
+        // whole lines, line breaks included.
+        v.handle_mouse(mouse(down, 0, 0), false);
+        v.handle_mouse(mouse(drag, 0, 2), false);
+        let buf = render_in(&mut v, 20, 5, area);
+        assert_eq!(buf[(19, 1)].bg, theme.selection_background);
+        assert_eq!(buf[(0, 2)].bg, theme.terminal_background);
+        v.handle_mouse(mouse(up, 0, 2), false);
+        assert_eq!(v.take_copied().as_deref(), Some("one two\nthree\n"));
+        // Past the right edge takes the last column too.
+        v.handle_mouse(mouse(down, 18, 2), false);
+        v.handle_mouse(mouse(drag, 25, 2), false);
+        v.handle_mouse(mouse(up, 25, 2), false);
+        // ...which is blank here, so the trailing blanks go.
+        assert_eq!(v.take_copied(), None);
+        v.process(b"\x1b[3;19Hab");
+        v.handle_mouse(mouse(down, 18, 2), false);
+        v.handle_mouse(mouse(drag, 25, 2), false);
+        v.handle_mouse(mouse(up, 25, 2), false);
+        assert_eq!(v.take_copied().as_deref(), Some("ab"));
     }
 
     #[test]
@@ -1037,6 +1052,11 @@ mod tests {
         v.handle_mouse(mouse(drag, 2, 0), false);
         v.handle_mouse(mouse(drag, 1, 0), false);
         v.handle_mouse(mouse(up, 1, 0), false);
+        assert_eq!(v.take_copied(), None);
+        // Across one cell is one character.
+        v.handle_mouse(mouse(down, 1, 0), false);
+        v.handle_mouse(mouse(drag, 2, 0), false);
+        v.handle_mouse(mouse(up, 2, 0), false);
         assert_eq!(v.take_copied().as_deref(), Some("n"));
         // Nothing but blanks isn't worth the clipboard.
         v.handle_mouse(mouse(down, 2, 2), false);
@@ -1088,7 +1108,7 @@ mod tests {
         assert!(v.tick());
         assert_eq!(v.scrollback_offset(), 4);
         // Back up past the top and release there: the text runs from the
-        // top row down to the "lin" of the anchor.
+        // top row down to the "li" before the anchor.
         v.handle_mouse(mouse(drag, 0, 1), false);
         assert_eq!(v.scrollback_offset(), 5);
         v.handle_mouse(mouse(up, 0, 1), false);
@@ -1096,8 +1116,15 @@ mod tests {
         let copied = v.take_copied().expect("copied");
         assert_eq!(
             copied,
-            "line11\nline12\nline13\nline14\nline15\nline16\nline17\nline18\nlin"
+            "line11\nline12\nline13\nline14\nline15\nline16\nline17\nline18\nli"
         );
+        // From "line14" on the fourth row, below the bottom scrolls one
+        // line down and takes the new bottom row whole.
+        v.handle_mouse(mouse(down, 0, 5), false);
+        v.handle_mouse(mouse(drag, 0, 7), false);
+        v.handle_mouse(mouse(up, 0, 7), false);
+        assert_eq!(v.scrollback_offset(), 4);
+        assert_eq!(v.take_copied().as_deref(), Some("line14\nline15\nline16\n"));
         // Scrolling past the start stops there.
         v.handle_mouse(mouse(down, 0, 6), false);
         for _ in 0..30 {
@@ -1137,7 +1164,7 @@ mod tests {
         assert!(v.is_selecting());
         assert!(v.handle_mouse(mouse(drag, 3, 0), false).is_empty());
         assert!(v.handle_mouse(mouse(up, 3, 0), false).is_empty());
-        assert_eq!(v.take_copied().as_deref(), Some("line"));
+        assert_eq!(v.take_copied().as_deref(), Some("lin"));
         // Escaped, the wheel is the view's too.
         assert!(
             v.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0), true)
