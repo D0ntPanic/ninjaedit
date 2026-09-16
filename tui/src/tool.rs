@@ -215,6 +215,7 @@ impl Tool {
     /// first command.
     pub fn clear_screen(&mut self) {
         let (cols, rows) = self.view.size();
+        self.view.clear_selection();
         let terminal = self.view.terminal_mut();
         *terminal = ninjaedit_core::terminal::Terminal::new(cols as usize, rows as usize);
         terminal.set_scrollback_limit(self.scrollback);

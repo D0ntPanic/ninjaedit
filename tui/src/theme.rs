@@ -202,7 +202,8 @@ theme_colors! {
 required {
     view_background => "view-background",
     view_text => "view-text",
-    /// The background of selected text in the editor.
+    /// The background of selected text in the editor, and of text being
+    /// selected with the mouse in a terminal.
     selection_background => "selection-background",
     /// The background of a search match.
     find_result_background => "find-result-background",

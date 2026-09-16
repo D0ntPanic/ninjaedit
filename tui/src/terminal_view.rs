@@ -19,6 +19,20 @@
 //! full-screen program that turned mouse reporting on) the wheel is sent
 //! to it rather than scrolling the view.
 //!
+//! Dragging the left button over the output selects text to copy. The
+//! host terminal's own Shift+drag can't do this, since it knows nothing
+//! of the scrollback here, so the view does it whenever the program isn't
+//! reading the mouse, and also when it is but the user has escaped to the
+//! editor's keys with the prefix (Ctrl+]), which the application tells
+//! the view with `escaped`. Dragging past the top or bottom of the view
+//! scrolls through the scrollback, faster the further past, so a
+//! selection can be longer than the screen. Releasing the button ends the
+//! selection: the text is copied at once and the highlight goes, since
+//! there is nothing else to do with a selection in a terminal, and a
+//! lingering one would invite a Ctrl+C that kills the program instead.
+//! The application takes the text with [`take_copied`] and puts it on
+//! the clipboard.
+//!
 //! Source locations in the output (the file and line of a compiler's
 //! warning or error; see [`find_source_links`]) are drawn as links,
 //! underlined in the theme's link color, and [`link_at`] tells the
@@ -29,12 +43,14 @@
 //!
 //! [`handle_key`]: TerminalView::handle_key
 //! [`link_at`]: TerminalView::link_at
+//! [`take_copied`]: TerminalView::take_copied
 
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::terminal::{
     Color as TermColor, Key, Modifiers, MouseButton as TermButton, MouseEvent as TermMouse,
-    MouseEventKind as TermMouseKind, Row, Style as TermStyle, Terminal, Underline,
+    MouseEventKind as TermMouseKind, Point, Row, Selection, Style as TermStyle, Terminal,
+    Underline,
 };
 use ninjaedit_core::{SourceLocation, find_source_links};
 use ratatui::buffer::Buffer;
@@ -64,6 +80,18 @@ pub struct TerminalView {
     /// button it started with, so drag and release events can follow the
     /// pointer outside the view.
     dragging: Option<MouseButton>,
+    /// The text being selected with the mouse, from the press until the
+    /// release that copies it.
+    selection: Option<Selection>,
+    /// Whether the selection's head has left the cell it was pressed on:
+    /// a press and release in place is a click, not a selection.
+    selection_moved: bool,
+    /// Lines to scroll each tick while the pointer is dragging a
+    /// selection past the top (positive, into the scrollback) or the
+    /// bottom (negative) of the view; zero while it's inside.
+    autoscroll: isize,
+    /// Text a finished selection copied, until the application takes it.
+    copied: Option<String>,
     /// The screen region the terminal was last drawn into.
     area: Rect,
     /// The source links on screen at the last render, and what the
@@ -80,6 +108,10 @@ impl TerminalView {
             terminal: Terminal::new(cols as usize, rows as usize),
             scrollback: 0,
             dragging: None,
+            selection: None,
+            selection_moved: false,
+            autoscroll: 0,
+            copied: None,
             area: Rect::default(),
             links: Vec::new(),
             links_for: None,
@@ -122,10 +154,30 @@ impl TerminalView {
         self.terminal.title()
     }
 
-    /// Whether a drag is being sent to the program, so the view wants
-    /// drag and release events even outside its area.
+    /// Whether a drag is being sent to the program or is selecting text,
+    /// so the view wants drag and release events even outside its area.
     pub fn is_dragging(&self) -> bool {
-        self.dragging.is_some()
+        self.dragging.is_some() || self.selection.is_some()
+    }
+
+    /// Whether the mouse is selecting text to copy, for tests.
+    #[cfg(test)]
+    pub fn is_selecting(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    /// Text the last selection copied, if the application hasn't taken
+    /// it yet. Taking it clears it.
+    pub fn take_copied(&mut self) -> Option<String> {
+        self.copied.take()
+    }
+
+    /// Drop a selection in progress without copying, as when the screen
+    /// it was made on is wiped.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selection_moved = false;
+        self.autoscroll = 0;
     }
 
     /// Jump back to the live screen, as any input does.
@@ -176,26 +228,64 @@ impl TerminalView {
 
     /// Handle a mouse event, returning bytes to send to the program (a
     /// mouse report, when it asked for one). The wheel scrolls the view's
-    /// scrollback unless the program is reading the mouse itself.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Vec<u8> {
-        // The wheel scrolls the scrollback when the program isn't using
-        // the mouse, and there's scrollback to move through.
-        let wheel = matches!(
-            mouse.kind,
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-        );
-        if wheel && !self.terminal.reports_mouse() {
+    /// scrollback unless the program is reading the mouse itself, and a
+    /// left drag selects text to copy (see the module notes). `escaped`
+    /// says the user has pressed the prefix to reach the editor's keys,
+    /// which keeps the mouse from a program reading it too.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, escaped: bool) -> Vec<u8> {
+        // A selection in progress takes the drag and the release that
+        // ends it, wherever the pointer has gone; another button
+        // meanwhile does nothing.
+        if self.selection.is_some() {
             match mouse.kind {
-                MouseEventKind::ScrollUp => self.scroll_by(WHEEL_LINES as isize),
-                MouseEventKind::ScrollDown => self.scroll_by(-(WHEEL_LINES as isize)),
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.drag_selection(mouse.column, mouse.row);
+                    return Vec::new();
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.finish_selection();
+                    return Vec::new();
+                }
+                MouseEventKind::Down(_) | MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
+                    return Vec::new();
+                }
+                // The wheel moves the view under the selection, whoever
+                // has the mouse otherwise.
+                MouseEventKind::ScrollUp => {
+                    self.scroll_by(WHEEL_LINES as isize);
+                    return Vec::new();
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_by(-(WHEEL_LINES as isize));
+                    return Vec::new();
+                }
                 _ => {}
             }
-            return Vec::new();
         }
-        let Some(event) = self.translate_mouse(mouse) else {
-            return Vec::new();
-        };
-        self.terminal.encode_mouse(event).unwrap_or_default()
+        // Likewise a drag the program is following, even if the user
+        // escaped partway: the release must reach it.
+        let following = self.dragging.is_some()
+            && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_));
+        let program_mouse = following || (self.terminal.reports_mouse() && !escaped);
+        if program_mouse {
+            let Some(event) = self.translate_mouse(mouse) else {
+                return Vec::new();
+            };
+            return self.terminal.encode_mouse(event).unwrap_or_default();
+        }
+        // The mouse is the view's: the wheel scrolls the scrollback, a
+        // left press starts selecting, and the rest is nothing to it.
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_by(WHEEL_LINES as isize),
+            MouseEventKind::ScrollDown => self.scroll_by(-(WHEEL_LINES as isize)),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.selection = Some(Selection::new(self.point_at(mouse.column, mouse.row)));
+                self.selection_moved = false;
+                self.autoscroll = 0;
+            }
+            _ => {}
+        }
+        Vec::new()
     }
 
     /// Turn a crossterm mouse event into the emulator's, in cell
@@ -225,6 +315,99 @@ impl TerminalView {
             row,
             modifiers: modifiers(mouse.modifiers),
         })
+    }
+
+    // ----- Selection ------------------------------------------------------
+
+    /// The line number of the screen row at the top of the view.
+    fn top_line(&self) -> usize {
+        self.terminal.top_line(self.scrollback)
+    }
+
+    /// The cell of the history under a screen position, with a position
+    /// outside the view clamped to its nearest edge.
+    fn point_at(&self, x: u16, y: u16) -> Point {
+        let (cols, rows) = self.terminal.size();
+        let col = (x.saturating_sub(self.area.x) as usize).min(cols.saturating_sub(1));
+        let row = (y.saturating_sub(self.area.y) as usize).min(rows.saturating_sub(1));
+        Point::new(self.top_line() + row, col)
+    }
+
+    /// Extend the selection to the pointer. Past the top or bottom of the
+    /// view the selection reaches the end of the row at that edge and the
+    /// view starts scrolling that way, one line per row the pointer is
+    /// past the edge, now and on each tick until it comes back.
+    fn drag_selection(&mut self, x: u16, y: u16) {
+        self.autoscroll = if y < self.area.y {
+            (self.area.y - y) as isize
+        } else if y >= self.area.bottom() {
+            -((y - self.area.bottom() + 1) as isize)
+        } else {
+            0
+        };
+        if self.autoscroll != 0 {
+            self.autoscroll_step();
+            return;
+        }
+        let point = self.point_at(x, y);
+        if let Some(selection) = &mut self.selection {
+            if point != selection.anchor() {
+                self.selection_moved = true;
+            }
+            selection.extend(point);
+        }
+    }
+
+    /// Scroll a selection drag that's past an edge one step, taking the
+    /// selection's head along to the edge row. Returns whether anything
+    /// changed.
+    fn autoscroll_step(&mut self) -> bool {
+        let Some(mut selection) = self.selection else {
+            return false;
+        };
+        if self.autoscroll == 0 {
+            return false;
+        }
+        let before = (self.scrollback, selection);
+        self.scroll_by(self.autoscroll);
+        let (cols, rows) = self.terminal.size();
+        let head = if self.autoscroll > 0 {
+            Point::new(self.top_line(), 0)
+        } else {
+            Point::new(
+                self.top_line() + rows.saturating_sub(1),
+                cols.saturating_sub(1),
+            )
+        };
+        selection.extend(head);
+        self.selection_moved |= head != selection.anchor();
+        self.selection = Some(selection);
+        (self.scrollback, selection) != before
+    }
+
+    /// Housekeeping between events: keeps a selection drag held past an
+    /// edge scrolling. Returns whether the screen changed.
+    pub fn tick(&mut self) -> bool {
+        self.autoscroll_step()
+    }
+
+    /// End the selection at the button's release: its text, if the
+    /// pointer moved and there is any, is left for the application to
+    /// copy, and the highlight goes.
+    fn finish_selection(&mut self) {
+        self.autoscroll = 0;
+        let Some(selection) = self.selection.take() else {
+            return;
+        };
+        if !self.selection_moved {
+            return;
+        }
+        let text = self
+            .terminal
+            .text_between(selection.start(), selection.end());
+        if !text.trim().is_empty() {
+            self.copied = Some(text);
+        }
     }
 
     // ----- Scrollback -----------------------------------------------------
@@ -350,6 +533,20 @@ impl TerminalView {
         for span in &self.links {
             for x in span.x.clone() {
                 buf[(x, span.y)].set_style(link_style);
+            }
+        }
+
+        // Text being selected keeps its colors over the selection
+        // background, as in the editor.
+        if let Some(selection) = &self.selection {
+            let top = self.top_line();
+            for row in 0..rows {
+                if let Some(range) = selection.columns_on(top + row, cols) {
+                    let y = area.y + row as u16;
+                    for col in range {
+                        buf[(area.x + col as u16, y)].set_bg(theme.selection_background);
+                    }
+                }
             }
         }
 
@@ -646,7 +843,7 @@ mod tests {
             row: 1,
             modifiers: KeyModifiers::NONE,
         };
-        assert!(v.handle_mouse(wheel).is_empty());
+        assert!(v.handle_mouse(wheel, false).is_empty());
         assert_eq!(v.scrollback_offset(), WHEEL_LINES);
         // A key jumps back to the bottom.
         v.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
@@ -668,7 +865,7 @@ mod tests {
             row: 2,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(v.handle_mouse(down), b"\x1b[<0;5;3M");
+        assert_eq!(v.handle_mouse(down, false), b"\x1b[<0;5;3M");
         assert!(v.is_dragging());
         let up = MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Left),
@@ -676,7 +873,7 @@ mod tests {
             row: 2,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(v.handle_mouse(up), b"\x1b[<0;5;3m");
+        assert_eq!(v.handle_mouse(up, false), b"\x1b[<0;5;3m");
         assert!(!v.is_dragging());
         // The wheel now goes to the program too, not the scrollback.
         let wheel = MouseEvent {
@@ -685,7 +882,7 @@ mod tests {
             row: 2,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(v.handle_mouse(wheel), b"\x1b[<64;5;3M");
+        assert_eq!(v.handle_mouse(wheel, false), b"\x1b[<64;5;3M");
     }
 
     #[test]
@@ -755,6 +952,202 @@ mod tests {
         assert_eq!(v.link_at(6, 0), None);
         v.process(b"\x1b[?1000l");
         assert!(v.link_at(6, 0).is_some());
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Render the view into `area` of a screen `width` by `height`, giving
+    /// the screen buffer.
+    fn render_in(v: &mut TerminalView, width: u16, height: u16, area: Rect) -> Buffer {
+        let mut term = RatTerminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| {
+            v.render(area, f.buffer_mut(), &theme());
+        })
+        .unwrap();
+        term.backend().buffer().clone()
+    }
+
+    #[test]
+    fn dragging_selects_text_and_the_release_copies_it() {
+        let theme = theme();
+        let mut v = view();
+        v.process(b"one two\r\nthree\r\nfour five six\r\n");
+        let area = Rect::new(0, 0, 20, 5);
+        render_in(&mut v, 20, 5, area);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        // Press on "two" and drag to the "r" of "four".
+        assert!(v.handle_mouse(mouse(down, 4, 0), false).is_empty());
+        assert!(v.is_selecting());
+        assert!(v.is_dragging());
+        assert_eq!(v.take_copied(), None);
+        v.handle_mouse(mouse(drag, 3, 2), false);
+        // The selection is highlighted: the tail of the first row, all of
+        // the middle one, and the head of the last.
+        let buf = render_in(&mut v, 20, 5, area);
+        let selected = |x: u16, y: u16| buf[(x, y)].bg == theme.selection_background;
+        assert!(selected(4, 0));
+        assert!(selected(19, 0));
+        assert!(!selected(3, 0));
+        assert!(selected(0, 1));
+        assert!(selected(19, 1));
+        assert!(selected(0, 2));
+        assert!(selected(3, 2));
+        assert!(!selected(4, 2));
+        assert!(!selected(0, 3));
+        // Text keeps its color over the highlight.
+        assert_eq!(buf[(4, 0)].fg, theme.terminal_text);
+        // The release copies and deselects.
+        v.handle_mouse(mouse(up, 3, 2), false);
+        assert!(!v.is_selecting());
+        assert!(!v.is_dragging());
+        assert_eq!(v.take_copied().as_deref(), Some("two\nthree\nfour"));
+        assert_eq!(v.take_copied(), None, "taken once");
+        let buf = render_in(&mut v, 20, 5, area);
+        assert_eq!(buf[(0, 1)].bg, theme.terminal_background);
+        // Dragging backwards selects the same text.
+        v.handle_mouse(mouse(down, 3, 2), false);
+        v.handle_mouse(mouse(drag, 4, 0), false);
+        v.handle_mouse(mouse(up, 4, 0), false);
+        assert_eq!(v.take_copied().as_deref(), Some("two\nthree\nfour"));
+    }
+
+    #[test]
+    fn a_click_or_a_selection_of_blanks_copies_nothing() {
+        let mut v = view();
+        v.process(b"one two\r\n");
+        render_in(&mut v, 20, 5, Rect::new(0, 0, 20, 5));
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        // A press and release in place is a click.
+        v.handle_mouse(mouse(down, 1, 0), false);
+        v.handle_mouse(mouse(up, 1, 0), false);
+        assert_eq!(v.take_copied(), None);
+        // So is a drag that comes back to where it started.
+        v.handle_mouse(mouse(down, 1, 0), false);
+        v.handle_mouse(mouse(drag, 2, 0), false);
+        v.handle_mouse(mouse(drag, 1, 0), false);
+        v.handle_mouse(mouse(up, 1, 0), false);
+        assert_eq!(v.take_copied().as_deref(), Some("n"));
+        // Nothing but blanks isn't worth the clipboard.
+        v.handle_mouse(mouse(down, 2, 2), false);
+        v.handle_mouse(mouse(drag, 8, 3), false);
+        v.handle_mouse(mouse(up, 8, 3), false);
+        assert_eq!(v.take_copied(), None);
+        assert!(!v.is_selecting());
+        // The right button selects nothing.
+        v.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 1, 0), false);
+        assert!(!v.is_selecting());
+    }
+
+    #[test]
+    fn dragging_past_an_edge_scrolls_the_scrollback_and_keeps_scrolling() {
+        let mut v = view();
+        for i in 0..20 {
+            v.process(format!("line{i}\r\n").as_bytes());
+        }
+        // The view sits two rows down a taller screen, so there's room
+        // to drag above it.
+        let area = Rect::new(0, 2, 20, 5);
+        render_in(&mut v, 20, 10, area);
+        assert_eq!(v.scrollback_offset(), 0);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        // Press on "line19", the fourth row of the view.
+        v.handle_mouse(mouse(down, 2, 5), false);
+        // One row above the view: one line up, and the selection reaches
+        // the start of the new top row.
+        v.handle_mouse(mouse(drag, 7, 1), false);
+        assert_eq!(v.scrollback_offset(), 1);
+        // Holding there keeps scrolling a line a tick.
+        assert!(v.tick());
+        assert_eq!(v.scrollback_offset(), 2);
+        // Two rows above: two lines a step.
+        v.handle_mouse(mouse(drag, 7, 0), false);
+        assert_eq!(v.scrollback_offset(), 4);
+        assert!(v.tick());
+        assert_eq!(v.scrollback_offset(), 6);
+        // Back inside: the scrolling stops and the head follows the
+        // pointer.
+        v.handle_mouse(mouse(drag, 3, 2), false);
+        assert!(!v.tick());
+        assert_eq!(v.scrollback_offset(), 6);
+        // Below the view, scrolling back down toward the bottom.
+        v.handle_mouse(mouse(drag, 0, 7), false);
+        assert_eq!(v.scrollback_offset(), 5);
+        assert!(v.tick());
+        assert_eq!(v.scrollback_offset(), 4);
+        // Back up past the top and release there: the text runs from the
+        // top row down to the "lin" of the anchor.
+        v.handle_mouse(mouse(drag, 0, 1), false);
+        assert_eq!(v.scrollback_offset(), 5);
+        v.handle_mouse(mouse(up, 0, 1), false);
+        assert!(!v.tick());
+        let copied = v.take_copied().expect("copied");
+        assert_eq!(
+            copied,
+            "line11\nline12\nline13\nline14\nline15\nline16\nline17\nline18\nlin"
+        );
+        // Scrolling past the start stops there.
+        v.handle_mouse(mouse(down, 0, 6), false);
+        for _ in 0..30 {
+            v.handle_mouse(mouse(drag, 0, 0), false);
+        }
+        assert_eq!(v.scrollback_offset(), 16);
+        assert!(!v.tick());
+        v.handle_mouse(mouse(up, 0, 0), false);
+        assert!(v.take_copied().unwrap().starts_with("line0\nline1\n"));
+    }
+
+    #[test]
+    fn a_program_reading_the_mouse_keeps_it_unless_the_user_escaped() {
+        let mut v = view();
+        for i in 0..8 {
+            v.process(format!("line{i}\r\n").as_bytes());
+        }
+        // Button-event tracking (mode 1002), so drags are reported too.
+        v.process(b"\x1b[?1002h\x1b[?1006h");
+        render_in(&mut v, 20, 5, Rect::new(0, 0, 20, 5));
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        // Without the prefix the drag is reported to the program.
+        assert_eq!(v.handle_mouse(mouse(down, 0, 0), false), b"\x1b[<0;1;1M");
+        assert!(!v.is_selecting());
+        assert_eq!(v.handle_mouse(mouse(drag, 3, 0), false), b"\x1b[<32;4;1M");
+        assert_eq!(v.handle_mouse(mouse(up, 3, 0), false), b"\x1b[<0;4;1m");
+        assert_eq!(v.take_copied(), None);
+        // A drag the program is following finishes there even if the
+        // prefix is pressed partway.
+        v.handle_mouse(mouse(down, 0, 0), false);
+        assert_eq!(v.handle_mouse(mouse(up, 3, 0), true), b"\x1b[<0;4;1m");
+        // Escaped, the press selects and nothing reaches the program;
+        // the selection carries on after the prefix is spent.
+        assert!(v.handle_mouse(mouse(down, 0, 0), true).is_empty());
+        assert!(v.is_selecting());
+        assert!(v.handle_mouse(mouse(drag, 3, 0), false).is_empty());
+        assert!(v.handle_mouse(mouse(up, 3, 0), false).is_empty());
+        assert_eq!(v.take_copied().as_deref(), Some("line"));
+        // Escaped, the wheel is the view's too.
+        assert!(
+            v.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0), true)
+                .is_empty()
+        );
+        assert_eq!(v.scrollback_offset(), WHEEL_LINES);
+        assert_eq!(
+            v.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0), false),
+            b"\x1b[<64;1;1M"
+        );
     }
 
     fn theme() -> Theme {

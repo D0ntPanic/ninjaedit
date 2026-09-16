@@ -148,7 +148,11 @@
 //! the shell. Ctrl+] Ctrl+] sends one Ctrl+] to the program, and any key
 //! the editor has no use for after the prefix is sent along with the
 //! prefix, so nothing is lost, only held for a keystroke. There is no
-//! timeout; the status bar shows the prefix while it waits. With nothing
+//! timeout; the status bar shows the prefix while it waits. The prefix
+//! also takes the mouse from a program reading it: dragging in the
+//! terminal after Ctrl+] selects text to copy, as it does without the
+//! prefix when the program isn't reading the mouse (see the terminal
+//! view); the press spends the prefix, as any click does. With nothing
 //! running in the tool (the output tool between jobs) the editor's keys
 //! work without the prefix, since there is no program to want them.
 //! Terminals without the kitty keyboard protocol deliver Ctrl+] as
@@ -327,7 +331,7 @@ const BUILD_HINT: &str =
 const OUTPUT_IDLE_HINT: &str =
     "Ctrl+B build · Ctrl+R run · Ctrl+D dismiss · Ctrl+E mode · Ctrl+P commands";
 /// What the status bar shows while the prefix waits for its key.
-const PREFIX_HINT: &str = "Ctrl+]  then Ctrl+ P commands · E mode · O file · T tab · F search · J line · L log · B build · R run · Q quit · ] itself";
+const PREFIX_HINT: &str = "Ctrl+]  then Ctrl+ P commands · E mode · O file · T tab · F search · J line · L log · B build · R run · Q quit · ] itself · drag to copy";
 /// What the output tool shows before the first job.
 const OUTPUT_WELCOME: &str = "Ctrl+B builds and Ctrl+R runs the current target\r\n";
 /// How long a change to the search query waits for the search to finish,
@@ -2412,6 +2416,12 @@ impl App {
     pub fn tick(&mut self) -> bool {
         let mut redraw = self.check_open_files_if_due();
         redraw |= self.take_discoveries();
+        // A selection dragged past the tool's edge keeps scrolling.
+        if let Some(tool) = self.tool_pane.active_mut()
+            && tool.view_mut().tick()
+        {
+            redraw = true;
+        }
         let polled = match &mut self.mode {
             Mode::GitLog(tabs) => {
                 let polled = tabs.poll();
@@ -2626,8 +2636,12 @@ impl App {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         let (x, y) = (mouse.column, mouse.row);
-        // A click with the prefix waiting decides where the next key goes
-        // by itself, so the prefix is dropped rather than left dangling.
+        // A click with the prefix waiting is the gesture it was held for:
+        // in the tool's terminal it takes the mouse from a program
+        // reading it, so a drag selects text, and anywhere else it
+        // decides where the next key goes by itself. Either way the
+        // prefix is spent rather than left dangling.
+        let escaped = self.prefix.is_some();
         if matches!(mouse.kind, MouseEventKind::Down(_)) {
             self.prefix = None;
         }
@@ -2725,7 +2739,7 @@ impl App {
             if tool_dragging
                 && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
             {
-                self.route_tool_mouse(mouse);
+                self.route_tool_mouse(mouse, escaped);
                 return;
             }
             // The tool pane's tab bar: switch tools, or close (kill) one.
@@ -2755,7 +2769,7 @@ impl App {
                 if matches!(mouse.kind, MouseEventKind::Down(_)) {
                     self.focus = Focus::Tool;
                 }
-                self.route_tool_mouse(mouse);
+                self.route_tool_mouse(mouse, escaped);
                 return;
             }
         }
@@ -2878,12 +2892,25 @@ impl App {
         }
     }
 
-    /// Send a mouse event to the active tool and write back any report it
-    /// makes to the program.
-    fn route_tool_mouse(&mut self, mouse: MouseEvent) {
-        if let Some(tool) = self.tool_pane.active_mut() {
-            let bytes = tool.view_mut().handle_mouse(mouse);
-            tool.write(bytes);
+    /// Send a mouse event to the focused tool's view, writing any report
+    /// it makes to the program and copying any text a selection ended
+    /// with. `escaped` says the prefix was waiting when the event came,
+    /// which takes the mouse from a program reading it.
+    fn route_tool_mouse(&mut self, mouse: MouseEvent, escaped: bool) {
+        let Some(tool) = self.tool_pane.active_mut() else {
+            return;
+        };
+        let bytes = tool.view_mut().handle_mouse(mouse, escaped);
+        let copied = tool.view_mut().take_copied();
+        tool.write(bytes);
+        if let Some(text) = copied {
+            let lines = text.lines().count();
+            self.status = Some(if lines == 1 {
+                "Copied 1 line to the clipboard".to_owned()
+            } else {
+                format!("Copied {lines} lines to the clipboard")
+            });
+            self.clipboard.set(text);
         }
     }
 
@@ -5129,6 +5156,58 @@ mod tests {
         // Click in the tool's terminal: focus moves back.
         let row = app.tool_term_area.y;
         click(&mut app, 6, row);
+        assert_eq!(app.focus, Focus::Tool);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dragging_in_a_tool_copies_its_text_and_the_prefix_takes_the_mouse_from_a_program() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        app.clipboard = Clipboard::local_only();
+        ctrl(&mut app, '`');
+        draw(&mut app, 40, 20);
+        app.tool_pane.tools_mut()[0].process(b"hello world\r\nsecond line\r\n");
+        let area = app.tool_term_area;
+        let (x, y) = (area.x, area.y);
+        let drag = |app: &mut App, from: (u16, u16), to: (u16, u16)| {
+            mouse_at(app, MouseEventKind::Down(MouseButton::Left), from.0, from.1);
+            mouse_at(app, MouseEventKind::Drag(MouseButton::Left), to.0, to.1);
+            mouse_at(app, MouseEventKind::Up(MouseButton::Left), to.0, to.1);
+        };
+        // The shell isn't reading the mouse, so a drag selects and the
+        // release copies, says so, and leaves nothing selected.
+        drag(&mut app, (x, y), (x + 5, y + 1));
+        assert_eq!(app.clipboard.get().as_deref(), Some("hello world\nsecond"));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Copied 2 lines to the clipboard")
+        );
+        let screen = draw(&mut app, 40, 20);
+        assert!(screen[19].contains("Copied 2 lines"), "{screen:#?}");
+        assert!(!app.tool_pane.tools()[0].view().is_selecting());
+
+        // A program reading the mouse gets the drag instead.
+        app.status = None;
+        app.tool_pane.tools_mut()[0].process(b"\x1b[?1000h");
+        drag(&mut app, (x + 6, y), (x + 10, y));
+        assert_eq!(
+            app.clipboard.get().as_deref(),
+            Some("hello world\nsecond"),
+            "the program's drag copied nothing"
+        );
+        assert_eq!(app.status, None);
+
+        // After the prefix the mouse is the editor's again: the drag
+        // selects, and the press spends the prefix.
+        ctrl(&mut app, ']');
+        assert!(app.prefix.is_some());
+        drag(&mut app, (x + 6, y), (x + 10, y));
+        assert_eq!(app.prefix, None);
+        assert_eq!(app.clipboard.get().as_deref(), Some("world"));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Copied 1 line to the clipboard")
+        );
         assert_eq!(app.focus, Focus::Tool);
     }
 

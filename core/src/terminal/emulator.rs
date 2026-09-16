@@ -21,10 +21,20 @@
 //! [`Terminal::take_events`]. The screen is read back a row at a time with
 //! [`Terminal::rows`], which takes a scrollback offset so that a frontend
 //! showing older output needs no copy.
+//!
+//! For copying, lines are also numbered through the whole history, the
+//! scrollback and then the screen, from the first line ever scrolled off
+//! (see [`Terminal::first_line`]). A line keeps its number as output
+//! pushes it up into the scrollback and as the oldest lines are dropped at
+//! the limit, so a [`Selection`] made in those numbers stays on its text,
+//! and [`Terminal::text_between`] gives what it says.
+//!
+//! [`Selection`]: super::selection::Selection
 
 use super::cell::{Cell, Color, Style, Underline};
 use super::grid::{Grid, Row};
 use super::keys::{self, Key, Modifiers, MouseEvent};
+use super::selection::Point;
 use crate::text;
 use compact_str::CompactString;
 use std::collections::VecDeque;
@@ -167,6 +177,10 @@ struct Inner {
     alternate_active: bool,
     scrollback: VecDeque<Row>,
     scrollback_limit: usize,
+    /// How many lines have been dropped from the front of the scrollback,
+    /// so that the lines still kept can be numbered from the first ever
+    /// scrolled off; see [`Terminal::first_line`].
+    dropped: usize,
     cursor: Cursor,
     saved_primary: Option<SavedCursor>,
     saved_alternate: Option<SavedCursor>,
@@ -208,6 +222,7 @@ impl Terminal {
                 alternate_active: false,
                 scrollback: VecDeque::new(),
                 scrollback_limit: DEFAULT_SCROLLBACK,
+                dropped: 0,
                 cursor: Cursor::default(),
                 saved_primary: None,
                 saved_alternate: None,
@@ -311,6 +326,92 @@ impl Terminal {
     /// The text of one screen row, trailing spaces removed.
     pub fn row_text(&self, row: usize) -> String {
         self.inner.grid().row(row).text()
+    }
+
+    /// The number of the oldest line kept. Lines are numbered through the
+    /// history from the first ever scrolled off the screen, so the lines
+    /// on hand are `first_line()..first_line() + line_count()`, the
+    /// screen's top row being `first_line() + scrollback_len()`. A line
+    /// keeps its number as output pushes it into the scrollback and as
+    /// older lines are dropped at the limit, which lets a
+    /// [`Selection`](super::selection::Selection) stay on its text.
+    pub fn first_line(&self) -> usize {
+        self.inner.dropped
+    }
+
+    /// How many lines there are from [`first_line`](Self::first_line):
+    /// the scrollback and then the screen.
+    pub fn line_count(&self) -> usize {
+        self.inner.scrollback.len() + self.inner.rows
+    }
+
+    /// The number of the top row that [`rows`](Self::rows) gives when
+    /// scrolled back `scroll` lines, for a frontend to turn a screen row
+    /// into a line number.
+    pub fn top_line(&self, scroll: usize) -> usize {
+        let inner = &self.inner;
+        let scroll = if inner.alternate_active {
+            0
+        } else {
+            scroll.min(inner.scrollback.len())
+        };
+        inner.dropped + inner.scrollback.len() - scroll
+    }
+
+    /// The row at a line number, in the scrollback or on the screen, or
+    /// `None` for a line dropped or not yet written.
+    pub fn line(&self, number: usize) -> Option<&Row> {
+        let inner = &self.inner;
+        let index = number.checked_sub(inner.dropped)?;
+        if index < inner.scrollback.len() {
+            inner.scrollback.get(index)
+        } else {
+            let row = index - inner.scrollback.len();
+            (row < inner.rows).then(|| inner.grid().row(row))
+        }
+    }
+
+    /// The text from one cell of the history to another, both included,
+    /// as a copy of it should read. Rows that were one line before the
+    /// terminal wrapped it are joined back together; other rows end in a
+    /// line break, with the blanks at their end dropped. A wide character
+    /// selected by either of its cells appears once.
+    pub fn text_between(&self, start: Point, end: Point) -> String {
+        let mut text = String::new();
+        for number in start.line..=end.line {
+            let last = number == end.line;
+            let Some(row) = self.line(number) else {
+                // A line beyond the history: nothing to add, but the
+                // lines before it still ended.
+                if !last {
+                    text.push('\n');
+                }
+                continue;
+            };
+            let from = if number == start.line { start.col } else { 0 };
+            let to = if last { end.col + 1 } else { usize::MAX };
+            let mut line = String::new();
+            for (col, cell) in row.cells.iter().enumerate() {
+                if cell.spacer || col + cell.width() <= from || col >= to {
+                    continue;
+                }
+                line.push_str(&cell.text);
+            }
+            // Blanks at the end of a row are padding, not text, unless
+            // the row wraps onto the next (then they're inside the line)
+            // or the selection stops short of the row's end (then they
+            // were chosen).
+            let cut_short = last && end.col + 1 < row.cells.len();
+            if !(row.wrapped || cut_short) {
+                let keep = line.trim_end_matches(' ').len();
+                line.truncate(keep);
+            }
+            text.push_str(&line);
+            if !last && !row.wrapped {
+                text.push('\n');
+            }
+        }
+        text
     }
 
     /// The cursor as (column, row), when it is shown.
@@ -435,6 +536,7 @@ impl Inner {
     fn trim_scrollback(&mut self) {
         while self.scrollback.len() > self.scrollback_limit {
             self.scrollback.pop_front();
+            self.dropped += 1;
         }
     }
 
@@ -730,7 +832,10 @@ impl Inner {
                 self.blank_range(row, 0, col + 1, style);
             }
             2 => self.grid_mut().clear(style),
-            3 => self.scrollback.clear(),
+            3 => {
+                self.dropped += self.scrollback.len();
+                self.scrollback.clear();
+            }
             _ => {}
         }
     }
@@ -1979,6 +2084,67 @@ mod tests {
         assert_eq!(rows, ["6", "7"]);
         feed(&mut t, "\x1b[3J");
         assert_eq!(t.scrollback_len(), 0);
+    }
+
+    #[test]
+    fn lines_keep_their_numbers_through_the_history() {
+        let mut t = term(4, 2);
+        t.set_scrollback_limit(3);
+        assert_eq!((t.first_line(), t.line_count()), (0, 2));
+        assert_eq!(t.top_line(0), 0);
+        feed(&mut t, "a\r\nb\r\nc\r\n");
+        // Two lines scrolled off: a and b are lines 0 and 1, and the
+        // screen (c and a blank) starts at line 2.
+        assert_eq!((t.first_line(), t.line_count()), (0, 4));
+        assert_eq!(t.top_line(0), 2);
+        assert_eq!(t.top_line(2), 0);
+        assert_eq!(t.top_line(50), 0, "clamped to the scrollback");
+        assert_eq!(t.line(1).map(Row::text).as_deref(), Some("b"));
+        assert_eq!(t.line(2).map(Row::text).as_deref(), Some("c"));
+        assert_eq!(t.line(3).map(Row::text).as_deref(), Some(""));
+        assert_eq!(t.line(4), None);
+        // Dropping the oldest line at the limit leaves the numbers alone.
+        feed(&mut t, "d\r\ne\r\n");
+        assert_eq!((t.first_line(), t.line_count()), (1, 5));
+        assert_eq!(t.line(0), None);
+        assert_eq!(t.line(1).map(Row::text).as_deref(), Some("b"));
+        assert_eq!(t.line(3).map(Row::text).as_deref(), Some("d"));
+        assert_eq!(t.line(4).map(Row::text).as_deref(), Some("e"));
+        assert_eq!(t.top_line(0), 4);
+        // Clearing the scrollback drops them all.
+        feed(&mut t, "\x1b[3J");
+        assert_eq!((t.first_line(), t.line_count()), (4, 2));
+        assert_eq!(t.line(3), None);
+        // The alternate screen has no scrollback to scroll into.
+        feed(&mut t, "\x1b[?1049h");
+        assert_eq!(t.top_line(1), 4);
+        assert_eq!(t.line(4).map(Row::text).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn text_between_joins_wrapped_rows_and_trims_padding() {
+        let mut t = term(5, 4);
+        feed(&mut t, "abcdefg\r\nhi  \r\n\r\n한글x");
+        // Screen: "abcde" wrapped, "fg", "hi", "", "한글x" -- the first
+        // has scrolled off.
+        assert_eq!(screen(&t), ["fg", "hi", "", "한글x"]);
+        let p = Point::new;
+        // The whole history: the wrapped line is joined, the trailing
+        // blanks of "hi  " go, the blank line stays.
+        assert_eq!(t.text_between(p(0, 0), p(4, 4)), "abcdefg\nhi\n\n한글x");
+        // From inside the wrapped row.
+        assert_eq!(t.text_between(p(0, 3), p(1, 0)), "def");
+        // Stopping short of a row's end keeps the blanks that were chosen.
+        assert_eq!(t.text_between(p(2, 0), p(2, 3)), "hi  ");
+        assert_eq!(t.text_between(p(2, 0), p(2, 4)), "hi");
+        // Either cell of a wide character gives it once, and the
+        // spacer's column alone gives it too.
+        assert_eq!(t.text_between(p(4, 0), p(4, 1)), "한");
+        assert_eq!(t.text_between(p(4, 1), p(4, 2)), "한글");
+        assert_eq!(t.text_between(p(4, 3), p(4, 4)), "글x");
+        // Lines past the history add nothing.
+        assert_eq!(t.text_between(p(4, 4), p(9, 0)), "x\n\n\n\n\n");
+        assert_eq!(t.text_between(p(20, 0), p(20, 0)), "");
     }
 
     #[test]

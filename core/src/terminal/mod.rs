@@ -7,6 +7,8 @@
 //! * [`Terminal`] is the emulator: it takes those bytes and maintains a
 //!   screen of [`Cell`]s, with scrollback, and encodes the user's keys
 //!   and mouse for the program.
+//! * A [`Selection`] marks a stretch of the screen and scrollback the
+//!   user has dragged over, for the terminal to give the text of.
 //! * A frontend owns both, feeds the session's output to the terminal,
 //!   draws the terminal's rows, and writes the encoded input back to the
 //!   session.
@@ -20,9 +22,11 @@ pub mod emulator;
 pub mod grid;
 pub mod keys;
 pub mod pty;
+pub mod selection;
 
 pub use cell::{Cell, Color, Style, Underline};
 pub use emulator::{CursorStyle, Event, Modes, MouseMode, Terminal};
 pub use grid::Row;
 pub use keys::{Key, Modifiers, MouseButton, MouseEvent, MouseEventKind};
 pub use pty::{Command, ExitStatus, Output, Session, SessionId, detected_shell};
+pub use selection::{Point, Selection};
