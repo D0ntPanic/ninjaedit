@@ -173,7 +173,7 @@ use crate::editor_view::EditorView;
 use crate::git_layout;
 use crate::git_view::{self, GitLogTabs};
 use crate::goto_line::{GoToLineBox, GoToLineOutcome};
-use crate::palette::{Palette, PaletteAction, PaletteItem, PaletteOutcome};
+use crate::palette::{Palette, PaletteAction, PaletteItem, PaletteOutcome, Prefix};
 use crate::project_search::{ProjectSearchDialog, ProjectSearchOutcome};
 use crate::search_box::{self, SearchBox, SearchOutcome};
 use crate::settings_view::{self, SettingsOutcome, SettingsView};
@@ -308,9 +308,9 @@ const DIVIDER_HEIGHT: u16 = 1;
 /// titles, and the action that shows one by index.
 type RepositoryTabs = (usize, Vec<String>, fn(usize) -> PaletteAction);
 
-const TABS_PLACEHOLDER: &str = "Search open tabs";
+const TABS_PLACEHOLDER: &str = "Search open tabs, ! for unsaved";
 const REPOSITORIES_PLACEHOLDER: &str = "The project's repository or a submodule";
-const FILES_PLACEHOLDER: &str = "Search files in project";
+const FILES_PLACEHOLDER: &str = "Search files, * to include ignored";
 const MODES_PLACEHOLDER: &str = "Editor, a page, or a tool";
 const COMMANDS_PLACEHOLDER: &str = "Search commands and views";
 /// The note in a palette that lists targets while some are still being
@@ -383,7 +383,9 @@ const SEARCH_WRAPPED: &str =
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaletteKind {
     /// The file search, which needs refreshing as the index fills in.
-    Files,
+    /// `all` is whether it lists ignored files too, as it does while
+    /// the query starts with `*`.
+    Files { all: bool },
     /// The command palette, which remembers what it ran, and lists a
     /// run entry per target, so it fills in as targets are found.
     Commands,
@@ -688,7 +690,7 @@ impl App {
         let items = match self.palette_kind {
             PaletteKind::Commands => self.command_items(),
             PaletteKind::Targets => self.target_items().0,
-            PaletteKind::Files | PaletteKind::Other => return,
+            PaletteKind::Files { .. } | PaletteKind::Other => return,
         };
         if let Some(mut palette) = self.palette.take() {
             palette.set_items(items);
@@ -965,6 +967,7 @@ impl App {
                     },
                     search: titles[index].clone(),
                     shortcut: None,
+                    marked: false,
                     action: action(index),
                 })
                 .collect();
@@ -986,11 +989,13 @@ impl App {
                     detail: parent_of(&path),
                     search: path,
                     shortcut: None,
+                    marked: tab.view.editor().is_modified(),
                     action: PaletteAction::SwitchTab(index),
                 }
             })
             .collect();
-        let mut palette = Palette::new(TABS_PLACEHOLDER, items);
+        // `!` first in the query lists only the tabs with unsaved changes.
+        let mut palette = Palette::new(TABS_PLACEHOLDER, items).with_prefix(Prefix::Only('!'));
         palette.select(1);
         self.palette = Some(palette);
         self.palette_kind = PaletteKind::Other;
@@ -1000,24 +1005,57 @@ impl App {
         self.close_search_box(true);
         self.goto_line = None;
         self.hide_project_search();
-        let mut palette = Palette::new(FILES_PLACEHOLDER, self.file_items());
-        self.refresh_index_hint(&mut palette);
+        // `*` first in the query brings in the ignored files: build
+        // artifacts and the like, which are otherwise left out.
+        let mut palette = Palette::new(FILES_PLACEHOLDER, self.file_items(false))
+            .with_prefix(Prefix::Include('*'));
+        self.refresh_index_hint(&mut palette, false);
         self.palette = Some(palette);
-        self.palette_kind = PaletteKind::Files;
+        self.palette_kind = PaletteKind::Files { all: false };
+    }
+
+    /// After the file search's query changed: give it every file,
+    /// ignored ones included, once the query starts with `*`, and the
+    /// project's files again once it doesn't. The ignored files are
+    /// only listed on demand because a build tree can hold many times
+    /// more files than the project itself.
+    fn refresh_files_palette(&mut self) {
+        let PaletteKind::Files { all } = self.palette_kind else {
+            return;
+        };
+        let Some(mut palette) = self.palette.take() else {
+            return;
+        };
+        let wanted = palette.prefix_active();
+        if wanted != all {
+            self.palette_kind = PaletteKind::Files { all: wanted };
+            palette.set_items(self.file_items(wanted));
+            self.refresh_index_hint(&mut palette, wanted);
+        }
+        self.palette = Some(palette);
     }
 
     /// Every file in the project, in the index's order: each directory's
-    /// files by name, then its subdirectories likewise. (The index is
-    /// asked for the list afresh, and this runs again whenever it
-    /// changes while the palette is up, so on a project of hundreds of
-    /// thousands of files it is worth keeping cheap: no sorting, and
+    /// files by name, then its subdirectories likewise. With `all`, the
+    /// ignored files as well, marked for the palette's `*` prefix. (The
+    /// index is asked for the list afresh, and this runs again whenever
+    /// it changes while the palette is up, so on a project of hundreds
+    /// of thousands of files it is worth keeping cheap: no sorting, and
     /// the three strings each entry needs and no more.)
-    fn file_items(&self) -> Vec<PaletteItem> {
-        self.project
-            .index()
-            .files(false)
+    fn file_items(&self, all: bool) -> Vec<PaletteItem> {
+        let index = self.project.index();
+        let files = if all {
+            index.all_files()
+        } else {
+            index
+                .files(false)
+                .into_iter()
+                .map(|path| (path, false))
+                .collect()
+        };
+        files
             .into_iter()
-            .map(|path| {
+            .map(|(path, ignored)| {
                 let relative = self.display_path(&path);
                 let label = path
                     .file_name()
@@ -1033,14 +1071,24 @@ impl App {
                     detail,
                     search: relative,
                     shortcut: None,
+                    marked: ignored,
                     action: PaletteAction::OpenFile(path),
                 }
             })
             .collect()
     }
 
-    fn refresh_index_hint(&self, palette: &mut Palette) {
-        let hint = (!self.project.index().is_primary_complete()).then(|| "indexing…".to_owned());
+    /// Note in a palette that lists files that the index is still
+    /// filling in. Ignored directories are scanned after the rest, so a
+    /// palette listing them too (`all`) waits on the whole tree.
+    fn refresh_index_hint(&self, palette: &mut Palette, all: bool) {
+        let index = self.project.index();
+        let complete = if all {
+            index.is_fully_complete()
+        } else {
+            index.is_primary_complete()
+        };
+        let hint = (!complete).then(|| "indexing…".to_owned());
         palette.set_hint(hint);
     }
 
@@ -1066,6 +1114,7 @@ impl App {
                 detail: view.description().to_owned(),
                 search: view.label().to_owned(),
                 shortcut: view.shortcut(),
+                marked: false,
                 action: view.action(),
             })
             .collect();
@@ -1098,6 +1147,7 @@ impl App {
             detail: command.description().to_owned(),
             search: format!("{} {}", command.label(), command.description()),
             shortcut: command.shortcut(),
+            marked: false,
             action: PaletteAction::Command(command),
         });
         let views = View::all().map(|view| PaletteItem {
@@ -1105,6 +1155,7 @@ impl App {
             detail: view.description().to_owned(),
             search: format!("{} {}", view.label(), view.description()),
             shortcut: view.shortcut(),
+            marked: false,
             action: view.action(),
         });
         let mut items: Vec<PaletteItem> = commands
@@ -1148,6 +1199,7 @@ impl App {
                     search: format!("Run {} {}", target.name, detail),
                     detail,
                     shortcut: None,
+                    marked: false,
                     action: PaletteAction::RunTarget { root: r, index: i },
                 });
             }
@@ -1525,12 +1577,13 @@ impl App {
                     detail: parent_of(&display),
                     search: display,
                     shortcut: None,
+                    marked: false,
                     action: PaletteAction::AddBuildRoot(path),
                 }
             })
             .collect();
         let mut palette = Palette::new(ADD_ROOT_PLACEHOLDER, items);
-        self.refresh_index_hint(&mut palette);
+        self.refresh_index_hint(&mut palette, false);
         self.palette = Some(palette);
         self.palette_kind = PaletteKind::Other;
     }
@@ -1578,6 +1631,7 @@ impl App {
                     detail: root.label(),
                     search: format!("{} {}", configuration.name, root.label()),
                     shortcut: None,
+                    marked: false,
                     action: PaletteAction::SelectConfiguration { root: r, index: i },
                 });
             }
@@ -1621,6 +1675,7 @@ impl App {
                     detail: root.label(),
                     search: format!("{} {}", target.name, root.label()),
                     shortcut: None,
+                    marked: false,
                     action: PaletteAction::SelectTarget { root: r, index: i },
                 });
             }
@@ -2518,10 +2573,10 @@ impl App {
             return redraw;
         }
         self.index_generation = generation;
-        if self.palette_kind == PaletteKind::Files {
+        if let PaletteKind::Files { all } = self.palette_kind {
             if let Some(mut palette) = self.palette.take() {
-                palette.set_items(self.file_items());
-                self.refresh_index_hint(&mut palette);
+                palette.set_items(self.file_items(all));
+                self.refresh_index_hint(&mut palette, all);
                 self.palette = Some(palette);
             }
             return true;
@@ -2566,7 +2621,9 @@ impl App {
 
     fn handle_paste(&mut self, text: &str) {
         if let Some(palette) = &mut self.palette {
-            palette.paste(text);
+            if palette.paste(text) {
+                self.refresh_files_palette();
+            }
         } else if let Some(search_box) = &mut self.search_box {
             if search_box.paste(text) {
                 self.update_search_query();
@@ -2625,7 +2682,7 @@ impl App {
 
         if let Some(palette) = &mut self.palette {
             match palette.handle_key(key, &mut self.clipboard) {
-                PaletteOutcome::Continue => {}
+                PaletteOutcome::Continue => self.refresh_files_palette(),
                 PaletteOutcome::Close => self.palette = None,
                 PaletteOutcome::Activate(action) => self.run_palette_action(action),
             }
@@ -5930,6 +5987,105 @@ mod tests {
         for c in s.chars() {
             press(app, KeyCode::Char(c));
         }
+    }
+
+    /// The labels of the palette's result rows, top to bottom.
+    fn palette_rows(app: &mut App) -> Vec<String> {
+        let screen = draw(app, 60, 16);
+        // Row 1 is the top border, 2 the query, 3 onwards the results
+        // until the bottom border.
+        screen[3..]
+            .iter()
+            .take_while(|row| !row.contains("╰"))
+            .map(|row| row.trim_matches(|c| c == '│' || c == ' ').to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn tab_palette_lists_unsaved_tabs_with_a_bang() {
+        let (_dir, mut app) =
+            app_with_files(&[("alpha.rs", ""), ("beta.rs", ""), ("gamma.rs", "")]);
+        // Edit beta without saving; gamma stays active and unchanged.
+        app.activate(1);
+        type_str(&mut app, "x");
+        assert!(app.tabs[1].view.editor().is_modified());
+        app.activate(2);
+        ctrl(&mut app, 't');
+        let rows = palette_rows(&mut app);
+        assert_eq!(rows.len(), 3, "{rows:#?}");
+        type_str(&mut app, "!");
+        let rows = palette_rows(&mut app);
+        assert_eq!(rows.len(), 1, "{rows:#?}");
+        assert!(rows[0].starts_with("beta.rs"), "{rows:#?}");
+        // The rest of the query searches among the unsaved tabs.
+        type_str(&mut app, "gam");
+        let rows = palette_rows(&mut app);
+        assert!(rows[0].starts_with("No matches"), "{rows:#?}");
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.palette.is_none());
+        assert_eq!(app.active, 1);
+    }
+
+    #[test]
+    fn file_palette_lists_ignored_files_with_a_star() {
+        let (_dir, mut app) = app_with_files(&[
+            (
+                ".gitignore",
+                "target/
+",
+            ),
+            ("src/main.rs", ""),
+            ("target/main.o", ""),
+        ]);
+        ctrl(&mut app, 'w');
+        ctrl(&mut app, 'w');
+        ctrl(&mut app, 'w');
+        assert!(app.tabs.is_empty());
+        assert!(app.project.index().wait_for_full(Duration::from_secs(10)));
+        ctrl(&mut app, 'o');
+        // Only the project's files, whatever is typed.
+        assert_eq!(app.palette_kind, PaletteKind::Files { all: false });
+        let rows = palette_rows(&mut app);
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("main.rs") && row.contains("src")),
+            "{rows:#?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("target")), "{rows:#?}");
+        type_str(&mut app, "main.o");
+        let rows = palette_rows(&mut app);
+        assert!(rows[0].starts_with("No matches"), "{rows:#?}");
+        // A star first brings in the ignored ones as well.
+        press(&mut app, KeyCode::Home);
+        type_str(&mut app, "*");
+        assert_eq!(app.palette_kind, PaletteKind::Files { all: true });
+        let rows = palette_rows(&mut app);
+        assert_eq!(rows.len(), 1, "{rows:#?}");
+        assert!(
+            rows[0].starts_with("main.o") && rows[0].contains("target"),
+            "{rows:#?}"
+        );
+        press(&mut app, KeyCode::End);
+        for _ in 0.."main.o".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        let rows = palette_rows(&mut app);
+        assert_eq!(rows.len(), 3, "{rows:#?}");
+        // Taking the star away goes back to the project's files, with
+        // the highlight kept on the same file.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.palette_kind, PaletteKind::Files { all: false });
+        let rows = palette_rows(&mut app);
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        // Opening an ignored file works like any other.
+        type_str(&mut app, "*main.o");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].title(), "main.o");
     }
 
     /// Wait for the active tab's search to finish, since it runs in the

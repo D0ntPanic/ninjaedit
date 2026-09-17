@@ -290,6 +290,16 @@ impl FileIndex {
         self.shared.files(include_ignored)
     }
 
+    /// Absolute paths of all indexed files, ignored ones included, each
+    /// with whether it is ignored. For listings that show every file but
+    /// want to tell the ignored ones apart.
+    pub fn all_files(&self) -> Vec<(PathBuf, bool)> {
+        let mut out = Vec::new();
+        self.shared
+            .walk_files(true, &mut |path, ignored| out.push((path, ignored)));
+        out
+    }
+
     /// A handle to the index's file list that can be sent to another
     /// thread, for work that waits on the index in the background.
     pub fn file_list(&self) -> FileList {
@@ -338,22 +348,41 @@ impl Shared {
     }
 
     fn files(&self, include_ignored: bool) -> Vec<PathBuf> {
-        fn walk(node: &DirNode, path: &Path, include_ignored: bool, out: &mut Vec<PathBuf>) {
+        let mut out = Vec::new();
+        self.walk_files(include_ignored, &mut |path, _| out.push(path));
+        out
+    }
+
+    /// Call `f` with each indexed file's absolute path and whether it is
+    /// ignored, in the tree's order. Ignored files, and everything under
+    /// ignored directories, are left out unless `include_ignored`.
+    fn walk_files(&self, include_ignored: bool, f: &mut dyn FnMut(PathBuf, bool)) {
+        fn walk(
+            node: &DirNode,
+            path: &Path,
+            ignored: bool,
+            include_ignored: bool,
+            f: &mut dyn FnMut(PathBuf, bool),
+        ) {
             for file in &node.files {
                 if include_ignored || !file.ignored {
-                    out.push(path.join(&file.name));
+                    f(path.join(&file.name), ignored || file.ignored);
                 }
             }
             for dir in &node.dirs {
                 if include_ignored || !dir.ignored {
-                    walk(dir, &path.join(&dir.name), include_ignored, out);
+                    walk(
+                        dir,
+                        &path.join(&dir.name),
+                        ignored || dir.ignored,
+                        include_ignored,
+                        f,
+                    );
                 }
             }
         }
         let state = self.state.lock().unwrap();
-        let mut out = Vec::new();
-        walk(&state.root, &self.root_path, include_ignored, &mut out);
-        out
+        walk(&state.root, &self.root_path, false, include_ignored, f);
     }
 }
 

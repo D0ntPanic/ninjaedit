@@ -14,6 +14,12 @@
 //! An item can carry the key it is bound to, shown at the right end of
 //! its row, so a palette of commands doubles as the place to learn the
 //! keys.
+//!
+//! A palette can give one character a meaning at the start of the query
+//! (see [`Prefix`]): the file search lists ignored files too when the
+//! query starts with `*`, and the tab search lists only tabs with
+//! unsaved changes when it starts with `!`. The rest of the query is
+//! what is matched.
 
 use crate::clipboard::Clipboard;
 use crate::command::Command;
@@ -130,7 +136,33 @@ pub struct PaletteItem {
     /// The key the item is bound to, if any, shown at the right end of
     /// its row.
     pub shortcut: Option<&'static str>,
+    /// Whether the item is one the palette's [`Prefix`] picks out: an
+    /// ignored file, a tab with unsaved changes. Means nothing in a
+    /// palette without a prefix.
+    pub marked: bool,
     pub action: PaletteAction,
+}
+
+/// A character that changes what the palette searches when it is typed
+/// first in the query. The query after it is what is matched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prefix {
+    /// Marked items are left out until the query starts with the
+    /// character; then every item is searched. The file search hides
+    /// ignored files this way.
+    Include(char),
+    /// Only marked items are searched while the query starts with the
+    /// character; otherwise every item is. The tab search picks out tabs
+    /// with unsaved changes this way.
+    Only(char),
+}
+
+impl Prefix {
+    fn character(self) -> char {
+        match self {
+            Prefix::Include(c) | Prefix::Only(c) => c,
+        }
+    }
 }
 
 /// What the application should do after the palette handled an event.
@@ -147,6 +179,8 @@ pub struct Palette {
     /// A note shown in the bottom border, such as indexing progress.
     hint: Option<String>,
     query: Input,
+    /// The character with a meaning at the start of the query, if any.
+    prefix: Option<Prefix>,
     items: Vec<PaletteItem>,
     /// Indices into `items`, best match first.
     results: Vec<usize>,
@@ -166,6 +200,7 @@ impl Palette {
             placeholder,
             hint: None,
             query: Input::new(),
+            prefix: None,
             items,
             results: Vec::new(),
             selected: 0,
@@ -175,6 +210,31 @@ impl Palette {
         };
         palette.search();
         palette
+    }
+
+    /// Give a character a meaning at the start of the query.
+    pub fn with_prefix(mut self, prefix: Prefix) -> Palette {
+        self.prefix = Some(prefix);
+        self.search();
+        self
+    }
+
+    /// Whether the query starts with the palette's prefix character.
+    pub fn prefix_active(&self) -> bool {
+        self.split_query().0
+    }
+
+    /// Whether the query starts with the prefix character, and the query
+    /// after it: the text the items are matched against.
+    fn split_query(&self) -> (bool, &str) {
+        let query = self.query.text();
+        match self.prefix {
+            Some(prefix) => match query.strip_prefix(prefix.character()) {
+                Some(rest) => (true, rest),
+                None => (false, query),
+            },
+            None => (false, query),
+        }
     }
 
     /// Replace the searchable items, keeping the query and, as far as
@@ -213,14 +273,24 @@ impl Palette {
     }
 
     fn search(&mut self) {
-        let candidates: Vec<(&str, &str)> = self
+        let (active, query) = self.split_query();
+        let shown = |item: &PaletteItem| match self.prefix {
+            Some(Prefix::Include(_)) => active || !item.marked,
+            Some(Prefix::Only(_)) => !active || item.marked,
+            None => true,
+        };
+        // Indices into `items` of the items the prefix leaves in, in
+        // their order, and what is matched for each.
+        let (indices, candidates): (Vec<usize>, Vec<(&str, &str)>) = self
             .items
             .iter()
-            .map(|item| (item.label.as_str(), item.search.as_str()))
-            .collect();
-        self.results = fuzzy::rank_labeled_top(&candidates, self.query.text(), MAX_RESULTS)
+            .enumerate()
+            .filter(|(_, item)| shown(item))
+            .map(|(index, item)| (index, (item.label.as_str(), item.search.as_str())))
+            .unzip();
+        self.results = fuzzy::rank_labeled_top(&candidates, query, MAX_RESULTS)
             .into_iter()
-            .map(|ranked| ranked.index)
+            .map(|ranked| indices[ranked.index])
             .collect();
         self.selected = 0;
         self.first_visible = 0;
@@ -438,9 +508,98 @@ mod tests {
                 detail: String::new(),
                 search: name.to_string(),
                 shortcut: None,
+                marked: false,
                 action: PaletteAction::OpenFile(PathBuf::from(name)),
             })
             .collect()
+    }
+
+    /// File items, the ones named in `marked` flagged for the prefix.
+    fn marked_items(names: &[&str], marked: &[&str]) -> Vec<PaletteItem> {
+        let mut items = file_items(names);
+        for item in &mut items {
+            item.marked = marked.contains(&item.label.as_str());
+        }
+        items
+    }
+
+    fn type_str(palette: &mut Palette, text: &str) {
+        let mut clipboard = Clipboard::new();
+        for c in text.chars() {
+            palette.handle_key(
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut clipboard,
+            );
+        }
+    }
+
+    fn result_labels(palette: &Palette) -> Vec<&str> {
+        palette
+            .results
+            .iter()
+            .map(|&index| palette.items[index].label.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn include_prefix_adds_marked_items() {
+        let items = marked_items(
+            &["main.rs", "target/main.o", "lib.rs", "target/lib.o"],
+            &["target/main.o", "target/lib.o"],
+        );
+        let mut palette = Palette::new("", items).with_prefix(Prefix::Include('*'));
+        assert!(!palette.prefix_active());
+        assert_eq!(result_labels(&palette), ["main.rs", "lib.rs"]);
+
+        type_str(&mut palette, "*");
+        assert!(palette.prefix_active());
+        assert_eq!(
+            result_labels(&palette),
+            ["main.rs", "target/main.o", "lib.rs", "target/lib.o"]
+        );
+        // The query after the prefix is what is matched.
+        type_str(&mut palette, "main");
+        assert_eq!(result_labels(&palette), ["main.rs", "target/main.o"]);
+
+        // The prefix only counts at the start of the query.
+        let mut palette = Palette::new("", marked_items(&["a.rs", "b.o"], &["b.o"]))
+            .with_prefix(Prefix::Include('*'));
+        type_str(&mut palette, "b*");
+        assert!(!palette.prefix_active());
+        assert!(result_labels(&palette).is_empty());
+    }
+
+    #[test]
+    fn only_prefix_keeps_marked_items_alone() {
+        let items = marked_items(&["a.rs", "b.rs", "c.rs"], &["b.rs"]);
+        let mut palette = Palette::new("", items).with_prefix(Prefix::Only('!'));
+        assert_eq!(result_labels(&palette), ["a.rs", "b.rs", "c.rs"]);
+        type_str(&mut palette, "!");
+        assert_eq!(result_labels(&palette), ["b.rs"]);
+        type_str(&mut palette, "a");
+        assert!(result_labels(&palette).is_empty());
+        // Deleting back to the prefix alone lists the marked items again,
+        // and deleting the prefix lists everything.
+        let mut clipboard = Clipboard::new();
+        palette.handle_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut clipboard,
+        );
+        assert_eq!(result_labels(&palette), ["b.rs"]);
+        palette.handle_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut clipboard,
+        );
+        assert_eq!(result_labels(&palette), ["a.rs", "b.rs", "c.rs"]);
+    }
+
+    #[test]
+    fn marks_mean_nothing_without_a_prefix() {
+        let items = marked_items(&["a.rs", "b.rs"], &["b.rs"]);
+        let mut palette = Palette::new("", items);
+        assert_eq!(result_labels(&palette), ["a.rs", "b.rs"]);
+        type_str(&mut palette, "!");
+        assert!(result_labels(&palette).is_empty());
     }
 
     fn selected_label(palette: &Palette) -> &str {
