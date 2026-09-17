@@ -18,6 +18,12 @@ status-bar-background = "light"
 status-bar-filename-text = "blue"
 status-bar-position-text = "green"
 status-bar-project-text = "orange"
+# What the bar says on its left: key bindings, an error, or something
+# under way, each in its own color.
+status-bar-key-text = "blue"
+status-bar-help-text = "content"
+status-bar-error-text = "red"
+status-bar-progress-text = "yellow"
 command-palette-background = "mid"
 command-palette-box-color = "dimmed"
 command-palette-placeholder-text = "dimmed"

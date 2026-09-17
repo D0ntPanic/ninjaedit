@@ -24,6 +24,7 @@ mod palette;
 mod project_search;
 mod search_box;
 mod settings_view;
+mod status;
 mod tabs;
 mod terminal_view;
 mod theme;

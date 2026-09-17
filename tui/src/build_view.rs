@@ -37,6 +37,7 @@
 use crate::clipboard::Clipboard;
 use crate::fields::{FieldKey, Fields, wrap_words};
 use crate::palette::palette_background;
+use crate::status::StatusLine;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::{BuildConfig, BuildSystem, ConfigurationKey, TargetKey, Variable};
@@ -89,7 +90,7 @@ pub enum BuildOutcome {
     /// The user asked to add a root: offer the project's root files.
     AddRoot,
     /// A message for the status bar, such as a request to confirm.
-    Notice(String),
+    Notice(StatusLine),
 }
 
 /// One row of the tree.
@@ -651,9 +652,9 @@ impl BuildView {
                 .map(|i| Node::Configuration(r, i)),
             Some(Node::Target(r, i)) => config.duplicate_target(r, i).map(|i| Node::Target(r, i)),
             _ => {
-                return BuildOutcome::Notice(
-                    "Select a configuration or a target to duplicate".to_owned(),
-                );
+                return BuildOutcome::Notice(StatusLine::error(
+                    "Select a configuration or a target to duplicate",
+                ));
             }
         };
         match copied {
@@ -678,9 +679,9 @@ impl BuildView {
             Node::Configuration(..) => "configuration",
             Node::Target(..) => "target",
             Node::Configurations(_) | Node::Targets(_) => {
-                return BuildOutcome::Notice(
-                    "Select a root, a configuration, or a target to remove".to_owned(),
-                );
+                return BuildOutcome::Notice(StatusLine::error(
+                    "Select a root, a configuration, or a target to remove",
+                ));
             }
         };
         // A discovered target is disabled rather than removed, and
@@ -697,10 +698,10 @@ impl BuildView {
         }
         if self.confirm_remove != Some(node) {
             self.confirm_remove = Some(node);
-            return BuildOutcome::Notice(format!(
+            return BuildOutcome::Notice(StatusLine::info(format!(
                 "Press Delete again to remove the {what} {}",
                 node.label(config)
-            ));
+            )));
         }
         self.confirm_remove = None;
         match node {
@@ -708,7 +709,7 @@ impl BuildView {
             Node::Configuration(r, i) => config.remove_configuration(r, i),
             Node::Target(r, i) => {
                 if let Err(reason) = config.remove_target(r, i) {
-                    return BuildOutcome::Notice(reason);
+                    return BuildOutcome::Notice(StatusLine::error(reason));
                 }
             }
             _ => {}
@@ -1410,7 +1411,7 @@ mod tests {
         assert_eq!(view.selected_node(), Some(Node::Configuration(0, 2)));
         assert!(matches!(
             press(&mut view, &mut config, KeyCode::Delete),
-            BuildOutcome::Notice(ref m) if m.contains("bench")
+            BuildOutcome::Notice(ref m) if m.text().contains("bench")
         ));
         press(&mut view, &mut config, KeyCode::Down);
         assert_eq!(

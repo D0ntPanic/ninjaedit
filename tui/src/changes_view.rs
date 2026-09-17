@@ -87,6 +87,7 @@ use crate::diff_pane::{
 use crate::editor_view::EditorView;
 use crate::git_layout::{ChangesSizes, GitChangesLayout, MAIN_REPOSITORY};
 use crate::palette::palette_background;
+use crate::status::StatusLine;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{ChangeKind, Changes, FileChange, FileDiff, FileTree, TreeRow, short_id};
@@ -122,11 +123,42 @@ const CLEAN: &str = "Nothing to commit: the working tree is clean";
 const NO_UNSTAGED: &str = "No unstaged changes";
 const NO_STAGED: &str = "No staged changes";
 const SCANNING: &str = "scanning…";
-const UNSTAGED_HINT: &str = "↑↓ move · ←→ fold · Space stage · a all · Enter diff · o open · m amend · Ctrl+S commit · Tab pane";
-const STAGED_HINT: &str = "↑↓ move · ←→ fold · Space unstage · a all · Enter diff · o open · m amend · Ctrl+S commit · Tab pane";
-const COMMIT_HINT: &str = "type the message · Ctrl+S commit · Tab pane · Ctrl+E leave";
-const CONTENT_HINT: &str =
-    "↑↓ scroll · ←→ sideways · ▲▼ buttons expand context · Tab pane · Ctrl+E leave";
+/// The key bindings the status bar lists, pane by pane.
+const UNSTAGED_HELP: &[(&str, &str)] = &[
+    ("↑↓", "move"),
+    ("←→", "fold"),
+    ("Space", "stage"),
+    ("a", "all"),
+    ("Enter", "diff"),
+    ("o", "open"),
+    ("m", "amend"),
+    ("Ctrl+S", "commit"),
+    ("Tab", "pane"),
+];
+const STAGED_HELP: &[(&str, &str)] = &[
+    ("↑↓", "move"),
+    ("←→", "fold"),
+    ("Space", "unstage"),
+    ("a", "all"),
+    ("Enter", "diff"),
+    ("o", "open"),
+    ("m", "amend"),
+    ("Ctrl+S", "commit"),
+    ("Tab", "pane"),
+];
+const COMMIT_HELP: &[(&str, &str)] = &[
+    ("", "type the message"),
+    ("Ctrl+S", "commit"),
+    ("Tab", "pane"),
+    ("Ctrl+E", "leave"),
+];
+const CONTENT_HELP: &[(&str, &str)] = &[
+    ("↑↓", "scroll"),
+    ("←→", "sideways"),
+    ("▲▼", "expand context"),
+    ("Tab", "pane"),
+    ("Ctrl+E", "leave"),
+];
 
 /// Which pane has the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,7 +243,7 @@ pub enum ChangesOutcome {
     Continue,
     /// Something to say in the status bar: a commit made, an action
     /// that failed.
-    Notice(String),
+    Notice(StatusLine),
     /// Open a file in the editor; `conflicted` asks for the cursor at
     /// its first merge conflict.
     OpenFile {
@@ -556,7 +588,7 @@ impl ChangesTabs {
     }
 
     /// What the status bar shows.
-    pub fn hint(&self) -> String {
+    pub fn hint(&self) -> StatusLine {
         self.active_view()
             .map(ChangesView::hint)
             .unwrap_or_default()
@@ -755,19 +787,18 @@ impl ChangesView {
             .unwrap_or_default()
     }
 
-    /// What the status bar shows for the page.
-    pub fn hint(&self) -> String {
-        let pane = match self.pane {
-            Pane::Unstaged => UNSTAGED_HINT,
-            Pane::Staged => STAGED_HINT,
-            Pane::Commit => COMMIT_HINT,
-            Pane::Content => CONTENT_HINT,
-        };
+    /// What the status bar shows for the page: the scan while one is
+    /// under way, otherwise the pane's key bindings.
+    pub fn hint(&self) -> StatusLine {
         if self.scanning() {
-            format!("{SCANNING} · {pane}")
-        } else {
-            pane.to_owned()
+            return StatusLine::progress(SCANNING);
         }
+        StatusLine::help(match self.pane {
+            Pane::Unstaged => UNSTAGED_HELP,
+            Pane::Staged => STAGED_HELP,
+            Pane::Commit => COMMIT_HELP,
+            Pane::Content => CONTENT_HELP,
+        })
     }
 
     #[cfg(test)]
@@ -1008,7 +1039,7 @@ impl ChangesView {
                 self.follow_lists();
                 ChangesOutcome::Continue
             }
-            Err(err) => ChangesOutcome::Notice(format!(
+            Err(err) => ChangesOutcome::Notice(StatusLine::error(format!(
                 "Could not {} {what}: {}",
                 if list == List::Unstaged {
                     "stage"
@@ -1016,7 +1047,7 @@ impl ChangesView {
                     "unstage"
                 },
                 err.message()
-            )),
+            ))),
         }
     }
 
@@ -1029,7 +1060,10 @@ impl ChangesView {
         };
         let amend = !changes.is_amending();
         if let Err(err) = changes.set_amend(amend) {
-            return ChangesOutcome::Notice(format!("Could not amend: {}", err.message()));
+            return ChangesOutcome::Notice(StatusLine::error(format!(
+                "Could not amend: {}",
+                err.message()
+            )));
         }
         self.acted = true;
         self.content = None;
@@ -1058,9 +1092,15 @@ impl ChangesView {
                 self.follow_lists();
                 let summary = message.trim().lines().next().unwrap_or("").to_owned();
                 let verb = if amended { "Amended" } else { "Committed" };
-                ChangesOutcome::Notice(format!("{verb} {} {summary}", short_id(id)))
+                ChangesOutcome::Notice(StatusLine::info(format!(
+                    "{verb} {} {summary}",
+                    short_id(id)
+                )))
             }
-            Err(err) => ChangesOutcome::Notice(format!("Could not commit: {}", err.message())),
+            Err(err) => ChangesOutcome::Notice(StatusLine::error(format!(
+                "Could not commit: {}",
+                err.message()
+            ))),
         }
     }
 
@@ -1073,13 +1113,13 @@ impl ChangesView {
             return ChangesOutcome::Continue;
         };
         if change.submodule {
-            return ChangesOutcome::Notice(format!(
+            return ChangesOutcome::Notice(StatusLine::info(format!(
                 "{} is a submodule: its changes are on its own tab",
                 change.path
-            ));
+            )));
         }
         if change.kind == ChangeKind::Deleted {
-            return ChangesOutcome::Notice(format!("{} is deleted", change.path));
+            return ChangesOutcome::Notice(StatusLine::info(format!("{} is deleted", change.path)));
         }
         ChangesOutcome::OpenFile {
             path: changes.workdir().join(&change.path),
@@ -2139,7 +2179,7 @@ mod tests {
         // selection: a.rs's unstaged change against the index.
         assert!(view.content_area.width > view.unstaged_area.width);
         assert!(row_with(&screen, "+     two();").len() > width);
-        assert!(view.hint().contains("Space stage"));
+        assert!(view.hint().text().contains("Space stage"));
 
         // Down to c.txt shows its whole contents as added; Space stages
         // it, and the selection stays put on the next file.
@@ -2168,7 +2208,7 @@ mod tests {
         assert_eq!(view.list, List::Staged);
         let screen = draw(&mut view, 100, 30);
         assert!(screen.iter().any(|r| r.contains("+ c")), "{screen:#?}");
-        assert!(view.hint().contains("Space unstage"));
+        assert!(view.hint().text().contains("Space unstage"));
         // Space unstages it again; `a` in the unstaged list stages all.
         // The lists show the outcome before the scan confirms it, with
         // no word of waiting.
@@ -2176,7 +2216,7 @@ mod tests {
         assert!(view.is_loading());
         assert!(view.files(List::Staged).is_empty());
         assert_eq!(view.files(List::Unstaged).len(), 3);
-        assert!(!view.hint().contains(SCANNING), "{}", view.hint());
+        assert!(!view.hint().text().contains(SCANNING), "{}", view.hint());
         settle(&mut view);
         assert!(view.files(List::Staged).is_empty());
         assert_eq!(view.files(List::Unstaged).len(), 3);
@@ -2204,7 +2244,7 @@ mod tests {
         assert_eq!(view.pane, Pane::Commit);
         let outcome = ctrl(&mut view, 's');
         assert!(
-            matches!(&outcome, ChangesOutcome::Notice(m) if m.contains("needs a message")),
+            matches!(&outcome, ChangesOutcome::Notice(m) if m.text().contains("needs a message")),
             "{outcome:?}"
         );
         type_str(&mut view, "Change things\n\nA body, with the why.");
@@ -2219,7 +2259,7 @@ mod tests {
         );
         let outcome = ctrl(&mut view, 's');
         assert!(
-            matches!(&outcome, ChangesOutcome::Notice(m) if m.starts_with("Committed ") && m.ends_with("Change things")),
+            matches!(&outcome, ChangesOutcome::Notice(m) if m.text().starts_with("Committed ") && m.text().ends_with("Change things")),
             "{outcome:?}"
         );
         assert!(view.take_acted());
@@ -2511,7 +2551,7 @@ mod tests {
         type_str(&mut view, " and bee");
         let outcome = ctrl(&mut view, 's');
         assert!(
-            matches!(&outcome, ChangesOutcome::Notice(m) if m.starts_with("Amended ")),
+            matches!(&outcome, ChangesOutcome::Notice(m) if m.text().starts_with("Amended ")),
             "{outcome:?}"
         );
         settle(&mut view);
@@ -2622,12 +2662,12 @@ mod tests {
         // Ctrl+S, makes the merge commit.
         let outcome = press(&mut view, KeyCode::Char('m'));
         assert!(
-            matches!(&outcome, ChangesOutcome::Notice(m) if m.contains("merge")),
+            matches!(&outcome, ChangesOutcome::Notice(m) if m.text().contains("merge")),
             "{outcome:?}"
         );
         let outcome = ctrl(&mut view, 's');
         assert!(
-            matches!(&outcome, ChangesOutcome::Notice(m) if m.contains("conflicts")),
+            matches!(&outcome, ChangesOutcome::Notice(m) if m.text().contains("conflicts")),
             "{outcome:?}"
         );
         fs::write(dir.path().join("f.txt"), "one\nboth\nthree\n").unwrap();
@@ -2643,7 +2683,7 @@ mod tests {
         );
         let outcome = ctrl(&mut view, 's');
         assert!(
-            matches!(&outcome, ChangesOutcome::Notice(m) if m.starts_with("Committed")),
+            matches!(&outcome, ChangesOutcome::Notice(m) if m.text().starts_with("Committed")),
             "{outcome:?}"
         );
         settle(&mut view);

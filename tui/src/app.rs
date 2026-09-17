@@ -168,6 +168,7 @@ use crate::build_view::{self, BuildOutcome, BuildView, Node};
 use crate::changes_view::{self, ChangesOutcome, ChangesTabs};
 use crate::clipboard::Clipboard;
 use crate::command::Command;
+use crate::diff_pane::draw_pieces;
 use crate::editor_view::EditorView;
 use crate::git_layout;
 use crate::git_view::{self, GitLogTabs};
@@ -176,6 +177,7 @@ use crate::palette::{Palette, PaletteAction, PaletteItem, PaletteOutcome};
 use crate::project_search::{ProjectSearchDialog, ProjectSearchOutcome};
 use crate::search_box::{self, SearchBox, SearchOutcome};
 use crate::settings_view::{self, SettingsOutcome, SettingsView};
+use crate::status::StatusLine;
 use crate::tabs::{TabBar, TabHit, TabLabel};
 use crate::theme::Theme;
 use crate::tool::{Tool, ToolKind, ToolPane};
@@ -323,15 +325,47 @@ const TARGET_PLACEHOLDER: &str = "Target to build and run";
 /// The modes palette's row for the editor.
 const EDITOR_MODE_LABEL: &str = "Editor";
 /// What the status bar shows on the settings page.
-const SETTINGS_HINT: &str = "Tab/↑↓ next · Enter apply · Ctrl+D default · Ctrl+E leave";
+const SETTINGS_HELP: &[(&str, &str)] = &[
+    ("Tab/↑↓", "next"),
+    ("Enter", "apply"),
+    ("Ctrl+D", "default"),
+    ("Ctrl+E", "leave"),
+];
 /// What the status bar shows on the build configuration page.
-const BUILD_HINT: &str =
-    "↑↓ select · Enter options · Ctrl+N new · Ctrl+D duplicate · Del remove · Ctrl+E leave";
+const BUILD_HELP: &[(&str, &str)] = &[
+    ("↑↓", "select"),
+    ("Enter", "options"),
+    ("Ctrl+N", "new"),
+    ("Ctrl+D", "duplicate"),
+    ("Del", "remove"),
+    ("Ctrl+E", "leave"),
+];
 /// What the status bar shows with the output tool focused and idle.
-const OUTPUT_IDLE_HINT: &str =
-    "Ctrl+B build · Ctrl+R run · Ctrl+D dismiss · Ctrl+E mode · Ctrl+P commands";
+const OUTPUT_IDLE_HELP: &[(&str, &str)] = &[
+    ("Ctrl+B", "build"),
+    ("Ctrl+R", "run"),
+    ("Ctrl+D", "dismiss"),
+    ("Ctrl+E", "mode"),
+    ("Ctrl+P", "commands"),
+];
 /// What the status bar shows while the prefix waits for its key.
-const PREFIX_HINT: &str = "Ctrl+]  then Ctrl+ P commands · E mode · O file · T tab · F search · J line · L log · B build · R run · Q quit · ] itself · drag to copy";
+const PREFIX_HELP: &[(&str, &str)] = &[
+    ("Ctrl+]", "then Ctrl+"),
+    ("P", "commands"),
+    ("E", "mode"),
+    ("O", "file"),
+    ("T", "tab"),
+    ("F", "search"),
+    ("J", "line"),
+    ("L", "log"),
+    ("B", "build"),
+    ("R", "run"),
+    ("Q", "quit"),
+    ("]", "itself"),
+    ("drag", "to copy"),
+];
+/// What the status bar shows in the editor with no file open.
+const NO_FILE_HELP: &[(&str, &str)] = &[("Ctrl+O", "open a file"), ("Ctrl+Q", "quit")];
 /// What the output tool shows before the first job.
 const OUTPUT_WELCOME: &str = "Ctrl+B builds and Ctrl+R runs the current target\r\n";
 /// How long a change to the search query waits for the search to finish,
@@ -471,7 +505,7 @@ pub struct App {
     file_activity: u64,
     last_file_check: Option<Instant>,
     /// A message shown in the status bar until the next key press.
-    status: Option<String>,
+    status: Option<StatusLine>,
     confirm: Option<Confirm>,
     /// Lives as long as the app: see the `clipboard` module for why.
     clipboard: Clipboard,
@@ -508,7 +542,10 @@ impl App {
         // settings page replaces it.
         let (settings, mut status) = match storage.load_settings() {
             Ok(settings) => (settings, None),
-            Err(err) => (Settings::default(), Some(err.to_string())),
+            Err(err) => (
+                Settings::default(),
+                Some(StatusLine::error(err.to_string())),
+            ),
         };
         // Likewise the build configuration; with none saved yet the
         // project's own root files are found.
@@ -517,7 +554,7 @@ impl App {
             Ok(Some(build)) => build,
             Ok(None) => BuildConfig::find_roots(project.root()),
             Err(err) => {
-                status = Some(err.to_string());
+                status = Some(StatusLine::error(err.to_string()));
                 BuildConfig::find_roots(project.root())
             }
         };
@@ -716,7 +753,10 @@ impl App {
                 self.activate(self.tabs.len() - 1);
             }
             Err(err) => {
-                self.status = Some(format!("Could not open {}: {err}", path.display()));
+                self.status = Some(StatusLine::error(format!(
+                    "Could not open {}: {err}",
+                    path.display()
+                )));
             }
         }
     }
@@ -762,10 +802,10 @@ impl App {
         };
         if tab.view.editor().is_modified() && self.confirm != Some(Confirm::CloseTab(index)) {
             self.confirm = Some(Confirm::CloseTab(index));
-            self.status = Some(format!(
+            self.status = Some(StatusLine::info(format!(
                 "{} has unsaved changes: press Ctrl+W again to close without saving, Ctrl+S to save",
                 tab.title()
-            ));
+            )));
             return;
         }
         self.close_tab(index);
@@ -779,9 +819,9 @@ impl App {
             .count();
         if unsaved > 0 && self.confirm != Some(Confirm::Quit) {
             self.confirm = Some(Confirm::Quit);
-            self.status = Some(format!(
+            self.status = Some(StatusLine::info(format!(
                 "{unsaved} file(s) have unsaved changes: press Ctrl+Q again to quit without saving"
-            ));
+            )));
             return;
         }
         self.quit = true;
@@ -793,8 +833,8 @@ impl App {
         };
         let title = tab.title();
         self.status = Some(match tab.view.editor_mut().save() {
-            Ok(()) => format!("Saved {title}"),
-            Err(err) => format!("Could not save {title}: {err}"),
+            Ok(()) => StatusLine::info(format!("Saved {title}")),
+            Err(err) => StatusLine::error(format!("Could not save {title}: {err}")),
         });
     }
 
@@ -806,9 +846,11 @@ impl App {
         };
         let title = tab.title();
         self.status = Some(match tab.view.editor_mut().discard_changes() {
-            Ok(true) => format!("Discarded unsaved changes to {title} (undo brings them back)"),
-            Ok(false) => format!("{title} has no unsaved changes"),
-            Err(err) => format!("Could not reload {title}: {err}"),
+            Ok(true) => StatusLine::info(format!(
+                "Discarded unsaved changes to {title} (undo brings them back)"
+            )),
+            Ok(false) => StatusLine::info(format!("{title} has no unsaved changes")),
+            Err(err) => StatusLine::error(format!("Could not reload {title}: {err}")),
         });
     }
 
@@ -824,27 +866,29 @@ impl App {
         let mut changed = false;
         for tab in &mut self.tabs {
             let title = tab.title();
+            // A change taken in cleanly is news; one that needs the
+            // user's attention, or couldn't be read, is an error.
             let message = match tab.view.editor_mut_in_place().check_disk() {
                 Ok(ExternalChange::None) => continue,
-                Ok(ExternalChange::Reloaded) => format!("{title} changed on disk: reloaded"),
-                Ok(ExternalChange::Merged) => {
-                    format!(
-                        "{title} changed on disk: merged with unsaved changes (undo to keep yours)"
-                    )
+                Ok(ExternalChange::Reloaded) => {
+                    StatusLine::info(format!("{title} changed on disk: reloaded"))
                 }
+                Ok(ExternalChange::Merged) => StatusLine::info(format!(
+                    "{title} changed on disk: merged with unsaved changes (undo to keep yours)"
+                )),
                 Ok(ExternalChange::Conflicted) => {
                     tab.view.reveal_cursor();
-                    format!("{title} changed on disk: conflicts with unsaved changes are marked")
+                    StatusLine::error(format!(
+                        "{title} changed on disk: conflicts with unsaved changes are marked"
+                    ))
                 }
-                Ok(ExternalChange::Unmerged) => {
-                    format!(
-                        "{title} changed on disk but can't be merged with unsaved changes: saving will overwrite it"
-                    )
-                }
+                Ok(ExternalChange::Unmerged) => StatusLine::error(format!(
+                    "{title} changed on disk but can't be merged with unsaved changes: saving will overwrite it"
+                )),
                 Ok(ExternalChange::Deleted) => {
-                    format!("{title} was deleted on disk: save to recreate it")
+                    StatusLine::error(format!("{title} was deleted on disk: save to recreate it"))
                 }
-                Err(err) => format!("Could not read {title}: {err}"),
+                Err(err) => StatusLine::error(format!("Could not read {title}: {err}")),
             };
             self.status = Some(message);
             changed = true;
@@ -1290,12 +1334,12 @@ impl App {
     fn settings_changed(&mut self) {
         self.apply_settings();
         if let Err(err) = self.storage.save_settings(&self.settings) {
-            self.status = Some(format!(
+            self.status = Some(StatusLine::error(format!(
                 "Could not save {}: {err}",
                 self.storage
                     .path(ninjaedit_core::storage::SETTINGS_FILE)
                     .display()
-            ));
+            )));
         }
     }
 
@@ -1354,7 +1398,7 @@ impl App {
                         ) {
                             Ok(layout) => layout,
                             Err(err) => {
-                                self.status = Some(err.to_string());
+                                self.status = Some(StatusLine::error(err.to_string()));
                                 Default::default()
                             }
                         };
@@ -1384,7 +1428,7 @@ impl App {
                 ) {
                     Ok(layout) => layout,
                     Err(err) => {
-                        self.status = Some(err.to_string());
+                        self.status = Some(StatusLine::error(err.to_string()));
                         Default::default()
                     }
                 };
@@ -1401,7 +1445,9 @@ impl App {
             let outcome = tabs.toggle_amend();
             self.handle_changes_outcome(outcome);
         } else {
-            self.status = Some("Amending is a choice on the changes page (Ctrl+U)".to_owned());
+            self.status = Some(StatusLine::info(
+                "Amending is a choice on the changes page (Ctrl+U)",
+            ));
         }
     }
 
@@ -1435,12 +1481,12 @@ impl App {
     /// storage.
     fn build_changed(&mut self) {
         if let Err(err) = self.project_storage.save_build_config(&self.build) {
-            self.status = Some(format!(
+            self.status = Some(StatusLine::error(format!(
                 "Could not save {}: {err}",
                 self.project_storage
                     .path(ninjaedit_core::build::BUILD_FILE)
                     .display()
-            ));
+            )));
         }
     }
 
@@ -1493,7 +1539,10 @@ impl App {
     /// the targets found under it, and select it on the page.
     fn add_build_root(&mut self, path: PathBuf) {
         let Some(root) = BuildRoot::pending(&path) else {
-            self.status = Some(format!("{} is not a build root file", path.display()));
+            self.status = Some(StatusLine::error(format!(
+                "{} is not a build root file",
+                path.display()
+            )));
             return;
         };
         let discovery = root.discovery(self.project.root());
@@ -1505,7 +1554,7 @@ impl App {
                 }
                 self.build_changed();
             }
-            Err(err) => self.status = Some(err),
+            Err(err) => self.status = Some(StatusLine::error(err)),
         }
     }
 
@@ -1607,7 +1656,7 @@ impl App {
         // is still being looked for would build the wrong thing.
         match self.build.current_for_job() {
             Ok(selection) => self.start_selected_job(selection, run),
-            Err(message) => self.status = Some(message),
+            Err(message) => self.status = Some(StatusLine::error(message)),
         }
     }
 
@@ -1644,7 +1693,7 @@ impl App {
                     self.job_dirs.push(dir);
                 }
             }
-            Err(err) => self.status = Some(err),
+            Err(err) => self.status = Some(StatusLine::error(err)),
         }
     }
 
@@ -1663,7 +1712,7 @@ impl App {
                 self.job_configure = None;
                 self.start_job(job);
             }
-            Err(err) => self.status = Some(err),
+            Err(err) => self.status = Some(StatusLine::error(err)),
         }
     }
 
@@ -1677,7 +1726,7 @@ impl App {
                 self.job_configure = None;
                 self.start_job(job);
             }
-            Err(err) => self.status = Some(err),
+            Err(err) => self.status = Some(StatusLine::error(err)),
         }
     }
 
@@ -1735,7 +1784,10 @@ impl App {
             .map(PathBuf::as_path)
             .chain(std::iter::once(root.as_path()));
         let Some(path) = location.resolve(bases) else {
-            self.status = Some(format!("Could not find {}", location.path));
+            self.status = Some(StatusLine::error(format!(
+                "Could not find {}",
+                location.path
+            )));
             return;
         };
         let path = std::fs::canonicalize(&path).unwrap_or(path);
@@ -1779,7 +1831,7 @@ impl App {
             );
             tool.process(format!("\x1b[1;31m{message}\x1b[0m\r\n").as_bytes());
             self.pending_steps.clear();
-            self.status = Some(message);
+            self.status = Some(StatusLine::error(message));
         }
     }
 
@@ -1795,7 +1847,7 @@ impl App {
             }
             if self.pending_steps.is_empty() {
                 tool.process(b"\x1b[1;32mFinished\x1b[0m\r\n");
-                self.status = Some(format!("{}: finished", self.job_title));
+                self.status = Some(StatusLine::info(format!("{}: finished", self.job_title)));
             } else {
                 tool.process(b"\r\n");
                 self.start_next_step();
@@ -1808,7 +1860,10 @@ impl App {
             tool.process(format!("\x1b[1;31mFailed: {why}\x1b[0m\r\n").as_bytes());
             self.pending_steps.clear();
             self.job_configure = None;
-            self.status = Some(format!("{}: failed with {why}", self.job_title));
+            self.status = Some(StatusLine::error(format!(
+                "{}: failed with {why}",
+                self.job_title
+            )));
         }
     }
 
@@ -1949,7 +2004,10 @@ impl App {
             editor.set_search_query(&self.last_search);
             if !editor.accept_search() {
                 editor.clear_search();
-                self.status = Some(format!("No matches for {}", self.last_search));
+                self.status = Some(StatusLine::info(format!(
+                    "No matches for {}",
+                    self.last_search
+                )));
             }
         }
     }
@@ -1970,10 +2028,12 @@ impl App {
             ConflictStep::Moved => {}
             ConflictStep::Wrapped => {
                 let end = if forward { "first" } else { "last" };
-                self.status = Some(format!("Wrapped around to the {end} conflict in the file"));
+                self.status = Some(StatusLine::info(format!(
+                    "Wrapped around to the {end} conflict in the file"
+                )));
             }
             ConflictStep::NoConflicts => {
-                self.status = Some("No merge conflicts in this file".to_owned());
+                self.status = Some(StatusLine::info("No merge conflicts in this file"));
                 return;
             }
         }
@@ -1990,7 +2050,7 @@ impl App {
             tab.view.editor_mut().next_match()
         };
         if step == SearchStep::ReachedStart {
-            self.status = Some(SEARCH_WRAPPED.to_owned());
+            self.status = Some(StatusLine::info(SEARCH_WRAPPED));
         }
     }
 
@@ -2204,7 +2264,7 @@ impl App {
             return;
         };
         if let Err(err) = tool.start(|cols, rows| spawn_session(&command, cols, rows, events)) {
-            self.status = Some(format!("Could not start {name}: {err}"));
+            self.status = Some(StatusLine::error(format!("Could not start {name}: {err}")));
         }
     }
 
@@ -2826,10 +2886,10 @@ impl App {
                             tabs.layout(),
                         )
                     {
-                        self.status = Some(format!(
+                        self.status = Some(StatusLine::error(format!(
                             "Could not save {}: {err}",
                             self.project_storage.path(git_layout::LAYOUT_FILE).display()
-                        ));
+                        )));
                     }
                 }
                 Mode::Changes(tabs)
@@ -2847,12 +2907,12 @@ impl App {
                             tabs.layout(),
                         )
                     {
-                        self.status = Some(format!(
+                        self.status = Some(StatusLine::error(format!(
                             "Could not save {}: {err}",
                             self.project_storage
                                 .path(git_layout::CHANGES_LAYOUT_FILE)
                                 .display()
-                        ));
+                        )));
                     }
                 }
                 _ => {}
@@ -2905,11 +2965,11 @@ impl App {
         tool.write(bytes);
         if let Some(text) = copied {
             let lines = text.lines().count();
-            self.status = Some(if lines == 1 {
+            self.status = Some(StatusLine::info(if lines == 1 {
                 "Copied 1 line to the clipboard".to_owned()
             } else {
                 format!("Copied {lines} lines to the clipboard")
-            });
+            }));
             self.clipboard.set(text);
         }
     }
@@ -3193,42 +3253,52 @@ impl App {
             configuration.clear();
             target.clear();
         }
+        let target_color = if finding {
+            theme.status_bar_progress_text
+        } else {
+            theme.status_bar_position_text
+        };
         let right = [
             (position.unwrap_or_default(), theme.status_bar_position_text),
             (configuration, theme.status_bar_position_text),
-            (target, theme.status_bar_position_text),
+            (target, target_color),
         ];
         let mode_hint = match &self.mode {
-            Mode::Editor => String::new(),
-            Mode::Settings(_) => SETTINGS_HINT.to_owned(),
-            Mode::Build(_) => BUILD_HINT.to_owned(),
+            Mode::Editor => StatusLine::default(),
+            Mode::Settings(_) => StatusLine::help(SETTINGS_HELP),
+            Mode::Build(_) => StatusLine::help(BUILD_HELP),
             Mode::GitLog(tabs) => tabs.hint(),
             Mode::Changes(tabs) => tabs.hint(),
         };
+        // Something under way on a page has the bar to itself: it is
+        // what the user is waiting on, and the message that came
+        // before it has been seen.
         let left = match &self.status {
-            _ if self.prefix.is_some() => PREFIX_HINT.to_owned(),
+            _ if self.prefix.is_some() => StatusLine::help(PREFIX_HELP),
+            _ if mode_hint.is_progress() => mode_hint,
             Some(message) => message.clone(),
             None if tool_focused => match self.tool_pane.active() {
                 Some(tool) if tool.kind() == ToolKind::Output && !tool.is_running() => {
-                    OUTPUT_IDLE_HINT.to_owned()
+                    StatusLine::help(OUTPUT_IDLE_HELP)
                 }
-                Some(tool) => tool.title(),
-                None => String::new(),
+                Some(tool) => StatusLine::info(tool.title()),
+                None => StatusLine::default(),
             },
             None if !in_editor => mode_hint,
             None => match tab.and_then(Tab::path) {
-                Some(path) => self.display_path(path),
-                None => "Ctrl+O to open a file, Ctrl+Q to quit".to_owned(),
+                Some(path) => StatusLine::info(self.display_path(path)),
+                None => StatusLine::help(NO_FILE_HELP),
             },
         };
         let right_width: u16 = right.iter().map(|(text, _)| width_of(text)).sum();
         let left_width = area.width.saturating_sub(right_width + 1) as usize;
-        buf.set_stringn(
+        draw_pieces(
+            buf,
             area.x + 1,
             area.y,
-            &left,
             left_width,
-            base.fg(theme.status_bar_filename_text),
+            &left.pieces(theme, base),
+            0,
         );
         if right_width <= area.width {
             let mut x = area.right() - right_width;
@@ -3397,6 +3467,11 @@ fn parent_of(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// What the status bar has been told to say, as text.
+    fn status_text(app: &App) -> Option<String> {
+        app.status.as_ref().map(StatusLine::text)
+    }
+
     use super::*;
     use crossterm::event::KeyEventState;
     use ninjaedit_core::Position;
@@ -3459,6 +3534,82 @@ mod tests {
         let ln = row.find("Ln 1").unwrap() as u16;
         assert_eq!(buffer[(ln, 4)].fg, Color::Rgb(10, 11, 12));
         assert_eq!(buffer[(ln, 4)].bg, Color::Rgb(4, 5, 6));
+    }
+
+    #[test]
+    fn the_status_bar_colors_what_it_says_by_kind() {
+        let (dir, mut app) = app_with_files(&[("a.txt", "hello\n")]);
+        app.set_theme(
+            Theme::parse(
+                "status-bar-filename-text = \"#010101\"\nstatus-bar-key-text = \"#020202\"\n\
+                 status-bar-help-text = \"#030303\"\nstatus-bar-error-text = \"#040404\"\n\
+                 status-bar-progress-text = \"#050505\"\n",
+            )
+            .unwrap(),
+        );
+        // The status bar's row, and the color of the text at `needle`.
+        let status_row = |app: &mut App| -> (String, Vec<Color>) {
+            let mut terminal = Terminal::new(TestBackend::new(70, 8)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let row: String = (0..70).map(|x| buffer[(x, 7)].symbol()).collect();
+            let colors = (0..70).map(|x| buffer[(x, 7)].fg).collect();
+            (row, colors)
+        };
+        let color_at = |row: &str, colors: &[Color], needle: &str| -> Color {
+            let at = row
+                .find(needle)
+                .unwrap_or_else(|| panic!("no {needle:?} in {row:?}"));
+            colors[row[..at].chars().count()]
+        };
+
+        // The file being edited.
+        let (row, colors) = status_row(&mut app);
+        assert_eq!(color_at(&row, &colors, "a.txt"), Color::Rgb(1, 1, 1));
+        // A message about something that went wrong.
+        app.status = Some(StatusLine::error("Could not save a.txt"));
+        let (row, colors) = status_row(&mut app);
+        assert_eq!(color_at(&row, &colors, "Could not"), Color::Rgb(4, 4, 4));
+        // A page's key bindings: the keys in one color, what they do in
+        // another.
+        app.status = None;
+        app.open_settings();
+        let (row, colors) = status_row(&mut app);
+        assert_eq!(color_at(&row, &colors, "Enter"), Color::Rgb(2, 2, 2));
+        assert_eq!(color_at(&row, &colors, "apply"), Color::Rgb(3, 3, 3));
+        assert_eq!(color_at(&row, &colors, "Ctrl+E"), Color::Rgb(2, 2, 2));
+        assert_eq!(color_at(&row, &colors, "leave"), Color::Rgb(3, 3, 3));
+
+        // Something under way has the bar to itself, in its own color,
+        // even over a message: a checkout started on the git log page,
+        // not yet polled.
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("a.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Say hello", &tree, &[])
+            .unwrap();
+        ctrl(&mut app, 'l');
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Mode::GitLog(tabs) = &app.mode
+            && tabs.is_loading()
+            && Instant::now() < deadline
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (row, colors) = status_row(&mut app);
+        assert_eq!(color_at(&row, &colors, "Space"), Color::Rgb(2, 2, 2));
+        assert_eq!(color_at(&row, &colors, "checkout"), Color::Rgb(3, 3, 3));
+        press(&mut app, KeyCode::Char(' '));
+        app.status = Some(StatusLine::error("Could not save a.txt"));
+        let (row, colors) = status_row(&mut app);
+        assert!(row.contains("checking out "), "{row:?}");
+        assert!(!row.contains("Could not"), "{row:?}");
+        assert!(!row.contains("checkout"), "{row:?}");
+        assert_eq!(color_at(&row, &colors, "checking out"), Color::Rgb(5, 5, 5));
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
@@ -3737,7 +3888,7 @@ mod tests {
         type_str(&mut app, "Inner change");
         ctrl(&mut app, 's');
         assert!(
-            app.status
+            status_text(&app)
                 .as_deref()
                 .is_some_and(|s| s.starts_with("Committed")),
             "{:?}",
@@ -4083,7 +4234,7 @@ mod tests {
             .unwrap();
         let (events, _events_rx) = std::sync::mpsc::channel();
         let mut app = App::new(Project::open(dir.path()).unwrap(), storage, events);
-        let status = app.status.clone().expect("reported");
+        let status = status_text(&app).expect("reported");
         assert!(status.contains("settings.toml"), "{status}");
         assert!(status.contains("search.max-results"), "{status}");
         assert_eq!(app.settings, Settings::default());
@@ -4215,7 +4366,8 @@ mod tests {
         let screen = draw(&mut again, 80, 20);
         assert!(screen[19].contains("▸ a… "), "{screen:#?}");
         ctrl(&mut again, 'b');
-        let status = again.status.take().unwrap_or_default();
+        let status = status_text(&again).unwrap_or_default();
+        again.status = None;
         assert!(
             status.contains("Still finding") && status.contains('a'),
             "{status}"
@@ -4366,7 +4518,7 @@ mod tests {
         app.build = BuildConfig::default();
         ctrl(&mut app, 'b');
         assert!(
-            app.status
+            status_text(&app)
                 .as_deref()
                 .unwrap_or("")
                 .contains("No build root"),
@@ -4430,7 +4582,10 @@ mod tests {
             "{screen:#?}"
         );
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.status.as_deref(), Some("No build roots to clean"));
+        assert_eq!(
+            status_text(&app).as_deref(),
+            Some("No build roots to clean")
+        );
         assert!(!app.tool_pane.is_visible());
 
         // Quit is a command as well.
@@ -4472,7 +4627,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(line(&app), 1);
         assert_eq!(
-            app.status.as_deref(),
+            status_text(&app).as_deref(),
             Some("Wrapped around to the first conflict in the file")
         );
 
@@ -4489,7 +4644,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(line(&app), 7);
         assert_eq!(
-            app.status.as_deref(),
+            status_text(&app).as_deref(),
             Some("Wrapped around to the last conflict in the file")
         );
         ctrl(&mut app, 'p');
@@ -4517,7 +4672,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(line(&app), 1);
         assert_eq!(
-            app.status.as_deref(),
+            status_text(&app).as_deref(),
             Some("No merge conflicts in this file")
         );
     }
@@ -4695,7 +4850,9 @@ mod tests {
         assert_eq!(app.focus, Focus::Tool, "so Ctrl+C reaches the job");
         assert_eq!(app.tool_pane.active().unwrap().kind(), ToolKind::Output);
         pump(&mut app, &events_rx, |app| {
-            app.status.as_deref().is_some_and(|s| s.contains("failed"))
+            status_text(app)
+                .as_deref()
+                .is_some_and(|s| s.contains("failed"))
         });
         let text = output_text(&app);
         for expected in [
@@ -4712,7 +4869,7 @@ mod tests {
         assert!(app.pending_steps.is_empty());
         assert!(!app.tool_pane.active().unwrap().is_running());
         assert_eq!(
-            app.status.as_deref(),
+            status_text(&app).as_deref(),
             Some("Test job: failed with exit code 3")
         );
         let screen = draw(&mut app, 60, 20);
@@ -4725,7 +4882,10 @@ mod tests {
         assert!(app.palette.is_some());
         press(&mut app, KeyCode::Esc);
         let screen = draw(&mut app, 100, 20);
-        assert!(screen[19].contains(OUTPUT_IDLE_HINT), "{screen:#?}");
+        assert!(
+            screen[19].contains(&StatusLine::help(OUTPUT_IDLE_HELP).text()),
+            "{screen:#?}"
+        );
         press(&mut app, KeyCode::Char('x'));
         assert!(
             app.tool_pane.is_visible(),
@@ -4745,7 +4905,7 @@ mod tests {
         assert!(app.tool_pane.is_visible());
         assert_eq!(app.focus, Focus::Tool);
         pump(&mut app, &events_rx, |app| {
-            app.status
+            status_text(app)
                 .as_deref()
                 .is_some_and(|s| s.contains("finished"))
         });
@@ -4812,7 +4972,10 @@ mod tests {
         let column = text.find("src/nope.rs").unwrap() as u16;
         click(&mut app, column, row as u16);
         assert_eq!(app.tabs.len(), 2);
-        assert_eq!(app.status.as_deref(), Some("Could not find src/nope.rs"));
+        assert_eq!(
+            status_text(&app).as_deref(),
+            Some("Could not find src/nope.rs")
+        );
     }
 
     // The shell tool spawns a real process, so these are unix-only and
@@ -5179,7 +5342,7 @@ mod tests {
         drag(&mut app, (x, y), (x + 6, y + 1));
         assert_eq!(app.clipboard.get().as_deref(), Some("hello world\nsecond"));
         assert_eq!(
-            app.status.as_deref(),
+            status_text(&app).as_deref(),
             Some("Copied 2 lines to the clipboard")
         );
         let screen = draw(&mut app, 40, 20);
@@ -5205,7 +5368,7 @@ mod tests {
         assert_eq!(app.prefix, None);
         assert_eq!(app.clipboard.get().as_deref(), Some("world"));
         assert_eq!(
-            app.status.as_deref(),
+            status_text(&app).as_deref(),
             Some("Copied 1 line to the clipboard")
         );
         assert_eq!(app.focus, Focus::Tool);
@@ -5842,7 +6005,7 @@ mod tests {
         assert!(app.status.is_none());
         ctrl(&mut app, 'g');
         assert_eq!(app.tabs[0].view.editor().selection(), Some(19..22));
-        assert!(app.status.as_deref().unwrap().contains("wrapped"));
+        assert!(status_text(&app).as_deref().unwrap().contains("wrapped"));
         ctrl(&mut app, 'g');
         assert_eq!(app.tabs[0].view.editor().selection(), Some(3..6));
         assert!(app.status.is_none());
@@ -6901,7 +7064,7 @@ mod tests {
         press(&mut app, KeyCode::Char('z'));
         ctrl(&mut app, 'w');
         assert_eq!(app.tabs.len(), 1);
-        assert!(app.status.as_deref().unwrap().contains("unsaved"));
+        assert!(status_text(&app).as_deref().unwrap().contains("unsaved"));
         ctrl(&mut app, 'w');
         assert!(app.tabs.is_empty());
 
@@ -6922,7 +7085,7 @@ mod tests {
             app.tabs[app.active].view.editor().buffer().to_text(),
             "one\ntwo\nthree\n"
         );
-        let status = app.status.clone().unwrap_or_default();
+        let status = status_text(&app).unwrap_or_default();
         assert!(
             status.contains("a.rs changed on disk: reloaded"),
             "{status}"
@@ -6940,7 +7103,7 @@ mod tests {
             app.tabs[app.active].view.editor().buffer().to_text(),
             "one\ntwo\n"
         );
-        let status = app.status.clone().unwrap_or_default();
+        let status = status_text(&app).unwrap_or_default();
         assert!(
             status.starts_with("Discarded unsaved changes to a.rs"),
             "{status}"
@@ -6982,7 +7145,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             app.tick();
         }
-        let status = app.status.clone().unwrap_or_default();
+        let status = status_text(&app).unwrap_or_default();
         assert!(
             status.contains("a.rs changed on disk: reloaded"),
             "{status}"

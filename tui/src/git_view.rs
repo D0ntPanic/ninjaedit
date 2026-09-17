@@ -140,6 +140,7 @@ use crate::diff_pane::{
 };
 use crate::git_layout::{GitLogLayout, MAIN_REPOSITORY, PaneSizes};
 use crate::palette::palette_background;
+use crate::status::StatusLine;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
@@ -176,15 +177,41 @@ const NOT_A_REPOSITORY: &str = "Not a git repository";
 const NOT_INITIALIZED: &str = "Submodule not initialized";
 const NO_COMMITS: &str = "No commits yet";
 const NO_BRANCHES: &str = "none";
-const SIDEBAR_HINT: &str =
-    "↑↓ branch · Enter go to · ←→ fold remote · F5 fetch · Tab pane · Ctrl+E leave";
-const LOG_HINT: &str =
-    "↑↓ commit · Enter files · Space checkout · ←→ sideways · F5 fetch · Tab pane · Ctrl+E leave";
-const PROMPT_HINT: &str = "Enter create branch and check out · Esc cancel";
-const FILES_HINT: &str =
-    "↑↓ file · Enter view · ←→ fold/unfold · F5 fetch · Tab pane · Ctrl+E leave";
-const CONTENT_HINT: &str =
-    "↑↓ scroll · ←→ sideways · ▲▼ buttons expand context · F5 fetch · Tab pane · Ctrl+E leave";
+/// The key bindings the status bar lists, pane by pane.
+const SIDEBAR_HELP: &[(&str, &str)] = &[
+    ("↑↓", "branch"),
+    ("Enter", "go to"),
+    ("←→", "fold remote"),
+    ("F5", "fetch"),
+    ("Tab", "pane"),
+    ("Ctrl+E", "leave"),
+];
+const LOG_HELP: &[(&str, &str)] = &[
+    ("↑↓", "commit"),
+    ("Enter", "files"),
+    ("Space", "checkout"),
+    ("←→", "sideways"),
+    ("F5", "fetch"),
+    ("Tab", "pane"),
+    ("Ctrl+E", "leave"),
+];
+const PROMPT_HELP: &[(&str, &str)] = &[("Enter", "create branch and check out"), ("Esc", "cancel")];
+const FILES_HELP: &[(&str, &str)] = &[
+    ("↑↓", "file"),
+    ("Enter", "view"),
+    ("←→", "fold/unfold"),
+    ("F5", "fetch"),
+    ("Tab", "pane"),
+    ("Ctrl+E", "leave"),
+];
+const CONTENT_HELP: &[(&str, &str)] = &[
+    ("↑↓", "scroll"),
+    ("←→", "sideways"),
+    ("▲▼", "expand context"),
+    ("F5", "fetch"),
+    ("Tab", "pane"),
+    ("Ctrl+E", "leave"),
+];
 
 /// Which pane has the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -453,9 +480,10 @@ impl GitLogTabs {
                 self.active = index;
                 self.active().go_to(jump.id);
             }
-            None => self
-                .active()
-                .set_notice(format!("No tab for submodule {}", jump.path)),
+            None => self.active().set_notice(StatusLine::error(format!(
+                "No tab for submodule {}",
+                jump.path
+            ))),
         }
     }
 
@@ -512,14 +540,14 @@ impl GitLogTabs {
     }
 
     /// What the status bar shows.
-    pub fn hint(&self) -> String {
+    pub fn hint(&self) -> StatusLine {
         self.active_view().map(GitLogView::hint).unwrap_or_default()
     }
 
     /// What the status bar is to say, once: how the shown page's fetch
     /// or checkout went, when one has finished since the last time this
     /// was asked.
-    pub fn take_notice(&mut self) -> Option<String> {
+    pub fn take_notice(&mut self) -> Option<StatusLine> {
         self.tabs[self.active]
             .view
             .as_mut()
@@ -551,7 +579,7 @@ pub struct GitLogView {
     checkout: Option<(Oid, CheckoutJob)>,
     /// What the status bar is to say, once: how a fetch or a checkout
     /// went.
-    notice: Option<String>,
+    notice: Option<StatusLine>,
     pane: Pane,
     side_rows: Vec<SideRow>,
     /// Which remotes are folded up; all of them to start with.
@@ -826,7 +854,10 @@ impl GitLogView {
             return false;
         }
         self.pending_jump = None;
-        self.notice = Some(format!("Commit {} is not in the log", short_id(id)));
+        self.notice = Some(StatusLine::error(format!(
+            "Commit {} is not in the log",
+            short_id(id)
+        )));
         true
     }
 
@@ -839,7 +870,7 @@ impl GitLogView {
             return;
         }
         let Some(history) = &self.history else {
-            self.notice = Some(self.no_history_message());
+            self.notice = Some(StatusLine::error(self.no_history_message()));
             return;
         };
         // A submodule diff on show that couldn't find its commits
@@ -860,7 +891,12 @@ impl GitLogView {
         };
         match Fetch::start(history.git_dir(), wanted) {
             Ok(fetch) => self.fetch = Some(fetch),
-            Err(err) => self.notice = Some(format!("Could not fetch: {}", err.message())),
+            Err(err) => {
+                self.notice = Some(StatusLine::error(format!(
+                    "Could not fetch: {}",
+                    err.message()
+                )));
+            }
         }
     }
 
@@ -885,9 +921,19 @@ impl GitLogView {
             return changed;
         }
         self.notice = Some(match self.fetch.take().and_then(Fetch::outcome) {
-            Some(Ok(report)) => report.summary(),
-            Some(Err(why)) => format!("Could not fetch: {why}"),
-            None => "Could not fetch: the fetch stopped".to_owned(),
+            // A remote that couldn't be fetched makes the report an
+            // error, whatever else went well.
+            Some(Ok(report)) => {
+                let failed = !report.failed.is_empty()
+                    || report.submodules.iter().any(|(_, r)| !r.failed.is_empty());
+                if failed {
+                    StatusLine::error(report.summary())
+                } else {
+                    StatusLine::info(report.summary())
+                }
+            }
+            Some(Err(why)) => StatusLine::error(format!("Could not fetch: {why}")),
+            None => StatusLine::error("Could not fetch: the fetch stopped"),
         });
         // A submodule's diff is read from the submodule's repository,
         // which the fetch may have filled in: build it again. A file's
@@ -1000,48 +1046,51 @@ impl GitLogView {
     }
 
     /// What the status bar shows for the page.
-    pub fn hint(&self) -> String {
+    pub fn hint(&self) -> StatusLine {
+        // Something under way has the bar to itself: it is what the
+        // user is waiting on, and the bindings have been seen.
         if let Some((id, job)) = &self.checkout {
             let id = short_id(*id);
-            return match job.progress() {
+            return StatusLine::progress(match job.progress() {
                 Some((written, total)) => {
-                    format!("checking out {id}… {written}/{total} files · {LOG_HINT}")
+                    format!("checking out {id}… {written}/{total} files")
                 }
-                None => format!("checking out {id}… · {LOG_HINT}"),
-            };
+                None => format!("checking out {id}…"),
+            });
+        }
+        if let Some(history) = &self.history
+            && history.is_loading()
+        {
+            return StatusLine::progress(format!("loading {} commits…", history.commits().len()));
+        }
+        if let Some(fresh) = &self.pending {
+            return StatusLine::progress(format!("refreshing {} commits…", fresh.commits().len()));
+        }
+        if let Some(fetch) = &self.fetch {
+            return StatusLine::progress(match fetch.current() {
+                Some(remote) => format!("fetching {remote}…"),
+                None => "fetching…".to_owned(),
+            });
         }
         if self.branch_prompt.is_some() {
-            return PROMPT_HINT.to_owned();
+            return StatusLine::help(PROMPT_HELP);
         }
-        let pane = match self.pane {
-            Pane::Sidebar => SIDEBAR_HINT,
-            Pane::Log => LOG_HINT,
-            Pane::Files => FILES_HINT,
-            Pane::Content => CONTENT_HINT,
-        };
-        match (&self.history, &self.pending, &self.fetch) {
-            (Some(history), _, _) if history.is_loading() => {
-                format!("loading {} commits… · {pane}", history.commits().len())
-            }
-            (_, Some(fresh), _) => {
-                format!("refreshing {} commits… · {pane}", fresh.commits().len())
-            }
-            (_, _, Some(fetch)) => match fetch.current() {
-                Some(remote) => format!("fetching {remote}… · {pane}"),
-                None => format!("fetching… · {pane}"),
-            },
-            _ => pane.to_owned(),
-        }
+        StatusLine::help(match self.pane {
+            Pane::Sidebar => SIDEBAR_HELP,
+            Pane::Log => LOG_HELP,
+            Pane::Files => FILES_HELP,
+            Pane::Content => CONTENT_HELP,
+        })
     }
 
     /// What the status bar is to say, once: how a fetch or a checkout
     /// went, or why a commit couldn't be gone to, when any has happened
     /// since the last time this was asked.
-    pub fn take_notice(&mut self) -> Option<String> {
+    pub fn take_notice(&mut self) -> Option<StatusLine> {
         self.notice.take()
     }
 
-    fn set_notice(&mut self, notice: String) {
+    fn set_notice(&mut self, notice: StatusLine) {
         self.notice = Some(notice);
     }
 
@@ -1205,13 +1254,13 @@ impl GitLogView {
                     });
                 }
                 None => {
-                    self.notice = Some(format!(
+                    self.notice = Some(StatusLine::error(format!(
                         "Submodule {} was removed: no commit to go to",
                         diff.path
-                    ));
+                    )));
                 }
             },
-            Some(Content::Failed(why)) => self.notice = Some(why.clone()),
+            Some(Content::Failed(why)) => self.notice = Some(StatusLine::error(why.clone())),
             _ => {}
         }
     }
@@ -1544,7 +1593,7 @@ impl GitLogView {
     /// status bar says what was done, or why it couldn't be.
     fn checkout_selected(&mut self) {
         if self.checkout.is_some() {
-            self.notice = Some("A checkout is under way".to_owned());
+            self.notice = Some(StatusLine::error("A checkout is under way"));
             return;
         }
         let Some(id) = self.selected_id() else {
@@ -1560,7 +1609,9 @@ impl GitLogView {
     fn start_checkout(&mut self, id: Oid, job: Result<CheckoutJob, CheckoutError>) {
         match job {
             Ok(job) => self.checkout = Some((id, job)),
-            Err(err) => self.notice = Some(format!("Could not check out: {err}")),
+            Err(err) => {
+                self.notice = Some(StatusLine::error(format!("Could not check out: {err}")))
+            }
         }
     }
 
@@ -1586,12 +1637,12 @@ impl GitLogView {
                     history.head() == Some(id)
                         && matches!(&how, Checkout::Branch(name) if history.head_branch() == Some(name))
                 });
-                self.notice = Some(match &how {
+                self.notice = Some(StatusLine::info(match &how {
                     Checkout::Branch(name) if already && submodules == 0 => {
                         format!("Already on {name}")
                     }
                     _ => how.summary(id, submodules),
-                });
+                }));
                 self.branch_prompt = None;
                 self.checked_out = true;
                 self.refresh();
@@ -1608,9 +1659,13 @@ impl GitLogView {
             }
             Some(CheckoutOutcome::Failed(err)) => {
                 self.branch_prompt = None;
-                self.notice = Some(format!("Could not check out: {err}"));
+                self.notice = Some(StatusLine::error(format!("Could not check out: {err}")));
             }
-            None => self.notice = Some("Could not check out: the checkout stopped".to_owned()),
+            None => {
+                self.notice = Some(StatusLine::error(
+                    "Could not check out: the checkout stopped",
+                ));
+            }
         }
         true
     }
@@ -2638,6 +2693,15 @@ fn date_line(label: &str, time: ninjaedit_core::git::CommitTime) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The page's notice, as text.
+    fn notice_of(view: &mut GitLogView) -> Option<String> {
+        view.take_notice().map(|notice| notice.text())
+    }
+
+    fn notice_of_tabs(tabs: &mut GitLogTabs) -> Option<String> {
+        tabs.take_notice().map(|notice| notice.text())
+    }
+
     use super::*;
     use crate::commit_row::HEAD_NODE;
     use crate::diff_pane::HSCROLL_SLACK;
@@ -3091,7 +3155,7 @@ mod tests {
             screen.iter().any(|r| r.contains("Inner three")),
             "{screen:#?}"
         );
-        assert!(tabs.take_notice().is_none());
+        assert!(notice_of_tabs(&mut tabs).is_none());
 
         // Back on the main tab, the commit that added the submodule
         // (and `.gitmodules` with it): a double-click on `sub` goes to
@@ -3176,7 +3240,7 @@ mod tests {
         assert_eq!(tabs.active_index(), 1);
         wait_tabs(&mut tabs);
         assert_eq!(
-            tabs.take_notice().as_deref(),
+            notice_of_tabs(&mut tabs).as_deref(),
             Some(format!("Commit {} is not in the log", short_id(subs[2])).as_str())
         );
         assert_ne!(tabs.active().selected_commit(), Some(subs[2]));
@@ -3849,14 +3913,14 @@ mod tests {
         let row = screen.iter().position(|r| r.contains("On main")).unwrap();
         assert!(row_with(&screen, "a.rs").contains("+1"), "{screen:#?}");
         assert!(screen.iter().any(|r| r.contains("two();")), "{screen:#?}");
-        assert!(!view.hint().contains("refreshing"));
+        assert!(!view.hint().text().contains("refreshing"));
 
         // A commit made meanwhile. Until the refresh is done, the page
         // is as it was, and says it is refreshing.
         commit_on_head(&dir, "n.txt", "new\n", "After the merge");
         view.refresh();
         assert!(view.is_loading());
-        assert!(view.hint().contains("refreshing"), "{}", view.hint());
+        assert!(view.hint().text().contains("refreshing"), "{}", view.hint());
         let screen = draw(&mut view, 110, 24);
         assert_eq!(view.selected_commit(), Some(b));
         assert!(
@@ -3867,7 +3931,11 @@ mod tests {
 
         // Done: the same commit on the same row, its file still shown.
         wait(&mut view);
-        assert!(!view.hint().contains("refreshing"), "{}", view.hint());
+        assert!(
+            !view.hint().text().contains("refreshing"),
+            "{}",
+            view.hint()
+        );
         let screen = draw(&mut view, 110, 24);
         assert_eq!(view.selected_commit(), Some(b));
         assert_eq!(view.history.as_ref().unwrap().commits().len(), 5);
@@ -3986,13 +4054,13 @@ mod tests {
         // upstream's branches and tags come in, and the page refreshes
         // where it was, with what came of it for the status bar.
         view.handle_key(key(KeyCode::F(5)), &mut Clipboard::new());
-        assert!(view.hint().contains("fetching"), "{}", view.hint());
+        assert!(view.hint().text().contains("fetching"), "{}", view.hint());
         wait(&mut view);
-        assert!(!view.hint().contains("fetching"), "{}", view.hint());
-        let notice = view.take_notice().unwrap();
+        assert!(!view.hint().text().contains("fetching"), "{}", view.hint());
+        let notice = notice_of(&mut view).unwrap();
         // origin's two branches and its tag.
         assert_eq!(notice, "Fetched origin: 3 refs updated");
-        assert_eq!(view.take_notice(), None);
+        assert_eq!(notice_of(&mut view), None);
         assert_eq!(view.selected_commit(), Some(local));
         assert_eq!(view.pane, Pane::Files);
         let screen = draw(&mut view, 110, 24);
@@ -4009,7 +4077,7 @@ mod tests {
         view.handle_key(key(KeyCode::F(5)), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
-            view.take_notice().as_deref(),
+            notice_of(&mut view).as_deref(),
             Some("Fetched origin: up to date")
         );
         // A commit upstream is fetched and shown.
@@ -4017,7 +4085,7 @@ mod tests {
         view.handle_key(key(KeyCode::F(5)), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
-            view.take_notice().as_deref(),
+            notice_of(&mut view).as_deref(),
             Some("Fetched origin: 1 ref updated")
         );
         view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
@@ -4093,7 +4161,7 @@ mod tests {
         view.handle_key(key(KeyCode::F(5)), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
-            view.take_notice().as_deref(),
+            notice_of(&mut view).as_deref(),
             Some("Fetched origin: 1 ref updated")
         );
         view.jump_to(bump);
@@ -4117,7 +4185,7 @@ mod tests {
             .unwrap();
         view.handle_key(key(KeyCode::F(5)), &mut Clipboard::new());
         wait(&mut view);
-        let notice = view.take_notice().unwrap();
+        let notice = notice_of(&mut view).unwrap();
         assert!(
             notice.starts_with("Fetched origin: up to date · sub: Fetched origin: "),
             "{notice}"
@@ -4141,7 +4209,7 @@ mod tests {
         view.handle_key(key(KeyCode::F(5)), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
-            view.take_notice().as_deref(),
+            notice_of(&mut view).as_deref(),
             Some("No remotes to fetch from")
         );
 
@@ -4149,7 +4217,7 @@ mod tests {
         let mut view = GitLogView::new(dir.path());
         view.handle_key(key(KeyCode::F(5)), &mut Clipboard::new());
         assert!(!view.is_loading());
-        let notice = view.take_notice().unwrap();
+        let notice = notice_of(&mut view).unwrap();
         assert!(notice.starts_with(NOT_A_REPOSITORY), "{notice}");
     }
 
@@ -4200,18 +4268,19 @@ mod tests {
         // says what is going on until it is done.
         assert!(
             view.hint()
+                .text()
                 .starts_with(&format!("checking out {}…", short_id(s))),
             "{}",
             view.hint()
         );
         view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
         assert_eq!(
-            view.take_notice().as_deref(),
+            notice_of(&mut view).as_deref(),
             Some("A checkout is under way")
         );
         wait(&mut view);
-        assert_eq!(view.hint(), LOG_HINT);
-        assert_eq!(view.take_notice().as_deref(), Some("Checked out side"));
+        assert_eq!(view.hint(), StatusLine::help(LOG_HELP));
+        assert_eq!(notice_of(&mut view).as_deref(), Some("Checked out side"));
         assert_eq!(head_of(&dir), (Some("side".to_owned()), s));
         assert_eq!(
             fs::read_to_string(dir.path().join("s.txt")).unwrap(),
@@ -4229,7 +4298,7 @@ mod tests {
         view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
-            view.take_notice().as_deref(),
+            notice_of(&mut view).as_deref(),
             Some(format!("HEAD detached at {}", short_id(b)).as_str())
         );
         assert_eq!(head_of(&dir), (None, b));
@@ -4253,7 +4322,7 @@ mod tests {
         view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
-            view.take_notice().as_deref(),
+            notice_of(&mut view).as_deref(),
             Some(format!("Checked out {main}").as_str())
         );
         assert_eq!(head_of(&dir), (Some(main.clone()), m));
@@ -4261,7 +4330,7 @@ mod tests {
         view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
-            view.take_notice().as_deref(),
+            notice_of(&mut view).as_deref(),
             Some(format!("Already on {main}").as_str())
         );
         assert_eq!(head_of(&dir), (Some(main), m));
@@ -4290,7 +4359,7 @@ mod tests {
         tabs.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         tabs.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
         wait_tabs(&mut tabs);
-        let notice = tabs.take_notice().unwrap();
+        let notice = notice_of_tabs(&mut tabs).unwrap();
         assert!(notice.ends_with("; 1 submodule updated"), "{notice}");
         assert_eq!(head_of_repo(&sub), (Some("old".to_owned()), s1));
         assert_eq!(
@@ -4310,7 +4379,7 @@ mod tests {
         tabs.handle_key(key(KeyCode::Up), &mut Clipboard::new());
         tabs.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
         wait_tabs(&mut tabs);
-        let notice = tabs.take_notice().unwrap();
+        let notice = notice_of_tabs(&mut tabs).unwrap();
         assert!(notice.ends_with("; 1 submodule updated"), "{notice}");
         assert_eq!(head_of_repo(&sub), (Some(sub_main), s3));
         wait_tabs(&mut tabs);
@@ -4321,7 +4390,7 @@ mod tests {
         tabs.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
         wait_tabs(&mut tabs);
         assert_eq!(
-            tabs.take_notice().as_deref(),
+            notice_of_tabs(&mut tabs).as_deref(),
             Some(
                 "Could not check out: in submodule sub: unstaged changes would be lost; \
                  commit or stash them first"
@@ -4354,12 +4423,16 @@ mod tests {
         click(&mut view, column, row);
         assert_eq!(view.selected_commit(), Some(s));
         assert_eq!(head_of(&dir).1, m);
-        assert_eq!(view.take_notice(), None);
+        assert_eq!(notice_of(&mut view), None);
         click(&mut view, column, row);
         // The checkout is under way, and the status bar says so.
-        assert!(view.hint().starts_with("checking out "), "{}", view.hint());
+        assert!(
+            view.hint().text().starts_with("checking out "),
+            "{}",
+            view.hint()
+        );
         wait(&mut view);
-        assert_eq!(view.take_notice().as_deref(), Some("Checked out side"));
+        assert_eq!(notice_of(&mut view).as_deref(), Some("Checked out side"));
         assert_eq!(head_of(&dir), (Some("side".to_owned()), s));
         wait(&mut view);
     }
@@ -4377,7 +4450,7 @@ mod tests {
         view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
-            view.take_notice().as_deref(),
+            notice_of(&mut view).as_deref(),
             Some("Could not check out: unstaged changes would be lost; commit or stash them first")
         );
         assert_eq!(head_of(&dir), (Some(main), m));
@@ -4404,7 +4477,7 @@ mod tests {
         view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
-            view.take_notice().as_deref(),
+            notice_of(&mut view).as_deref(),
             Some("Checked out new branch feature tracking origin/feature")
         );
         assert_eq!(head_of(&dir), (Some("feature".to_owned()), b));
@@ -4476,7 +4549,7 @@ mod tests {
         view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
-            view.take_notice().as_deref(),
+            notice_of(&mut view).as_deref(),
             Some("Fast-forwarded side to origin/side and checked it out")
         );
         let (branch, at) = head_of(&dir);
@@ -4501,7 +4574,7 @@ mod tests {
         view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
-            view.take_notice().as_deref(),
+            notice_of(&mut view).as_deref(),
             Some(
                 format!(
                     "Could not check out: {main} is ahead of origin/{main} by 2 commits; \
@@ -4536,7 +4609,7 @@ mod tests {
         view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
         wait(&mut view);
         assert!(view.branch_prompt.is_some());
-        assert_eq!(view.hint(), PROMPT_HINT);
+        assert_eq!(view.hint(), StatusLine::help(PROMPT_HELP));
         let screen = draw(&mut view, 110, 24);
         assert!(
             screen.iter().any(|r| r.contains("Name for the new branch")),
@@ -4553,7 +4626,7 @@ mod tests {
         view.handle_key(key(KeyCode::Esc), &mut Clipboard::new());
         assert!(view.branch_prompt.is_none());
         assert_eq!(head_of(&dir), (Some(main.clone()), m));
-        assert_eq!(view.take_notice(), None);
+        assert_eq!(notice_of(&mut view), None);
 
         // A name that won't do keeps the box open and says why.
         view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
@@ -4594,7 +4667,7 @@ mod tests {
         wait(&mut view);
         assert!(view.branch_prompt.is_none());
         assert_eq!(
-            view.take_notice().as_deref(),
+            notice_of(&mut view).as_deref(),
             Some("Checked out new branch mine tracking origin/other")
         );
         assert_eq!(head_of(&dir), (Some("mine".to_owned()), a));
@@ -4610,7 +4683,7 @@ mod tests {
         );
         wait(&mut view);
         assert_eq!(view.history.as_ref().unwrap().head_branch(), Some("mine"));
-        assert_eq!(view.hint(), LOG_HINT);
+        assert_eq!(view.hint(), StatusLine::help(LOG_HELP));
 
         // A click outside the box closes it too.
         view.handle_key(key(KeyCode::Home), &mut Clipboard::new());
@@ -4624,7 +4697,7 @@ mod tests {
         // main points at the merge too, so it wins: no box.
         assert!(view.branch_prompt.is_none());
         assert_eq!(
-            view.take_notice().as_deref(),
+            notice_of(&mut view).as_deref(),
             Some(format!("Checked out {main}").as_str())
         );
     }

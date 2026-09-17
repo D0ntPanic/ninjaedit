@@ -28,6 +28,15 @@
 //! `terminal-bright-white`, and underlines the source locations in
 //! compiler output in `terminal-link`.
 //!
+//! The status bar says one of a few kinds of thing on its left, each in
+//! its own color so that the kind can be told at a glance: the file
+//! being edited or a message about something that happened
+//! (`status-bar-filename-text`), the key bindings of the page showing
+//! (the keys in `status-bar-key-text`, what they do in
+//! `status-bar-help-text`), something that couldn't be done
+//! (`status-bar-error-text`), or something under way that the user is
+//! waiting on (`status-bar-progress-text`).
+//!
 //! A few colors are optional, such as `selection-text`: leaving one out
 //! (or setting it to `""`, to undo the default) means the interface falls
 //! back to a related color instead, or to drawing nothing extra: the
@@ -225,9 +234,20 @@ required {
     /// The scrollbar thumb.
     scroll_bar_color => "scroll-bar-color",
     status_bar_background => "status-bar-background",
+    /// The file being edited, and a message about something that
+    /// happened.
     status_bar_filename_text => "status-bar-filename-text",
     status_bar_position_text => "status-bar-position-text",
     status_bar_project_text => "status-bar-project-text",
+    /// The keys in the key bindings a page lists in the status bar.
+    status_bar_key_text => "status-bar-key-text",
+    /// What those keys do.
+    status_bar_help_text => "status-bar-help-text",
+    /// A message about something that couldn't be done.
+    status_bar_error_text => "status-bar-error-text",
+    /// Something under way that the user is waiting on, such as a
+    /// fetch or a checkout, which has the bar to itself meanwhile.
+    status_bar_progress_text => "status-bar-progress-text",
     command_palette_background => "command-palette-background",
     /// The border around the palette.
     command_palette_box_color => "command-palette-box-color",
