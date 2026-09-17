@@ -34,7 +34,9 @@
 //! A submodule whose commit a local branch of its own points at is put
 //! on that branch (its current branch when that is one of them),
 //! rather than left with HEAD detached; with no branch there, HEAD is
-//! detached. The submodules are checked before anything moves: one
+//! detached. A submodule already at its commit is left as it is, HEAD
+//! and all, so nothing in it is written; its own submodules are still
+//! seen to. The submodules are checked before anything moves: one
 //! with changes of its own, or without the commit (not fetched yet),
 //! refuses the whole checkout and is named. A submodule that isn't
 //! initialized is left alone, as git leaves it.
@@ -405,8 +407,9 @@ fn check_submodules(repo: &Repository, commit: &git2::Commit<'_>) -> Result<(), 
 
 /// Bring every initialized submodule of a commit to the commit it
 /// points it at, on a local branch of its own that points there if
-/// there is one, and its own submodules likewise. Returns how many
-/// were moved, nested ones included.
+/// there is one, and its own submodules likewise. One already at its
+/// commit is left as it is. Returns how many were moved, nested ones
+/// included.
 fn update_submodules(
     repo: &Repository,
     commit: &git2::Commit<'_>,
@@ -418,14 +421,27 @@ fn update_submodules(
             continue;
         };
         updated += in_submodule(&path, || {
+            if head_is_at(&sub, id) {
+                // Already there: its index and working tree are left
+                // untouched (a checkout would rewrite the index even
+                // with nothing to do), but its own submodules may
+                // still be behind.
+                return update_submodules(&sub, &sub.find_commit(id)?, progress);
+            }
             let how = match local_branch_at(&sub, id)? {
                 Some(name) => Checkout::Branch(name),
                 None => Checkout::Detached,
             };
-            how.run_with(&sub, id, progress)
-        })? + 1;
+            Ok(how.run_with(&sub, id, progress)? + 1)
+        })?;
     }
     Ok(updated)
+}
+
+/// Whether a repository's HEAD is at `id`: on a branch there, or
+/// detached there. An unborn HEAD is not.
+fn head_is_at(repo: &Repository, id: Oid) -> bool {
+    repo.head().ok().and_then(|head| head.target()) == Some(id)
 }
 
 /// How a [`CheckoutJob`] ended.
@@ -1181,6 +1197,61 @@ mod tests {
         assert_eq!(updated, 2);
         assert_eq!(head_of(&inner).1, i2);
         assert!(!head_of(&inner).2);
+    }
+
+    #[test]
+    fn a_submodule_already_at_its_commit_is_left_alone() {
+        let mut t = TestRepo::new();
+        t.commit(&[("f.txt", "one\n")], "One", &[]);
+        let sub = t.add_submodule("sub");
+        let inner = crate::git::history::tests::add_submodule_to(&sub, "inner");
+        let i1 = inner.head().unwrap().target().unwrap();
+        stage_submodule(&t.repo, "sub");
+        let p1 = commit_index(&t.repo, "Sub with inner");
+        let s1 = sub.head().unwrap().target().unwrap();
+        // A commit that changes a file but not the submodule.
+        let p2 = t.commit(&[("f.txt", "two\n")], "Two", &[p1]);
+        // And one that moves the nested submodule on, and so the
+        // submodule, but leaves the working tree at the old commits.
+        let i2 = commit_in(&inner, "deep.txt", "two\n", "Deep two");
+        stage_submodule(&sub, "inner");
+        let s2 = commit_index(&sub, "Bump inner");
+        stage_submodule(&t.repo, "sub");
+        let p3 = commit_index(&t.repo, "Bump sub");
+        let main = head_of(&t.repo).0.unwrap();
+        Checkout::Detached.run(&t.repo, p1).unwrap();
+        assert_eq!((head_of(&sub).1, head_of(&inner).1), (s1, i1));
+
+        // The submodule's HEAD detached at its commit, with a branch
+        // there that a checkout would put it on, and its index locked
+        // as a crashed process leaves it: a checkout in it would fail,
+        // so leaving it alone is what makes these go through.
+        sub.set_head_detached(s1).unwrap();
+        let lock = sub.path().join("index.lock");
+        fs::write(&lock, "").unwrap();
+
+        let updated = Checkout::Detached.run(&t.repo, p2).unwrap();
+        assert_eq!(updated, 0);
+        assert_eq!(head_of(&sub), (None, s1, true));
+        assert_eq!(fs::read_to_string(t.path().join("f.txt")).unwrap(), "two\n");
+        let updated = Checkout::Detached.run(&t.repo, p1).unwrap();
+        assert_eq!(updated, 0);
+        assert_eq!(head_of(&sub), (None, s1, true));
+        assert!(lock.exists());
+
+        // A nested submodule that fell behind is still brought along,
+        // though its parent is left alone.
+        fs::remove_file(&lock).unwrap();
+        sub.set_head_detached(s2).unwrap();
+        sub.checkout_head(Some(CheckoutBuilder::new().force()))
+            .unwrap();
+        assert_eq!(head_of(&inner).1, i1, "the checkout doesn't recurse");
+        fs::write(&lock, "").unwrap();
+        let updated = Checkout::Branch(main).run(&t.repo, p3).unwrap();
+        assert_eq!(updated, 1, "only the nested submodule moved");
+        assert_eq!(head_of(&sub), (None, s2, true));
+        assert_eq!(head_of(&inner).1, i2);
+        assert!(lock.exists());
     }
 
     #[test]
