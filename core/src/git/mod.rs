@@ -10,15 +10,20 @@
 //! committing. The [`fetch`] module brings the remote-tracking
 //! references up to date from the remotes, as `git fetch` does, and
 //! those of the submodules that need it, as `git fetch`'s on-demand
-//! recursion does.
+//! recursion does. The [`checkout`] module moves HEAD, and the working
+//! tree with it, to a commit picked from the log, on to whatever
+//! branch points there.
 //! Everything goes through libgit2, by way of the `git2` crate; nothing
 //! shells out to git.
 //!
-//! Only the [`changes`] and [`fetch`] modules change the repository,
-//! and only its index, HEAD, and remote-tracking references: nothing
-//! here touches the working directory's files or a local branch.
+//! Only the [`changes`], [`fetch`], and [`checkout`] modules change the
+//! repository. The first two touch only its index, HEAD, and
+//! remote-tracking references; a checkout also rewrites the working
+//! directory's files and may make a local branch, and refuses to while
+//! there are changes it could lose.
 
 pub mod changes;
+pub mod checkout;
 pub mod diff;
 pub mod fetch;
 pub mod graph;
@@ -27,6 +32,7 @@ pub mod submodules;
 pub mod tree;
 
 pub use changes::Changes;
+pub use checkout::{Checkout, CheckoutError, CheckoutJob, CheckoutOutcome, CheckoutPlan};
 pub use diff::{
     ChangeKind, CommitDetail, DiffLine, DiffRow, FileChange, FileDiff, LineKind, Person, Side,
     Unshown,

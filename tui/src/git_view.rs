@@ -12,9 +12,11 @@
 //! commit, then its message; the second its author, its abbreviated id,
 //! and when it was made. Each starts right after its own part of the
 //! graph rather than in one column for the whole log, so that a few
-//! wide rows don't push every message right. The commit HEAD is on is bold and in the
-//! theme's `git-head-text`, and is where the log opens, once the walk
-//! (see the core crate's `git::history` module) reaches it.
+//! wide rows don't push every message right. The commit HEAD is on is
+//! bold and in the theme's `git-head-text`, says `HEAD →` before the
+//! branch HEAD is on (or `HEAD` alone when HEAD is detached), and is
+//! where the log opens, once the walk (see the core crate's
+//! `git::history` module) reaches it.
 //!
 //! Below the log, the left pane lists `Description` and then every file
 //! the selected commit changed, as a tree of directories (see the core
@@ -44,8 +46,9 @@
 //! and Enter goes to the branch's commit in the log. In the log ↑ and ↓
 //! move between commits (Page Up and Page Down by a screenful, Home and
 //! End to the ends), ← and → scroll the messages sideways (← at the
-//! left edge goes back to the sidebar), and Enter moves on to the
-//! files. In the files ↑ and ↓ choose what the right pane shows,
+//! left edge goes back to the sidebar), Enter moves on to the
+//! files, and Space (or a double-click) checks the commit out. In the
+//! files ↑ and ↓ choose what the right pane shows,
 //! Enter, → or a double-click on a file moves into it, ← on a file
 //! goes to its directory, and ← at the top of the tree goes back to
 //! the log. In the diff the arrows scroll, Page Up and Page Down by a
@@ -103,11 +106,33 @@
 //! have, and the one whose diff is on show if it couldn't find its
 //! commits. F5 during one does nothing.
 //!
-//! Beyond fetching, the page only looks at the repository: checking
-//! out a branch or commit will come later.
+//! Space or a double-click on a commit in the log checks it out: HEAD
+//! moves there, and the working tree with it, as the core crate's
+//! `git::checkout` module does it. A branch pointing at the commit is
+//! checked out, so that commits made from there go on the branch. When
+//! only a remote's branch points there, the local branch tracking it
+//! is fast-forwarded to the commit and checked out if it is merely
+//! behind (one that is ahead, or has diverged, refuses: that needs a
+//! merge, which will come later); with no branch tracking it, a local
+//! branch of the same name is made tracking it, and if a local branch
+//! by that name already exists elsewhere a box over the log asks for
+//! another name (see the `branch_prompt` module). With nothing
+//! pointing at the commit, HEAD is detached there. The commit's
+//! submodules follow, each on to a local branch of its own that points
+//! at its new commit if there is one. Changes to tracked files, staged
+//! or not, in the repository or a submodule, refuse the checkout,
+//! since it could lose them; the status bar says so, as it says what
+//! was checked out and how many submodules came along. The checkout
+//! runs in the background, as a fetch does, with the status bar saying
+//! which commit is being checked out and how many files are written
+//! so far; Space or a double-click meanwhile says one is under way. The
+//! page then refreshes, as it does when coming back, so the HEAD marker
+//! moves to the commit; the submodules' tabs refresh when next shown.
 
+use crate::branch_prompt::{BranchPrompt, BranchPromptOutcome};
 use crate::clicks::ClickTracker;
-use crate::commit_row::{CommitLine, commit_extent, draw_commit_line, lane_cap};
+use crate::clipboard::Clipboard;
+use crate::commit_row::{CommitLine, Highlight, commit_extent, draw_commit_line, lane_cap};
 use crate::diff_pane::{
     Button, HScroll, Piece, WHEEL_COLUMNS, WHEEL_LINES, clamp_between, content_background,
     diff_extent, display_width, draw_cells, fit_end, layout_cells, render_diff, share_for,
@@ -118,8 +143,8 @@ use crate::palette::palette_background;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
-    ChangeKind, CommitDetail, Fetch, FileDiff, FileTree, History, Oid, TreeRow, short_id,
-    submodules,
+    ChangeKind, Checkout, CheckoutError, CheckoutJob, CheckoutOutcome, CommitDetail, Fetch,
+    FileDiff, FileTree, History, Oid, TreeRow, short_id, submodules,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
@@ -153,7 +178,9 @@ const NO_COMMITS: &str = "No commits yet";
 const NO_BRANCHES: &str = "none";
 const SIDEBAR_HINT: &str =
     "↑↓ branch · Enter go to · ←→ fold remote · F5 fetch · Tab pane · Ctrl+E leave";
-const LOG_HINT: &str = "↑↓ commit · Enter files · ←→ sideways · F5 fetch · Tab pane · Ctrl+E leave";
+const LOG_HINT: &str =
+    "↑↓ commit · Enter files · Space checkout · ←→ sideways · F5 fetch · Tab pane · Ctrl+E leave";
+const PROMPT_HINT: &str = "Enter create branch and check out · Esc cancel";
 const FILES_HINT: &str =
     "↑↓ file · Enter view · ←→ fold/unfold · F5 fetch · Tab pane · Ctrl+E leave";
 const CONTENT_HINT: &str =
@@ -322,6 +349,14 @@ impl GitLogTabs {
     /// are now, keeping the pages of those still there; a shown tab
     /// whose submodule is gone gives way to the main repository's.
     pub fn refresh(&mut self) {
+        self.rescan();
+        self.active();
+    }
+
+    /// Read the submodules again and mark every page as due a refresh
+    /// when next shown (the shown one included, until [`active`](Self::active)
+    /// is next asked for it).
+    fn rescan(&mut self) {
         let root = self.tabs[0].workdir.clone();
         let shown = self.tabs[self.active].title.clone();
         let mut old: Vec<GitTab> = self.tabs.drain(1..).collect();
@@ -344,7 +379,18 @@ impl GitLogTabs {
             .iter()
             .position(|tab| tab.title == shown)
             .unwrap_or(0);
-        self.active();
+    }
+
+    /// After a checkout on the shown page (which finishes in a poll)
+    /// that has refreshed itself:
+    /// the submodules may have moved with it, or come and gone, so the
+    /// tabs are read again and the other pages made due a refresh.
+    fn follow_checkout(&mut self) {
+        if !self.active().take_checked_out() {
+            return;
+        }
+        self.rescan();
+        self.tabs[self.active].stale = false;
     }
 
     /// The pane sizes of every repository, to keep.
@@ -354,9 +400,15 @@ impl GitLogTabs {
 
     /// Give the shown page a key, and go where it asks (see
     /// [`follow_submodule`](Self::follow_submodule)).
-    pub fn handle_key(&mut self, key: KeyEvent) {
-        self.active().handle_key(key);
+    pub fn handle_key(&mut self, key: KeyEvent, clipboard: &mut Clipboard) {
+        self.active().handle_key(key, clipboard);
+        self.follow_checkout();
         self.follow_submodule();
+    }
+
+    /// Add pasted text to the shown page's branch name box, if open.
+    pub fn paste(&mut self, text: &str) {
+        self.active().paste(text);
     }
 
     /// Give the shown page a mouse event, and go where it asks (see
@@ -373,6 +425,7 @@ impl GitLogTabs {
                 self.layout.set(&key, sizes);
             }
         }
+        self.follow_checkout();
         self.follow_submodule();
         resized
     }
@@ -453,7 +506,9 @@ impl GitLogTabs {
     /// Take in commits the shown page's walk has produced. Returns
     /// whether the page needs redrawing.
     pub fn poll(&mut self) -> bool {
-        self.active().poll()
+        let polled = self.active().poll();
+        self.follow_checkout();
+        polled
     }
 
     /// What the status bar shows.
@@ -462,7 +517,8 @@ impl GitLogTabs {
     }
 
     /// What the status bar is to say, once: how the shown page's fetch
-    /// went, when one has finished since the last time this was asked.
+    /// or checkout went, when one has finished since the last time this
+    /// was asked.
     pub fn take_notice(&mut self) -> Option<String> {
         self.tabs[self.active]
             .view
@@ -490,7 +546,11 @@ pub struct GitLogView {
     pending: Option<History>,
     /// A fetch under way (F5); the page refreshes once it is done.
     fetch: Option<Fetch>,
-    /// What the status bar is to say, once: how a fetch went.
+    /// A checkout under way (Space or a double-click in the log), of
+    /// which commit; the page refreshes once it is done.
+    checkout: Option<(Oid, CheckoutJob)>,
+    /// What the status bar is to say, once: how a fetch or a checkout
+    /// went.
     notice: Option<String>,
     pane: Pane,
     side_rows: Vec<SideRow>,
@@ -555,11 +615,17 @@ pub struct GitLogView {
     files_rule: Rect,
     /// The expand buttons drawn in the content pane, to hit-test clicks.
     buttons: Vec<(Rect, Button)>,
-    /// Presses in the file list, to notice a double-click.
+    /// Presses in the log and the file list, to notice a double-click.
     clicks: ClickTracker,
     /// A commit of a submodule to show on the submodule's tab, asked
     /// for and not yet taken (see [`take_submodule_jump`](Self::take_submodule_jump)).
     submodule_jump: Option<SubmoduleJump>,
+    /// The box asking for a new branch's name, while a checkout waits
+    /// on one.
+    branch_prompt: Option<BranchPrompt>,
+    /// Whether a checkout has been done and not yet noticed by the
+    /// tabs (see [`take_checked_out`](Self::take_checked_out)).
+    checked_out: bool,
 }
 
 impl GitLogView {
@@ -592,6 +658,7 @@ impl GitLogView {
             error: None,
             pending: None,
             fetch: None,
+            checkout: None,
             notice: None,
             pane: Pane::Log,
             side_rows: Vec::new(),
@@ -634,6 +701,8 @@ impl GitLogView {
             buttons: Vec::new(),
             clicks: ClickTracker::default(),
             submodule_jump: None,
+            branch_prompt: None,
+            checked_out: false,
         };
         view.install(GitLogView::open_history(root, exact));
         view
@@ -706,7 +775,8 @@ impl GitLogView {
     /// Take in commits the walk has produced, and the refresh's once
     /// it is done. Returns whether the page needs redrawing.
     pub fn poll(&mut self) -> bool {
-        let fetched = self.poll_fetch();
+        let checked_out = self.poll_checkout();
+        let fetched = self.poll_fetch() || checked_out;
         let refreshed = self.poll_refresh() || fetched;
         let Some(history) = &mut self.history else {
             return refreshed;
@@ -931,6 +1001,18 @@ impl GitLogView {
 
     /// What the status bar shows for the page.
     pub fn hint(&self) -> String {
+        if let Some((id, job)) = &self.checkout {
+            let id = short_id(*id);
+            return match job.progress() {
+                Some((written, total)) => {
+                    format!("checking out {id}… {written}/{total} files · {LOG_HINT}")
+                }
+                None => format!("checking out {id}… · {LOG_HINT}"),
+            };
+        }
+        if self.branch_prompt.is_some() {
+            return PROMPT_HINT.to_owned();
+        }
         let pane = match self.pane {
             Pane::Sidebar => SIDEBAR_HINT,
             Pane::Log => LOG_HINT,
@@ -952,9 +1034,9 @@ impl GitLogView {
         }
     }
 
-    /// What the status bar is to say, once: how a fetch went, or why
-    /// a commit couldn't be gone to, when either has happened since
-    /// the last time this was asked.
+    /// What the status bar is to say, once: how a fetch or a checkout
+    /// went, or why a commit couldn't be gone to, when any has happened
+    /// since the last time this was asked.
     pub fn take_notice(&mut self) -> Option<String> {
         self.notice.take()
     }
@@ -985,12 +1067,14 @@ impl GitLogView {
         self.selected_id()
     }
 
-    /// Whether the walk, or a refresh's, or a fetch is still going.
+    /// Whether the walk, or a refresh's, or a fetch, or a checkout is
+    /// still going.
     #[cfg(test)]
     pub fn is_loading(&self) -> bool {
         self.history.as_ref().is_some_and(History::is_loading)
             || self.pending.is_some()
             || self.fetch.is_some()
+            || self.checkout.is_some()
     }
 
     /// Where the rule under the log was drawn.
@@ -1421,7 +1505,7 @@ impl GitLogView {
             .take(rows.div_ceil(2))
             .map(|commit| {
                 let lanes = commit.graph.width().clamp(1, cap);
-                commit_extent(commit, head == Some(commit.id), lanes)
+                commit_extent(commit, Highlight::head_if(head == Some(commit.id)), lanes)
             })
             .max()
             .unwrap_or(0)
@@ -1452,7 +1536,132 @@ impl GitLogView {
 
     // ----- Input ----------------------------------------------------------
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    // ----- Checking out --------------------------------------------------
+
+    /// Space or a double-click in the log: check the selected commit
+    /// out (see the core crate's `git::checkout` module), or open the
+    /// box asking for a new branch's name when one is wanted. The
+    /// status bar says what was done, or why it couldn't be.
+    fn checkout_selected(&mut self) {
+        if self.checkout.is_some() {
+            self.notice = Some("A checkout is under way".to_owned());
+            return;
+        }
+        let Some(id) = self.selected_id() else {
+            return;
+        };
+        let Some(history) = &self.history else {
+            return;
+        };
+        self.start_checkout(id, CheckoutJob::start(history.git_dir(), id));
+    }
+
+    /// Keep a checkout job just started, or say why it couldn't be.
+    fn start_checkout(&mut self, id: Oid, job: Result<CheckoutJob, CheckoutError>) {
+        match job {
+            Ok(job) => self.checkout = Some((id, job)),
+            Err(err) => self.notice = Some(format!("Could not check out: {err}")),
+        }
+    }
+
+    /// Take in what the checkout has reported, and once it is done act
+    /// on how it went: say so and read the repository again so the
+    /// HEAD marker moves; open the box asking for a branch's name; or
+    /// say why it couldn't be done (in the box, when it is the name
+    /// that won't do). Returns whether anything changed.
+    fn poll_checkout(&mut self) -> bool {
+        let Some((_, job)) = &mut self.checkout else {
+            return false;
+        };
+        let changed = job.poll();
+        if !job.is_done() {
+            return changed;
+        }
+        let Some((id, job)) = self.checkout.take() else {
+            return changed;
+        };
+        match job.outcome() {
+            Some(CheckoutOutcome::Done { how, submodules }) => {
+                let already = self.history.as_ref().is_some_and(|history| {
+                    history.head() == Some(id)
+                        && matches!(&how, Checkout::Branch(name) if history.head_branch() == Some(name))
+                });
+                self.notice = Some(match &how {
+                    Checkout::Branch(name) if already && submodules == 0 => {
+                        format!("Already on {name}")
+                    }
+                    _ => how.summary(id, submodules),
+                });
+                self.branch_prompt = None;
+                self.checked_out = true;
+                self.refresh();
+            }
+            Some(CheckoutOutcome::NeedsName { upstream, taken }) => {
+                self.branch_prompt = Some(BranchPrompt::new(id, upstream, taken));
+            }
+            Some(CheckoutOutcome::Failed(
+                err @ (CheckoutError::InvalidName(_) | CheckoutError::NameTaken(_)),
+            )) if self.branch_prompt.is_some() => {
+                if let Some(prompt) = &mut self.branch_prompt {
+                    prompt.refuse(err.to_string());
+                }
+            }
+            Some(CheckoutOutcome::Failed(err)) => {
+                self.branch_prompt = None;
+                self.notice = Some(format!("Could not check out: {err}"));
+            }
+            None => self.notice = Some("Could not check out: the checkout stopped".to_owned()),
+        }
+        true
+    }
+
+    /// Whether a checkout has been done since the last time this was
+    /// asked: the submodules may have moved with it, so their tabs are
+    /// due a refresh.
+    fn take_checked_out(&mut self) -> bool {
+        std::mem::take(&mut self.checked_out)
+    }
+
+    /// Do what the branch name box asks: start making the branch by
+    /// the name given and checking the commit out on it. The box stays
+    /// open until that is done, so that a name that won't do can be
+    /// refused in it; Enter again meanwhile does nothing.
+    fn handle_prompt_outcome(&mut self, outcome: BranchPromptOutcome) {
+        match outcome {
+            BranchPromptOutcome::Continue => {}
+            BranchPromptOutcome::Close => self.branch_prompt = None,
+            BranchPromptOutcome::Accept(name) => {
+                if self.checkout.is_some() {
+                    return;
+                }
+                let (Some(prompt), Some(history)) = (&self.branch_prompt, &self.history) else {
+                    return;
+                };
+                let (id, upstream) = (prompt.id, prompt.upstream.clone());
+                let how = Checkout::NewBranch { name, upstream };
+                let job = CheckoutJob::start_with(history.git_dir(), id, how);
+                if job.is_err() {
+                    self.branch_prompt = None;
+                }
+                self.start_checkout(id, job);
+            }
+        }
+    }
+
+    /// Add pasted text to the branch name box, if open; nothing else
+    /// on the page takes text.
+    pub fn paste(&mut self, text: &str) {
+        if let Some(prompt) = &mut self.branch_prompt {
+            prompt.paste(text);
+        }
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent, clipboard: &mut Clipboard) {
+        if let Some(prompt) = &mut self.branch_prompt {
+            let outcome = prompt.handle_key(key, clipboard);
+            self.handle_prompt_outcome(outcome);
+            return;
+        }
         // The file list follows the selected commit's detail, which is
         // read on the first draw after the selection moves; a key that
         // comes first (from a test, or a burst of input) needs it too.
@@ -1525,6 +1734,10 @@ impl GitLogView {
             KeyCode::End => Some(usize::MAX),
             KeyCode::Enter => {
                 self.pane = Pane::Files;
+                None
+            }
+            KeyCode::Char(' ') => {
+                self.checkout_selected();
                 None
             }
             KeyCode::Right => {
@@ -1716,6 +1929,16 @@ impl GitLogView {
     /// Handle a mouse event. Returns whether the pane sizes changed:
     /// a drag of a rule ended.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        // The branch name box, while open, takes the mouse over it, and
+        // a press anywhere else closes it, as the go to line box does.
+        if let Some(prompt) = &mut self.branch_prompt {
+            if prompt.contains(mouse.column, mouse.row) || prompt.is_dragging() {
+                prompt.handle_mouse(mouse);
+            } else if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.branch_prompt = None;
+            }
+            return false;
+        }
         self.ensure_detail();
         let at = ScreenPosition::new(mouse.column, mouse.row);
         // A rule being dragged owns the mouse until the button comes up.
@@ -1819,10 +2042,16 @@ impl GitLogView {
                     }
                     Pane::Log => {
                         let index = self.log_scroll + (mouse.row - self.log_area.y) as usize / 2;
+                        let presses = self.clicks.press(mouse.column, mouse.row);
                         if index < self.commit_count() {
                             self.head_shown = true;
                             self.pending_jump = None;
                             self.select_commit(index);
+                            // A commit is checked out on a double-click,
+                            // as on Space.
+                            if presses == 2 {
+                                self.checkout_selected();
+                            }
                         }
                     }
                     Pane::Files => {
@@ -1890,9 +2119,23 @@ impl GitLogView {
 
     // ----- Rendering ------------------------------------------------------
 
-    /// Draw the page into `area`. The page never wants the terminal
-    /// cursor.
-    pub fn render(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+    /// Draw the page into `area`. Returns where the terminal cursor
+    /// belongs: in the branch name box while it is open, and nowhere
+    /// otherwise.
+    pub fn render(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        theme: &Theme,
+    ) -> Option<ScreenPosition> {
+        self.render_panes(area, buf, theme);
+        match &mut self.branch_prompt {
+            Some(prompt) => prompt.render(area, buf, theme),
+            None => None,
+        }
+    }
+
+    fn render_panes(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         self.area = area;
         let background = palette_background(theme);
         buf.set_style(area, background);
@@ -2157,7 +2400,7 @@ impl GitLogView {
                 break;
             }
             let height = 2.min(bottom - y0);
-            let is_head = head == Some(commit.id);
+            let highlight = Highlight::head_if(head == Some(commit.id));
             let is_selected = index == self.selected;
             let row_style = if is_selected {
                 buf.set_style(Rect::new(area.x, y0, area.width, height), selected_style);
@@ -2174,7 +2417,7 @@ impl GitLogView {
             for (y, line) in (y0..y0 + height).zip(lines) {
                 let row = Rect::new(area.x + 1, y, area.width - 1, 1);
                 draw_commit_line(
-                    buf, row, commit, line, is_head, lanes, row_style, theme, scroll_col,
+                    buf, row, commit, line, highlight, lanes, row_style, theme, scroll_col,
                 );
             }
         }
@@ -2399,6 +2642,7 @@ mod tests {
     use crate::commit_row::HEAD_NODE;
     use crate::diff_pane::HSCROLL_SLACK;
     use crossterm::event::{KeyEventKind, KeyEventState};
+    use git2::BranchType;
     use git2::{Repository, Signature};
     use ninjaedit_core::TokenKind;
     use ninjaedit_core::git::NODE;
@@ -2594,7 +2838,7 @@ mod tests {
             theme.unfocused_list_selection_background
         );
         // Base is the root.
-        view.handle_key(key(KeyCode::End));
+        view.handle_key(key(KeyCode::End), &mut Clipboard::new());
         assert_eq!(view.selected_commit(), Some(a));
         let screen = draw(&mut view, 110, 24);
         assert!(row_with(&screen, "Parents:").contains("root"));
@@ -2608,8 +2852,8 @@ mod tests {
         let b = ids[1];
         view.jump_to(b);
         // Down in the files pane picks a.rs; Enter moves to the diff.
-        view.handle_key(key(KeyCode::Enter));
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 24);
         assert!(row_with(&screen, "M a.rs").contains("+1 −0"), "{screen:#?}");
         let plus = row_with(&screen, "+     two();");
@@ -2690,8 +2934,8 @@ mod tests {
         let (dir, bump, subs) = repo_with_submodule_bump();
         let mut view = view(&dir);
         view.jump_to(bump);
-        view.handle_key(key(KeyCode::Enter));
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 30);
         row_with(&screen, "M sub");
         // The content pane: the heading, then the submodule's commits
@@ -2723,6 +2967,9 @@ mod tests {
         assert_eq!(three, at(&rows, "Submodule sub: ") + 1);
         assert_eq!(at(&rows, "Submodule sub: "), content_y);
         assert!(rows[three].contains(HEAD_NODE), "{rows:#?}");
+        // Drawn as HEAD is, but not called HEAD: it is where the
+        // submodule now points, not where the user is.
+        assert!(!rows[three].contains("HEAD"), "{rows:#?}");
         assert!(
             rows[two].contains(NODE) && !rows[two].contains(HEAD_NODE),
             "{rows:#?}"
@@ -2752,8 +2999,8 @@ mod tests {
         // In a pane too small for all of it, the pane scrolls by rows:
         // one down puts the new commit's node line at the top; and
         // sideways, the text moving and the graph staying put.
-        view.handle_key(key(KeyCode::Tab));
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Tab), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         let screen = draw(&mut view, 60, 10);
         assert!(view.content_area.height < 7, "{:?}", view.content_area);
         let small_x = view.content_area.x as usize;
@@ -2763,7 +3010,7 @@ mod tests {
             top.contains(HEAD_NODE) && top.contains("Inner three"),
             "{screen:#?}"
         );
-        view.handle_key(key(KeyCode::Right));
+        view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
         let screen = draw(&mut view, 60, 10);
         let scrolled = screen[small_y].chars().skip(small_x).collect::<String>();
         assert_eq!(column_of(&scrolled, HEAD_NODE), column_of(&top, HEAD_NODE));
@@ -2787,9 +3034,9 @@ mod tests {
         view.jump_to(added);
         // Back from the content pane to the files pane, and down past
         // .gitmodules to it.
-        view.handle_key(key(KeyCode::Left));
-        view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 30);
         let rows: Vec<String> = screen.iter().map(|r| content(r)).collect();
         assert!(rows.iter().any(|r| r.contains("added at ")), "{rows:#?}");
@@ -2827,13 +3074,13 @@ mod tests {
         // The bump's files are Description and then `sub`: Enter on
         // the submodule shows the submodule's tab, at the commit the
         // bump moved it to, with the keyboard in the log.
-        tabs.handle_key(key(KeyCode::Tab));
-        tabs.handle_key(key(KeyCode::Down));
+        tabs.handle_key(key(KeyCode::Tab), &mut Clipboard::new());
+        tabs.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         assert_eq!(
             file_row_of(tabs.active(), "sub"),
             tabs.active().file_selected
         );
-        tabs.handle_key(key(KeyCode::Enter));
+        tabs.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
         assert_eq!(tabs.active_index(), 1);
         wait_tabs(&mut tabs);
         let view = tabs.active();
@@ -2850,9 +3097,9 @@ mod tests {
         // (and `.gitmodules` with it): a double-click on `sub` goes to
         // the commit it was added at.
         tabs.set_active(0);
-        tabs.handle_key(key(KeyCode::Left));
+        tabs.handle_key(key(KeyCode::Left), &mut Clipboard::new());
         assert_eq!(tabs.active().pane, Pane::Log);
-        tabs.handle_key(key(KeyCode::Down));
+        tabs.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         let view = tabs.active();
         assert_eq!(
             view.history.as_ref().unwrap().commits()[view.selected].summary,
@@ -2887,8 +3134,8 @@ mod tests {
         // A double-click on an ordinary file moves into its diff, as
         // Enter does.
         tabs.set_active(0);
-        tabs.handle_key(key(KeyCode::Left));
-        tabs.handle_key(key(KeyCode::Down));
+        tabs.handle_key(key(KeyCode::Left), &mut Clipboard::new());
+        tabs.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         let view = tabs.active();
         assert_eq!(
             view.history.as_ref().unwrap().commits()[view.selected].summary,
@@ -2919,13 +3166,13 @@ mod tests {
         wait_tabs(&mut tabs);
         tabs.set_active(0);
         wait_tabs(&mut tabs);
-        tabs.handle_key(key(KeyCode::Tab));
-        tabs.handle_key(key(KeyCode::Tab));
+        tabs.handle_key(key(KeyCode::Tab), &mut Clipboard::new());
+        tabs.handle_key(key(KeyCode::Tab), &mut Clipboard::new());
         assert_eq!(tabs.active().pane, Pane::Log);
-        tabs.handle_key(key(KeyCode::Home));
-        tabs.handle_key(key(KeyCode::Enter));
-        tabs.handle_key(key(KeyCode::Down));
-        tabs.handle_key(key(KeyCode::Enter));
+        tabs.handle_key(key(KeyCode::Home), &mut Clipboard::new());
+        tabs.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        tabs.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        tabs.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
         assert_eq!(tabs.active_index(), 1);
         wait_tabs(&mut tabs);
         assert_eq!(
@@ -2959,9 +3206,9 @@ mod tests {
         let new = old.replace("line 20\n", "line twenty\n");
         let _b = commit(&new, &[a]);
         let mut view = view(&dir);
-        view.handle_key(key(KeyCode::Enter));
-        view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
         let screen = draw(&mut view, 90, 30);
         let gap = screen
             .iter()
@@ -2992,7 +3239,7 @@ mod tests {
         assert!(screen.iter().any(|r| r.contains(" line 7")), "{screen:#?}");
         // "all" on the last gap (End scrolls down to it) reveals the
         // rest of the file.
-        view.handle_key(key(KeyCode::End));
+        view.handle_key(key(KeyCode::End), &mut Clipboard::new());
         let screen = draw(&mut view, 90, 30);
         let last = screen
             .iter()
@@ -3000,7 +3247,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{screen:#?}"));
         let x = column_of(&screen[last], "all");
         click(&mut view, x, last as u16);
-        view.handle_key(key(KeyCode::End));
+        view.handle_key(key(KeyCode::End), &mut Clipboard::new());
         let screen = draw(&mut view, 90, 30);
         assert!(screen.iter().any(|r| r.contains("line 40")), "{screen:#?}");
         assert!(
@@ -3015,30 +3262,30 @@ mod tests {
         let mut view = view(&dir);
         let [_a, _b, s, m] = ids[..] else { panic!() };
         draw(&mut view, 110, 24);
-        view.handle_key(key(KeyCode::BackTab));
+        view.handle_key(key(KeyCode::BackTab), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Sidebar);
         // Down to `side`, Enter goes to its commit and to the log.
-        view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
         assert_eq!(view.selected_commit(), Some(s));
         assert_eq!(view.pane, Pane::Log);
         // Back in the sidebar, the remote unfolds with → and its branch
         // goes to the merge.
-        view.handle_key(key(KeyCode::Left));
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         assert_eq!(view.side_rows[view.side_selected], SideRow::Remote(0));
-        view.handle_key(key(KeyCode::Right));
+        view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
         let screen = draw(&mut view, 110, 24);
         assert!(screen.iter().any(|r| r.contains("▾ origin")), "{screen:#?}");
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         assert!(matches!(
             view.side_rows[view.side_selected],
             SideRow::RemoteBranch(0, 0)
         ));
-        view.handle_key(key(KeyCode::Char(' ')));
+        view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
         assert_eq!(view.selected_commit(), Some(m));
         assert_eq!(view.pane, Pane::Sidebar);
-        view.handle_key(key(KeyCode::Left));
+        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
         let screen = draw(&mut view, 110, 24);
         assert!(screen.iter().any(|r| r.contains("▸ origin")), "{screen:#?}");
         assert_eq!(view.side_rows[view.side_selected], SideRow::Remote(0));
@@ -3100,13 +3347,13 @@ mod tests {
 
         // Into the files: Down to core/src, ← folds it and keeps the
         // selection on it; → unfolds it again.
-        view.handle_key(key(KeyCode::Enter));
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         assert!(matches!(
             view.selected_file_row(),
             Some(TreeRow::Dir { dir: 0, .. })
         ));
-        view.handle_key(key(KeyCode::Left));
+        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 30);
         assert!(
             screen.iter().any(|r| r.contains("▸ core/src")),
@@ -3139,7 +3386,7 @@ mod tests {
             screen.iter().any(|r| r.contains("A git/diff.rs  +1 −0")),
             "{screen:#?}"
         );
-        view.handle_key(key(KeyCode::Right));
+        view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
         assert!(matches!(
             view.selected_file_row(),
             Some(TreeRow::Dir {
@@ -3151,13 +3398,13 @@ mod tests {
         // Down twice to diff.rs; folding git from there (a click on its
         // row) leaves the selection on git, and ← from an open file
         // goes to its directory.
-        view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         assert!(matches!(
             view.selected_file_row(),
             Some(TreeRow::File { file: 1, .. })
         ));
-        view.handle_key(key(KeyCode::Left));
+        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
         assert!(matches!(
             view.selected_file_row(),
             Some(TreeRow::Dir { dir: 1, .. })
@@ -3177,8 +3424,8 @@ mod tests {
         assert!(screen.iter().any(|r| r.contains("▸ git")), "{screen:#?}");
         assert!(screen.iter().any(|r| r.contains("A lib.rs")), "{screen:#?}");
         // Enter on a file row shows its diff.
-        view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Content);
         let screen = draw(&mut view, 100, 30);
         assert!(
@@ -3240,7 +3487,7 @@ mod tests {
         );
         // Scrolling to the end shows the last commit whole, the odd
         // row blank below it, since only whole commits scroll.
-        view.handle_key(key(KeyCode::End));
+        view.handle_key(key(KeyCode::End), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 40);
         assert_eq!(view.log_scroll, 2, "{screen:#?}");
         assert!(screen[2].contains("Base commit"), "{screen:#?}");
@@ -3249,7 +3496,7 @@ mod tests {
         let odd_row: String = screen[4].chars().skip(log_x).collect();
         assert_eq!(odd_row.trim(), "", "{screen:#?}");
         // The partly shown commit can be clicked, which reveals it whole.
-        view.handle_key(key(KeyCode::Home));
+        view.handle_key(key(KeyCode::Home), &mut Clipboard::new());
         draw(&mut view, 100, 40);
         let log = view.log_area;
         click(&mut view, log.x + 5, log.y + 4);
@@ -3273,7 +3520,7 @@ mod tests {
         assert_eq!(view.log_h.bar.y as usize, log_bottom);
         let graph_column = column_of(&screen[0], "◉");
         for _ in 0..60 {
-            view.handle_key(key(KeyCode::Right));
+            view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
         }
         let col = view.log_h.col;
         let screen = draw(&mut view, 90, 30);
@@ -3285,11 +3532,11 @@ mod tests {
         let extent = view.log_extent(view.log_scroll, view.log_rows);
         assert!(display_width(&message) < extent, "the graph is part of it");
         assert_eq!(col, extent + HSCROLL_SLACK - capacity);
-        view.handle_key(key(KeyCode::Right));
+        view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
         assert_eq!(view.log_h.col, col);
         // Moving to the short commit keeps the position, since the long
         // one is still on screen; the horizontal wheel scrolls back.
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         assert_eq!(view.log_h.col, col);
         view.handle_mouse(MouseEvent {
             kind: MouseEventKind::ScrollLeft,
@@ -3327,7 +3574,7 @@ mod tests {
         // The long message is still cut off, so the bar stays.
         let screen = draw(&mut view, 90, 30);
         assert!(screen[log_bottom].contains('█'), "{screen:#?}");
-        view.handle_key(key(KeyCode::Left));
+        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Sidebar);
     }
 
@@ -3335,10 +3582,10 @@ mod tests {
     fn a_diff_scrolls_sideways_with_its_gutter_fixed() {
         let (dir, _) = repo_with_long_lines();
         let mut view = view(&dir);
-        view.handle_key(key(KeyCode::End));
-        view.handle_key(key(KeyCode::Enter));
-        view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::End), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Content);
         let screen = draw(&mut view, 100, 30);
         let line = screen
@@ -3350,7 +3597,7 @@ mod tests {
         assert!(screen[content_bottom].contains('█'), "{screen:#?}");
         let number_column = column_of(&screen[line], "1 +");
         for _ in 0..50 {
-            view.handle_key(key(KeyCode::Right));
+            view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
         }
         let col = view.content_h.col;
         let screen = draw(&mut view, 100, 30);
@@ -3369,22 +3616,22 @@ mod tests {
             if view.pane == Pane::Files {
                 break;
             }
-            view.handle_key(key(KeyCode::Left));
+            view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
         }
         assert_eq!(view.pane, Pane::Files);
         assert_eq!(view.content_h.col, 0);
-        view.handle_key(key(KeyCode::Right));
+        view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Content);
-        view.handle_key(key(KeyCode::Right));
+        view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
         assert_eq!(view.content_h.col, WHEEL_COLUMNS);
-        view.handle_key(key(KeyCode::Left));
+        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
         assert_eq!(view.content_h.col, 0);
-        view.handle_key(key(KeyCode::Left));
+        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Files);
-        view.handle_key(key(KeyCode::Up));
-        view.handle_key(key(KeyCode::Up));
-        view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Up), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Up), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 30);
         assert!(
             screen.iter().any(|r| r.contains("+ let long")),
@@ -3393,13 +3640,13 @@ mod tests {
         assert_eq!(view.content_h.col, 0);
         // The description scrolls too: this commit's long message needs
         // the bar, the short commit's doesn't.
-        view.handle_key(key(KeyCode::Up));
+        view.handle_key(key(KeyCode::Up), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 30);
         assert!(screen.iter().any(|r| r.contains("Parents:")), "{screen:#?}");
         assert!(screen[content_bottom].contains('█'), "{screen:#?}");
-        view.handle_key(key(KeyCode::Left));
+        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Log);
-        view.handle_key(key(KeyCode::Home));
+        view.handle_key(key(KeyCode::Home), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 30);
         assert!(screen.iter().any(|r| r.contains("Parents:")), "{screen:#?}");
         assert!(!screen[content_bottom].contains('█'), "{screen:#?}");
@@ -3423,11 +3670,11 @@ mod tests {
         repo.commit(Some("HEAD"), &sig, &sig, "Tall", &tree, &[])
             .unwrap();
         let mut view = view(&dir);
-        view.handle_key(key(KeyCode::Enter));
-        view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Content);
-        view.handle_key(key(KeyCode::End));
+        view.handle_key(key(KeyCode::End), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 30);
         let content_bottom = view.content_area.bottom() as usize - 1;
         assert!(screen[content_bottom].contains('█'), "{screen:#?}");
@@ -3437,9 +3684,9 @@ mod tests {
         );
         assert_eq!(view.content_scroll + view.content_shown, view.content_rows);
         // Scrolling down a line at a time gets there too.
-        view.handle_key(key(KeyCode::Home));
+        view.handle_key(key(KeyCode::Home), &mut Clipboard::new());
         for _ in 0..100 {
-            view.handle_key(key(KeyCode::Down));
+            view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         }
         let screen = draw(&mut view, 100, 30);
         assert!(
@@ -3593,11 +3840,11 @@ mod tests {
         draw(&mut view, 110, 24);
         // Down twice to On main, scrolled onto the log's second row;
         // into its files, and the diff of its one file.
-        view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         assert_eq!(view.selected_commit(), Some(b));
-        view.handle_key(key(KeyCode::Enter));
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         let screen = draw(&mut view, 110, 24);
         let row = screen.iter().position(|r| r.contains("On main")).unwrap();
         assert!(row_with(&screen, "a.rs").contains("+1"), "{screen:#?}");
@@ -3629,8 +3876,8 @@ mod tests {
         assert!(row_with(&screen, "a.rs").contains("+1"), "{screen:#?}");
         assert!(screen.iter().any(|r| r.contains("two();")), "{screen:#?}");
         // The new commit is at the top of the log.
-        view.handle_key(key(KeyCode::Left));
-        view.handle_key(key(KeyCode::Home));
+        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Home), &mut Clipboard::new());
         let screen = draw(&mut view, 110, 24);
         assert!(
             screen.iter().any(|r| r.contains("After the merge")),
@@ -3675,12 +3922,12 @@ mod tests {
         let [a, ..] = ids[..] else { panic!() };
         draw(&mut view, 110, 24);
         // In the sidebar: unfold origin, and select `side`.
-        view.handle_key(key(KeyCode::BackTab));
-        view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::BackTab), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         assert_eq!(view.side_rows[view.side_selected], SideRow::Remote(0));
-        view.handle_key(key(KeyCode::Right));
-        view.handle_key(key(KeyCode::Up));
+        view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Up), &mut Clipboard::new());
         assert_eq!(view.side_rows[view.side_selected], SideRow::Branch(1));
         // A branch sorting before `side` and a remote sorting before
         // `origin` appear.
@@ -3727,7 +3974,7 @@ mod tests {
         let local = view.selected_commit().unwrap();
         draw(&mut view, 110, 24);
         // Into the files pane, so that there is a place to keep.
-        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Files);
         let screen = draw(&mut view, 110, 24);
         assert!(
@@ -3738,7 +3985,7 @@ mod tests {
         // F5: the fetch is under way, and the page says so; the
         // upstream's branches and tags come in, and the page refreshes
         // where it was, with what came of it for the status bar.
-        view.handle_key(key(KeyCode::F(5)));
+        view.handle_key(key(KeyCode::F(5)), &mut Clipboard::new());
         assert!(view.hint().contains("fetching"), "{}", view.hint());
         wait(&mut view);
         assert!(!view.hint().contains("fetching"), "{}", view.hint());
@@ -3759,7 +4006,7 @@ mod tests {
         assert_eq!(view.history.as_ref().unwrap().head(), Some(local));
 
         // Again, with nothing new upstream: up to date.
-        view.handle_key(key(KeyCode::F(5)));
+        view.handle_key(key(KeyCode::F(5)), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
             view.take_notice().as_deref(),
@@ -3767,14 +4014,14 @@ mod tests {
         );
         // A commit upstream is fetched and shown.
         commit_on_head(&upstream, "u.txt", "up\n", "Upstream since");
-        view.handle_key(key(KeyCode::F(5)));
+        view.handle_key(key(KeyCode::F(5)), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
             view.take_notice().as_deref(),
             Some("Fetched origin: 1 ref updated")
         );
-        view.handle_key(key(KeyCode::Left));
-        view.handle_key(key(KeyCode::Home));
+        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Home), &mut Clipboard::new());
         let screen = draw(&mut view, 110, 24);
         assert!(
             screen.iter().any(|r| r.contains("Upstream since")),
@@ -3843,15 +4090,15 @@ mod tests {
             .set_str("fetch.recurseSubmodules", "false")
             .unwrap();
         let mut view = view(&dir);
-        view.handle_key(key(KeyCode::F(5)));
+        view.handle_key(key(KeyCode::F(5)), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
             view.take_notice().as_deref(),
             Some("Fetched origin: 1 ref updated")
         );
         view.jump_to(bump);
-        view.handle_key(key(KeyCode::Enter));
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         let screen = draw(&mut view, 110, 30);
         row_with(&screen, "M sub");
         let row = row_with(&screen, "is not in the submodule's repository");
@@ -3868,7 +4115,7 @@ mod tests {
             .unwrap()
             .set_str("fetch.recurseSubmodules", "on-demand")
             .unwrap();
-        view.handle_key(key(KeyCode::F(5)));
+        view.handle_key(key(KeyCode::F(5)), &mut Clipboard::new());
         wait(&mut view);
         let notice = view.take_notice().unwrap();
         assert!(
@@ -3891,7 +4138,7 @@ mod tests {
         Repository::init(dir.path()).unwrap();
         commit_on_head(&dir, "l.txt", "local\n", "Local");
         let mut view = view(&dir);
-        view.handle_key(key(KeyCode::F(5)));
+        view.handle_key(key(KeyCode::F(5)), &mut Clipboard::new());
         wait(&mut view);
         assert_eq!(
             view.take_notice().as_deref(),
@@ -3900,7 +4147,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let mut view = GitLogView::new(dir.path());
-        view.handle_key(key(KeyCode::F(5)));
+        view.handle_key(key(KeyCode::F(5)), &mut Clipboard::new());
         assert!(!view.is_loading());
         let notice = view.take_notice().unwrap();
         assert!(notice.starts_with(NOT_A_REPOSITORY), "{notice}");
@@ -3921,6 +4168,464 @@ mod tests {
         assert!(
             screen.iter().any(|r| r.contains("First commit")),
             "{screen:#?}"
+        );
+    }
+
+    /// Where HEAD is: its branch (`None` when detached) and its commit.
+    fn head_of(dir: &tempfile::TempDir) -> (Option<String>, Oid) {
+        head_of_repo(&Repository::open(dir.path()).unwrap())
+    }
+
+    fn type_text(view: &mut GitLogView, text: &str) {
+        for c in text.chars() {
+            view.handle_key(key(KeyCode::Char(c)), &mut Clipboard::new());
+        }
+    }
+
+    #[test]
+    fn space_checks_out_the_selected_commit_on_its_branch_or_detached() {
+        let (dir, ids) = repo_with_history();
+        let [a, b, s, m] = ids[..] else { panic!() };
+        let main = head_of(&dir).0.unwrap();
+        let mut view = view(&dir);
+        draw(&mut view, 110, 24);
+        assert_eq!(view.selected_commit(), Some(m));
+
+        // On side: its branch is checked out, with its files, and the
+        // page refreshes with HEAD there.
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        assert_eq!(view.selected_commit(), Some(s));
+        view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        // Under way: a second Space is refused, and the status bar
+        // says what is going on until it is done.
+        assert!(
+            view.hint()
+                .starts_with(&format!("checking out {}…", short_id(s))),
+            "{}",
+            view.hint()
+        );
+        view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        assert_eq!(
+            view.take_notice().as_deref(),
+            Some("A checkout is under way")
+        );
+        wait(&mut view);
+        assert_eq!(view.hint(), LOG_HINT);
+        assert_eq!(view.take_notice().as_deref(), Some("Checked out side"));
+        assert_eq!(head_of(&dir), (Some("side".to_owned()), s));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("s.txt")).unwrap(),
+            "side\n"
+        );
+        wait(&mut view);
+        let history = view.history.as_ref().unwrap();
+        assert_eq!(history.head_branch(), Some("side"));
+        assert_eq!(history.head(), Some(s));
+        assert_eq!(view.selected_commit(), Some(s));
+
+        // On main: no branch points at it, so HEAD is detached there.
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        assert_eq!(view.selected_commit(), Some(b));
+        view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        wait(&mut view);
+        assert_eq!(
+            view.take_notice().as_deref(),
+            Some(format!("HEAD detached at {}", short_id(b)).as_str())
+        );
+        assert_eq!(head_of(&dir), (None, b));
+        assert!(!dir.path().join("s.txt").exists());
+        wait(&mut view);
+        assert_eq!(view.history.as_ref().unwrap().head_branch(), None);
+        // Detached, the commit still says HEAD, with no branch to point
+        // at; the branch's commit no longer does.
+        let screen = draw(&mut view, 110, 24);
+        let on_main = row_with(&screen, "On main");
+        assert!(on_main.contains("HEAD  On main"), "{on_main}");
+        assert!(on_main.contains(HEAD_NODE), "{on_main}");
+        let merge = row_with(&screen, "Merge side into main");
+        assert!(!merge.contains("HEAD"), "{merge}");
+        assert!(!merge.contains(HEAD_NODE), "{merge}");
+
+        // The merge: main and origin/main point at it; the local
+        // branch wins. Once there, Space again just says so.
+        view.handle_key(key(KeyCode::Home), &mut Clipboard::new());
+        assert_eq!(view.selected_commit(), Some(m));
+        view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        wait(&mut view);
+        assert_eq!(
+            view.take_notice().as_deref(),
+            Some(format!("Checked out {main}").as_str())
+        );
+        assert_eq!(head_of(&dir), (Some(main.clone()), m));
+        wait(&mut view);
+        view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        wait(&mut view);
+        assert_eq!(
+            view.take_notice().as_deref(),
+            Some(format!("Already on {main}").as_str())
+        );
+        assert_eq!(head_of(&dir), (Some(main), m));
+        let _ = a;
+    }
+
+    #[test]
+    fn a_checkout_brings_the_submodules_along_and_refreshes_their_tabs() {
+        let (dir, bump, subs) = repo_with_submodule_bump();
+        let [s1, _s2, s3] = subs[..] else { panic!() };
+        let sub = Repository::open(dir.path().join("sub")).unwrap();
+        let sub_main = sub.head().unwrap().shorthand().unwrap().to_owned();
+        sub.branch("old", &sub.find_commit(s1).unwrap(), false)
+            .unwrap();
+        let mut tabs = GitLogTabs::new(dir.path(), GitLogLayout::default());
+        wait_tabs(&mut tabs);
+        // Open the submodule's tab, so that it has a page to refresh.
+        tabs.set_active(1);
+        wait_tabs(&mut tabs);
+        assert_eq!(tabs.active().history.as_ref().unwrap().head(), Some(s3));
+        tabs.set_active(0);
+        assert_eq!(tabs.active().selected_commit(), Some(bump));
+
+        // Add submodule: the submodule goes back to its first commit,
+        // on to the branch there.
+        tabs.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        tabs.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        wait_tabs(&mut tabs);
+        let notice = tabs.take_notice().unwrap();
+        assert!(notice.ends_with("; 1 submodule updated"), "{notice}");
+        assert_eq!(head_of_repo(&sub), (Some("old".to_owned()), s1));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("sub/inner.txt")).unwrap(),
+            "one\n"
+        );
+        wait_tabs(&mut tabs);
+        // The submodule's tab, shown again, refreshes to where it is now.
+        tabs.set_active(1);
+        wait_tabs(&mut tabs);
+        let history = tabs.active().history.as_ref().unwrap();
+        assert_eq!(history.head(), Some(s1));
+        assert_eq!(history.head_branch(), Some("old"));
+
+        // And forward again, on to the submodule's own branch.
+        tabs.set_active(0);
+        tabs.handle_key(key(KeyCode::Up), &mut Clipboard::new());
+        tabs.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        wait_tabs(&mut tabs);
+        let notice = tabs.take_notice().unwrap();
+        assert!(notice.ends_with("; 1 submodule updated"), "{notice}");
+        assert_eq!(head_of_repo(&sub), (Some(sub_main), s3));
+        wait_tabs(&mut tabs);
+
+        // Changes in the submodule refuse the checkout and are named.
+        fs::write(dir.path().join("sub/inner.txt"), "edited\n").unwrap();
+        tabs.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        tabs.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        wait_tabs(&mut tabs);
+        assert_eq!(
+            tabs.take_notice().as_deref(),
+            Some(
+                "Could not check out: in submodule sub: unstaged changes would be lost; \
+                 commit or stash them first"
+            )
+        );
+        assert_eq!(head_of_repo(&sub).1, s3);
+    }
+
+    /// Where a repository's HEAD is: its branch (`None` when detached)
+    /// and its commit.
+    fn head_of_repo(repo: &Repository) -> (Option<String>, Oid) {
+        let head = repo.head().unwrap();
+        let name = if repo.head_detached().unwrap() {
+            None
+        } else {
+            Some(head.shorthand().unwrap().to_owned())
+        };
+        (name, head.target().unwrap())
+    }
+
+    #[test]
+    fn a_double_click_on_a_commit_checks_it_out() {
+        let (dir, ids) = repo_with_history();
+        let [_a, _b, s, m] = ids[..] else { panic!() };
+        let mut view = view(&dir);
+        let screen = draw(&mut view, 110, 24);
+        let row = screen.iter().position(|r| r.contains("On side")).unwrap() as u16;
+        let column = column_of(&screen[row as usize], "On side");
+        // One click only selects.
+        click(&mut view, column, row);
+        assert_eq!(view.selected_commit(), Some(s));
+        assert_eq!(head_of(&dir).1, m);
+        assert_eq!(view.take_notice(), None);
+        click(&mut view, column, row);
+        // The checkout is under way, and the status bar says so.
+        assert!(view.hint().starts_with("checking out "), "{}", view.hint());
+        wait(&mut view);
+        assert_eq!(view.take_notice().as_deref(), Some("Checked out side"));
+        assert_eq!(head_of(&dir), (Some("side".to_owned()), s));
+        wait(&mut view);
+    }
+
+    #[test]
+    fn a_checkout_refuses_while_tracked_files_are_changed() {
+        let (dir, ids) = repo_with_history();
+        let [_a, _b, s, m] = ids[..] else { panic!() };
+        let main = head_of(&dir).0.unwrap();
+        let mut view = view(&dir);
+        draw(&mut view, 110, 24);
+        fs::write(dir.path().join("a.rs"), "changed\n").unwrap();
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        assert_eq!(view.selected_commit(), Some(s));
+        view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        wait(&mut view);
+        assert_eq!(
+            view.take_notice().as_deref(),
+            Some("Could not check out: unstaged changes would be lost; commit or stash them first")
+        );
+        assert_eq!(head_of(&dir), (Some(main), m));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+            "changed\n"
+        );
+        assert!(!view.is_loading());
+    }
+
+    #[test]
+    fn a_remote_branch_gets_a_local_branch_tracking_it() {
+        let (dir, ids) = repo_with_history();
+        let [_a, b, _s, _m] = ids[..] else { panic!() };
+        Repository::open(dir.path())
+            .unwrap()
+            .reference("refs/remotes/origin/feature", b, false, "t")
+            .unwrap();
+        let mut view = view(&dir);
+        draw(&mut view, 110, 24);
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        assert_eq!(view.selected_commit(), Some(b));
+        view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        wait(&mut view);
+        assert_eq!(
+            view.take_notice().as_deref(),
+            Some("Checked out new branch feature tracking origin/feature")
+        );
+        assert_eq!(head_of(&dir), (Some("feature".to_owned()), b));
+        let repo = Repository::open(dir.path()).unwrap();
+        let branch = repo.find_branch("feature", BranchType::Local).unwrap();
+        assert_eq!(
+            branch.upstream().unwrap().name().unwrap(),
+            Some("origin/feature")
+        );
+        wait(&mut view);
+        let screen = draw(&mut view, 110, 24);
+        assert!(
+            screen
+                .iter()
+                .any(|r| r.contains("feature") && r.contains("On main")),
+            "{screen:#?}"
+        );
+    }
+
+    #[test]
+    fn a_tracking_branch_is_fast_forwarded_or_the_checkout_refused() {
+        let (dir, ids) = repo_with_history();
+        let [_a, b, s, m] = ids[..] else { panic!() };
+        let main = head_of(&dir).0.unwrap();
+        {
+            // origin/side is a commit past side, which tracks it;
+            // origin/main is behind main, which tracks it.
+            let repo = Repository::open(dir.path()).unwrap();
+            repo.set_head("refs/heads/side").unwrap();
+            repo.checkout_tree(
+                repo.find_commit(s).unwrap().as_object(),
+                Some(git2::build::CheckoutBuilder::new().force()),
+            )
+            .unwrap();
+            let past = commit_on_head(&dir, "t.txt", "t\n", "Past side");
+            repo.reference("refs/heads/side", s, true, "t").unwrap();
+            repo.reference("refs/remotes/origin/side", past, false, "t")
+                .unwrap();
+            repo.find_branch("side", BranchType::Local)
+                .unwrap()
+                .set_upstream(Some("origin/side"))
+                .unwrap();
+            repo.reference(&format!("refs/remotes/origin/{main}"), b, true, "t")
+                .unwrap();
+            repo.find_branch(&main, BranchType::Local)
+                .unwrap()
+                .set_upstream(Some(&format!("origin/{main}")))
+                .unwrap();
+            repo.set_head(&format!("refs/heads/{main}")).unwrap();
+            repo.checkout_tree(
+                repo.find_commit(m).unwrap().as_object(),
+                Some(git2::build::CheckoutBuilder::new().force()),
+            )
+            .unwrap();
+        }
+        let mut view = view(&dir);
+        draw(&mut view, 110, 24);
+        assert_eq!(view.selected_commit(), Some(m));
+
+        // Past side: side is fast-forwarded to it and checked out.
+        view.handle_key(key(KeyCode::Home), &mut Clipboard::new());
+        let screen = draw(&mut view, 110, 24);
+        let row = screen.iter().position(|r| r.contains("Past side")).unwrap() as u16;
+        click(
+            &mut view,
+            column_of(&screen[row as usize], "Past side"),
+            row,
+        );
+        view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        wait(&mut view);
+        assert_eq!(
+            view.take_notice().as_deref(),
+            Some("Fast-forwarded side to origin/side and checked it out")
+        );
+        let (branch, at) = head_of(&dir);
+        assert_eq!(branch.as_deref(), Some("side"));
+        assert_eq!(fs::read_to_string(dir.path().join("t.txt")).unwrap(), "t\n");
+        wait(&mut view);
+        let history = view.history.as_ref().unwrap();
+        assert_eq!(history.head(), Some(at));
+        assert_eq!(history.head_branch(), Some("side"));
+        let screen = draw(&mut view, 110, 24);
+        assert!(
+            screen
+                .iter()
+                .any(|r| r.contains("side") && r.contains("Past side")),
+            "{screen:#?}"
+        );
+
+        // On main: main tracks origin/main from ahead, so nothing moves.
+        let row = screen.iter().position(|r| r.contains("On main")).unwrap() as u16;
+        click(&mut view, column_of(&screen[row as usize], "On main"), row);
+        assert_eq!(view.selected_commit(), Some(b));
+        view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        wait(&mut view);
+        assert_eq!(
+            view.take_notice().as_deref(),
+            Some(
+                format!(
+                    "Could not check out: {main} is ahead of origin/{main} by 2 commits; \
+                     push or reset it first"
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(head_of(&dir).0.as_deref(), Some("side"));
+        assert!(!view.is_loading());
+    }
+
+    #[test]
+    fn a_taken_branch_name_is_asked_for_in_a_box_over_the_log() {
+        let (dir, ids) = repo_with_history();
+        let [a, _b, _s, m] = ids[..] else { panic!() };
+        let main = head_of(&dir).0.unwrap();
+        {
+            let repo = Repository::open(dir.path()).unwrap();
+            repo.reference("refs/remotes/origin/other", a, false, "t")
+                .unwrap();
+            repo.branch("other", &repo.find_commit(m).unwrap(), false)
+                .unwrap();
+        }
+        let mut view = view(&dir);
+        draw(&mut view, 110, 24);
+        view.handle_key(key(KeyCode::End), &mut Clipboard::new());
+        assert_eq!(view.selected_commit(), Some(a));
+
+        // The box opens, saying why, and takes the keyboard; Esc closes
+        // it with nothing done.
+        view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        wait(&mut view);
+        assert!(view.branch_prompt.is_some());
+        assert_eq!(view.hint(), PROMPT_HINT);
+        let screen = draw(&mut view, 110, 24);
+        assert!(
+            screen.iter().any(|r| r.contains("Name for the new branch")),
+            "{screen:#?}"
+        );
+        assert!(
+            screen
+                .iter()
+                .any(|r| r.contains("branch other exists · new branch will track origin/other")),
+            "{screen:#?}"
+        );
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        assert_eq!(view.selected_commit(), Some(a));
+        view.handle_key(key(KeyCode::Esc), &mut Clipboard::new());
+        assert!(view.branch_prompt.is_none());
+        assert_eq!(head_of(&dir), (Some(main.clone()), m));
+        assert_eq!(view.take_notice(), None);
+
+        // A name that won't do keeps the box open and says why.
+        view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        wait(&mut view);
+        type_text(&mut view, "other");
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        wait(&mut view);
+        assert!(view.branch_prompt.is_some());
+        let screen = draw(&mut view, 110, 24);
+        assert!(
+            screen
+                .iter()
+                .any(|r| r.contains("branch other already exists")),
+            "{screen:#?}"
+        );
+        assert_eq!(head_of(&dir), (Some(main.clone()), m));
+        for _ in 0..5 {
+            view.handle_key(key(KeyCode::Backspace), &mut Clipboard::new());
+        }
+        type_text(&mut view, "bad name");
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        wait(&mut view);
+        let screen = draw(&mut view, 110, 24);
+        assert!(
+            screen
+                .iter()
+                .any(|r| r.contains("\"bad name\" is not a valid branch name")),
+            "{screen:#?}"
+        );
+        for _ in 0..8 {
+            view.handle_key(key(KeyCode::Backspace), &mut Clipboard::new());
+        }
+
+        // A free name makes the branch, tracking the remote's, and
+        // checks the commit out on it.
+        type_text(&mut view, "mine");
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        wait(&mut view);
+        assert!(view.branch_prompt.is_none());
+        assert_eq!(
+            view.take_notice().as_deref(),
+            Some("Checked out new branch mine tracking origin/other")
+        );
+        assert_eq!(head_of(&dir), (Some("mine".to_owned()), a));
+        let repo = Repository::open(dir.path()).unwrap();
+        let branch = repo.find_branch("mine", BranchType::Local).unwrap();
+        assert_eq!(
+            branch.upstream().unwrap().name().unwrap(),
+            Some("origin/other")
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+            "fn main() {\n    one();\n}\n"
+        );
+        wait(&mut view);
+        assert_eq!(view.history.as_ref().unwrap().head_branch(), Some("mine"));
+        assert_eq!(view.hint(), LOG_HINT);
+
+        // A click outside the box closes it too.
+        view.handle_key(key(KeyCode::Home), &mut Clipboard::new());
+        wait(&mut view);
+        Repository::open(dir.path())
+            .unwrap()
+            .reference("refs/remotes/origin/other", m, true, "t")
+            .unwrap();
+        view.handle_key(key(KeyCode::Char(' ')), &mut Clipboard::new());
+        wait(&mut view);
+        // main points at the merge too, so it wins: no box.
+        assert!(view.branch_prompt.is_none());
+        assert_eq!(
+            view.take_notice().as_deref(),
+            Some(format!("Checked out {main}").as_str())
         );
     }
 }

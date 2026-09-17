@@ -15,11 +15,16 @@
 //!
 //! What a commit changed is read on demand, on the caller's thread, by
 //! [`History::detail`] and [`History::file_diff`]; see the [`diff`]
-//! module.
+//! module. A commit is checked out, on the caller's thread too, by
+//! [`History::checkout_plan`] and [`History::checkout`]; see the
+//! [`checkout`] module. The history itself doesn't follow: open a fresh
+//! one to see HEAD where it now is.
 //!
 //! [`graph`]: super::graph
 //! [`diff`]: super::diff
+//! [`checkout`]: super::checkout
 
+use super::checkout::{Checkout, CheckoutError, CheckoutPlan};
 use super::diff::{self, CommitDetail, FileDiff};
 use super::graph::{GraphLayout, GraphRow};
 pub use git2::Oid;
@@ -352,6 +357,19 @@ impl History {
         old_path: Option<&str>,
     ) -> Result<FileDiff, git2::Error> {
         diff::file_diff(&self.repo, id, path, old_path)
+    }
+
+    /// What checking out a commit calls for, or why it can't be done
+    /// now; see [`Checkout::plan`].
+    pub fn checkout_plan(&self, id: Oid) -> Result<CheckoutPlan, CheckoutError> {
+        Checkout::plan(&self.repo, id)
+    }
+
+    /// Check out a commit, submodules and all; see [`Checkout::run`],
+    /// whose count of submodules updated this returns. The history
+    /// shown keeps the old HEAD: open it again to see the new.
+    pub fn checkout(&self, id: Oid, how: &Checkout) -> Result<usize, CheckoutError> {
+        how.run(&self.repo, id)
     }
 }
 

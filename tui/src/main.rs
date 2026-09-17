@@ -6,6 +6,7 @@
 //! palette, and the status bar.
 
 mod app;
+mod branch_prompt;
 mod build_view;
 mod changes_view;
 mod clicks;

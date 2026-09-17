@@ -26,7 +26,7 @@
 //! text drawn end to end ([`draw_pieces`]), and the small sums the
 //! pages' layouts are made of.
 
-use crate::commit_row::{CommitLine, commit_extent, draw_commit_line, lane_cap};
+use crate::commit_row::{CommitLine, Highlight, commit_extent, draw_commit_line, lane_cap};
 use crate::palette::palette_background;
 use crate::theme::Theme;
 use ninjaedit_core::git::{
@@ -473,7 +473,7 @@ fn submodule_row_extent(
         SubmoduleRow::Note(note) => display_width(note),
         SubmoduleRow::Commit(commit, _) => commit_extent(
             commit,
-            range.new == Some(commit.id),
+            Highlight::target_if(range.new == Some(commit.id)),
             commit.graph.width().clamp(1, max_lanes),
         ),
     }
@@ -542,7 +542,7 @@ fn render_submodule(
                 row_area,
                 commit,
                 *line,
-                range.new == Some(commit.id),
+                Highlight::target_if(range.new == Some(commit.id)),
                 commit.graph.width().clamp(1, max_lanes),
                 background,
                 theme,

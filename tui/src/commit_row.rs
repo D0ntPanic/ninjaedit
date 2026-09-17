@@ -9,7 +9,10 @@
 //! at most a share of the width and stays put while the text scrolls
 //! sideways. The commit HEAD is on (or, for a submodule, the commit the
 //! submodule now points at) gets a different node and its message in
-//! the theme's HEAD color, bold.
+//! the theme's HEAD color, bold. In the log HEAD's commit also says so
+//! in words before its references, as `git log --decorate` does:
+//! `HEAD → main` when HEAD is on a branch, `HEAD` alone when it is
+//! detached, so that where you are is said and not only colored.
 
 use crate::diff_pane::{Piece, draw_pieces, pieces_width};
 use crate::theme::Theme;
@@ -28,6 +31,40 @@ const MAX_GRAPH_SHARE: usize = 3;
 pub(crate) enum CommitLine {
     Node,
     Transition,
+}
+
+/// How a commit stands out among the others of a graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Highlight {
+    /// One commit among many.
+    None,
+    /// The commit HEAD is on, in the log: its node, its message in the
+    /// HEAD color, and `HEAD` said before its references.
+    Head,
+    /// The commit a submodule now points at, in its diff: drawn as HEAD
+    /// is, but not called HEAD, since it isn't.
+    Target,
+}
+
+impl Highlight {
+    /// [`Head`](Self::Head) when `is_head`, else [`None`](Self::None).
+    pub(crate) fn head_if(is_head: bool) -> Highlight {
+        if is_head {
+            Highlight::Head
+        } else {
+            Highlight::None
+        }
+    }
+
+    /// [`Target`](Self::Target) when `is_target`, else
+    /// [`None`](Self::None).
+    pub(crate) fn target_if(is_target: bool) -> Highlight {
+        if is_target {
+            Highlight::Target
+        } else {
+            Highlight::None
+        }
+    }
 }
 
 /// How many lanes of the graph a pane `width` columns wide draws, at
@@ -52,19 +89,25 @@ pub(crate) fn lane_palette(theme: &Theme) -> [Color; 8] {
 
 /// A commit's two lines of text: the references and the message, then
 /// the author, the id, and the time. Styled over `row_style` with the
-/// theme's colors when given (HEAD's row bold and in its color),
-/// otherwise plain, for measuring.
+/// theme's colors when given (a highlighted row bold and in HEAD's
+/// color), otherwise plain, for measuring. HEAD's commit in the log
+/// says `HEAD → ` before the branch HEAD is on, or `HEAD ` alone when
+/// HEAD is detached and there is no branch to point at.
 pub(crate) fn commit_lines(
     commit: &Commit,
-    is_head: bool,
+    highlight: Highlight,
     styles: Option<(&Theme, Style)>,
 ) -> (Vec<Piece>, Vec<Piece>) {
+    let is_head = highlight != Highlight::None;
     let row_style = styles.map_or_else(Style::default, |(_, style)| style);
     let colored = |pick: fn(&Theme) -> Color| match styles {
         Some((theme, style)) => style.fg(pick(theme)),
         None => row_style,
     };
     let mut first: Vec<Piece> = Vec::new();
+    if highlight == Highlight::Head && !commit.refs.iter().any(|label| label.is_head) {
+        first.push(("HEAD ".to_owned(), colored(|t| t.git_head_text)));
+    }
     for label in &commit.refs {
         if label.is_head {
             first.push(("HEAD → ".to_owned(), colored(|t| t.git_head_text)));
@@ -105,8 +148,8 @@ pub(crate) fn commit_lines(
 
 /// The columns a commit's row reaches, drawn `lanes` lanes wide: its
 /// part of the graph, a gap, and the longer of its two lines.
-pub(crate) fn commit_extent(commit: &Commit, is_head: bool, lanes: usize) -> usize {
-    let (first, second) = commit_lines(commit, is_head, None);
+pub(crate) fn commit_extent(commit: &Commit, highlight: Highlight, lanes: usize) -> usize {
+    let (first, second) = commit_lines(commit, highlight, None);
     cells_for(lanes) + 1 + pieces_width(&first).max(pieces_width(&second))
 }
 
@@ -120,12 +163,13 @@ pub(crate) fn draw_commit_line(
     area: Rect,
     commit: &Commit,
     line: CommitLine,
-    is_head: bool,
+    highlight: Highlight,
     lanes: usize,
     row_style: Style,
     theme: &Theme,
     scroll: usize,
 ) {
+    let is_head = highlight != Highlight::None;
     let lane_colors = lane_palette(theme);
     let cells = match line {
         CommitLine::Node => commit.graph.node_cells(lanes),
@@ -155,7 +199,7 @@ pub(crate) fn draw_commit_line(
     if text_width == 0 {
         return;
     }
-    let (first, second) = commit_lines(commit, is_head, Some((theme, row_style)));
+    let (first, second) = commit_lines(commit, highlight, Some((theme, row_style)));
     let pieces = match line {
         CommitLine::Node => &first,
         CommitLine::Transition => &second,

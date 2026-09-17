@@ -2535,8 +2535,8 @@ impl App {
             view.paste(text);
         } else if let Mode::Changes(tabs) = &mut self.mode {
             tabs.paste(text);
-        } else if matches!(self.mode, Mode::GitLog(_)) {
-            // Nothing on the page takes text.
+        } else if let Mode::GitLog(tabs) = &mut self.mode {
+            tabs.paste(text);
         } else if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.view.editor_mut().paste(text);
         }
@@ -2601,7 +2601,7 @@ impl App {
             return;
         }
         if let Mode::GitLog(tabs) = &mut self.mode {
-            tabs.handle_key(key);
+            tabs.handle_key(key, &mut self.clipboard);
             return;
         }
         if let Mode::Changes(tabs) = &mut self.mode {
@@ -3013,7 +3013,7 @@ impl App {
                 let active = tabs.active_index();
                 self.mode_tab_bar
                     .render(tab_area, buf, theme, &labels, active, editor_focused);
-                tabs.active().render(self.editor_area, buf, theme);
+                cursor = tabs.active().render(self.editor_area, buf, theme);
             }
             Mode::Changes(tabs) => {
                 let labels: Vec<TabLabel> = tabs
