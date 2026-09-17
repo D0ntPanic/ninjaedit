@@ -163,9 +163,11 @@ mod tests {
         let spacer = Cell::spacer(Style::default());
         assert_eq!(spacer.width(), 0);
         assert!(!spacer.is_default());
-        let mut wide = Cell::default();
-        wide.text = "한".into();
-        wide.wide = true;
+        let wide = Cell {
+            text: "한".into(),
+            wide: true,
+            ..Default::default()
+        };
         assert_eq!(wide.width(), 2);
     }
 }
