@@ -1586,6 +1586,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "packer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "corpus",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tokenizer",
+ "twox-hash",
+]
+
+[[package]]
 name = "palette"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

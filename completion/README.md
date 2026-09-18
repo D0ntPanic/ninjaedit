@@ -24,3 +24,12 @@ does not pay for their dependencies. Build with `cargo build --release -p corpus
 
 The corpus library defines the train/valid/test split as a hash of the crate
 name (98/1/1), so every stage agrees on which crates are held out.
+
+* `packer` — tokenizes the corpus and packs it into fixed-length training rows.
+  Each split is a flat file of `seq_len` little-endian u16 tokens per row; the
+  high bit marks tokens excluded from the loss (padding and the crate/file name
+  header). Half of the documents get a fill-in-the-middle transformation, split
+  at character positions so the prefix can end mid-identifier like a real
+  cursor, in both the PSM and SPM layouts. Long files are cut at line
+  boundaries so every FIM document fits in one row; plain documents may be
+  split across rows to fill gaps. `packer show` decodes a row for inspection.
