@@ -12,12 +12,12 @@ mod stats;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use corpus::{CrateRecord, FileRecord, expand_home, read_shard};
 use flate2::read::GzDecoder;
 use index::CrateEntry;
 use license::Policy;
 use minhash::Signature;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 use stats::Stats;
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -104,23 +104,6 @@ const MAX_CRATE_FILES: usize = 5000;
 const SHARD_BYTES: u64 = 1024 * 1024 * 1024;
 const ZSTD_LEVEL: i32 = 3;
 
-#[derive(Serialize, Deserialize)]
-struct FileRecord {
-    path: String,
-    content: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct CrateRecord {
-    name: String,
-    version: String,
-    edition: String,
-    license: Option<String>,
-    pubtime: Option<String>,
-    deps: Vec<String>,
-    files: Vec<FileRecord>,
-}
-
 struct Processed {
     record: CrateRecord,
     /// One signature per file in `record.files`; `None` for files too short to compare.
@@ -148,15 +131,6 @@ impl ExactSet {
     }
 }
 
-fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return Path::new(&home).join(rest);
-    }
-    PathBuf::from(path)
-}
-
 fn main() -> Result<()> {
     match Command::parse() {
         Command::Build(args) => build(args),
@@ -180,10 +154,9 @@ fn inspect(args: InspectArgs) -> Result<()> {
 fn inspect_inner(args: InspectArgs) -> Result<()> {
     let path = expand_home(&args.shard);
     let mut out = BufWriter::new(std::io::stdout().lock());
-    let reader = BufReader::new(zstd::stream::read::Decoder::new(File::open(&path)?)?);
     let mut shown = 0usize;
-    for line in reader.lines() {
-        let record: CrateRecord = serde_json::from_str(&line?)?;
+    for record in read_shard(&path)? {
+        let record = record?;
         match &args.krate {
             None => {
                 let bytes: usize = record.files.iter().map(|f| f.content.len()).sum();

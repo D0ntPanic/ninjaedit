@@ -1,0 +1,15 @@
+[package]
+name = "tokenizer"
+version = "0.1.0"
+edition = "2024"
+description = "Byte-level BPE tokenizer for Rust source with indentation-aware line tokens"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+corpus = { path = "../corpus" }
+rayon = "1.10"
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+twox-hash = { version = "2.1.4", default-features = false, features = ["xxhash3_64"] }
