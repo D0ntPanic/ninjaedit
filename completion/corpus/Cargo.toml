@@ -1,0 +1,19 @@
+[package]
+name = "corpus"
+version = "0.1.0"
+edition = "2024"
+description = "Builds a filtered, deduplicated Rust source corpus from a local crates.io mirror"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+rayon = "1.10"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+toml = "1.1.5"
+twox-hash = { version = "2.1.4", default-features = false, features = ["xxhash3_64"] }
+zstd = "0.13"
+
