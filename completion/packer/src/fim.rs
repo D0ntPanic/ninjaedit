@@ -4,28 +4,22 @@ use crate::rng::Rng;
 use tokenizer::pretok::Indent;
 use tokenizer::{Encoder, Tokenizer};
 
-/// Cursor positions where a split may happen: character boundaries that are not inside a
-/// line's leading indentation. The end of every line is included.
-pub fn cursor_positions(text: &str) -> Vec<usize> {
-    let mut positions = Vec::with_capacity(text.len() / 2);
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let ws = body.len() - body.trim_start().len();
-        positions.extend(
-            body.char_indices()
-                .filter(|&(i, _)| i >= ws)
-                .map(|(i, _)| offset + i),
-        );
-        positions.push(offset + body.len());
-        offset += line.len();
+/// Cursor positions where a split may happen: pre-token boundaries, which include the end of
+/// every line and the end of the text. Inference backs the context up to the last pre-token
+/// boundary and constrains generation over whatever was typed past it, so the model only ever
+/// sees prefixes that end on a boundary; splitting there also keeps the prefix, middle and
+/// suffix tokenizing exactly as the whole document does.
+pub fn cursor_positions(text: &str, indent: Indent) -> Vec<usize> {
+    let mut positions = tokenizer::pretok::piece_starts(text, indent);
+    if positions.last() != Some(&text.len()) {
+        positions.push(text.len());
     }
     positions
 }
 
 /// How the middle of a document is chosen. The mix favours what an editor asks for: the
 /// rest of the current line, a few lines, or the rest of the enclosing block, with a share of
-/// arbitrary spans so the model also copes with cursors and boundaries inside tokens.
+/// arbitrary spans for variety.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpanKind {
     /// From the cursor to the end of its line.
@@ -164,11 +158,12 @@ pub fn transform(
     rng: &mut Rng,
     out: &mut Vec<u32>,
 ) -> Option<SpanKind> {
-    let positions = cursor_positions(text);
+    let positions = cursor_positions(text, indent);
     if positions.len() < 2 {
         return None;
     }
     let (start, end, kind) = choose_span(text, &positions, rng);
+    // The fallback span may end one byte past a position, inside a multibyte character.
     if !text.is_char_boundary(end) {
         return None;
     }
@@ -228,14 +223,16 @@ mod tests {
     }
 
     #[test]
-    fn positions_skip_indentation() {
+    fn positions_are_pre_token_boundaries() {
         let text = "fn a() {\n    b();\n\n}\n";
-        let positions = cursor_positions(text);
+        let positions = cursor_positions(text, Indent::Spaces(4));
         // Line 2 starts at offset 9; its indentation occupies 9..13.
         assert!(!positions.contains(&10));
         assert!(positions.contains(&13));
+        assert!(!positions.contains(&15)); // inside `();`
         assert!(positions.contains(&17)); // end of "    b();"
         assert!(positions.contains(&18)); // the blank line
         assert!(positions.contains(&0));
+        assert_eq!(positions.last(), Some(&text.len()));
     }
 }

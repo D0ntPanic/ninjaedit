@@ -123,6 +123,25 @@ impl Tokenizer {
         }
     }
 
+    /// The bytes each id renders to when line breaks use `indent` per indent level: the bytes of
+    /// a BPE token, the line break and its indentation, or nothing for a special token. Indexed
+    /// by id; `decode` produces the concatenation of these.
+    pub fn render_table(&self, indent: &str) -> Vec<Vec<u8>> {
+        (0..self.vocab.len() as u32)
+            .map(|id| {
+                if let Some(level) = self.newline_level(id) {
+                    let mut bytes = vec![b'\n'];
+                    for _ in 0..level {
+                        bytes.extend_from_slice(indent.as_bytes());
+                    }
+                    bytes
+                } else {
+                    self.token_bytes(id).map(<[u8]>::to_vec).unwrap_or_default()
+                }
+            })
+            .collect()
+    }
+
     pub fn encoder(&self) -> Encoder<'_> {
         Encoder {
             tok: self,

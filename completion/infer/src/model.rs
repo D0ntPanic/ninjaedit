@@ -531,13 +531,17 @@ impl<'a> Session<'a> {
     }
 }
 
-/// Token ids the completion loop needs to interpret the model's output.
+/// Token ids the completion loop needs to interpret the model's output, and the bytes each
+/// token renders to.
 #[derive(Clone, Debug)]
 pub struct TokenSet {
     pub eom: u32,
     pub eos: u32,
     /// The line-break tokens, one per indent level.
     pub newline: std::ops::Range<u32>,
+    /// What every token renders to, indexed by id, with line breaks including their
+    /// indentation and specials empty. Constrains generation over a partially typed token.
+    pub render: Vec<Vec<u8>>,
 }
 
 /// Limits and thresholds for a completion. An editor's "eagerness" setting maps onto these.
@@ -638,22 +642,55 @@ fn softmax_in_place(x: &mut [f32]) {
     }
 }
 
+/// The most likely token allowed while `remaining` typed bytes are unaccounted for: one whose
+/// rendering starts with them, or is a prefix of them. Returns the token, its probability
+/// renormalized over the allowed tokens, and how many of the bytes it covers. Every byte value
+/// is a token, so this only fails when the render table is empty.
+fn constrained_argmax(
+    probs: &[f32],
+    render: &[Vec<u8>],
+    remaining: &[u8],
+) -> Option<(u32, f32, usize)> {
+    let mut best: Option<(usize, f32)> = None;
+    let mut total = 0.0;
+    for (id, (bytes, &p)) in render.iter().zip(probs).enumerate() {
+        if bytes.is_empty() || !(bytes.starts_with(remaining) || remaining.starts_with(bytes)) {
+            continue;
+        }
+        total += p;
+        if best.is_none_or(|(_, b)| p > b) {
+            best = Some((id, p));
+        }
+    }
+    best.map(|(id, p)| (id as u32, p / total, render[id].len().min(remaining.len())))
+}
+
 impl Session<'_> {
     /// Greedy completion as a sequence of lines with confidence, stopping at the end token,
     /// at a line end where the end token is likely enough, when the next line would duplicate
     /// the suffix's first line (`suffix_line`, content tokens only) or an earlier line, or at
     /// the limits. The session's context ends with the last kept line's content, so accepting
     /// that text costs no recomputation.
+    ///
+    /// `partial` is text the user has typed past the end of the context that is not in it: the
+    /// incomplete last token, which would encode differently once finished. The context should
+    /// end at a pre-token boundary (`tokenizer::pretok::last_piece_start`). Until the generated
+    /// text covers the partial, only tokens consistent with it are considered, so the model
+    /// picks the whole token the user is typing rather than continuing a fragment it never saw
+    /// in training. The completion's text therefore begins with the partial, and its first
+    /// line's confidence is over the renormalized choices.
     pub fn complete(
         &mut self,
         tokens: &TokenSet,
         opts: &CompletionOptions,
         suffix_line: &[u32],
+        partial: &[u8],
     ) -> Completion {
         let mut lines: Vec<Line> = Vec::new();
         let mut current = Line::default();
         let mut generated = 0usize;
         let mut probs: Vec<f32> = Vec::new();
+        let mut remaining = partial;
         // Context length at the end of the last kept line, before its line break was fed.
         let mut kept_len = self.tokens.len();
         loop {
@@ -666,9 +703,22 @@ impl Session<'_> {
             probs.clear();
             probs.extend_from_slice(logits);
             softmax_in_place(&mut probs);
-            let next = argmax(&probs);
-            let p_next = probs[next as usize];
             let p_eom = probs[tokens.eom as usize];
+            let (next, p_next) = if remaining.is_empty() {
+                let next = argmax(&probs);
+                (next, probs[next as usize])
+            } else {
+                let Some((next, p, covered)) =
+                    constrained_argmax(&probs, &tokens.render, remaining)
+                else {
+                    return Completion {
+                        lines,
+                        reason: StopReason::EndToken,
+                    };
+                };
+                remaining = &remaining[covered..];
+                (next, p)
+            };
             if next == tokens.eom || next == tokens.eos {
                 if !current.tokens.is_empty() {
                     current.stop_prob = p_next;
@@ -841,5 +891,53 @@ mod tests {
         let mut fresh = model.new_cache();
         let expected = model.forward(&toks[36..], &mut fresh, false);
         assert!(max_diff(session.last_logits().unwrap(), &expected) < 1e-4);
+    }
+
+    #[test]
+    fn completion_covers_the_partial() {
+        let model = tiny();
+        let vocab = model.config.vocab_size;
+        // Token 2 is a line break; ids 3.. render to two-letter strings, 0 and 1 to nothing.
+        let render: Vec<Vec<u8>> = (0..vocab)
+            .map(|id| match id {
+                0 | 1 => Vec::new(),
+                2 => b"\n".to_vec(),
+                _ => vec![b'a' + (id % 26) as u8, b'a' + (id / 26 % 26) as u8],
+            })
+            .collect();
+        let tokens = TokenSet {
+            eom: 0,
+            eos: 1,
+            newline: 2..3,
+            render,
+        };
+        let opts = CompletionOptions {
+            max_tokens: 6,
+            stop_threshold: 2.0,
+            ..CompletionOptions::default()
+        };
+        for partial in [&b"d"[..], b"dab", b"dadbdc", b"\nab"] {
+            let mut session = Session::new(&model);
+            session.feed(&[5, 6, 7]);
+            let completion = session.complete(&tokens, &opts, &[], partial);
+            let text: Vec<u8> = completion
+                .tokens()
+                .iter()
+                .flat_map(|&t| tokens.render[t as usize].clone())
+                .collect();
+            assert!(
+                text.starts_with(partial),
+                "{:?} does not start with {:?}",
+                String::from_utf8_lossy(&text),
+                String::from_utf8_lossy(partial)
+            );
+            // The line holding the healed tokens has a renormalized confidence.
+            let first = completion
+                .lines
+                .iter()
+                .find(|l| !l.tokens.is_empty())
+                .unwrap();
+            assert!(first.confidence > 0.0 && first.confidence <= 1.0);
+        }
     }
 }

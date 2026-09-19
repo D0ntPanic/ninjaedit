@@ -79,34 +79,81 @@ pub fn pretokenize(text: &str, indent: Indent) -> Vec<Piece<'_>> {
     let mut out = Vec::with_capacity(text.len() / 4);
     for (i, line) in text.split('\n').enumerate() {
         let bytes = line.as_bytes();
-        let tabs = bytes.iter().take_while(|&&c| c == b'\t').count();
-        let spaces = bytes[tabs..].iter().take_while(|&&c| c == b' ').count();
-        let (mut level, remainder) = match indent {
-            Indent::Spaces(unit) => (tabs + spaces / unit, spaces % unit),
-            Indent::Tabs => (tabs, spaces),
-        };
-        let mut rest = tabs + spaces;
-        let mut extra = 0;
-        if level > MAX_INDENT {
-            extra = level - MAX_INDENT;
-            level = MAX_INDENT;
-        }
-        if i > 0 {
+        let rest = if i > 0 {
+            let (level, consumed) = line_indent(bytes, indent);
             out.push(Piece::Newline(level));
-            // Excess indentation beyond the unit or the maximum level stays literal.
-            let literal = remainder
-                + match indent {
-                    Indent::Spaces(unit) => extra * unit,
-                    Indent::Tabs => extra,
-                };
-            rest -= literal;
+            consumed
         } else {
             // The first line has no preceding line break; keep any indentation literal.
-            rest = 0;
-        }
+            0
+        };
         line_pieces(&bytes[rest..], &mut out);
     }
     out
+}
+
+/// The indent level of a line and the number of leading bytes that level accounts for.
+/// Indentation beyond the unit or the maximum level stays literal.
+fn line_indent(line: &[u8], indent: Indent) -> (usize, usize) {
+    let tabs = line.iter().take_while(|&&c| c == b'\t').count();
+    let spaces = line[tabs..].iter().take_while(|&&c| c == b' ').count();
+    let (level, remainder) = match indent {
+        Indent::Spaces(unit) => (tabs + spaces / unit, spaces % unit),
+        Indent::Tabs => (tabs, spaces),
+    };
+    let extra = level.saturating_sub(MAX_INDENT);
+    let literal = remainder
+        + match indent {
+            Indent::Spaces(unit) => extra * unit,
+            Indent::Tabs => extra,
+        };
+    (level - extra, tabs + spaces - literal)
+}
+
+/// Byte offsets where every pre-token of `text` starts: the `\n` of each line break and the first
+/// byte of each run. These are the cursor positions at which the text so far encodes exactly as
+/// it does within the whole, so a document split at one of them tokenizes as the concatenation
+/// of its parts. Positions inside indentation are not included.
+pub fn piece_starts(text: &str, indent: Indent) -> Vec<usize> {
+    let mut out = Vec::with_capacity(text.len() / 4);
+    let mut offset = 0;
+    for (i, line) in text.split('\n').enumerate() {
+        let bytes = line.as_bytes();
+        let rest = if i > 0 {
+            out.push(offset - 1);
+            line_indent(bytes, indent).1
+        } else {
+            0
+        };
+        line_spans(&bytes[rest..], |start, _| out.push(offset + rest + start));
+        offset += line.len() + 1;
+    }
+    out
+}
+
+/// Start of the last pre-token of `text`, which may still be incomplete: more typing could
+/// extend it and change its encoding. Everything before this offset encodes exactly as it will
+/// once the text is finished, because BPE merges never cross pre-token boundaries. When the
+/// last line holds nothing but indentation, the last pre-token is its line break, so the offset
+/// is that of the `\n`; an editor completing from here treats the line break and the typed
+/// indentation as one partial token.
+pub fn last_piece_start(text: &str, indent: Indent) -> usize {
+    let line_start = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &text.as_bytes()[line_start..];
+    if line_start > 0 {
+        let (_, consumed) = line_indent(line, indent);
+        let body = &line[consumed..];
+        if body.iter().all(|&c| c == b' ' || c == b'\t') {
+            return line_start - 1;
+        }
+        let mut last = 0;
+        line_spans(body, |start, _| last = start);
+        line_start + consumed + last
+    } else {
+        let mut last = 0;
+        line_spans(line, |start, _| last = start);
+        last
+    }
 }
 
 fn is_word(c: u8) -> bool {
@@ -120,26 +167,31 @@ fn is_punct(c: u8) -> bool {
 /// Splits one line's bytes into word, punctuation and whitespace runs. A single space before a
 /// run is attached to it, so `let x` becomes `let` and ` x`.
 fn line_pieces<'a>(line: &'a [u8], out: &mut Vec<Piece<'a>>) {
+    line_spans(line, |start, end| out.push(Piece::Bytes(&line[start..end])));
+}
+
+/// Calls `emit` with the byte range of each run of a line, in order.
+fn line_spans(line: &[u8], mut emit: impl FnMut(usize, usize)) {
     let mut i = 0;
     while i < line.len() {
         let c = line[i];
         if c == b' ' {
             let run = line[i..].iter().take_while(|&&c| c == b' ').count();
             if i + run == line.len() {
-                out.push(Piece::Bytes(&line[i..]));
+                emit(i, line.len());
                 break;
             }
             if run > 1 {
-                out.push(Piece::Bytes(&line[i..i + run - 1]));
+                emit(i, i + run - 1);
             }
             let start = i + run - 1;
             i += run;
             let end = run_end(line, i);
-            out.push(Piece::Bytes(&line[start..end]));
+            emit(start, end);
             i = end;
         } else {
             let end = run_end(line, i);
-            out.push(Piece::Bytes(&line[i..end]));
+            emit(i, end);
             i = end;
         }
     }
@@ -216,5 +268,67 @@ mod tests {
             ]
         );
         assert_eq!(pieces("a   b\n"), ["a", "  ", " b", "<nl:0>"]);
+    }
+
+    #[test]
+    fn piece_starts_split_the_text_into_its_pieces() {
+        let text = "fn a() {\n    let x = a::b(1,\n          2);\n\n}\n";
+        let indent = Indent::Spaces(4);
+        let starts = piece_starts(text, indent);
+        assert_eq!(
+            starts,
+            [
+                0, 2, 4, 6, 8, 13, 16, 18, 20, 22, 24, 25, 26, 27, 28, 37, 38, 40, 42, 43, 44, 45
+            ]
+        );
+        // Splitting at any piece start leaves both parts tokenizing as they do in the whole.
+        let whole = pretokenize(text, indent);
+        for &at in &starts {
+            let mut parts = pretokenize(&text[..at], indent);
+            parts.extend(pretokenize(&text[at..], indent));
+            assert_eq!(parts, whole, "split at {at}");
+        }
+        // Anywhere else changes the pieces (the end of the text trivially does not).
+        for at in 0..text.len() {
+            if !starts.contains(&at) {
+                let mut parts = pretokenize(&text[..at], indent);
+                parts.extend(pretokenize(&text[at..], indent));
+                assert_ne!(parts, whole, "split at {at}");
+            }
+        }
+        // The last start agrees with `last_piece_start` when the text ends in a run.
+        for prefix in ["fn a() {\n    let x", "fn a() {\n    let x =", "fn a() {\n"] {
+            assert_eq!(
+                piece_starts(prefix, indent).last().copied(),
+                Some(last_piece_start(prefix, indent))
+            );
+        }
+    }
+
+    #[test]
+    fn last_piece_start_backs_up_to_the_pre_token() {
+        let four = Indent::Spaces(4);
+        assert_eq!(last_piece_start("", four), 0);
+        assert_eq!(last_piece_start("fn", four), 0);
+        assert_eq!(last_piece_start("fn main", four), 2);
+        assert_eq!(last_piece_start("fn main(", four), 7);
+        // A trailing space is the start of the next run.
+        assert_eq!(last_piece_start("let x = ", four), 7);
+        assert_eq!(last_piece_start("a  ", four), 1);
+        assert_eq!(last_piece_start("fn a() {\n    b", four), 13);
+        // Aligned continuation: the extra space is its own run, `2` carries one space.
+        assert_eq!(last_piece_start("x(1,\n      2", four), 10);
+        // A line holding only indentation backs up to the line break.
+        assert_eq!(last_piece_start("fn a() {\n    ", four), 8);
+        assert_eq!(last_piece_start("fn a() {\n  ", four), 8);
+        assert_eq!(last_piece_start("fn a() {\n", four), 8);
+        assert_eq!(last_piece_start("fn a() {\n\t", Indent::Tabs), 8);
+        // Everything before the boundary encodes as it will once the text is finished.
+        let text = "fn a() {\n    let x = Option";
+        let at = last_piece_start(text, four);
+        assert_eq!(&text[at..], " Option");
+        let full = pretokenize(text, four);
+        let head = pretokenize(&text[..at], four);
+        assert_eq!(&full[..full.len() - 1], &head[..]);
     }
 }

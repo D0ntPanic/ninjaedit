@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokenizer::Tokenizer;
+use tokenizer::pretok::{self, Indent};
 
 #[derive(Parser)]
 #[command(about = "CPU inference for the completion model")]
@@ -48,6 +49,10 @@ struct SampleArgs {
     stop_threshold: f32,
     #[arg(long, default_value_t = 0.0)]
     min_line_confidence: f32,
+    /// Feed the prefix exactly as typed instead of backing up to the last pre-token boundary
+    /// and constraining generation to cover what was typed past it.
+    #[arg(long)]
+    no_heal: bool,
     #[arg(long)]
     threads: Option<usize>,
 }
@@ -133,16 +138,29 @@ fn main() -> Result<()> {
                 Some(path) => fs::read_to_string(expand_home(path))?,
                 None => String::new(),
             };
-            let indent = tokenizer::pretok::detect_indent(&format!("{prefix}{suffix}"));
+            let indent = pretok::detect_indent(&format!("{prefix}{suffix}"));
+            let indent_str = match indent {
+                Indent::Spaces(n) => " ".repeat(n),
+                Indent::Tabs => "\t".to_owned(),
+            };
+            // The context ends at the last pre-token boundary; the rest of the prefix is the
+            // partial token the completion must cover.
+            let boundary = if args.no_heal {
+                prefix.len()
+            } else {
+                pretok::last_piece_start(&prefix, indent)
+            };
+            let (context, partial) = prefix.split_at(boundary);
             let mut encoder = tok.encoder();
             let mut ids = vec![tok.special("<fim_prefix>"), tok.special("<fim_suffix>")];
             encoder.encode_with(&suffix, indent, &mut ids);
             ids.push(tok.special("<fim_middle>"));
-            encoder.encode_with(&prefix, indent, &mut ids);
+            encoder.encode_with(context, indent, &mut ids);
             let token_set = TokenSet {
                 eom: tok.special("<eom>"),
                 eos: tok.special("<eos>"),
                 newline: Tokenizer::NEWLINE_BASE..Tokenizer::BYTE_BASE,
+                render: tok.render_table(&indent_str),
             };
             let opts = CompletionOptions {
                 max_lines: args.max_lines,
@@ -164,7 +182,7 @@ fn main() -> Result<()> {
             session.feed(&ids);
             let prefill = started.elapsed();
             let started = Instant::now();
-            let completion = session.complete(&token_set, &opts, &suffix_line);
+            let completion = session.complete(&token_set, &opts, &suffix_line, partial.as_bytes());
             let decode = started.elapsed();
             let generated = completion.tokens();
             eprintln!(
@@ -176,6 +194,20 @@ fn main() -> Result<()> {
                 decode.as_secs_f64() * 1000.0 / generated.len().max(1) as f64,
                 completion.reason
             );
+            if !partial.is_empty() {
+                let covered: Vec<String> = generated
+                    .iter()
+                    .scan(0usize, |seen, &t| {
+                        let len = token_set.render[t as usize].len();
+                        let done = *seen >= partial.len();
+                        *seen += len;
+                        Some((done, t))
+                    })
+                    .take_while(|&(done, _)| !done)
+                    .map(|(_, t)| tok.token_text(t))
+                    .collect();
+                eprintln!("healed partial {partial:?} as {covered:?}");
+            }
             for (i, line) in completion.lines.iter().enumerate() {
                 eprintln!(
                     "  line {:>2}  confidence {:.2}  min {:.2}  stop {:.3}",
@@ -185,7 +217,9 @@ fn main() -> Result<()> {
                     line.stop_prob
                 );
             }
-            println!("{}", tok.decode(&generated, "    "));
+            // The completion's text begins with the partial the user already typed.
+            let text = tok.decode(&generated, &indent_str);
+            println!("{}", text.get(partial.len()..).unwrap_or(""));
         }
         Command::Bench(args) => {
             set_threads(args.threads);
