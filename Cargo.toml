@@ -1,6 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["core", "tui", "completion/*"]
+members = [
+	"core",
+	"tui",
+	"completion/corpus",
+	"completion/tokenizer",
+	"completion/packer",
+	"completion/infer",
+]
 default-members = ["tui"]
 
 

@@ -70,6 +70,17 @@ impl Tokenizer {
         self.vocab.len()
     }
 
+    /// A hash of the merge list. Two tokenizers with the same fingerprint assign the same ids;
+    /// a model is only usable with the tokenizer it was trained with, so checkpoints record it.
+    pub fn fingerprint(&self) -> String {
+        let mut bytes = Vec::with_capacity(self.merges.len() * 8);
+        for &(a, b) in &self.merges {
+            bytes.extend_from_slice(&a.to_le_bytes());
+            bytes.extend_from_slice(&b.to_le_bytes());
+        }
+        format!("{:016x}", twox_hash::XxHash3_64::oneshot(&bytes))
+    }
+
     pub fn merges(&self) -> &[Pair] {
         &self.merges
     }

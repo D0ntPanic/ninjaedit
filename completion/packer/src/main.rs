@@ -70,6 +70,7 @@ struct Meta {
     vocab_size: usize,
     mask_bit: u16,
     tokenizer: String,
+    tokenizer_fingerprint: String,
     fim_rate: f64,
     sample: u64,
     seed: u64,
@@ -106,6 +107,12 @@ fn build(args: BuildArgs) -> Result<()> {
         eprintln!("packing {} (1/{sample} of crates)...", split.name());
         stats[i] = pack_split(&tok, &shards, split, sample, &args, &out)?;
         let s = &stats[i];
+        let spans: Vec<String> = fim::SpanKind::ALL
+            .iter()
+            .zip(s.spans)
+            .map(|(k, n)| format!("{} {n}", k.name()))
+            .collect();
+        eprintln!("  spans: {}", spans.join(", "));
         eprintln!(
             "  {} rows, {} tokens, {} docs ({} fim, {} split), {:.2}% pad, {:.2}% masked ({:.0}s)",
             s.rows,
@@ -123,6 +130,7 @@ fn build(args: BuildArgs) -> Result<()> {
         vocab_size: tok.vocab_size(),
         mask_bit: MASK_BIT,
         tokenizer: args.tokenizer.clone(),
+        tokenizer_fingerprint: tok.fingerprint(),
         fim_rate: args.fim_rate,
         sample: args.sample,
         seed: args.seed,
@@ -214,9 +222,15 @@ fn pack_crate<W: Write>(
         let indent = pretok::detect_indent(&file.content);
         for piece in pieces(tok, encoder, &file.content, indent, max_content) {
             ids.clear();
-            let fim = rng.chance(args.fim_rate)
-                && fim::transform(tok, encoder, piece, indent, rng, &mut ids);
-            if !fim {
+            let span = if rng.chance(args.fim_rate) {
+                fim::transform(tok, encoder, piece, indent, rng, &mut ids)
+            } else {
+                None
+            };
+            let fim = span.is_some();
+            if let Some(kind) = span {
+                packer.stats.spans[kind as usize] += 1;
+            } else {
                 ids.clear();
                 encoder.encode_with(piece, indent, &mut ids);
             }

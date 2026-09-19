@@ -1,0 +1,14 @@
+[project]
+name = "ninjaedit-completion"
+version = "0.1.0"
+description = "MLX training scripts for the ninjaedit code completion model"
+requires-python = ">=3.13"
+dependencies = [
+    "mlx>=0.32",
+    "numpy>=2",
+    "safetensors>=0.5",
+]
+
+[tool.uv]
+# Scripts, not an installable package.
+package = false

@@ -1,0 +1,21 @@
+{
+  "name": "150m",
+  "description": "Largest planned size; CPU decode about 3 ms/token at short context.",
+  "model": {
+    "d_model": 896,
+    "n_layers": 14,
+    "n_heads": 14,
+    "d_ff": 2432,
+    "rope_theta": 10000.0
+  },
+  "train": {
+    "batch": 16,
+    "tokens": 4500000000,
+    "lr": 0.0003,
+    "warmup": 2000,
+    "weight_decay": 0.1,
+    "eval_every": 500,
+    "eval_batches": 16,
+    "save_every": 1000
+  }
+}
