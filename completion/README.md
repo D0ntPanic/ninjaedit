@@ -23,8 +23,10 @@ Crates:
   Each split is a flat file of `seq_len` little-endian u16 tokens per row; the
   high bit marks tokens excluded from the loss (padding and the crate/file name
   header). Half of the documents get a fill-in-the-middle transformation, split
-  at character positions so the prefix can end mid-identifier like a real
-  cursor, in both the PSM and SPM layouts. Long files are cut at line
+  at pre-token boundaries in both the PSM and SPM layouts. Inference never
+  feeds a partial token (see `infer` below), so training does not spend
+  examples on prefixes that end inside one, and the three parts of a
+  document tokenize exactly as the whole does. Long files are cut at line
   boundaries so every FIM document fits in one row; plain documents may be
   split across rows to fill gaps. `packer show` decodes a row for inspection.
 
@@ -52,8 +54,17 @@ Crates:
   end token, at a line end where the end token clears a threshold, when the
   next line would duplicate the suffix's first line or a previous line, or
   at the limits, and leaves the context at the end of the kept text so
-  accepting it costs nothing. `infer bench` measures throughput,
-  `infer sample` completes a prefix/suffix pair.
+  accepting it costs nothing. The context ends at the last pre-token boundary
+  of the prefix (`pretok::last_piece_start`), and whatever the user has typed
+  past it is passed as a partial token: BPE merges never cross pre-token
+  boundaries, so everything before it encodes exactly as it will once the
+  token is finished, and generation is constrained to tokens consistent with
+  the partial until it is covered. The model therefore chooses the whole
+  token being typed (`Option` for `Opti`) instead of continuing a fragment
+  it rarely saw in training, and keystrokes inside a token leave the fed
+  context, and its cache, untouched. `infer bench` measures throughput,
+  `infer sample` completes a prefix/suffix pair; `--no-heal` feeds the prefix
+  as typed for comparison.
 
 Model shapes live in `shapes/*.json`: each names an architecture and its
 planned training run (batch, token budget, learning rate, warmup, intervals).
