@@ -1,0 +1,26 @@
+# Tooling for the MLX side of the completion work. `mise install` fetches Python and uv;
+# every task depends on `setup`, which installs the Python dependencies from pyproject.toml
+# into .venv, so on a fresh machine `mise run train -- --shape 70m` is all it takes.
+
+[tools]
+python = "3.13"
+uv = "latest"
+
+[tasks.setup]
+description = "Install the Python dependencies (mlx, numpy, safetensors) into .venv"
+run = "uv sync"
+
+[tasks.train]
+description = "Train a model: mise run train -- --shape 70m [flags]"
+depends = ["setup"]
+run = "uv run python mlx/train.py"
+
+[tasks.export]
+description = "Export a checkpoint's weights for shipping: mise run export -- --checkpoint DIR --out DIR"
+depends = ["setup"]
+run = "uv run python mlx/export.py"
+
+[tasks.shapes]
+description = "List the model shapes with parameter counts and training plans"
+depends = ["setup"]
+run = "uv run python mlx/shapes.py"

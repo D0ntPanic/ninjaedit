@@ -24,6 +24,8 @@ enum Command {
     Encode(EncodeArgs),
     /// List the vocabulary.
     Vocab(VocabArgs),
+    /// Print the tokenizer's fingerprint.
+    Fingerprint(VocabArgs),
 }
 
 #[derive(Parser)]
@@ -72,6 +74,13 @@ fn main() -> Result<()> {
         Command::Eval(args) => eval(args),
         Command::Encode(args) => encode(args),
         Command::Vocab(args) => vocab(args),
+        Command::Fingerprint(args) => {
+            println!(
+                "{}",
+                Tokenizer::load(&expand_home(&args.model))?.fingerprint()
+            );
+            Ok(())
+        }
     }
 }
 

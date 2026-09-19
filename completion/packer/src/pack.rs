@@ -18,6 +18,8 @@ pub struct PackStats {
     pub fim_docs: u64,
     pub split_docs: u64,
     pub dropped_docs: u64,
+    /// FIM documents per span kind, in `SpanKind::ALL` order: line, lines, block, uniform.
+    pub spans: [u64; 4],
     pub rows: u64,
     pub tokens: u64,
     pub pad_tokens: u64,
@@ -30,6 +32,9 @@ impl PackStats {
         self.fim_docs += other.fim_docs;
         self.split_docs += other.split_docs;
         self.dropped_docs += other.dropped_docs;
+        for (a, b) in self.spans.iter_mut().zip(other.spans) {
+            *a += b;
+        }
         self.rows += other.rows;
         self.tokens += other.tokens;
         self.pad_tokens += other.pad_tokens;

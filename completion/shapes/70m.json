@@ -1,0 +1,21 @@
+{
+  "name": "70m",
+  "description": "First size intended for real use. Same width class as the 34M test with a deeper stack.",
+  "model": {
+    "d_model": 640,
+    "n_layers": 12,
+    "n_heads": 10,
+    "d_ff": 1728,
+    "rope_theta": 10000.0
+  },
+  "train": {
+    "batch": 16,
+    "tokens": 2000000000,
+    "lr": 0.0005,
+    "warmup": 1000,
+    "weight_decay": 0.1,
+    "eval_every": 500,
+    "eval_batches": 16,
+    "save_every": 1000
+  }
+}
