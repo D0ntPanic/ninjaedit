@@ -6,6 +6,8 @@ highlighted-find-result-background = "dark-blue"
 inactive-line-number = "dimmed"
 active-line-number = "alt"
 gutter-guide = "dark-dimmed"
+# A code completion proposed after the cursor, before it is accepted.
+pending-completion-text = "dimmed"
 inactive-tab-background = "black"
 active-tab-background = "mid"
 inactive-tab-text = "alt"

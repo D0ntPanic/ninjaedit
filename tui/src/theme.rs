@@ -224,6 +224,8 @@ required {
     active_line_number => "active-line-number",
     /// The vertical guide between the gutter and the text.
     gutter_guide => "gutter-guide",
+    /// A code completion shown after the cursor, not yet in the file.
+    pending_completion_text => "pending-completion-text",
     inactive_tab_background => "inactive-tab-background",
     active_tab_background => "active-tab-background",
     inactive_tab_text => "inactive-tab-text",

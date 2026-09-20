@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
+serde_json = "1"
 code-fuzzy-match = "0.2.2"
 git2 = { version = "0.21.0", features = ["ssh", "https", "vendored-libgit2", "vendored-openssl"] }
 regex = "1.13.1"
@@ -18,3 +20,6 @@ portable-pty = "0.9"
 compact_str = "0.9"
 toml = "1.1.5"
 twox-hash = { version = "2.1.4", default-features = false, features = ["xxhash64"] }
+# The code completion model and its tokenizer.
+infer = { path = "../completion/infer", default-features = false }
+tokenizer = { path = "../completion/tokenizer", default-features = false }

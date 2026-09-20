@@ -4,11 +4,22 @@ version = "0.1.0"
 edition = "2024"
 description = "Byte-level BPE tokenizer for Rust source with indentation-aware line tokens"
 
+[features]
+default = ["cli"]
+# The training and evaluation command; the library the editor uses needs
+# none of it.
+cli = ["dep:clap", "dep:corpus", "dep:rayon"]
+
+[[bin]]
+name = "tokenizer"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-corpus = { path = "../corpus" }
-rayon = "1.10"
+clap = { version = "4", features = ["derive"], optional = true }
+corpus = { path = "../corpus", optional = true }
+rayon = { version = "1.10", optional = true }
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -97,9 +97,30 @@
 //! conflict is one block that follows the file, and undo is still one
 //! step. The other way round, [`Editor::discard_changes`] reloads the
 //! file over any unsaved edits, and is undoable too.
+//!
+//! Code completion: the editor doesn't run the model (see the
+//! [`completion`](crate::completion) module) but holds the *suggestion*
+//! it makes, the text proposed at the cursor that a frontend shows as
+//! ghost text after it. Typing is what asks for a completion: after the
+//! user types, [`Editor::take_completion_request`] gives the request to
+//! send, and the answer comes back through [`Editor::offer_completion`].
+//! Moving the cursor never asks for one, so someone reading a file isn't
+//! shown ghost text as they go. A suggestion is dropped by any movement
+//! or edit, with one exception: typing the very characters it proposes
+//! (the line break included, indentation and all) consumes them from it
+//! and keeps the rest, so a suggestion the user is typing along with
+//! doesn't get replaced under them, and costs nothing more to compute.
+//! Tab accepts a suggestion a line at a time: the first press takes its
+//! first line, and a second press straight after takes all the rest.
+//! Typing in between (Enter, to go on to the next line, say) puts the
+//! next Tab back to taking a single line, so any number of lines can be
+//! taken with Tab, Enter, Tab, Enter and so on. Once a suggestion has
+//! been taken in full, or typed through to its end, the next completion
+//! is asked for.
 
 use crate::auto_indent::{self, CodeLine, CodeStyle, Indenter, Rules};
 use crate::buffer::{BufferSnapshot, DiskChange, FileBuffer};
+use crate::completion::CompletionRequest;
 use crate::indent::{self, Indentation};
 use crate::merge;
 use crate::search::{Search, SearchStep};
@@ -111,6 +132,12 @@ use std::path::Path;
 
 /// The default number of cells between tab stops.
 pub const DEFAULT_TAB_WIDTH: usize = 4;
+
+/// How much of the text before the cursor a completion request carries,
+/// at most; the model sees less, but the worker chooses which part.
+const COMPLETION_PREFIX_BYTES: usize = 24 * 1024;
+/// How many lines after the cursor's a completion request carries.
+const COMPLETION_SUFFIX_LINES: usize = 48;
 
 /// A cursor movement, used both to move the cursor and to extend a selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +236,17 @@ struct UndoEntry {
     after: CursorState,
     edit: Edit,
     kind: EditKind,
+}
+
+/// A completion proposed at the cursor; see the [module
+/// documentation](self).
+struct Suggestion {
+    /// What is left to insert at the cursor, with `\n` line breaks.
+    /// Never empty.
+    text: String,
+    /// Whether Tab has taken its first line, so that the next Tab takes
+    /// all the rest.
+    accepted_line: bool,
 }
 
 /// The layout of one line's content: its characters with their byte ranges
@@ -334,6 +372,17 @@ pub struct Editor {
     /// The last change brought in from disk, while nothing has been edited
     /// on top of it; see [`check_disk`](Self::check_disk).
     external: Option<External>,
+    /// The completion proposed at the cursor, shown as ghost text; see
+    /// the [module documentation](self).
+    suggestion: Option<Suggestion>,
+    /// Whether the user has typed since a completion was last asked for,
+    /// so that a new one is wanted; see
+    /// [`take_completion_request`](Self::take_completion_request).
+    completion_wanted: bool,
+    /// Numbers the completion requests, and moves on whenever the text
+    /// or the cursor changes, so the answer to a request made before is
+    /// known to be stale.
+    completion_serial: u64,
 }
 
 impl Editor {
@@ -363,6 +412,9 @@ impl Editor {
             highlighter,
             search: None,
             external: None,
+            suggestion: None,
+            completion_wanted: false,
+            completion_serial: 0,
         }
     }
 
@@ -711,6 +763,7 @@ impl Editor {
         self.desired_column = column;
         self.pending = None;
         self.search = None;
+        self.drop_suggestion();
     }
 
     /// Where [`Movement::LineStart`] goes from the cursor's line: the end of
@@ -733,12 +786,13 @@ impl Editor {
 
     /// Bookkeeping shared by all explicit cursor changes: they break undo
     /// grouping, forget the remembered vertical column, discard pending
-    /// indentation, and drop any search.
+    /// indentation, and drop any search and suggestion.
     fn end_movement(&mut self) {
         self.grouping = false;
         self.desired_column = None;
         self.pending = None;
         self.search = None;
+        self.drop_suggestion();
     }
 
     // ----- Search ---------------------------------------------------------
@@ -816,6 +870,7 @@ impl Editor {
         self.grouping = false;
         self.desired_column = None;
         self.pending = None;
+        self.drop_suggestion();
     }
 
     // ----- Position arithmetic -------------------------------------------
@@ -934,14 +989,39 @@ impl Editor {
     /// pending indentation to the buffer. Brackets are paired and
     /// stepped over, and some characters reindent their line; see the
     /// [module documentation](self).
+    ///
+    /// Typing what the suggestion at the cursor proposes consumes it from
+    /// the suggestion and keeps the rest, and is inserted as typed, with
+    /// no brackets paired (the suggestion has its own closing brackets);
+    /// typing anything else drops the suggestion. Either way this is
+    /// typing, which asks for a completion unless a suggestion remains.
     pub fn insert_char(&mut self, c: char) {
-        if c == '\n' || c == '\r' {
+        let newline = c == '\n' || c == '\r';
+        if let Some(suggestion) = self.suggestion.take() {
+            if newline && suggestion.text.starts_with('\n') {
+                self.insert_newline();
+                self.continue_suggestion_on_next_line(&suggestion.text[1..]);
+                return;
+            }
+            let mut bytes = [0u8; 4];
+            let typed = c.encode_utf8(&mut bytes);
+            if !newline && suggestion.text.starts_with(&*typed) {
+                self.type_char(c);
+                self.keep_suggestion(&suggestion.text[typed.len()..]);
+                return;
+            }
+        }
+        if newline {
             self.insert_newline();
-            return;
+        } else if self.selection().is_some() || !c.is_ascii() || !self.type_code_char(c as u8) {
+            self.type_char(c);
         }
-        if self.selection().is_none() && c.is_ascii() && self.type_code_char(c as u8) {
-            return;
-        }
+        self.completion_wanted = true;
+    }
+
+    /// Insert a typed character other than a line break, committing
+    /// pending indentation first.
+    fn type_char(&mut self, c: char) {
         let mut inserted = self.pending.take().unwrap_or_default().into_bytes();
         let mut bytes = [0u8; 4];
         inserted.extend_from_slice(c.encode_utf8(&mut bytes).as_bytes());
@@ -1132,8 +1212,15 @@ impl Editor {
 
     /// Insert text at the cursor, replacing the selection if there is one.
     /// Line breaks in the text are rewritten as the buffer's line ending.
-    /// Pending indentation is committed first.
+    /// Pending indentation is committed first. Counts as typing, so a
+    /// completion is asked for afterwards.
     pub fn insert_text(&mut self, text: &str) {
+        self.insert_text_quietly(text);
+        self.completion_wanted = true;
+    }
+
+    /// [`insert_text`](Self::insert_text) without asking for a completion.
+    fn insert_text_quietly(&mut self, text: &str) {
         let text = normalize_line_endings(text, self.buffer.eol().as_str());
         if text.is_empty() {
             return;
@@ -1149,6 +1236,12 @@ impl Editor {
     /// both. In a space-indented buffer, when only spaces precede the
     /// cursor on its line, removes back to the previous indentation stop.
     pub fn backspace(&mut self) {
+        self.drop_suggestion();
+        self.backspace_inner();
+        self.completion_wanted = true;
+    }
+
+    fn backspace_inner(&mut self) {
         if let Some(mut pending) = self.pending.take() {
             self.shrink_indent(&mut pending);
             if !pending.is_empty() {
@@ -1184,14 +1277,15 @@ impl Editor {
     /// Delete the selection, or the character after the cursor if nothing is
     /// selected. Pending indentation is discarded.
     pub fn delete_forward(&mut self) {
+        self.drop_suggestion();
         self.pending = None;
-        if self.delete_selection() {
-            return;
+        if !self.delete_selection() {
+            let end = self.next_char(self.cursor);
+            if end > self.cursor {
+                self.commit(self.cursor..end, Vec::new(), EditKind::Delete);
+            }
         }
-        let end = self.next_char(self.cursor);
-        if end > self.cursor {
-            self.commit(self.cursor..end, Vec::new(), EditKind::Delete);
-        }
+        self.completion_wanted = true;
     }
 
     /// Delete the selected text. Returns whether anything was selected.
@@ -1253,6 +1347,7 @@ impl Editor {
         self.pending = None;
         self.search = None;
         self.external = None;
+        self.drop_suggestion();
         let before = self.state();
         let edit = Edit {
             offset: range.start,
@@ -1363,6 +1458,12 @@ impl Editor {
     /// next indentation stop: a tab, or spaces up to the next multiple of
     /// the indentation width.
     pub fn indent(&mut self) {
+        self.drop_suggestion();
+        self.indent_inner();
+        self.completion_wanted = true;
+    }
+
+    fn indent_inner(&mut self) {
         if let Some(mut pending) = self.pending.take() {
             let step = self.indent_step(self.indent_columns(&pending));
             pending.push_str(&step);
@@ -1387,15 +1488,17 @@ impl Editor {
     /// the cursor's line) back to the previous indentation stop, keeping
     /// the selection. Lines that aren't indented are left alone.
     pub fn outdent(&mut self) {
+        self.drop_suggestion();
         if let Some(mut pending) = self.pending.take() {
             self.shrink_indent(&mut pending);
             if !pending.is_empty() {
                 self.pending = Some(pending);
             }
-            return;
+        } else {
+            let range = self.selection().unwrap_or(self.cursor..self.cursor);
+            self.shift_lines(range, false);
         }
-        let range = self.selection().unwrap_or(self.cursor..self.cursor);
-        self.shift_lines(range, false);
+        self.completion_wanted = true;
     }
 
     /// The display width of a run of spaces and tabs starting at column 0.
@@ -1518,6 +1621,188 @@ impl Editor {
         self.cursor = state.cursor;
         self.anchor = state.anchor;
         self.end_movement();
+    }
+
+    // ----- Code completion ------------------------------------------------
+
+    /// The completion proposed at the cursor, for a frontend to show as
+    /// ghost text: what would be inserted there, with `\n` line breaks.
+    /// `None` when there is none. Never empty.
+    pub fn suggestion(&self) -> Option<&str> {
+        self.suggestion.as_ref().map(|s| s.text.as_str())
+    }
+
+    pub fn has_suggestion(&self) -> bool {
+        self.suggestion.is_some()
+    }
+
+    /// Whether the next [`accept_suggestion`](Self::accept_suggestion)
+    /// takes all of the suggestion rather than its first line, because
+    /// the last one took a line and nothing has been typed since.
+    pub fn suggestion_continues(&self) -> bool {
+        self.suggestion.as_ref().is_some_and(|s| s.accepted_line)
+    }
+
+    /// Drop the suggestion without asking for another. Returns whether
+    /// there was one.
+    pub fn dismiss_suggestion(&mut self) -> bool {
+        let had = self.suggestion.is_some();
+        self.drop_suggestion();
+        had
+    }
+
+    /// Take the suggestion into the buffer: its first line, or, straight
+    /// after a first line was taken, all the rest (see the [module
+    /// documentation](self)). A suggestion that begins with line breaks
+    /// counts them as part of its first line, since taking nothing
+    /// would be no use. Returns whether there was a suggestion. Taking
+    /// the last of it asks for the next completion.
+    pub fn accept_suggestion(&mut self) -> bool {
+        let Some(suggestion) = self.suggestion.take() else {
+            return false;
+        };
+        let text = suggestion.text;
+        let end = if suggestion.accepted_line {
+            text.len()
+        } else {
+            first_line_end(&text)
+        };
+        self.insert_text_quietly(&text[..end]);
+        if end == text.len() {
+            self.completion_wanted = true;
+        } else {
+            self.suggestion = Some(Suggestion {
+                text: text[end..].to_owned(),
+                accepted_line: true,
+            });
+        }
+        true
+    }
+
+    /// Whether the user has typed since a completion was last asked for,
+    /// so that [`take_completion_request`](Self::take_completion_request)
+    /// has one to give.
+    pub fn completion_wanted(&self) -> bool {
+        self.completion_wanted
+    }
+
+    /// The request for the completion typing has made wanted, if any,
+    /// for the frontend to send to the [`Completer`](crate::Completer).
+    /// Taking it settles the want; the answer is expected back through
+    /// [`offer_completion`](Self::offer_completion) with the request's
+    /// serial. Nothing is asked for while text is selected.
+    pub fn take_completion_request(&mut self) -> Option<CompletionRequest> {
+        if !self.completion_wanted {
+            return None;
+        }
+        self.completion_wanted = false;
+        if self.selection().is_some() {
+            return None;
+        }
+        self.completion_serial = self.completion_serial.wrapping_add(1);
+        let buffer = &self.buffer;
+        let cursor = self.cursor;
+        let line = buffer.line_of_offset(cursor);
+        // The prefix opens with a line break (as the pieces the model was
+        // trained on do) at most `COMPLETION_PREFIX_BYTES` back, or with
+        // the start of the buffer.
+        let prefix_start = if line == 0 || cursor <= COMPLETION_PREFIX_BYTES {
+            0
+        } else {
+            let first = buffer.line_of_offset(cursor - COMPLETION_PREFIX_BYTES);
+            buffer.line_content_range(first.min(line - 1)).end
+        };
+        let mut prefix = text_of(&buffer.bytes_in_range(prefix_start..cursor));
+        if let Some(pending) = &self.pending {
+            prefix.push_str(pending);
+        }
+        let last = (line + COMPLETION_SUFFIX_LINES).min(buffer.line_count() - 1);
+        let suffix = text_of(&buffer.bytes_in_range(cursor..buffer.line_content_range(last).end));
+        Some(CompletionRequest {
+            serial: self.completion_serial,
+            language: self.language(),
+            prefix,
+            prefix_start,
+            suffix,
+            indentation: self.indentation,
+        })
+    }
+
+    /// The serial the latest request was given, and that an answer must
+    /// carry to be taken; see [`offer_completion`](Self::offer_completion).
+    pub fn completion_serial(&self) -> u64 {
+        self.completion_serial
+    }
+
+    /// The answer to the request numbered `serial`: `text` is what the
+    /// model proposes inserting at the cursor. Becomes the suggestion if
+    /// the request is still the latest and the text says something;
+    /// returns whether it did.
+    pub fn offer_completion(&mut self, serial: u64, text: &str) -> bool {
+        if serial != self.completion_serial || self.selection().is_some() {
+            return false;
+        }
+        let text = text.replace('\r', "");
+        let text = text.trim_end();
+        if text.is_empty() {
+            self.suggestion = None;
+            return false;
+        }
+        self.suggestion = Some(Suggestion {
+            text: text.to_owned(),
+            accepted_line: false,
+        });
+        true
+    }
+
+    /// Forget the suggestion, and any answer still to come to the last
+    /// request.
+    fn drop_suggestion(&mut self) {
+        self.suggestion = None;
+        self.completion_serial = self.completion_serial.wrapping_add(1);
+        self.completion_wanted = false;
+    }
+
+    /// What is left of a suggestion after typing part of it: kept as the
+    /// suggestion, or, when it has all been typed, gone, with the next
+    /// completion asked for.
+    fn keep_suggestion(&mut self, rest: &str) {
+        if rest.is_empty() {
+            self.completion_wanted = true;
+        } else {
+            self.suggestion = Some(Suggestion {
+                text: rest.to_owned(),
+                accepted_line: false,
+            });
+        }
+    }
+
+    /// After a line break typed along with a suggestion: `rest` is the
+    /// suggestion from its next line on. The line's indentation in the
+    /// suggestion becomes the pending indentation of the new line (in
+    /// place of the one copied from the line above), so the cursor
+    /// shows where the suggestion goes on; where the line break split a
+    /// line and indentation was written out, the suggestion has to
+    /// agree with it.
+    fn continue_suggestion_on_next_line(&mut self, rest: &str) {
+        let indent_len = rest
+            .bytes()
+            .take_while(|&b| b == b' ' || b == b'\t')
+            .count();
+        let (indent, body) = rest.split_at(indent_len);
+        let line_start = self
+            .buffer
+            .offset_of_line(self.buffer.line_of_offset(self.cursor));
+        if self.pending.is_some() || self.cursor == line_start {
+            self.pending = (!indent.is_empty()).then(|| indent.to_owned());
+            self.keep_suggestion(body);
+            return;
+        }
+        let written = self.buffer.bytes_in_range(line_start..self.cursor);
+        match rest.as_bytes().strip_prefix(written.as_slice()) {
+            Some(_) => self.keep_suggestion(&rest[written.len()..]),
+            None => self.completion_wanted = true,
+        }
     }
 
     // ----- Undo -----------------------------------------------------------
@@ -1773,6 +2058,26 @@ impl Editor {
         self.mark_saved();
         self.external = external;
     }
+}
+
+/// Text from the buffer for the completion model: lossily decoded, with
+/// `\n` line breaks.
+fn text_of(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if text.contains('\r') {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text.into_owned()
+    }
+}
+
+/// Where the first line of a suggestion ends: at its first line break
+/// after any it begins with, or at its end.
+fn first_line_end(text: &str) -> usize {
+    let skipped = text.len() - text.trim_start_matches('\n').len();
+    text[skipped..]
+        .find('\n')
+        .map_or(text.len(), |i| skipped + i)
 }
 
 /// A change brought in from disk that nothing has been edited on top of,
@@ -3740,5 +4045,280 @@ mod tests {
             "fn f() {\n\tlet x = foo(a,\n\t            ‸",
             "tabs to indent, spaces to align"
         );
+    }
+
+    // ----- Code completion ------------------------------------------------
+
+    /// Type, take the request that typing makes, and answer it with
+    /// `completion`.
+    fn suggest(ed: &mut Editor, completion: &str) {
+        let request = ed
+            .take_completion_request()
+            .expect("typing asks for a completion");
+        assert!(ed.offer_completion(request.serial, completion));
+        assert_eq!(ed.suggestion(), Some(completion.trim_end()));
+    }
+
+    #[test]
+    fn typing_asks_for_a_completion_and_moving_does_not() {
+        let mut ed = editor("fn main() {\n    \n}\n");
+        assert!(!ed.completion_wanted());
+        assert!(ed.take_completion_request().is_none());
+        ed.move_cursor(Down);
+        ed.move_cursor(LineEnd);
+        assert!(!ed.completion_wanted(), "moving doesn't ask");
+        ed.insert_char('l');
+        assert!(ed.completion_wanted());
+        let request = ed.take_completion_request().unwrap();
+        assert!(!ed.completion_wanted(), "taken");
+        assert_eq!(request.language, Language::Plain);
+        assert_eq!(request.prefix, "fn main() {\n    l");
+        assert_eq!(request.prefix_start, 0);
+        assert_eq!(request.suffix, "\n}\n");
+        assert_eq!(request.indentation, Indentation::Spaces(4));
+        // The answer to that request is the suggestion; a stale one is
+        // ignored.
+        assert!(!ed.offer_completion(request.serial + 1, "nope"));
+        assert!(ed.suggestion().is_none());
+        assert!(ed.offer_completion(request.serial, "et x = 1;\n"));
+        assert_eq!(ed.suggestion(), Some("et x = 1;"));
+        // Moving drops it, and doesn't ask for another.
+        ed.move_cursor(Left);
+        assert!(ed.suggestion().is_none());
+        assert!(!ed.completion_wanted());
+        // An answer arriving after the move is stale too.
+        assert!(!ed.offer_completion(request.serial, "et x = 1;"));
+        // Backspace and delete are typing.
+        ed.backspace();
+        assert!(ed.completion_wanted());
+        ed.take_completion_request();
+        ed.delete_forward();
+        assert!(ed.completion_wanted());
+        // Nothing is asked for with a selection, and a whitespace answer
+        // is no suggestion.
+        ed.take_completion_request();
+        ed.insert_char('x');
+        ed.set_selection(0, 3);
+        assert!(!ed.completion_wanted(), "selecting is a movement");
+        ed.clear_selection();
+        ed.insert_char('y');
+        let serial = ed.take_completion_request().unwrap().serial;
+        assert!(!ed.offer_completion(serial, "  \n"));
+        assert!(ed.suggestion().is_none());
+    }
+
+    #[test]
+    fn the_request_carries_a_window_around_the_cursor_with_pending_indentation() {
+        let mut ed = editor("");
+        ed.set_language(Language::Rust);
+        for _ in 0..200 {
+            type_str(&mut ed, &format!("{}\n", "x".repeat(200)));
+        }
+        type_str(&mut ed, "    fn f() {\n");
+        assert_eq!(ed.pending_indentation(), Some("        "));
+        let request = ed.take_completion_request().unwrap();
+        assert_eq!(request.language, Language::Rust);
+        // The prefix opens with a line break, holds at most the window,
+        // and ends with the indentation the cursor is shown at.
+        assert!(
+            request.prefix.starts_with("\nxxx"),
+            "{:?}",
+            &request.prefix[..10]
+        );
+        assert!(request.prefix.len() <= COMPLETION_PREFIX_BYTES + 201 + 18);
+        assert!(request.prefix.ends_with("\n    fn f() {\n        "));
+        assert_eq!(
+            ed.buffer().byte_at(request.prefix_start),
+            b'\n',
+            "starts at a line break"
+        );
+        assert!(request.prefix_start > 0);
+        assert_eq!(request.suffix, "\n    }", "the closing brace typing paired");
+
+        // CRLF files are sent with plain line breaks, and the suffix is a
+        // bounded number of lines.
+        let mut lines = String::new();
+        for i in 0..100 {
+            lines.push_str(&format!("line {i}\r\n"));
+        }
+        let mut ed = editor(&lines);
+        assert_eq!(ed.buffer().eol().as_str(), "\r\n");
+        ed.go_to_line(2);
+        ed.insert_char('a');
+        let request = ed.take_completion_request().unwrap();
+        assert_eq!(request.prefix, "line 0\nline 1\na");
+        assert_eq!(request.prefix_start, 0);
+        assert_eq!(
+            request.suffix.matches('\n').count(),
+            COMPLETION_SUFFIX_LINES
+        );
+        assert!(request.suffix.starts_with("line 2\nline 3\n"));
+        assert!(!request.suffix.contains('\r'));
+    }
+
+    #[test]
+    fn typing_along_with_a_suggestion_keeps_it() {
+        let mut ed = editor("");
+        type_str(&mut ed, "let");
+        suggest(&mut ed, " x = 1;\nlet y = 2;");
+        // Each matching character is consumed; no new completion is
+        // asked for.
+        type_str(&mut ed, " x =");
+        assert_eq!(ed.suggestion(), Some(" 1;\nlet y = 2;"));
+        assert!(!ed.completion_wanted());
+        assert_eq!(text(&ed), "let x =");
+        // A different character drops it and asks again.
+        ed.insert_char('2');
+        assert!(ed.suggestion().is_none());
+        assert!(ed.completion_wanted());
+        assert_eq!(text(&ed), "let x =2");
+
+        // Typing all of a suggestion asks for the next.
+        let mut ed = editor("");
+        type_str(&mut ed, "a");
+        suggest(&mut ed, "bc");
+        type_str(&mut ed, "bc");
+        assert!(ed.suggestion().is_none());
+        assert!(ed.completion_wanted());
+    }
+
+    #[test]
+    fn enter_along_with_a_suggestion_takes_its_indentation() {
+        // The next line of the suggestion is indented more than the
+        // current one: Enter goes on to it with that indentation pending.
+        // Deleting the paired brace leaves nothing after the cursor.
+        let mut ed = editor("");
+        type_str(&mut ed, "fn f() {");
+        ed.delete_forward();
+        suggest(&mut ed, "\n    body();\n}");
+        ed.insert_char('\n');
+        assert_eq!(text(&ed), "fn f() {\n");
+        assert_eq!(ed.pending_indentation(), Some("    "));
+        assert_eq!(ed.suggestion(), Some("body();\n}"));
+        assert_eq!(ed.cursor_position(), Position { line: 1, column: 4 });
+        type_str(&mut ed, "bo");
+        assert_eq!(text(&ed), "fn f() {\n    bo");
+        assert_eq!(ed.suggestion(), Some("dy();\n}"));
+        // Less indented: Enter inside the braces would indent the new
+        // line, but the suggestion says none.
+        type_str(&mut ed, "dy();");
+        assert_eq!(ed.suggestion(), Some("\n}"));
+        ed.insert_char('\n');
+        assert_eq!(ed.pending_indentation(), None);
+        assert_eq!(ed.suggestion(), Some("}"));
+        ed.insert_char('}');
+        assert_eq!(text(&ed), "fn f() {\n    body();\n}");
+        assert!(ed.suggestion().is_none());
+        assert!(ed.completion_wanted(), "typed through it all");
+
+        // Enter in the middle of a line writes the indentation out; the
+        // suggestion goes on if it agrees.
+        let mut ed = editor("    a();b();\n");
+        ed.set_cursor(8);
+        ed.insert_char('c');
+        assert_eq!(text(&ed), "    a();cb();\n");
+        ed.backspace();
+        suggest(&mut ed, "\n    d();");
+        ed.insert_char('\n');
+        assert_eq!(text(&ed), "    a();\n    b();\n");
+        assert_eq!(ed.suggestion(), Some("d();"));
+        // And is dropped if it doesn't.
+        ed.set_cursor(7);
+        ed.insert_char('x');
+        ed.backspace();
+        suggest(&mut ed, "\nd();");
+        ed.insert_char('\n');
+        assert_eq!(text(&ed), "    a()\n    ;\n    b();\n");
+        assert!(ed.suggestion().is_none());
+        assert!(ed.completion_wanted());
+    }
+
+    #[test]
+    fn tab_takes_a_line_then_the_rest() {
+        let mut ed = editor("fn f() {\n    \n}\n");
+        ed.go_to_line(1);
+        ed.move_cursor(LineEnd);
+        ed.insert_char('l');
+        suggest(&mut ed, "et a = 1;\n    let b = 2;\n    let c = 3;");
+        assert!(!ed.suggestion_continues());
+        assert!(ed.accept_suggestion());
+        assert_eq!(text(&ed), "fn f() {\n    let a = 1;\n}\n");
+        assert_eq!(ed.suggestion(), Some("\n    let b = 2;\n    let c = 3;"));
+        assert!(ed.suggestion_continues());
+        assert!(!ed.completion_wanted());
+        assert!(ed.accept_suggestion());
+        assert_eq!(
+            text(&ed),
+            "fn f() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n}\n"
+        );
+        assert!(ed.suggestion().is_none());
+        assert!(ed.completion_wanted(), "all taken: ask for more");
+        assert_eq!(
+            ed.cursor_position(),
+            Position {
+                line: 3,
+                column: 14
+            }
+        );
+        // Each acceptance is one undo step.
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "fn f() {\n    let a = 1;\n}\n");
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "fn f() {\n    l\n}\n");
+
+        // Typing after the first Tab puts the next one back to one line:
+        // Tab, Enter, Tab takes two lines.
+        let mut ed = editor("");
+        type_str(&mut ed, "a");
+        suggest(&mut ed, "1\nb2\nc3");
+        ed.accept_suggestion();
+        assert_eq!(text(&ed), "a1");
+        ed.insert_char('\n');
+        assert_eq!(ed.suggestion(), Some("b2\nc3"));
+        assert!(!ed.suggestion_continues());
+        ed.accept_suggestion();
+        assert_eq!(text(&ed), "a1\nb2");
+        assert_eq!(ed.suggestion(), Some("\nc3"));
+        // A suggestion that opens with line breaks: the first Tab takes
+        // through its first line of text.
+        ed.dismiss_suggestion();
+        assert!(!ed.completion_wanted(), "dismissing isn't typing");
+        ed.insert_char(';');
+        suggest(&mut ed, "\n\nfn g() {\n}");
+        ed.accept_suggestion();
+        assert_eq!(text(&ed), "a1\nb2;\n\nfn g() {");
+        assert_eq!(ed.suggestion(), Some("\n}"));
+        // Pending indentation is written out with the accepted text.
+        let mut ed = editor("");
+        type_str(&mut ed, "{\n");
+        assert_eq!(ed.pending_indentation(), Some("    "));
+        suggest(&mut ed, "x");
+        ed.accept_suggestion();
+        assert_eq!(text(&ed), "{\n    x\n}");
+    }
+
+    #[test]
+    fn suggestions_are_dropped_by_edits_and_movement() {
+        let mut ed = editor("abc\n");
+        ed.move_cursor(LineEnd);
+        ed.insert_char('d');
+        suggest(&mut ed, "ef");
+        ed.undo();
+        assert!(ed.suggestion().is_none());
+        assert!(!ed.completion_wanted(), "undo isn't typing");
+        ed.redo();
+        assert!(ed.suggestion().is_none());
+        ed.insert_char('e');
+        suggest(&mut ed, "f");
+        ed.paste("zz");
+        assert!(ed.suggestion().is_none());
+        assert!(ed.completion_wanted(), "pasting is typing");
+        ed.take_completion_request();
+        ed.insert_char('!');
+        suggest(&mut ed, "?");
+        ed.set_cursor(0);
+        assert!(ed.suggestion().is_none());
+        assert!(!ed.accept_suggestion());
+        assert!(!ed.dismiss_suggestion());
     }
 }

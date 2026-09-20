@@ -610,6 +610,8 @@ pub enum StopReason {
     LowConfidence,
     MaxLines,
     MaxTokens,
+    /// The caller asked to stop; see [`Session::complete_with`].
+    Cancelled,
 }
 
 #[derive(Clone, Debug)]
@@ -686,6 +688,20 @@ impl Session<'_> {
         suffix_line: &[u32],
         partial: &[u8],
     ) -> Completion {
+        self.complete_with(tokens, opts, suffix_line, partial, &mut || false)
+    }
+
+    /// As [`complete`](Self::complete), asking `cancel` before each token whether to stop.
+    /// A cancelled completion returns the lines finished so far with
+    /// [`StopReason::Cancelled`]; an editor that has moved on discards them.
+    pub fn complete_with(
+        &mut self,
+        tokens: &TokenSet,
+        opts: &CompletionOptions,
+        suffix_line: &[u32],
+        partial: &[u8],
+        cancel: &mut dyn FnMut() -> bool,
+    ) -> Completion {
         let mut lines: Vec<Line> = Vec::new();
         let mut current = Line::default();
         let mut generated = 0usize;
@@ -694,6 +710,12 @@ impl Session<'_> {
         // Context length at the end of the last kept line, before its line break was fed.
         let mut kept_len = self.tokens.len();
         loop {
+            if cancel() {
+                return Completion {
+                    lines,
+                    reason: StopReason::Cancelled,
+                };
+            }
             let Some(logits) = self.last_logits.as_deref() else {
                 return Completion {
                     lines,

@@ -202,9 +202,9 @@ use ninjaedit_core::git::{BranchError, Head, create_branch};
 use ninjaedit_core::search::literal_query;
 use ninjaedit_core::terminal::{ExitStatus, Output, Session, SessionId};
 use ninjaedit_core::{
-    BuildConfig, BuildRoot, ConflictStep, Discovery, DiscoveryResult, Editor, ExternalChange, Job,
-    Project, ProjectKind, ProjectMatch, SearchStep, Selection, Settings, SourceLocation, Step,
-    Storage,
+    BuildConfig, BuildRoot, Completer, CompletionOutcome, ConflictStep, Discovery, DiscoveryResult,
+    Editor, ExternalChange, Job, Language, Project, ProjectKind, ProjectMatch, SearchStep,
+    Selection, Settings, SourceLocation, Step, Storage,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -224,6 +224,8 @@ pub enum AppEvent {
     Terminal(Event),
     /// Output (or the exit) of the program in a tool's session.
     Pty(SessionId, Output),
+    /// A completion model has answered; see [`Completer`].
+    CompletionReady,
 }
 
 /// Which of the two on-screen views the keyboard drives: the upper one
@@ -431,6 +433,9 @@ enum Confirm {
 }
 
 struct Tab {
+    /// A number no other tab of this run has, so a completion answered
+    /// after tabs have been closed or moved still finds its editor.
+    id: u64,
     view: EditorView,
     /// When the tab was last active, as a tick of [`App::view_clock`].
     /// Higher is more recent.
@@ -463,6 +468,12 @@ pub struct App {
     /// Where the project's own state lives: its build configuration.
     project_storage: Storage,
     settings: Settings,
+    /// The code completion models, one per language the settings name
+    /// one for. Requests go out after typing and answers come back as
+    /// [`AppEvent::CompletionReady`]; see [`Completer`].
+    completer: Completer,
+    /// The id the last tab opened got; the next gets one more.
+    last_tab_id: u64,
     /// How the project is built and run, and with what.
     build: BuildConfig,
     /// The CMake build directories configured during this run, with the
@@ -603,7 +614,14 @@ impl App {
         // before then.
         let discoveries = build.request_discovery(project.root());
         let (discovery_tx, discovery_rx) = mpsc::channel();
-        let app = App {
+        // A completion model answering wakes the event loop like input
+        // does, so the ghost text shows as soon as it is ready.
+        let mut completer = Completer::new();
+        let wake = events.clone();
+        completer.set_waker(move || {
+            let _ = wake.send(AppEvent::CompletionReady);
+        });
+        let mut app = App {
             index_generation: project.index().generation(),
             file_activity: 0,
             last_file_check: None,
@@ -611,6 +629,8 @@ impl App {
             storage,
             project_storage,
             settings,
+            completer,
+            last_tab_id: 0,
             build,
             configured: HashMap::new(),
             pending_steps: Vec::new(),
@@ -659,6 +679,7 @@ impl App {
             prefix: None,
         };
         app.start_discoveries(discoveries);
+        app.apply_completion_models();
         app
     }
 
@@ -787,7 +808,9 @@ impl App {
             Ok(buffer) => {
                 let mut editor = Editor::new(buffer);
                 editor.set_code_style(self.settings.code_style());
+                self.last_tab_id += 1;
                 self.tabs.push(Tab {
+                    id: self.last_tab_id,
                     highlight_generation: editor.highlight_generation(),
                     search_generation: 0,
                     view: EditorView::new(editor),
@@ -1601,12 +1624,13 @@ impl App {
     }
 
     /// Apply the settings to what is running: every open editor's code
-    /// style, every terminal's scrollback, and the project search's
-    /// limit. The shell setting applies to the next shell started.
+    /// style, every terminal's scrollback, the project search's limit,
+    /// and the completion models. The shell setting applies to the next
+    /// shell started.
     fn apply_settings(&mut self) {
         let style = self.settings.code_style();
         for tab in &mut self.tabs {
-            tab.view.editor_mut().set_code_style(style);
+            tab.view.editor_mut_in_place().set_code_style(style);
         }
         let scrollback = self.settings.terminal_scrollback();
         for tool in self.tool_pane.tools_mut() {
@@ -1615,6 +1639,72 @@ impl App {
         if let Some(dialog) = &mut self.project_search {
             dialog.set_limit(self.settings.search_max_results());
         }
+        self.apply_completion_models();
+    }
+
+    /// Give the completer the model path of every language the settings
+    /// have one for, and take away those they don't.
+    fn apply_completion_models(&mut self) {
+        for language in Language::ALL {
+            self.completer
+                .set_model(language, self.settings.completion_model(language));
+        }
+    }
+
+    // ----- Code completion ------------------------------------------------
+
+    /// Send the completion request the active editor's typing has made
+    /// wanted, if any, and if its language has a model. Called after
+    /// every event, since only typing wants one; see
+    /// [`Editor::take_completion_request`].
+    fn send_completion_request(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let editor = tab.view.editor_mut_in_place();
+        if !editor.completion_wanted() {
+            return;
+        }
+        let owner = tab.id;
+        if let Some(request) = editor.take_completion_request()
+            && self.completer.has_model(request.language)
+        {
+            self.completer.request(owner, request);
+        }
+    }
+
+    /// Take what the completion models have answered: a suggestion for
+    /// the editor that asked, if it still wants it, or a report that a
+    /// model couldn't be loaded. Returns whether anything showed.
+    fn take_completions(&mut self) -> bool {
+        let mut redraw = false;
+        for outcome in self.completer.take_outcomes() {
+            match outcome {
+                CompletionOutcome::Completed {
+                    owner,
+                    serial,
+                    text,
+                } => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == owner)
+                        && tab
+                            .view
+                            .editor_mut_in_place()
+                            .offer_completion(serial, &text)
+                    {
+                        tab.view.reveal_suggestion();
+                        redraw = true;
+                    }
+                }
+                CompletionOutcome::Failed { language, error } => {
+                    self.status = Some(StatusLine::error(format!(
+                        "{} completion model: {error}",
+                        language.name()
+                    )));
+                    redraw = true;
+                }
+            }
+        }
+        redraw
     }
 
     // ----- Build configuration --------------------------------------------
@@ -2856,6 +2946,7 @@ impl App {
         {
             redraw = true;
         }
+        redraw |= self.take_completions();
         if let Some(tab) = self.tabs.get_mut(self.active) {
             let generation = tab.view.editor().highlight_generation();
             if generation != tab.highlight_generation {
@@ -2904,6 +2995,7 @@ impl App {
                 self.handle_pty(id, output);
                 true
             }
+            AppEvent::CompletionReady => self.take_completions(),
         }
     }
 
@@ -2917,6 +3009,7 @@ impl App {
             _ => {}
         }
         self.track_view();
+        self.send_completion_request();
     }
 
     fn handle_paste(&mut self, text: &str) {
@@ -8356,5 +8449,108 @@ mod tests {
         draw(&mut app, 40, 12);
         right_click(&mut app, 10, 5);
         assert!(app.context_menu.is_none());
+    }
+
+    /// A screen row's text without the scrollbar in its last column and
+    /// the blank after the text.
+    fn text_of(row: &str) -> String {
+        let mut chars: Vec<char> = row.chars().collect();
+        chars.pop();
+        chars.into_iter().collect::<String>().trim_end().to_owned()
+    }
+
+    #[test]
+    fn a_completion_shows_as_ghost_text_that_tab_takes_a_line_at_a_time() {
+        let (_dir, mut app) = app_with_files(&[("a.rs", "fn f() {\n    \n}\n")]);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::End);
+        type_str(&mut app, "l");
+        // No model for Rust is set, so the request typing made was
+        // settled without going anywhere.
+        assert!(!app.tabs[0].view.editor().completion_wanted());
+        let owner = app.tabs[0].id;
+        let serial = app.tabs[0].view.editor().completion_serial();
+        // An answer to an earlier request is ignored.
+        app.completer.inject(CompletionOutcome::Completed {
+            owner,
+            serial: serial - 1,
+            text: "stale".to_owned(),
+        });
+        assert!(!app.handle_app_event(AppEvent::CompletionReady));
+        assert!(app.tabs[0].view.editor().suggestion().is_none());
+        // The answer to the latest one is the suggestion.
+        app.completer.inject(CompletionOutcome::Completed {
+            owner,
+            serial,
+            text: "et a = 1;\n    let b = 2;".to_owned(),
+        });
+        assert!(app.handle_app_event(AppEvent::CompletionReady));
+        let screen = draw(&mut app, 30, 8);
+        assert_eq!(text_of(&screen[2]), " 2 │    let a = 1;");
+        assert_eq!(text_of(&screen[3]), "   │    let b = 2;");
+        assert_eq!(text_of(&screen[4]), " 3 │}");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.tabs[0].view.editor().buffer().to_text(),
+            "fn f() {\n    let a = 1;\n}\n"
+        );
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.tabs[0].view.editor().buffer().to_text(),
+            "fn f() {\n    let a = 1;\n    let b = 2;\n}\n"
+        );
+        let screen = draw(&mut app, 30, 8);
+        assert_eq!(text_of(&screen[4]), " 4 │}");
+        // An answer for a tab that has been closed goes nowhere.
+        press(&mut app, KeyCode::Esc);
+        app.completer.inject(CompletionOutcome::Completed {
+            owner: owner + 100,
+            serial: 1,
+            text: "x".to_owned(),
+        });
+        assert!(!app.take_completions());
+    }
+
+    #[test]
+    fn a_completion_model_that_cannot_load_is_reported() {
+        let (_dir, mut app) = app_with_files(&[("a.rs", "fn f() {}\n"), ("b.txt", "text\n")]);
+        app.settings
+            .set_text(SettingKey::RustCompletionModel, "/nonexistent/model")
+            .unwrap();
+        app.settings_changed();
+        assert!(app.completer.has_model(Language::Rust));
+        assert!(!app.completer.has_model(Language::Plain));
+        // Typing in the text file asks nothing of the model.
+        type_str(&mut app, "x");
+        assert!(!app.tabs[1].view.editor().completion_wanted());
+        // Typing in the Rust file does, and the model fails to load.
+        app.activate(0);
+        assert!(app.tabs[0].title().ends_with(".rs"));
+        press(&mut app, KeyCode::End);
+        type_str(&mut app, "x");
+        let started = Instant::now();
+        loop {
+            app.tick();
+            if app
+                .status
+                .as_ref()
+                .is_some_and(|s| s.text().contains("completion model"))
+            {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "no report");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let screen = draw(&mut app, 80, 6);
+        assert!(
+            screen[5].contains("Rust completion model") && screen[5].contains("not a directory"),
+            "{screen:#?}"
+        );
+        // Taking the path away takes the model away.
+        app.settings
+            .set_text(SettingKey::RustCompletionModel, "")
+            .unwrap();
+        app.settings_changed();
+        assert!(!app.completer.has_model(Language::Rust));
     }
 }
