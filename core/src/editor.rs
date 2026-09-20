@@ -416,6 +416,21 @@ impl Editor {
         step
     }
 
+    /// Whether the file holds a merge conflict, so that stepping between
+    /// conflicts has somewhere to go. Read from the buffer like
+    /// [`conflict_starts`](Self::conflict_starts), stopping at the
+    /// first.
+    pub fn has_conflicts(&self) -> bool {
+        let snapshot = self.buffer.snapshot();
+        let mut lines = snapshot.lines_from(0);
+        while let Some(content) = lines.next_line() {
+            if syntax::is_conflict_start(content) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The lines that open a conflict, in order. Read straight from the
     /// buffer rather than the highlighter's states, which may still be
     /// catching up on a large file: a jump has to land on what is there

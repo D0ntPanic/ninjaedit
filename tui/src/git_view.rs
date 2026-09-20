@@ -438,6 +438,18 @@ impl GitLogTabs {
         self.active().paste(text);
     }
 
+    /// The command palette's "Fetch from remotes": the shown page's F5.
+    pub fn fetch(&mut self) {
+        self.active().fetch();
+    }
+
+    /// The command palette's "Check out commit": the shown page's Space
+    /// in the log.
+    pub fn checkout_selected(&mut self) {
+        self.active().checkout_selected();
+        self.follow_checkout();
+    }
+
     /// Give the shown page a mouse event, and go where it asks (see
     /// [`follow_submodule`](Self::follow_submodule)). Returns whether
     /// the page's pane sizes changed (a drag of a rule ended), in
@@ -1111,7 +1123,6 @@ impl GitLogView {
     }
 
     /// The selected commit's id, if any.
-    #[cfg(test)]
     pub fn selected_commit(&self) -> Option<Oid> {
         self.selected_id()
     }
@@ -1591,7 +1602,7 @@ impl GitLogView {
     /// out (see the core crate's `git::checkout` module), or open the
     /// box asking for a new branch's name when one is wanted. The
     /// status bar says what was done, or why it couldn't be.
-    fn checkout_selected(&mut self) {
+    pub fn checkout_selected(&mut self) {
         if self.checkout.is_some() {
             self.notice = Some(StatusLine::error("A checkout is under way"));
             return;

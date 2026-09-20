@@ -622,7 +622,7 @@ impl BuildView {
     /// Ctrl+N: add to the list the selection is in, and select the new
     /// entry with its name field focused; with a root selected (or no
     /// rows at all), ask for a root.
-    fn add(&mut self, config: &mut BuildConfig) -> BuildOutcome {
+    pub fn add(&mut self, config: &mut BuildConfig) -> BuildOutcome {
         let added = match self.selected_node() {
             None | Some(Node::Root(_)) => return BuildOutcome::AddRoot,
             Some(Node::Configurations(r) | Node::Configuration(r, _)) => config
@@ -645,7 +645,7 @@ impl BuildView {
 
     /// Ctrl+D: duplicate the selected configuration or target and
     /// select the copy.
-    fn duplicate(&mut self, config: &mut BuildConfig) -> BuildOutcome {
+    pub fn duplicate(&mut self, config: &mut BuildConfig) -> BuildOutcome {
         let copied = match self.selected_node() {
             Some(Node::Configuration(r, i)) => config
                 .duplicate_configuration(r, i)
@@ -670,7 +670,7 @@ impl BuildView {
 
     /// Delete: remove the selected root, configuration, or target, on
     /// the second press.
-    fn remove(&mut self, config: &mut BuildConfig) -> BuildOutcome {
+    pub fn remove(&mut self, config: &mut BuildConfig) -> BuildOutcome {
         let Some(node) = self.selected_node() else {
             return BuildOutcome::Continue;
         };

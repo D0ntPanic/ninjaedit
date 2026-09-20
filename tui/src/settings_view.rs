@@ -186,7 +186,7 @@ impl SettingsView {
     }
 
     /// Ctrl+D: put the focused setting back to its default.
-    fn reset_focused(&mut self, settings: &mut Settings) -> SettingsOutcome {
+    pub fn reset_focused(&mut self, settings: &mut Settings) -> SettingsOutcome {
         let index = self.fields.focused();
         let key = SettingKey::ALL[index];
         let changed = settings.reset(key);

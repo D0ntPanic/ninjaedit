@@ -553,6 +553,32 @@ impl ChangesTabs {
         outcome
     }
 
+    /// Commit what is staged on the shown page, as its Ctrl+S does.
+    pub fn commit(&mut self) -> ChangesOutcome {
+        let outcome = self.active().commit();
+        self.refresh_others();
+        outcome
+    }
+
+    /// Stage everything on the shown page.
+    pub fn stage_all(&mut self) -> ChangesOutcome {
+        let outcome = self.active().stage_all();
+        self.refresh_others();
+        outcome
+    }
+
+    /// Unstage everything on the shown page.
+    pub fn unstage_all(&mut self) -> ChangesOutcome {
+        let outcome = self.active().unstage_all();
+        self.refresh_others();
+        outcome
+    }
+
+    /// Open the file selected on the shown page, as its `o` does.
+    pub fn open_selected(&mut self) -> ChangesOutcome {
+        self.active().open_selected()
+    }
+
     /// Give the shown page a mouse event. Returns whether the page's
     /// pane sizes changed (a drag of a rule ended), in which case the
     /// layout is worth keeping.
@@ -1009,6 +1035,34 @@ impl ChangesView {
         self.apply(list, &files, &what)
     }
 
+    /// The command palette's "Stage all changes": `a` in the unstaged
+    /// list.
+    pub fn stage_all(&mut self) -> ChangesOutcome {
+        self.toggle_all(List::Unstaged)
+    }
+
+    /// The command palette's "Unstage all changes": `a` in the staged
+    /// list.
+    pub fn unstage_all(&mut self) -> ChangesOutcome {
+        self.toggle_all(List::Staged)
+    }
+
+    /// Whether there is anything to stage.
+    pub fn has_unstaged(&self) -> bool {
+        !self.files(List::Unstaged).is_empty()
+    }
+
+    /// Whether there is anything to unstage.
+    pub fn has_staged(&self) -> bool {
+        !self.files(List::Staged).is_empty()
+    }
+
+    /// Whether a file is selected in the list the diff follows, for
+    /// `o` to open.
+    pub fn has_selected_change(&self) -> bool {
+        self.selected_change().is_some()
+    }
+
     /// Stage every unstaged file, or unstage every staged one.
     fn toggle_all(&mut self, list: List) -> ChangesOutcome {
         let files = self.files(list).to_vec();
@@ -1078,7 +1132,7 @@ impl ChangesView {
     }
 
     /// Commit what is staged with the message in the box.
-    fn commit(&mut self) -> ChangesOutcome {
+    pub fn commit(&mut self) -> ChangesOutcome {
         let message = self.message_text();
         let Some(changes) = &mut self.changes else {
             return ChangesOutcome::Continue;
@@ -1105,7 +1159,7 @@ impl ChangesView {
     }
 
     /// Open the selected file in the editor.
-    fn open_selected(&mut self) -> ChangesOutcome {
+    pub fn open_selected(&mut self) -> ChangesOutcome {
         let Some((_, change)) = self.selected_change() else {
             return ChangesOutcome::Continue;
         };

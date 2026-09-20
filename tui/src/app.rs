@@ -37,12 +37,18 @@
 //! active tab's cursor to the start of the line typed, clamped to the
 //! first or last line when the number is out of range, and closes the box.
 //!
-//! The command palette (Ctrl+P) lists every command (see the `command`
-//! module) and every view, with the key each is bound to, so it is
-//! both a way to run what has no key and the place to learn the keys
-//! that do. The commands run from it as their keys would; a view is
-//! shown and focused as the modes palette would. Whatever it last ran
-//! is listed first the next time it opens, so Ctrl+P, Enter repeats it:
+//! The command palette (Ctrl+P) lists the commands (see the `command`
+//! module) that apply to what is showing and going on, and every view,
+//! with the key each is bound to, so it is both a way to run what has
+//! no key and the place to learn the keys that do. Saving a file isn't
+//! offered while a page stands in for the editor, undo isn't with
+//! nothing to undo, and a page's own keys (fetching on the git log
+//! page, committing on the changes page) are commands on that page and
+//! nowhere else; the application says what is showing in a
+//! `command::Context` and each command decides from that. The commands
+//! run from it as their keys would; a view is shown and focused as the
+//! modes palette would. Whatever it last ran is listed first the next
+//! time it opens (if it still applies), so Ctrl+P, Enter repeats it:
 //! the way to step through a file's merge conflicts with "Next
 //! conflict", which has no key of its own. Typing a query ranks the
 //! entries as usual.
@@ -167,7 +173,7 @@
 use crate::build_view::{self, BuildOutcome, BuildView, Node};
 use crate::changes_view::{self, ChangesOutcome, ChangesTabs};
 use crate::clipboard::Clipboard;
-use crate::command::Command;
+use crate::command::{BuildContext, Command, Context as CommandContext, FileContext, Page};
 use crate::diff_pane::draw_pieces;
 use crate::editor_view::EditorView;
 use crate::git_layout;
@@ -1124,11 +1130,13 @@ impl App {
         self.palette_kind = PaletteKind::Other;
     }
 
-    /// Ctrl+P: open the command palette, listing every command, then
-    /// every view with the key bound to each, then "Run <target>" for
-    /// every target that isn't disabled, with whatever it last ran ahead
-    /// of them all. The description is searched too, so "clean" finds
-    /// the commands that delete build directories.
+    /// Ctrl+P: open the command palette, listing every command that
+    /// applies to what is showing (see [`Command::is_available`] and
+    /// [`command_context`](Self::command_context)), then every view
+    /// with the key bound to each, then "Run <target>" for every
+    /// target that isn't disabled, with whatever it last ran ahead of
+    /// them all. The description is searched too, so "clean" finds the
+    /// commands that delete build directories.
     fn open_command_palette(&mut self) {
         self.close_search_box(true);
         self.goto_line = None;
@@ -1142,14 +1150,18 @@ impl App {
     /// The command palette's entries; see
     /// [`open_command_palette`](Self::open_command_palette).
     fn command_items(&self) -> Vec<PaletteItem> {
-        let commands = Command::ALL.into_iter().map(|command| PaletteItem {
-            label: command.label().to_owned(),
-            detail: command.description().to_owned(),
-            search: format!("{} {}", command.label(), command.description()),
-            shortcut: command.shortcut(),
-            marked: false,
-            action: PaletteAction::Command(command),
-        });
+        let context = self.command_context();
+        let commands = Command::ALL
+            .into_iter()
+            .filter(|command| command.is_available(&context))
+            .map(|command| PaletteItem {
+                label: command.label().to_owned(),
+                detail: command.description().to_owned(),
+                search: format!("{} {}", command.label(), command.description()),
+                shortcut: command.shortcut(),
+                marked: false,
+                action: PaletteAction::Command(command),
+            });
         let views = View::all().map(|view| PaletteItem {
             label: view.label().to_owned(),
             detail: view.description().to_owned(),
@@ -1207,7 +1219,88 @@ impl App {
         items
     }
 
+    /// What is showing and going on, for the command palette to list
+    /// the commands that apply: the page in the editor's place, if
+    /// any; the active file and its state when the editor is showing;
+    /// what the build configuration has to build; and what the pages
+    /// and the tool pane have selected or under way.
+    fn command_context(&self) -> CommandContext {
+        let page = match &self.mode {
+            Mode::Editor => Page::Editor,
+            Mode::Settings(_) => Page::Settings,
+            Mode::Build(_) => Page::Build,
+            Mode::GitLog(_) => Page::GitLog,
+            Mode::Changes(_) => Page::Changes,
+        };
+        let file = match &self.mode {
+            Mode::Editor => self.tabs.get(self.active).map(|tab| {
+                let editor = tab.view.editor();
+                FileContext {
+                    modified: editor.is_modified(),
+                    can_undo: editor.can_undo(),
+                    can_redo: editor.can_redo(),
+                    has_selection: editor.selection().is_some(),
+                    has_conflicts: editor.has_conflicts(),
+                    can_find_next: editor.search().is_some() || !self.last_search.is_empty(),
+                }
+            }),
+            _ => None,
+        };
+        let roots = self.build.roots();
+        let selected_node = match &self.mode {
+            Mode::Build(view) => view.selected_node(),
+            _ => None,
+        };
+        let build = BuildContext {
+            has_roots: !roots.is_empty(),
+            has_configurations: roots.iter().any(|root| !root.configurations().is_empty()),
+            has_targets: roots
+                .iter()
+                .any(|root| root.targets().iter().any(|target| !target.disabled)),
+            has_current: self.build.current().is_some(),
+            can_duplicate: matches!(
+                selected_node,
+                Some(Node::Configuration(..) | Node::Target(..))
+            ),
+            can_remove: matches!(
+                selected_node,
+                Some(Node::Root(_) | Node::Configuration(..) | Node::Target(..))
+            ),
+        };
+        let output = self
+            .tool_pane
+            .tools()
+            .iter()
+            .find(|tool| tool.kind() == ToolKind::Output);
+        let output_showing = self.tool_pane.is_visible()
+            && self.tool_pane.active().map(Tool::kind) == Some(ToolKind::Output);
+        let changes = match &self.mode {
+            Mode::Changes(tabs) => tabs.active_view(),
+            _ => None,
+        };
+        CommandContext {
+            page,
+            file,
+            has_tabs: matches!(page, Page::GitLog | Page::Changes) || !self.tabs.is_empty(),
+            build,
+            job_running: output.is_some_and(Tool::is_running),
+            tool_pane_visible: self.tool_pane.is_visible(),
+            output_idle: output_showing && !output.is_some_and(Tool::is_running),
+            commit_selected: match &self.mode {
+                Mode::GitLog(tabs) => tabs
+                    .active_view()
+                    .is_some_and(|view| view.selected_commit().is_some()),
+                _ => false,
+            },
+            has_unstaged: changes.is_some_and(|view| view.has_unstaged()),
+            has_staged: changes.is_some_and(|view| view.has_staged()),
+            change_selected: changes.is_some_and(|view| view.has_selected_change()),
+        }
+    }
+
     /// Run a command picked from the command palette, as its key would.
+    /// A page's command with the page not showing does nothing, as its
+    /// key wouldn't; the palette doesn't list it then.
     fn run_command(&mut self, command: Command) {
         match command {
             Command::OpenFile => self.open_files_palette(),
@@ -1229,15 +1322,78 @@ impl App {
             Command::SelectAll => self.press_editor_key('a'),
             Command::Build => self.build(),
             Command::Run => self.run(),
+            Command::StopJob => self.stop_job(),
             Command::SelectConfiguration => self.open_configuration_palette(),
             Command::SelectTarget => self.open_target_palette(),
             Command::DeleteBuildDir => self.delete_build_dir(),
             Command::DeleteAllBuildDirs => self.delete_all_build_dirs(),
+            Command::AddBuildEntry => {
+                if let Mode::Build(view) = &mut self.mode {
+                    let outcome = view.add(&mut self.build);
+                    self.handle_build_outcome(outcome);
+                }
+            }
+            Command::DuplicateBuildEntry => {
+                if let Mode::Build(view) = &mut self.mode {
+                    let outcome = view.duplicate(&mut self.build);
+                    self.handle_build_outcome(outcome);
+                }
+            }
+            Command::RemoveBuildEntry => {
+                if let Mode::Build(view) = &mut self.mode {
+                    let outcome = view.remove(&mut self.build);
+                    self.handle_build_outcome(outcome);
+                }
+            }
+            Command::ResetSetting => {
+                if let Mode::Settings(view) = &mut self.mode {
+                    let outcome = view.reset_focused(&mut self.settings);
+                    self.handle_settings_outcome(outcome);
+                }
+            }
+            Command::Fetch => {
+                if let Mode::GitLog(tabs) = &mut self.mode {
+                    tabs.fetch();
+                }
+            }
+            Command::CheckoutCommit => {
+                if let Mode::GitLog(tabs) = &mut self.mode {
+                    tabs.checkout_selected();
+                }
+            }
+            Command::Commit => self.on_changes_page(ChangesTabs::commit),
+            Command::StageAll => self.on_changes_page(ChangesTabs::stage_all),
+            Command::UnstageAll => self.on_changes_page(ChangesTabs::unstage_all),
+            Command::OpenChange => self.on_changes_page(ChangesTabs::open_selected),
             Command::ToggleAmend => self.toggle_amend(),
             Command::SwitchView => self.open_modes_palette(),
             Command::NextView => self.focus_next(),
             Command::PreviousView => self.focus_previous(),
+            Command::DismissOutput => self.dismiss_output(),
             Command::Quit => self.request_quit(),
+        }
+    }
+
+    /// Do one of the changes page's actions from the command palette,
+    /// when the page is showing, and act on what it asks for.
+    fn on_changes_page(&mut self, action: fn(&mut ChangesTabs) -> ChangesOutcome) {
+        if let Mode::Changes(tabs) = &mut self.mode {
+            let outcome = action(tabs);
+            self.handle_changes_outcome(outcome);
+        }
+    }
+
+    /// "Dismiss output": hide the output tool once its job is over, as
+    /// Ctrl+D in it does. With a job still running, or another tool
+    /// showing, there is nothing to dismiss.
+    fn dismiss_output(&mut self) {
+        let idle_output = self.tool_pane.is_visible()
+            && self
+                .tool_pane
+                .active()
+                .is_some_and(|tool| tool.kind() == ToolKind::Output && !tool.is_running());
+        if idle_output {
+            self.dismiss_tool();
         }
     }
 
@@ -1825,6 +1981,26 @@ impl App {
         }
         self.pending_steps = job.steps;
         self.start_next_step();
+    }
+
+    /// "Stop build or run": end the job in the output tool, as Ctrl+C
+    /// in it would (though the program is killed rather than asked),
+    /// and say so where the job's end would have been said. The
+    /// program's exit, reported under a session that is gone, changes
+    /// nothing further; the steps still to come are dropped here.
+    fn stop_job(&mut self) {
+        let Some(index) = self.tool_pane.index_of_kind(ToolKind::Output) else {
+            return;
+        };
+        let tool = &mut self.tool_pane.tools_mut()[index];
+        if !tool.is_running() {
+            return;
+        }
+        tool.stop();
+        tool.process(b"\x1b[1;31mStopped\x1b[0m\r\n");
+        self.pending_steps.clear();
+        self.job_configure = None;
+        self.status = Some(StatusLine::info(format!("{}: stopped", self.job_title)));
     }
 
     /// Open the file a link in a tool's output names, at its line and
@@ -4600,13 +4776,22 @@ mod tests {
             .expect("the open file command");
         assert!(open.contains("Search the project's files"), "{open}");
         assert!(open.contains("Ctrl+O │"), "at the right end: {open}");
+        // With no build roots there is nothing to clean, so the
+        // commands that would aren't listed (they are with roots; see
+        // the run target test), nor are build and run.
         type_str(&mut app, "delete build");
         let screen = draw(&mut app, 80, 20);
-        let delete = screen
-            .iter()
-            .find(|r| r.contains("Delete build directory"))
-            .expect("the delete command");
-        assert!(!delete.contains("Ctrl"), "{delete}");
+        assert!(
+            !screen.iter().any(|r| r.contains("Delete build directory")),
+            "{screen:#?}"
+        );
+        ctrl(&mut app, 'a');
+        type_str(&mut app, "build");
+        let screen = draw(&mut app, 80, 20);
+        assert!(
+            !screen.iter().any(|r| r.contains("Ctrl+B │")),
+            "{screen:#?}"
+        );
 
         // A view is listed too, and picking it shows it.
         ctrl(&mut app, 'a');
@@ -4627,23 +4812,6 @@ mod tests {
         type_str(&mut app, "undo");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.tabs[0].view.editor().buffer().to_text(), "hi\n");
-
-        // The description is searched too: "clean" finds the commands
-        // that delete build directories, and with no roots there is
-        // nothing to delete.
-        ctrl(&mut app, 'p');
-        type_str(&mut app, "clean everything");
-        let screen = draw(&mut app, 80, 20);
-        assert!(
-            screen[3].contains("Delete all build directories"),
-            "{screen:#?}"
-        );
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(
-            status_text(&app).as_deref(),
-            Some("No build roots to clean")
-        );
-        assert!(!app.tool_pane.is_visible());
 
         // Quit is a command as well.
         ctrl(&mut app, 'p');
@@ -4721,17 +4889,22 @@ mod tests {
         assert!(screen[3].contains("Previous conflict"), "{screen:#?}");
         press(&mut app, KeyCode::Esc);
 
-        // With the markers gone there is nothing to go to.
+        // With the markers gone there is nothing to go to, so the
+        // commands aren't listed, not even the one last run at the top.
         app.tabs[0].view.editor_mut().select_all();
         app.tabs[0].view.editor_mut().insert_text("plain\n");
         ctrl(&mut app, 'p');
-        type_str(&mut app, "next conflict");
-        press(&mut app, KeyCode::Enter);
-        assert_eq!(line(&app), 1);
-        assert_eq!(
-            status_text(&app).as_deref(),
-            Some("No merge conflicts in this file")
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[3].contains("Open file"), "{screen:#?}");
+        type_str(&mut app, "conflict");
+        let screen = draw(&mut app, 80, 20);
+        assert!(
+            !screen
+                .iter()
+                .any(|r| r.contains("Next conflict") || r.contains("Previous conflict")),
+            "{screen:#?}"
         );
+        press(&mut app, KeyCode::Esc);
     }
 
     #[test]
@@ -4794,6 +4967,25 @@ mod tests {
         assert!(app.build.select_configuration(0, 1), "release");
         let before = app.build.current().unwrap();
         assert_eq!(app.build.current_target().unwrap().1.name, "a");
+
+        // With roots, the commands that clean are listed, without a
+        // key; the description is searched too, so "clean" finds them.
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "clean everything");
+        let screen = draw(&mut app, 80, 20);
+        assert!(
+            screen[3].contains("Delete all build directories"),
+            "{screen:#?}"
+        );
+        assert!(!screen[3].contains("Ctrl"), "{screen:#?}");
+        ctrl(&mut app, 'a');
+        type_str(&mut app, "delete build");
+        let screen = draw(&mut app, 80, 20);
+        assert!(
+            screen.iter().any(|r| r.contains("Delete build directory")),
+            "{screen:#?}"
+        );
+        press(&mut app, KeyCode::Esc);
 
         // Every target has a "Run" entry saying what it runs with; a
         // disabled one has none.
@@ -7246,6 +7438,210 @@ mod tests {
             status.contains("a.rs changed on disk: reloaded"),
             "{status}"
         );
+    }
+
+    #[test]
+    fn command_palette_lists_only_the_commands_that_apply() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        draw(&mut app, 80, 20);
+        let listed = |app: &mut App, query: &str, label: &str| -> Option<String> {
+            ctrl(app, 'p');
+            type_str(app, query);
+            let screen = draw(app, 100, 24);
+            let row = screen.iter().find(|r| r.contains(label)).cloned();
+            press(app, KeyCode::Esc);
+            row
+        };
+
+        // A file just opened: it can be saved, but has nothing to
+        // discard, undo, or cut, and no conflicts to step to.
+        assert!(listed(&mut app, "save", "Save file").is_some());
+        assert!(listed(&mut app, "discard", "Discard unsaved changes").is_none());
+        assert!(listed(&mut app, "undo", "Undo").is_none());
+        assert!(listed(&mut app, "redo", "Redo").is_none());
+        assert!(listed(&mut app, "cut", "Cut").is_none());
+        assert!(listed(&mut app, "next conflict", "Next conflict").is_none());
+        // The tool pane is hidden: there is no other view to focus.
+        assert!(listed(&mut app, "focus next", "Focus next view").is_none());
+        // Nothing has been searched for, so there is no next match.
+        assert!(listed(&mut app, "find next", "Find next").is_none());
+
+        // An edit brings discard and undo; a selection, cut and copy.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(listed(&mut app, "discard", "Discard unsaved changes").is_some());
+        assert!(listed(&mut app, "undo", "Undo").is_some());
+        assert!(listed(&mut app, "redo", "Redo").is_none());
+        ctrl(&mut app, 'a');
+        let cut = listed(&mut app, "cut", "Cut").expect("cut with a selection");
+        assert!(cut.contains("Ctrl+X │"), "{cut}");
+
+        // A page in the editor's place: the file's commands go, the
+        // page's own come, and what applies everywhere stays.
+        app.open_settings();
+        assert!(listed(&mut app, "save", "Save file").is_none());
+        assert!(listed(&mut app, "undo", "Undo").is_none());
+        let reset = listed(&mut app, "reset", "Reset setting to default").expect("the page's");
+        assert!(reset.contains("Ctrl+D │"), "{reset}");
+        assert!(listed(&mut app, "search in project", "Search in project").is_some());
+        assert!(listed(&mut app, "open file", "Open file").is_some());
+        assert!(listed(&mut app, "quit", "Quit").is_some());
+        // The tab search still lists the file's tab.
+        assert!(listed(&mut app, "switch tab", "Switch tab").is_some());
+
+        // The build page's commands likewise; nothing selected, so
+        // nothing to duplicate or remove.
+        app.open_build_config();
+        assert!(listed(&mut app, "reset", "Reset setting to default").is_none());
+        let add = listed(&mut app, "add build", "Add build configuration or target")
+            .expect("the build page's");
+        assert!(add.contains("Ctrl+N │"), "{add}");
+        assert!(listed(&mut app, "duplicate", "Duplicate build configuration").is_none());
+        assert!(listed(&mut app, "remove", "Remove build configuration").is_none());
+    }
+
+    #[test]
+    fn git_pages_list_their_own_commands_in_the_palette() {
+        let (dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("b.txt"), "hi\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("a.txt")).unwrap();
+        index.add_path(Path::new("b.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Say hi", &tree, &[])
+            .unwrap();
+        std::fs::write(dir.path().join("b.txt"), "hi there\n").unwrap();
+        let settle = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let loading = match &app.mode {
+                    Mode::GitLog(tabs) => tabs.is_loading(),
+                    Mode::Changes(tabs) => tabs.is_loading(),
+                    _ => false,
+                };
+                if !loading || Instant::now() > deadline {
+                    break;
+                }
+                app.tick();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let listed = |app: &mut App, query: &str, label: &str| -> Option<String> {
+            ctrl(app, 'p');
+            type_str(app, query);
+            let screen = draw(app, 100, 24);
+            let row = screen.iter().find(|r| r.contains(label)).cloned();
+            press(app, KeyCode::Esc);
+            row
+        };
+
+        // The git log: fetching with its key, checking out the
+        // selected commit, and none of the editor's.
+        ctrl(&mut app, 'l');
+        settle(&mut app);
+        draw(&mut app, 100, 24);
+        let fetch = listed(&mut app, "fetch", "Fetch from remotes").expect("the log's");
+        assert!(fetch.contains("F5 │"), "{fetch}");
+        assert!(listed(&mut app, "check out", "Check out commit").is_some());
+        assert!(listed(&mut app, "save", "Save file").is_none());
+        assert!(listed(&mut app, "commit", "Commit").is_none());
+        // Running it from the palette fetches (there is no remote, so
+        // that is soon over and said).
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "fetch");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        app.tick();
+        let status = status_text(&app).unwrap_or_default();
+        assert!(
+            status.contains("fetch") || status.contains("remote"),
+            "{status}"
+        );
+
+        // The changes page: committing with its key, staging everything
+        // while there is something unstaged, and unstaging once it is
+        // staged.
+        ctrl(&mut app, 'u');
+        settle(&mut app);
+        draw(&mut app, 100, 24);
+        let commit = listed(&mut app, "commit", "Commit").expect("the page's");
+        assert!(commit.contains("Ctrl+S │"), "{commit}");
+        assert!(listed(&mut app, "fetch", "Fetch from remotes").is_none());
+        assert!(listed(&mut app, "amend", "Toggle amend").is_some());
+        assert!(listed(&mut app, "stage all", "Stage all changes").is_some());
+        assert!(listed(&mut app, "unstage all", "Unstage all changes").is_none());
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "stage all");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        draw(&mut app, 100, 24);
+        assert!(listed(&mut app, "stage all", "Stage all changes").is_none());
+        assert!(listed(&mut app, "unstage all", "Unstage all changes").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_job_command_ends_the_job_in_the_output_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _events_rx) = std::sync::mpsc::channel();
+        let storage = Storage::new(dir.path().join(".storage"));
+        let mut app = App::new(Project::open(dir.path()).unwrap(), storage, events);
+        draw(&mut app, 60, 20);
+        let step = |description: &str, script: &str| Step {
+            description: description.to_owned(),
+            command: ninjaedit_core::terminal::Command::new("sh")
+                .arg("-c")
+                .arg(script),
+        };
+        // Nothing to stop before a job starts.
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "stop build");
+        let screen = draw(&mut app, 60, 20);
+        assert!(
+            !screen.iter().any(|r| r.contains("Stop build or run")),
+            "{screen:#?}"
+        );
+        press(&mut app, KeyCode::Esc);
+
+        app.start_job(Job {
+            title: "Test job".to_owned(),
+            steps: vec![step("Step one", "sleep 30"), step("Step two", "echo two")],
+        });
+        assert!(app.tool_pane.active().unwrap().is_running());
+        // The job has the keyboard, so the palette opens after the
+        // prefix; the command is listed while the job runs, and
+        // dismissing the output isn't.
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "stop build");
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[3].contains("Stop build or run"), "{screen:#?}");
+        ctrl(&mut app, 'a');
+        type_str(&mut app, "dismiss");
+        let screen = draw(&mut app, 60, 20);
+        assert!(
+            !screen.iter().any(|r| r.contains("Dismiss output")),
+            "{screen:#?}"
+        );
+        ctrl(&mut app, 'a');
+        type_str(&mut app, "stop build");
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.tool_pane.active().unwrap().is_running());
+        assert!(app.pending_steps.is_empty(), "the second step is dropped");
+        assert_eq!(status_text(&app).as_deref(), Some("Test job: stopped"));
+        assert!(output_text(&app).contains("Stopped"));
+
+        // Now the output is idle: dismissing it is offered, and does
+        // what Ctrl+D does.
+        ctrl(&mut app, 'p');
+        type_str(&mut app, "dismiss");
+        let screen = draw(&mut app, 60, 20);
+        assert!(screen[3].contains("Dismiss output"), "{screen:#?}");
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.tool_pane.is_visible());
+        assert_eq!(app.focus, Focus::Editor);
     }
 
     #[test]
