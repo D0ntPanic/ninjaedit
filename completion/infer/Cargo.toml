@@ -4,12 +4,23 @@ version = "0.1.0"
 edition = "2024"
 description = "Dedicated CPU inference for the completion model"
 
+[features]
+default = ["cli"]
+# The sampling and benchmark command; the library the editor uses needs
+# none of it.
+cli = ["dep:clap"]
+
+[[bin]]
+name = "infer"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 half = "2"
 rayon = "1.10"
 safetensors = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokenizer = { path = "../tokenizer" }
+tokenizer = { path = "../tokenizer", default-features = false }

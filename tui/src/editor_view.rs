@@ -26,6 +26,16 @@
 //! A click puts the cursor under the pointer and a drag selects; two
 //! clicks in quick succession on one cell select the word there.
 //!
+//! A code completion the editor holds (see [`Editor::suggestion`]) is
+//! drawn as ghost text: its first line after the cursor, in the theme's
+//! `pending-completion-text` color, with whatever follows the cursor on
+//! its line pushed along after it, and any further lines on rows of their
+//! own below. Those rows are not lines of the file, so they carry no line
+//! number and the lines after keep theirs; when the cursor is followed,
+//! the view scrolls so that they are in view as well. Tab accepts a
+//! suggestion and Escape dismisses it; otherwise the keys do what they
+//! always do, and the editor decides what becomes of the suggestion.
+//!
 //! The gutter to the left of the text is laid out as
 //! `[breakpoint][line number][space][guide]`. The breakpoint column is
 //! blank for now; a debugger can later mark it with a red circle. The
@@ -40,7 +50,7 @@ use crate::clicks::ClickTracker;
 use crate::clipboard::Clipboard;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ninjaedit_core::{Cell, ConflictStep, Editor, Movement, Position};
+use ninjaedit_core::{Cell, ConflictStep, Editor, Movement, Position, TokenKind, text};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
 use ratatui::style::Style;
@@ -65,6 +75,41 @@ enum Reveal {
     /// of view; horizontally, scrolled as little as possible while showing
     /// its start and as much of the rest as fits.
     Match(Position, usize),
+}
+
+/// A run of cells on one screen row: text of the file, or ghost text of
+/// a suggestion.
+struct Segment {
+    cells: Vec<Cell>,
+    ghost: bool,
+}
+
+/// One screen row of the view: the line of the file it shows, if any
+/// (a row of a suggestion's later lines shows none), and its cells.
+struct Row {
+    line: Option<usize>,
+    segments: Vec<Segment>,
+}
+
+impl Row {
+    fn of_line(line: usize, cells: Vec<Cell>) -> Row {
+        Row {
+            line: Some(line),
+            segments: vec![Segment {
+                cells,
+                ghost: false,
+            }],
+        }
+    }
+
+    /// The display width of the row.
+    fn width(&self) -> usize {
+        self.segments
+            .iter()
+            .rev()
+            .find_map(|segment| segment.cells.last())
+            .map_or(0, |cell| cell.column + cell.width)
+    }
 }
 
 /// What the mouse is dragging, from a button press until its release.
@@ -108,6 +153,11 @@ pub struct EditorView {
     hscroll: Rect,
     /// The total width in columns the horizontal scrollbar represents.
     hscroll_total: usize,
+    /// From the last render, the rows of a suggestion's later lines: the
+    /// row of the cursor's line and how many rows follow it that show
+    /// no line of the file, so that a mouse position below them can be
+    /// put back onto the line it is over.
+    ghost_rows: Option<(usize, usize)>,
 }
 
 /// The guide glyph drawn between the gutter and the text.
@@ -134,6 +184,7 @@ impl EditorView {
             vscroll: Rect::default(),
             hscroll: Rect::default(),
             hscroll_total: 0,
+            ghost_rows: None,
         }
     }
 
@@ -225,6 +276,13 @@ impl EditorView {
         self.follow_cursor = true;
     }
 
+    /// At the next render, scroll just enough to show the cursor and
+    /// the suggestion after it, as after typing. For when a suggestion
+    /// arrives without a key being pressed.
+    pub fn reveal_suggestion(&mut self) {
+        self.follow_cursor = true;
+    }
+
     /// At the next render, bring the cursor into view the way a jump
     /// does: centered vertically unless it's already on screen. For when
     /// something other than the user has moved it, such as a merge of
@@ -300,31 +358,53 @@ impl EditorView {
         // Each layout starts from the scroll position as it was, since
         // the first one clamps it for the full height and the second
         // has to be able to reach the last line with a row fewer.
+        // A suggestion's later lines take rows of their own below the
+        // cursor's line; following the cursor brings them into view too,
+        // as far as that keeps the cursor's line on screen.
+        let suggestion = self.editor.suggestion().map(str::to_owned);
+        let extra_rows = suggestion
+            .as_deref()
+            .map_or(0, |text| text.matches('\n').count());
         let full_height = area.height as usize;
         let wanted_scroll_line = self.scroll_line;
         let mut show_hscroll = false;
         let mut height;
-        let mut lines: Vec<Vec<Cell>>;
+        let mut rows: Vec<Row>;
         let mut max_width;
         loop {
             height = full_height - usize::from(show_hscroll);
             self.scroll_line = wanted_scroll_line;
             match reveal {
-                Some(Reveal::Cursor(target)) => self.scroll_to_line(target.line, height),
+                Some(Reveal::Cursor(target)) => {
+                    self.scroll_to_line(target.line, height);
+                    if extra_rows > 0 {
+                        let last = target.line + extra_rows.min(height.saturating_sub(1));
+                        self.scroll_to_line(last, height);
+                    }
+                }
                 Some(Reveal::Match(target, _)) => {
                     self.center_line_if_hidden(target.line, height);
                 }
                 None => {}
             }
-            self.scroll_line = self.scroll_line.min(line_count.saturating_sub(height));
-            lines = (self.scroll_line..(self.scroll_line + height).min(line_count))
-                .map(|line| self.editor.line_cells(line))
-                .collect();
-            max_width = lines
-                .iter()
-                .map(|cells| line_width(cells))
-                .max()
-                .unwrap_or(0);
+            self.scroll_line = self
+                .scroll_line
+                .min((line_count + extra_rows).saturating_sub(height));
+            rows = Vec::with_capacity(height);
+            for line in self.scroll_line..(self.scroll_line + height).min(line_count) {
+                let cells = self.editor.line_cells(line);
+                match suggestion.as_deref() {
+                    Some(text) if line == cursor.line => {
+                        rows.extend(self.rows_with_suggestion(line, cells, text, cursor));
+                    }
+                    _ => rows.push(Row::of_line(line, cells)),
+                }
+                if rows.len() >= height {
+                    rows.truncate(height);
+                    break;
+                }
+            }
+            max_width = rows.iter().map(Row::width).max().unwrap_or(0);
             let needed = (self.scroll_col > 0 || max_width > text_width) && full_height > 1;
             if needed && !show_hscroll {
                 show_hscroll = true;
@@ -346,6 +426,18 @@ impl EditorView {
             None => {}
         }
         self.follow_cursor = false;
+
+        self.ghost_rows = rows
+            .iter()
+            .position(|row| row.line == Some(cursor.line))
+            .map(|row| {
+                let ghost = rows[row + 1..]
+                    .iter()
+                    .take_while(|row| row.line.is_none())
+                    .count();
+                (row, ghost)
+            })
+            .filter(|&(_, ghost)| ghost > 0);
 
         let height = height as u16;
         self.gutter = Rect::new(area.x, area.y, gutter_width, height);
@@ -374,14 +466,11 @@ impl EditorView {
         let selected = Style::default().bg(theme.selection_background);
         // Search matches on the visible lines, ascending. Cells are walked
         // in the same order, so one index keeps up with them.
-        let matches = match self.editor.search() {
-            Some(search) if !lines.is_empty() => {
+        let last_line = rows.iter().filter_map(|row| row.line).next_back();
+        let matches = match (self.editor.search(), last_line) {
+            (Some(search), Some(last_line)) => {
                 let first = self.editor.buffer().offset_of_line(self.scroll_line);
-                let last = self
-                    .editor
-                    .buffer()
-                    .line_range(self.scroll_line + lines.len() - 1)
-                    .end;
+                let last = self.editor.buffer().line_range(last_line).end;
                 search.matches_in(first..last)
             }
             _ => Vec::new(),
@@ -389,14 +478,18 @@ impl EditorView {
         let mut next_match = 0;
         let found = Style::default().bg(theme.find_result_background);
         let found_current = Style::default().bg(theme.highlighted_find_result_background);
-        for (row, cells) in lines.iter().enumerate() {
-            let line = self.scroll_line + row;
+        let ghost_style = text_style.fg(theme.pending_completion_text);
+        for (row, Row { line, segments }) in rows.iter().enumerate() {
             let y = area.y + row as u16;
 
-            // Line number, right-aligned after the breakpoint column.
-            if self.show_gutter {
+            // Line number, right-aligned after the breakpoint column. A
+            // row of a suggestion's later lines isn't a line of the file
+            // and gets none.
+            if self.show_gutter
+                && let Some(line) = line
+            {
                 let number = format!("{:>width$}", line + 1, width = number_width as usize);
-                let color = if line == cursor.line {
+                let color = if *line == cursor.line {
                     theme.active_line_number
                 } else {
                     theme.inactive_line_number
@@ -406,9 +499,8 @@ impl EditorView {
 
             // The lines of a merge conflict are tinted by side, across
             // the whole text area; the text keeps its syntax colors.
-            let row_style = match self
-                .editor
-                .conflict_side(line)
+            let row_style = match line
+                .and_then(|line| self.editor.conflict_side(line))
                 .and_then(|side| theme.conflict_background(side))
             {
                 Some(background) => {
@@ -420,58 +512,68 @@ impl EditorView {
             };
 
             let visible = self.scroll_col..self.scroll_col + text_width;
-            for cell in cells {
-                if cell.width == 0 || cell.column + cell.width <= visible.start {
-                    continue;
-                }
-                if cell.column >= visible.end {
-                    break;
-                }
-                let syntax = theme.syntax(cell.kind);
-                while next_match < matches.len() && matches[next_match].end <= cell.range.start {
-                    next_match += 1;
-                }
-                let in_match = matches
-                    .get(next_match)
-                    .is_some_and(|m| m.start <= cell.range.start);
-                let in_current = current_match
-                    .as_ref()
-                    .is_some_and(|m| m.contains(&cell.range.start));
-                // The selection wins over a match, and the current match
-                // over the others.
-                let style = match &selection {
-                    Some(range) if range.contains(&cell.range.start) => {
-                        let style = syntax.apply(selected);
-                        match theme.selection_text {
-                            Some(color) => style.fg(color),
-                            None => style,
+            for Segment { cells, ghost } in segments {
+                for cell in cells {
+                    if cell.width == 0 || cell.column + cell.width <= visible.start {
+                        continue;
+                    }
+                    if cell.column >= visible.end {
+                        break;
+                    }
+                    let style = if *ghost {
+                        ghost_style
+                    } else {
+                        let syntax = theme.syntax(cell.kind);
+                        while next_match < matches.len()
+                            && matches[next_match].end <= cell.range.start
+                        {
+                            next_match += 1;
                         }
+                        let in_match = matches
+                            .get(next_match)
+                            .is_some_and(|m| m.start <= cell.range.start);
+                        let in_current = current_match
+                            .as_ref()
+                            .is_some_and(|m| m.contains(&cell.range.start));
+                        // The selection wins over a match, and the current
+                        // match over the others.
+                        match &selection {
+                            Some(range) if range.contains(&cell.range.start) => {
+                                let style = syntax.apply(selected);
+                                match theme.selection_text {
+                                    Some(color) => style.fg(color),
+                                    None => style,
+                                }
+                            }
+                            _ if in_current => syntax.apply(found_current),
+                            _ if in_match => syntax.apply(found),
+                            _ => syntax.apply(row_style),
+                        }
+                    };
+                    let fits =
+                        cell.column >= visible.start && cell.column + cell.width <= visible.end;
+                    let start = cell.column.max(visible.start);
+                    let end = (cell.column + cell.width).min(visible.end);
+                    let x = self.text.x + (start - visible.start) as u16;
+                    if cell.text == "\t" || !fits {
+                        // Tabs are blank; a wide character cut off by the
+                        // edge of the view shows as blank for the part
+                        // that fits.
+                        for x in x..x + (end - start) as u16 {
+                            buf[(x, y)].set_symbol(" ").set_style(style);
+                        }
+                    } else {
+                        buf.set_string(x, y, &cell.text, style);
                     }
-                    _ if in_current => syntax.apply(found_current),
-                    _ if in_match => syntax.apply(found),
-                    _ => syntax.apply(row_style),
-                };
-                let fits = cell.column >= visible.start && cell.column + cell.width <= visible.end;
-                let start = cell.column.max(visible.start);
-                let end = (cell.column + cell.width).min(visible.end);
-                let x = self.text.x + (start - visible.start) as u16;
-                if cell.text == "\t" || !fits {
-                    // Tabs are blank; a wide character cut off by the edge
-                    // of the view shows as blank for the part that fits.
-                    for x in x..x + (end - start) as u16 {
-                        buf[(x, y)].set_symbol(" ").set_style(style);
-                    }
-                } else {
-                    buf.set_string(x, y, &cell.text, style);
                 }
             }
 
             // A selection that continues onto the next line highlights one
             // cell past the end of this one, standing in for the line break.
-            if let Some(range) = &selection {
-                let end = self.editor.buffer().line_content_range(line).end;
+            if let (Some(range), Some(line)) = (&selection, line) {
+                let end = self.editor.buffer().line_content_range(*line).end;
                 if line + 1 < line_count && range.start <= end && end < range.end {
-                    let column = line_width(cells);
+                    let column = rows[row].width();
                     if visible.contains(&column) {
                         let x = self.text.x + (column - visible.start) as u16;
                         buf[(x, y)].set_symbol(" ").set_style(selected);
@@ -521,6 +623,65 @@ impl EditorView {
                 self.text.y + (cursor.line - self.scroll_line) as u16,
             )
         })
+    }
+
+    /// The rows that show the cursor's line with the suggestion `text`
+    /// after the cursor: the line's cells up to the cursor, the
+    /// suggestion's first line, then the rest of the line if the
+    /// suggestion has no more lines; otherwise each further line of the
+    /// suggestion on a row of its own, with the rest of the line after
+    /// the last.
+    fn rows_with_suggestion(
+        &self,
+        line: usize,
+        cells: Vec<Cell>,
+        text: &str,
+        cursor: Position,
+    ) -> Vec<Row> {
+        let tab_width = self.editor.tab_width();
+        let offset = self.editor.cursor();
+        let split = cells.partition_point(|cell| cell.range.start < offset);
+        let mut after = cells;
+        let before = after.drain(..split).collect();
+        let mut ghost_lines = text.split('\n');
+        let mut column = cursor.column;
+        let mut segments = vec![
+            Segment {
+                cells: before,
+                ghost: false,
+            },
+            Segment {
+                cells: ghost_cells(
+                    ghost_lines.next().unwrap_or(""),
+                    offset,
+                    &mut column,
+                    tab_width,
+                ),
+                ghost: true,
+            },
+        ];
+        let mut rows = Vec::new();
+        for ghost_line in ghost_lines {
+            rows.push(Row {
+                line: rows.is_empty().then_some(line),
+                segments: std::mem::take(&mut segments),
+            });
+            column = 0;
+            segments.push(Segment {
+                cells: ghost_cells(ghost_line, offset, &mut column, tab_width),
+                ghost: true,
+            });
+        }
+        relayout(&mut after, &mut column, tab_width);
+        segments.push(Segment {
+            cells: after,
+            ghost: false,
+        });
+        rows.push(Row {
+            line: rows.is_empty().then_some(line),
+            segments,
+        });
+        rows
     }
 
     /// Scroll vertically so that `line` is visible in a view `height` rows
@@ -709,10 +870,19 @@ impl EditorView {
             // with the shift modifier under enhanced keyboard protocols.
             KeyCode::BackTab => self.editor.outdent(),
             KeyCode::Tab if shift => self.editor.outdent(),
+            // Tab takes the suggestion when there is one: its first line,
+            // then the rest (see the editor).
+            KeyCode::Tab if self.editor.has_suggestion() => {
+                self.editor.accept_suggestion();
+            }
             KeyCode::Tab => self.editor.indent(),
             KeyCode::Backspace => self.editor.backspace(),
             KeyCode::Delete => self.editor.delete_forward(),
-            KeyCode::Esc => self.editor.clear_selection(),
+            KeyCode::Esc => {
+                if !self.editor.dismiss_suggestion() {
+                    self.editor.clear_selection();
+                }
+            }
             _ => return false,
         }
         if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
@@ -803,12 +973,21 @@ impl EditorView {
     /// area map to the nearest edge, one line or column beyond the view, so
     /// dragging past an edge scrolls in that direction.
     fn offset_at(&self, x: u16, y: u16) -> usize {
+        // Rows of a suggestion's later lines stand for the cursor's
+        // line, and the rows below them are that many lines further up
+        // than their position says.
+        let line_of_row = |row: usize| match self.ghost_rows {
+            Some((cursor_row, ghost)) if row > cursor_row => {
+                self.scroll_line + row.saturating_sub(ghost).max(cursor_row)
+            }
+            _ => self.scroll_line + row,
+        };
         let line = if y < self.text.y {
             self.scroll_line.saturating_sub(1)
         } else if y >= self.text.bottom() {
-            self.scroll_line + self.text.height as usize
+            line_of_row(self.text.height as usize)
         } else {
-            self.scroll_line + (y - self.text.y) as usize
+            line_of_row((y - self.text.y) as usize)
         };
         let column = if x < self.text.x {
             self.scroll_col.saturating_sub(1)
@@ -845,9 +1024,34 @@ impl EditorView {
     }
 }
 
-/// The display width of a laid-out line.
-fn line_width(cells: &[Cell]) -> usize {
-    cells.last().map(|c| c.column + c.width).unwrap_or(0)
+/// Cells for a line of ghost text laid out from `*column` on, which is
+/// moved past them. They stand at buffer offset `at` without covering
+/// anything, since the text isn't in the buffer.
+fn ghost_cells(text: &str, at: usize, column: &mut usize, tab_width: usize) -> Vec<Cell> {
+    text::graphemes(text.as_bytes())
+        .map(|grapheme| {
+            let width = grapheme.width(*column, tab_width);
+            let cell = Cell {
+                range: at..at,
+                text: grapheme.text.to_owned(),
+                column: *column,
+                width,
+                kind: TokenKind::Text,
+            };
+            *column += width;
+            cell
+        })
+        .collect()
+}
+
+/// Move cells to start at `*column`, laying them out afresh (tabs reach
+/// the next stop from where they now are), and move `*column` past them.
+fn relayout(cells: &mut [Cell], column: &mut usize, tab_width: usize) {
+    for cell in cells {
+        cell.column = *column;
+        cell.width = text::width(&cell.text, *column, tab_width);
+        *column += cell.width;
+    }
 }
 
 /// The number of decimal digits needed to show `n`.
@@ -904,5 +1108,183 @@ mod tests {
             Position { line: 1, column: 2 }
         );
         assert!(view.contains(0, 0));
+    }
+
+    /// A screen row's text without the scrollbar in its last column and
+    /// the blank after the text.
+    fn text_of(row: &str) -> String {
+        let mut chars: Vec<char> = row.chars().collect();
+        chars.pop();
+        chars.into_iter().collect::<String>().trim_end().to_owned()
+    }
+
+    /// Render into a buffer, for looking at styles as well as text.
+    fn render_to(view: &mut EditorView, width: u16, height: u16) -> Buffer {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf, &Theme::default());
+        buf
+    }
+
+    fn key(view: &mut EditorView, code: KeyCode) {
+        let mut clipboard = Clipboard::new();
+        view.handle_key(KeyEvent::new(code, KeyModifiers::NONE), &mut clipboard);
+    }
+
+    fn click(view: &mut EditorView, column: u16, row: u16) {
+        view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    /// Type `l` on the blank line and answer the request that makes
+    /// with `completion`.
+    fn suggest(view: &mut EditorView, completion: &str) {
+        key(view, KeyCode::Char('l'));
+        let editor = view.editor_mut_in_place();
+        let serial = editor.take_completion_request().unwrap().serial;
+        assert!(editor.offer_completion(serial, completion));
+    }
+
+    #[test]
+    fn a_suggestion_is_ghost_text_on_rows_of_their_own_without_numbers() {
+        let mut view = EditorView::new(Editor::new(FileBuffer::from_text(
+            "fn f() {\n    \n}\nlast\n",
+        )));
+        key(&mut view, KeyCode::Down);
+        key(&mut view, KeyCode::End);
+        suggest(&mut view, "et a = 1;\n    let b = 2;");
+        let (rows, cursor) = draw(&mut view, 30, 7);
+        assert_eq!(text_of(&rows[0]), " 1 │fn f() {");
+        assert_eq!(text_of(&rows[1]), " 2 │    let a = 1;");
+        // The suggestion's second line has no number; the lines after
+        // keep theirs.
+        assert_eq!(text_of(&rows[2]), "   │    let b = 2;");
+        assert_eq!(text_of(&rows[3]), " 3 │}");
+        assert_eq!(text_of(&rows[4]), " 4 │last");
+        assert_eq!(text_of(&rows[5]), " 5 │");
+        // The cursor stays where the typed text ends.
+        assert_eq!(cursor, Some(ScreenPosition::new(9, 1)));
+        // Ghost text is in its own color; the typed text isn't.
+        let buf = render_to(&mut view, 30, 7);
+        let theme = Theme::default();
+        assert_eq!(buf[(8, 1)].fg, theme.view_text, "the typed l");
+        assert_eq!(buf[(9, 1)].fg, theme.pending_completion_text, "the ghost e");
+        assert_eq!(
+            buf[(8, 2)].fg,
+            theme.pending_completion_text,
+            "the second ghost line"
+        );
+        assert_eq!(buf[(4, 3)].fg, theme.view_text, "the closing brace");
+
+        // A click below the ghost rows lands on the line shown there,
+        // and drops the suggestion; the rows then close up.
+        click(&mut view, 4, 4);
+        assert_eq!(
+            view.editor().cursor_position(),
+            Position { line: 3, column: 0 }
+        );
+        assert!(view.editor().suggestion().is_none());
+        let (rows, _) = draw(&mut view, 30, 7);
+        assert_eq!(text_of(&rows[2]), " 3 │}");
+        assert_eq!(text_of(&rows[3]), " 4 │last");
+
+        // A click on a ghost row goes to the cursor's line.
+        key(&mut view, KeyCode::Up);
+        key(&mut view, KeyCode::Up);
+        key(&mut view, KeyCode::End);
+        key(&mut view, KeyCode::Backspace);
+        suggest(&mut view, "et a = 1;\n    let b = 2;");
+        draw(&mut view, 30, 7);
+        click(&mut view, 6, 2);
+        assert_eq!(
+            view.editor().cursor_position(),
+            Position { line: 1, column: 2 }
+        );
+    }
+
+    #[test]
+    fn tab_takes_the_suggestion_and_escape_dismisses_it() {
+        let mut view = EditorView::new(Editor::new(FileBuffer::from_text("fn f() {\n    \n}\n")));
+        key(&mut view, KeyCode::Down);
+        key(&mut view, KeyCode::End);
+        suggest(&mut view, "et a = 1;\n    let b = 2;\n    let c = 3;");
+        key(&mut view, KeyCode::Tab);
+        assert_eq!(
+            view.editor().buffer().to_text(),
+            "fn f() {\n    let a = 1;\n}\n"
+        );
+        let (rows, _) = draw(&mut view, 30, 7);
+        assert_eq!(text_of(&rows[1]), " 2 │    let a = 1;");
+        assert_eq!(text_of(&rows[2]), "   │    let b = 2;");
+        assert_eq!(text_of(&rows[3]), "   │    let c = 3;");
+        assert_eq!(text_of(&rows[4]), " 3 │}");
+        key(&mut view, KeyCode::Tab);
+        assert_eq!(
+            view.editor().buffer().to_text(),
+            "fn f() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n}\n"
+        );
+        let (rows, _) = draw(&mut view, 30, 7);
+        assert_eq!(text_of(&rows[4]), " 5 │}");
+        // Without a suggestion, Tab indents as ever: to the next stop.
+        key(&mut view, KeyCode::Tab);
+        assert_eq!(
+            view.editor().buffer().to_text(),
+            "fn f() {\n    let a = 1;\n    let b = 2;\n    let c = 3;  \n}\n"
+        );
+        // Escape drops a suggestion and nothing more.
+        key(&mut view, KeyCode::Backspace);
+        key(&mut view, KeyCode::Backspace);
+        let editor = view.editor_mut_in_place();
+        let serial = editor.take_completion_request().unwrap().serial;
+        editor.offer_completion(serial, ";");
+        key(&mut view, KeyCode::Esc);
+        assert!(view.editor().suggestion().is_none());
+        assert_eq!(
+            view.editor().buffer().to_text(),
+            "fn f() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n}\n"
+        );
+    }
+
+    #[test]
+    fn following_the_cursor_shows_the_suggestion_too() {
+        let mut view = EditorView::new(Editor::new(FileBuffer::from_text("fn f() {\n    \n}\n")));
+        key(&mut view, KeyCode::Down);
+        key(&mut view, KeyCode::End);
+        suggest(&mut view, "et a = 1;\n    let b = 2;");
+        // Two rows: the cursor's line is followed, and the ghost row
+        // after it is brought in as well, at the cost of the line above.
+        view.reveal_suggestion();
+        let (rows, cursor) = draw(&mut view, 30, 2);
+        assert_eq!(text_of(&rows[0]), " 2 │    let a = 1;");
+        assert_eq!(text_of(&rows[1]), "   │    let b = 2;");
+        assert_eq!(cursor, Some(ScreenPosition::new(9, 0)));
+
+        // The rest of the cursor's line follows a one-line suggestion,
+        // pushed along after it; with more lines it follows the last.
+        let mut view = EditorView::new(Editor::new(FileBuffer::from_text("f(a, c)\n")));
+        view.editor_mut().set_cursor(4);
+        key(&mut view, KeyCode::Char(' '));
+        let editor = view.editor_mut_in_place();
+        let serial = editor.take_completion_request().unwrap().serial;
+        editor.offer_completion(serial, "b,");
+        let (rows, _) = draw(&mut view, 30, 2);
+        assert_eq!(text_of(&rows[0]), " 1 │f(a, b, c)");
+        let editor = view.editor_mut_in_place();
+        editor.dismiss_suggestion();
+        editor.offer_completion(editor.completion_serial(), "b,\n  d,");
+        let (rows, _) = draw(&mut view, 30, 3);
+        assert_eq!(text_of(&rows[0]), " 1 │f(a, b,");
+        assert_eq!(text_of(&rows[1]), "   │  d, c)");
+        assert_eq!(text_of(&rows[2]), " 2 │");
     }
 }

@@ -19,6 +19,9 @@
 //!
 //! [build]
 //! cmake-generator = "Xcode"
+//!
+//! [completion]
+//! rust-model = "~/models/rust-70m"
 //! ```
 //!
 //! Keys the editor doesn't know are kept as they are and written back, so
@@ -40,6 +43,7 @@
 use crate::auto_indent::{CodeStyle, ContinuationIndent};
 use crate::build::DEFAULT_CMAKE_GENERATOR;
 use crate::project_search::MAX_MATCHES;
+use crate::syntax::Language;
 use crate::terminal::emulator::DEFAULT_SCROLLBACK;
 use std::fmt;
 use toml::{Table, Value};
@@ -51,15 +55,18 @@ pub enum Category {
     Terminal,
     Search,
     Build,
+    /// Code completion: the model for each language it is available in.
+    Completion,
 }
 
 impl Category {
     /// Every category, in the order a settings page shows them.
-    pub const ALL: [Category; 4] = [
+    pub const ALL: [Category; 5] = [
         Category::Editor,
         Category::Terminal,
         Category::Search,
         Category::Build,
+        Category::Completion,
     ];
 
     pub fn name(self) -> &'static str {
@@ -68,6 +75,7 @@ impl Category {
             Category::Terminal => "Terminal",
             Category::Search => "Search",
             Category::Build => "Build",
+            Category::Completion => "Code Completion",
         }
     }
 
@@ -78,6 +86,7 @@ impl Category {
             Category::Terminal => "terminal",
             Category::Search => "search",
             Category::Build => "build",
+            Category::Completion => "completion",
         }
     }
 
@@ -140,17 +149,22 @@ pub enum SettingKey {
     /// The generator CMake configures with, passed as `-G`; blank to let
     /// CMake choose its own.
     CMakeGenerator,
+    /// The directory of the code completion model for Rust files; blank
+    /// for no completion in them. Completion models are trained per
+    /// language, so each language that has one gets a setting like this.
+    RustCompletionModel,
 }
 
 impl SettingKey {
     /// Every setting, in the order a settings page lists them (grouped by
     /// category, in [`Category::ALL`]'s order).
-    pub const ALL: [SettingKey; 5] = [
+    pub const ALL: [SettingKey; 6] = [
         SettingKey::ContinuationIndent,
         SettingKey::Shell,
         SettingKey::TerminalScrollback,
         SettingKey::SearchMaxResults,
         SettingKey::CMakeGenerator,
+        SettingKey::RustCompletionModel,
     ];
 
     pub fn category(self) -> Category {
@@ -159,6 +173,16 @@ impl SettingKey {
             SettingKey::Shell | SettingKey::TerminalScrollback => Category::Terminal,
             SettingKey::SearchMaxResults => Category::Search,
             SettingKey::CMakeGenerator => Category::Build,
+            SettingKey::RustCompletionModel => Category::Completion,
+        }
+    }
+
+    /// The completion model setting for a language, if completion can be
+    /// had for it at all.
+    pub fn completion_model(language: Language) -> Option<SettingKey> {
+        match language {
+            Language::Rust => Some(SettingKey::RustCompletionModel),
+            _ => None,
         }
     }
 
@@ -169,7 +193,8 @@ impl SettingKey {
             SettingKey::Shell
             | SettingKey::TerminalScrollback
             | SettingKey::SearchMaxResults
-            | SettingKey::CMakeGenerator => SettingKind::Text,
+            | SettingKey::CMakeGenerator
+            | SettingKey::RustCompletionModel => SettingKind::Text,
         }
     }
 
@@ -181,6 +206,7 @@ impl SettingKey {
             SettingKey::TerminalScrollback => "Scrollback lines",
             SettingKey::SearchMaxResults => "Maximum search results",
             SettingKey::CMakeGenerator => "CMake generator",
+            SettingKey::RustCompletionModel => "Rust model",
         }
     }
 
@@ -198,6 +224,9 @@ impl SettingKey {
             SettingKey::CMakeGenerator => {
                 "Passed as -G when CMake configures: Ninja, \"Unix Makefiles\", Xcode, and the like; blank for CMake's own choice"
             }
+            SettingKey::RustCompletionModel => {
+                "The checkpoint directory (config.json, model.safetensors, tokenizer.json) of the completion model for Rust files; blank for no completion in them"
+            }
         }
     }
 
@@ -209,6 +238,7 @@ impl SettingKey {
             SettingKey::TerminalScrollback => "scrollback",
             SettingKey::SearchMaxResults => "max-results",
             SettingKey::CMakeGenerator => "cmake-generator",
+            SettingKey::RustCompletionModel => "rust-model",
         }
     }
 
@@ -229,6 +259,7 @@ impl SettingKey {
             SettingKey::TerminalScrollback => DEFAULT_SCROLLBACK.to_string(),
             SettingKey::SearchMaxResults => MAX_MATCHES.to_string(),
             SettingKey::CMakeGenerator => DEFAULT_CMAKE_GENERATOR.to_owned(),
+            SettingKey::RustCompletionModel => String::new(),
         }
     }
 
@@ -243,6 +274,7 @@ impl SettingKey {
                 crate::terminal::detected_shell().to_string_lossy()
             ),
             SettingKey::CMakeGenerator => "CMake's default generator".to_owned(),
+            SettingKey::RustCompletionModel => "no completion for Rust files".to_owned(),
             _ => self.default_text(),
         }
     }
@@ -269,6 +301,7 @@ pub struct Settings {
     terminal_scrollback: Option<usize>,
     search_max_results: Option<usize>,
     cmake_generator: Option<String>,
+    rust_completion_model: Option<String>,
     /// Whatever else the settings file held: tables and keys this version
     /// of the editor doesn't know, kept to write back.
     unknown: Table,
@@ -316,6 +349,17 @@ impl Settings {
             .unwrap_or(DEFAULT_CMAKE_GENERATOR)
     }
 
+    /// The checkpoint directory of the code completion model for a
+    /// language, as the user typed it (a leading `~` stands for the home
+    /// directory), or `None` when there is no completion for it: none
+    /// exists for the language, or none has been set.
+    pub fn completion_model(&self, language: Language) -> Option<&str> {
+        match SettingKey::completion_model(language)? {
+            SettingKey::RustCompletionModel => self.rust_completion_model.as_deref(),
+            _ => None,
+        }
+    }
+
     // ----- Text form ------------------------------------------------------
 
     /// A setting's value as text: what a field holds. Blank for a shell
@@ -329,6 +373,9 @@ impl Settings {
             SettingKey::TerminalScrollback => self.terminal_scrollback().to_string(),
             SettingKey::SearchMaxResults => self.search_max_results().to_string(),
             SettingKey::CMakeGenerator => self.cmake_generator().to_owned(),
+            SettingKey::RustCompletionModel => {
+                self.rust_completion_model.clone().unwrap_or_default()
+            }
         }
     }
 
@@ -359,6 +406,9 @@ impl Settings {
             SettingKey::CMakeGenerator => {
                 self.cmake_generator = (text != DEFAULT_CMAKE_GENERATOR).then(|| text.to_owned());
             }
+            SettingKey::RustCompletionModel => {
+                self.rust_completion_model = (!text.is_empty()).then(|| text.to_owned());
+            }
         }
         Ok(*self != before)
     }
@@ -373,6 +423,7 @@ impl Settings {
             SettingKey::TerminalScrollback => self.terminal_scrollback() == DEFAULT_SCROLLBACK,
             SettingKey::SearchMaxResults => self.search_max_results() == MAX_MATCHES,
             SettingKey::CMakeGenerator => self.cmake_generator() == DEFAULT_CMAKE_GENERATOR,
+            SettingKey::RustCompletionModel => self.rust_completion_model.is_none(),
         }
     }
 
@@ -386,6 +437,7 @@ impl Settings {
             SettingKey::TerminalScrollback => self.terminal_scrollback = None,
             SettingKey::SearchMaxResults => self.search_max_results = None,
             SettingKey::CMakeGenerator => self.cmake_generator = None,
+            SettingKey::RustCompletionModel => self.rust_completion_model = None,
         }
         !was_default
     }
@@ -457,6 +509,13 @@ impl Settings {
                 self.cmake_generator =
                     (generator != DEFAULT_CMAKE_GENERATOR).then(|| generator.to_owned());
             }
+            SettingKey::RustCompletionModel => {
+                let path = value
+                    .as_str()
+                    .ok_or_else(|| SettingsError(format!("`{}` must be a string", key.path())))?
+                    .trim();
+                self.rust_completion_model = (!path.is_empty()).then(|| path.to_owned());
+            }
         }
         Ok(())
     }
@@ -474,7 +533,9 @@ impl Settings {
                 SettingKey::ContinuationIndent | SettingKey::Shell => Value::String(self.text(key)),
                 SettingKey::TerminalScrollback => Value::Integer(self.terminal_scrollback() as i64),
                 SettingKey::SearchMaxResults => Value::Integer(self.search_max_results() as i64),
-                SettingKey::CMakeGenerator => Value::String(self.text(key)),
+                SettingKey::CMakeGenerator | SettingKey::RustCompletionModel => {
+                    Value::String(self.text(key))
+                }
             };
             let category = table
                 .entry(key.category().table())
@@ -550,6 +611,8 @@ mod tests {
         assert_eq!(settings.terminal_scrollback(), DEFAULT_SCROLLBACK);
         assert_eq!(settings.search_max_results(), MAX_MATCHES);
         assert_eq!(settings.cmake_generator(), "Ninja");
+        assert_eq!(settings.completion_model(Language::Rust), None);
+        assert_eq!(settings.completion_model(Language::Plain), None);
         for key in SettingKey::ALL {
             assert!(settings.is_default(key), "{key:?}");
             assert_eq!(settings.text(key), key.default_text(), "{key:?}");
@@ -656,6 +719,32 @@ mod tests {
             Ok(true)
         );
         assert!(settings.is_default(SettingKey::CMakeGenerator));
+
+        // A completion model is a path as typed, blank for none.
+        assert_eq!(
+            settings.set_text(SettingKey::RustCompletionModel, " ~/models/rust "),
+            Ok(true)
+        );
+        assert_eq!(
+            settings.completion_model(Language::Rust),
+            Some("~/models/rust")
+        );
+        assert_eq!(
+            settings.text(SettingKey::RustCompletionModel),
+            "~/models/rust"
+        );
+        assert!(!settings.is_default(SettingKey::RustCompletionModel));
+        assert_eq!(
+            settings.completion_model(Language::C),
+            None,
+            "no model for C"
+        );
+        assert_eq!(
+            settings.set_text(SettingKey::RustCompletionModel, ""),
+            Ok(true)
+        );
+        assert_eq!(settings.completion_model(Language::Rust), None);
+        assert!(settings.is_default(SettingKey::RustCompletionModel));
     }
 
     #[test]
@@ -776,11 +865,18 @@ max-results = 25
 [build]
 cmake-generator = \" Unix Makefiles \"
 
+[completion]
+rust-model = \"~/models/rust\"
+
 [git]
 sign = true
 ";
         let settings = Settings::parse(text).unwrap();
         assert_eq!(settings.shell(), Some("fish"));
+        assert_eq!(
+            settings.completion_model(Language::Rust),
+            Some("~/models/rust")
+        );
         assert_eq!(settings.search_max_results(), 25);
         assert_eq!(settings.cmake_generator(), "Unix Makefiles", "trimmed");
         assert_eq!(settings.terminal_scrollback(), DEFAULT_SCROLLBACK);
@@ -843,6 +939,10 @@ sign = true
         assert_eq!(
             err("[build]\ncmake-generator = true\n"),
             "`build.cmake-generator` must be a string"
+        );
+        assert_eq!(
+            err("[completion]\nrust-model = 1\n"),
+            "`completion.rust-model` must be a string"
         );
         assert_eq!(
             err("terminal = 1\n"),

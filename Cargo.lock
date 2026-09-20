@@ -1362,15 +1362,19 @@ dependencies = [
 name = "ninjaedit-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "code-fuzzy-match",
  "compact_str",
  "git2",
  "ignore",
+ "infer",
  "jiff",
  "notify",
  "portable-pty",
  "regex",
+ "serde_json",
  "tempfile",
+ "tokenizer",
  "toml",
  "twox-hash",
  "unicode-segmentation",
