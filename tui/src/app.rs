@@ -174,6 +174,7 @@ use crate::build_view::{self, BuildOutcome, BuildView, Node};
 use crate::changes_view::{self, ChangesOutcome, ChangesTabs};
 use crate::clipboard::Clipboard;
 use crate::command::{BuildContext, Command, Context as CommandContext, FileContext, Page};
+use crate::context_menu::{ContextMenu, MenuEntry, MenuOutcome};
 use crate::diff_pane::draw_pieces;
 use crate::editor_view::EditorView;
 use crate::git_layout;
@@ -330,6 +331,20 @@ const CONFIGURATION_PLACEHOLDER: &str = "Build configuration to use";
 const TARGET_PLACEHOLDER: &str = "Target to build and run";
 /// The modes palette's row for the editor.
 const EDITOR_MODE_LABEL: &str = "Editor";
+
+/// What a right click over the text offers: the edits a mouse user
+/// expects to find there. Only the ones that apply are listed; see the
+/// `context_menu` module.
+const EDITOR_MENU: &[MenuEntry] = &[
+    MenuEntry::Command(Command::Undo),
+    MenuEntry::Command(Command::Redo),
+    MenuEntry::Separator,
+    MenuEntry::Command(Command::Cut),
+    MenuEntry::Command(Command::Copy),
+    MenuEntry::Command(Command::Paste),
+    MenuEntry::Separator,
+    MenuEntry::Command(Command::SelectAll),
+];
 /// What the status bar shows on the settings page.
 const SETTINGS_HELP: &[(&str, &str)] = &[
     ("Tab/↑↓", "next"),
@@ -493,6 +508,10 @@ pub struct App {
     /// The entry last picked from the command palette, listed first the
     /// next time it opens so that Enter alone runs it again.
     last_command: Option<PaletteAction>,
+    /// The right-click menu, while one is open. Never open at the same
+    /// time as the palette or the other overlays: the click that opens
+    /// it closes them, and a key that opens one closes it.
+    context_menu: Option<ContextMenu>,
     /// The search box, driving a search in the active tab. Never open at
     /// the same time as the palette.
     search_box: Option<SearchBox>,
@@ -604,6 +623,7 @@ impl App {
             palette: None,
             palette_kind: PaletteKind::Other,
             last_command: None,
+            context_menu: None,
             search_box: None,
             last_search: String::new(),
             goto_line: None,
@@ -1145,6 +1165,14 @@ impl App {
         self.refresh_discovery_hint(&mut palette);
         self.palette = Some(palette);
         self.palette_kind = PaletteKind::Commands;
+    }
+
+    /// A right click over the active file: open the editor's menu at
+    /// the pointer, listing the edits that apply (see [`EDITOR_MENU`]),
+    /// or nothing when none does.
+    fn open_editor_menu(&mut self, x: u16, y: u16) {
+        let context = self.command_context();
+        self.context_menu = ContextMenu::new(EDITOR_MENU, &context, x, y);
     }
 
     /// The command palette's entries; see
@@ -2543,6 +2571,7 @@ impl App {
             || self.search_box.is_some()
             || self.goto_line.is_some()
             || self.project_search_open
+            || self.context_menu.is_some()
     }
 
     /// Close any floating editor overlay, so it doesn't linger over the
@@ -2552,6 +2581,7 @@ impl App {
         self.close_search_box(true);
         self.goto_line = None;
         self.hide_project_search();
+        self.context_menu = None;
     }
 
     /// Send a key press to the focused tool's program, and write back any
@@ -2851,6 +2881,25 @@ impl App {
 
         self.prefix = None;
 
+        // The right-click menu takes the keys that drive it. Any other
+        // closes it and does what it always does, so the menu never
+        // stands in the way of typing.
+        if let Some(menu) = &mut self.context_menu {
+            match menu.handle_key(key) {
+                MenuOutcome::Continue => return,
+                MenuOutcome::Close => {
+                    self.context_menu = None;
+                    return;
+                }
+                MenuOutcome::Activate(command) => {
+                    self.context_menu = None;
+                    self.run_command(command);
+                    return;
+                }
+                MenuOutcome::Unhandled => self.context_menu = None,
+            }
+        }
+
         // Bindings shared with the tool pane, where they follow the prefix.
         if ctrl && self.handle_shared_key(key, confirm) {
             return;
@@ -2937,6 +2986,32 @@ impl App {
         let escaped = self.prefix.is_some();
         if matches!(mouse.kind, MouseEventKind::Down(_)) {
             self.prefix = None;
+        }
+
+        // The right-click menu is over everything else: it follows the
+        // pointer and takes a press on one of its rows. A press outside
+        // it closes it; a left click is spent on that, as one outside
+        // the palette is, while a right click goes on to open the menu
+        // for whatever it is over.
+        if let Some(menu) = &mut self.context_menu {
+            match menu.handle_mouse(mouse) {
+                MenuOutcome::Continue => return,
+                MenuOutcome::Close => {
+                    self.context_menu = None;
+                    return;
+                }
+                MenuOutcome::Activate(command) => {
+                    self.context_menu = None;
+                    self.run_command(command);
+                    return;
+                }
+                MenuOutcome::Unhandled => {
+                    self.context_menu = None;
+                    if mouse.kind != MouseEventKind::Down(MouseButton::Right) {
+                        return;
+                    }
+                }
+            }
         }
 
         // A divider drag owns the mouse until the button comes up.
@@ -3182,6 +3257,9 @@ impl App {
                 self.focus = Focus::Editor;
             }
             tab.view.handle_mouse(mouse);
+            if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
+                self.open_editor_menu(x, y);
+            }
         }
     }
 
@@ -3382,11 +3460,20 @@ impl App {
         // With the tool focused the tool's cursor is the one to show,
         // unless an overlay is open over it; otherwise the editor's or an
         // overlay's.
-        let show = if self.focus == Focus::Tool && !self.overlay_open() {
+        let mut show = if self.focus == Focus::Tool && !self.overlay_open() {
             tool_cursor
         } else {
             cursor
         };
+        // The right-click menu is drawn over everything, and the cursor
+        // stays where it is under it (the menu acts there) but isn't
+        // shown through it.
+        if let Some(menu) = &mut self.context_menu {
+            menu.render(screen, buf, theme);
+            if show.is_some_and(|position| menu.contains(position.x, position.y)) {
+                show = None;
+            }
+        }
         if let Some(position) = show {
             frame.set_cursor_position(position);
         }
@@ -7702,5 +7789,141 @@ mod tests {
             status.contains("a.rs changed on disk: reloaded"),
             "{status}"
         );
+    }
+
+    fn right_click(app: &mut App, column: u16, row: u16) {
+        mouse_at(app, MouseEventKind::Down(MouseButton::Right), column, row);
+        mouse_at(app, MouseEventKind::Up(MouseButton::Right), column, row);
+    }
+
+    /// The commands the open menu lists, with `None` for a separator.
+    fn menu_commands(app: &App) -> Vec<Option<Command>> {
+        app.context_menu.as_ref().unwrap().commands()
+    }
+
+    #[test]
+    fn right_click_over_the_text_opens_a_menu_of_the_edits_that_apply() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hello world\n")]);
+        let screen = draw(&mut app, 40, 12);
+        assert!(screen[1].contains("hello world"), "{screen:#?}");
+
+        // A fresh file with nothing selected: nothing to undo, cut, or
+        // copy, so only Paste and Select all are offered, and the
+        // separator that would come first is not.
+        right_click(&mut app, 10, 3);
+        assert_eq!(
+            menu_commands(&app),
+            [Some(Command::Paste), None, Some(Command::SelectAll)]
+        );
+        let screen = draw(&mut app, 40, 12);
+        assert!(screen[3].contains("╭"), "{screen:#?}");
+        assert!(screen[4].contains("│ Paste"), "{screen:#?}");
+        assert!(screen[4].contains("Ctrl+V │"), "{screen:#?}");
+        assert!(screen[5].contains("├─"), "{screen:#?}");
+        assert!(screen[6].contains("│ Select all"), "{screen:#?}");
+        assert!(screen[7].contains("╰"), "{screen:#?}");
+        // The click also put the cursor where it was: on the empty last
+        // line, below which the click was.
+        assert_eq!(app.tabs[0].view.editor().cursor(), 12);
+        // Escape closes the menu.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.context_menu.is_none());
+        let screen = draw(&mut app, 40, 12);
+        assert!(!screen[4].contains("Paste"), "{screen:#?}");
+
+        // With a selection, Cut and Copy join in. Selecting with the
+        // keyboard while the menu is open closes it first: the key
+        // isn't the menu's.
+        right_click(&mut app, 10, 3);
+        ctrl(&mut app, 'a');
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(0..12));
+        // A right click inside the selection keeps it.
+        right_click(&mut app, 6, 1);
+        assert_eq!(app.tabs[0].view.editor().selection(), Some(0..12));
+        assert_eq!(
+            menu_commands(&app),
+            [
+                Some(Command::Cut),
+                Some(Command::Copy),
+                Some(Command::Paste),
+                None,
+                Some(Command::SelectAll)
+            ]
+        );
+        // Clicking Cut runs it: the text goes to the clipboard, and the
+        // menu closes.
+        let screen = draw(&mut app, 40, 12);
+        let cut_row = screen.iter().position(|row| row.contains("│ Cut")).unwrap();
+        click(&mut app, 8, cut_row as u16);
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.tabs[0].view.editor().buffer().to_text(), "");
+        assert_eq!(app.clipboard.get().as_deref(), Some("hello world\n"));
+
+        // Now there is something to undo and nothing to cut: the first
+        // group is back, and one separator stands between each group
+        // left, none doubled where the middle group shrank.
+        right_click(&mut app, 3, 1);
+        assert_eq!(
+            menu_commands(&app),
+            [
+                Some(Command::Undo),
+                None,
+                Some(Command::Paste),
+                None,
+                Some(Command::SelectAll)
+            ]
+        );
+        // The keyboard drives it too: Down, Down picks Paste, and Enter
+        // runs it.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.context_menu.is_none());
+        assert_eq!(
+            app.tabs[0].view.editor().buffer().to_text(),
+            "hello world\n"
+        );
+    }
+
+    #[test]
+    fn a_click_outside_the_menu_closes_it() {
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hello world\n")]);
+        draw(&mut app, 40, 12);
+        right_click(&mut app, 6, 1);
+        assert!(app.context_menu.is_some());
+        draw(&mut app, 40, 12);
+        // A left click elsewhere closes the menu and does nothing else:
+        // the cursor stays where the right click put it.
+        assert_eq!(app.tabs[0].view.editor().cursor(), 2);
+        click(&mut app, 30, 6);
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.tabs[0].view.editor().cursor(), 2);
+        // A right click elsewhere opens the menu there instead.
+        right_click(&mut app, 6, 1);
+        draw(&mut app, 40, 12);
+        right_click(&mut app, 30, 8);
+        assert!(app.context_menu.is_some());
+        assert_eq!(app.tabs[0].view.editor().cursor(), 12);
+        // With no room below the pointer, or to its right, the menu opens
+        // upward from it and is moved left to fit.
+        let screen = draw(&mut app, 40, 12);
+        assert!(screen[8].ends_with("╯"), "{screen:#?}");
+        assert!(screen[4].ends_with("╮"), "{screen:#?}");
+        assert!(!screen[1].contains("╭"), "{screen:#?}");
+    }
+
+    #[test]
+    fn no_file_means_no_menu() {
+        let (_dir, mut app) = app_with_files(&[]);
+        draw(&mut app, 40, 12);
+        right_click(&mut app, 10, 5);
+        assert!(app.context_menu.is_none());
+        // Nor is there one over a page in the editor's place.
+        let (_dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        app.open_settings();
+        draw(&mut app, 40, 12);
+        right_click(&mut app, 10, 5);
+        assert!(app.context_menu.is_none());
     }
 }

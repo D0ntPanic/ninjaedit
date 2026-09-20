@@ -33,6 +33,10 @@ command-palette-result-text = "content"
 command-palette-result-context-text = "alt"
 command-palette-selection-background = "blue"
 command-palette-selection-text = "black"
+# The right-click menu takes the command palette's colors unless these
+# are set: context-menu-background, context-menu-box-color (the border
+# and separators), context-menu-text, context-menu-shortcut-text,
+# context-menu-selection-background, context-menu-selection-text.
 project-search-location-text = "dimmed"
 search-preview-background = "dark"
 

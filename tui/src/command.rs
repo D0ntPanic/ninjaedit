@@ -27,6 +27,11 @@
 //! named in the description instead, so the palette doesn't promise a
 //! key that types a letter in the next pane over.
 //!
+//! The right-click menus (see the `context_menu` module) offer commands
+//! from the same list, filtered by the same [`Command::is_available`],
+//! so what the mouse is offered and what the palette lists never
+//! disagree.
+//!
 //! The application runs the commands; this module only describes them.
 //! The views the modes palette (Ctrl+E) lists sit alongside them in
 //! the palette, as does "Run <target>" for each build target, but

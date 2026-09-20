@@ -346,6 +346,17 @@ optional {
     /// The background of the lines on their side of a merge conflict,
     /// from the `=======` marker to the `>>>>>>>`.
     conflict_theirs_background => "conflict-theirs-background",
+    // The right-click menu. Each color is the command palette's
+    // counterpart when unset, so a theme need only set the ones that
+    // should differ.
+    context_menu_background => "context-menu-background",
+    /// The border around the menu, and the separators in it.
+    context_menu_box_color => "context-menu-box-color",
+    context_menu_text => "context-menu-text",
+    /// The key bound to a command, at the right end of its row.
+    context_menu_shortcut_text => "context-menu-shortcut-text",
+    context_menu_selection_background => "context-menu-selection-background",
+    context_menu_selection_text => "context-menu-selection-text",
 }
 }
 

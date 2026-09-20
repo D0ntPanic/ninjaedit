@@ -767,6 +767,23 @@ impl EditorView {
                     self.follow_cursor = true;
                 }
             }
+            MouseEventKind::Down(MouseButton::Right) => {
+                // A right click opens a menu over the text (see the
+                // application). Outside the selection it puts the cursor
+                // where it is, so the menu acts there; inside it, the
+                // selection is what the menu is for, and stays.
+                if self.text.contains(at) || self.gutter.contains(at) {
+                    let offset = self.offset_at(x, y);
+                    let in_selection = self
+                        .editor
+                        .selection()
+                        .is_some_and(|range| range.contains(&offset));
+                    if !in_selection {
+                        self.editor.set_cursor(offset);
+                        self.follow_cursor = true;
+                    }
+                }
+            }
             MouseEventKind::Drag(MouseButton::Left) => match self.drag {
                 Drag::Selection => {
                     let anchor = self.editor.anchor().unwrap_or(self.editor.cursor());
