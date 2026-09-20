@@ -386,7 +386,7 @@ impl Command {
                 "On the changes page, unstage every staged file (a in the staged list)"
             }
             Command::OpenChange => {
-                "On the changes page, open the selected file in the editor (o in a list), at its first conflict if it has one"
+                "On the changes page, open the selected file in the editor (o in a list), at its first conflict if it has one; a submodule goes to its tab"
             }
             Command::ToggleAmend => {
                 "On the changes page, make the commit replace the last one (git commit --amend), or follow it (m in a list)"

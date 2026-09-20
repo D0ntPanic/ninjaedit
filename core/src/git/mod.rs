@@ -41,7 +41,7 @@ pub use fetch::{Fetch, FetchReport};
 pub use graph::{GraphCell, GraphRow, NODE, cells_for};
 pub use history::{Branch, Commit, CommitTime, History, Oid, RefKind, RefLabel, Remote, short_id};
 pub use submodules::{
-    RANGE_LIMIT, Submodule, SubmoduleRange, changed_submodules, has_uncommitted_changes,
-    submodule_range, submodules,
+    RANGE_LIMIT, Submodule, SubmoduleRange, UncommittedChange, changed_submodules,
+    has_uncommitted_changes, submodule_range, submodules, uncommitted_changes,
 };
 pub use tree::{Dir, Entry, FileTree, TreeRow};

@@ -28,10 +28,17 @@
 //! new, down to and including the commit(s) they have in common, so the
 //! graph joins up. A submodule added or removed shows just the one
 //! commit it points at.
+//!
+//! On the changes page a submodule may have uncommitted changes of its
+//! own as well as, or instead of, a move of the commit it points at,
+//! and a reader who sees only the graph could miss them.
+//! [`uncommitted_changes`] lists them, file by file as `git status`
+//! has them, for the page to show under the graph.
 
+use super::diff::ChangeKind;
 use super::graph::GraphLayout;
 use super::history::{Commit, Oid, PendingCommit, collect_refs, short_id};
-use git2::{ErrorCode, Repository, Sort, StatusOptions};
+use git2::{ErrorCode, Repository, Sort, Status, StatusOptions};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -97,23 +104,105 @@ fn collect(repo: &Repository, prefix: &str, found: &mut Vec<Submodule>, only_cha
     }
 }
 
-/// Whether anything in a repository's working tree or index differs
-/// from HEAD: a change to stage or commit, an untracked file, or a
-/// conflict. A submodule of it with changes of its own counts, as it
-/// does for `git status`.
-pub fn has_uncommitted_changes(repo: &Repository) -> bool {
+/// What `git status` asks for: untracked files (a directory of them
+/// as one entry), nothing ignored, and submodules included.
+fn status_options() -> StatusOptions {
     let mut options = StatusOptions::new();
     options
         .include_untracked(true)
         .recurse_untracked_dirs(false)
         .include_ignored(false)
         .exclude_submodules(false);
-    match repo.statuses(Some(&mut options)) {
+    options
+}
+
+/// Whether anything in a repository's working tree or index differs
+/// from HEAD: a change to stage or commit, an untracked file, or a
+/// conflict. A submodule of it with changes of its own counts, as it
+/// does for `git status`.
+pub fn has_uncommitted_changes(repo: &Repository) -> bool {
+    match repo.statuses(Some(&mut status_options())) {
         Ok(statuses) => statuses
             .iter()
             .any(|entry| !entry.status().is_empty() && !entry.status().is_ignored()),
         Err(_) => false,
     }
+}
+
+/// One uncommitted change inside a submodule, as `git status` lists
+/// it: a file (or a directory of untracked files) and how it changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UncommittedChange {
+    pub kind: ChangeKind,
+    /// The path from the submodule's working directory.
+    pub path: String,
+    /// Whether the change is in the index and not the working tree:
+    /// staged, and waiting only to be committed.
+    pub staged: bool,
+}
+
+/// The uncommitted changes inside the submodule whose working
+/// directory is `workdir`, in path order: what its own changes page
+/// lists, as `git status` summarizes it, for showing under the graph
+/// of the commits the parent's change moved it over. A change in both
+/// the index and the working tree is listed once, as the working
+/// tree's. Empty when the submodule isn't initialized or is clean.
+pub fn uncommitted_changes(workdir: &Path) -> Vec<UncommittedChange> {
+    let Ok(repo) = Repository::open(workdir) else {
+        return Vec::new();
+    };
+    let Ok(statuses) = repo.statuses(Some(&mut status_options())) else {
+        return Vec::new();
+    };
+    let mut changes: Vec<UncommittedChange> = statuses
+        .iter()
+        .filter_map(|entry| {
+            let status = entry.status();
+            let (kind, staged) = uncommitted_kind(status)?;
+            let path = entry.path().ok()?.replace('\\', "/");
+            Some(UncommittedChange { kind, path, staged })
+        })
+        .collect();
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    changes
+}
+
+/// How a status entry changed, and whether only in the index; `None`
+/// for an entry that isn't a change (ignored, or nothing).
+fn uncommitted_kind(status: Status) -> Option<(ChangeKind, bool)> {
+    if status.is_conflicted() {
+        return Some((ChangeKind::Conflicted, false));
+    }
+    let worktree = if status.is_wt_new() {
+        Some(ChangeKind::Untracked)
+    } else if status.is_wt_deleted() {
+        Some(ChangeKind::Deleted)
+    } else if status.is_wt_renamed() {
+        Some(ChangeKind::Renamed)
+    } else if status.is_wt_typechange() {
+        Some(ChangeKind::TypeChanged)
+    } else if status.is_wt_modified() {
+        Some(ChangeKind::Modified)
+    } else {
+        None
+    };
+    if let Some(kind) = worktree {
+        return Some((kind, false));
+    }
+    let index = if status.is_index_new() {
+        ChangeKind::Added
+    } else if status.is_index_deleted() {
+        ChangeKind::Deleted
+    } else if status.is_index_renamed() {
+        ChangeKind::Renamed
+    } else if status.is_index_typechange() {
+        ChangeKind::TypeChanged
+    } else if status.is_index_modified() {
+        ChangeKind::Modified
+    } else {
+        return None;
+    };
+    Some((index, true))
 }
 
 /// The commits a change to a submodule spans: from the commit it
@@ -141,6 +230,10 @@ pub struct SubmoduleRange {
     /// The commits (of `old` and `new`) the submodule's repository
     /// doesn't have, which a fetch of it may bring.
     pub missing: Vec<Oid>,
+    /// The uncommitted changes inside the submodule, for a change of
+    /// the working tree or the index (see [`uncommitted_changes`]);
+    /// empty for a commit's, and for a clean submodule.
+    pub uncommitted: Vec<UncommittedChange>,
 }
 
 /// The commits the submodule at `path` (in `parent`'s working
@@ -160,6 +253,7 @@ pub fn submodule_range(
         truncated: false,
         error: None,
         missing: Vec::new(),
+        uncommitted: Vec::new(),
     };
     if old == new {
         return range;

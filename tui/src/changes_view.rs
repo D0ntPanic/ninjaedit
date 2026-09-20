@@ -17,7 +17,11 @@
 //! unstaged file against the index, a staged one against HEAD, and a
 //! conflicted one against our side of the merge, so the conflict
 //! markers and the other side's lines show as additions. A selected
-//! directory shows what is under it, with the counts. Under the diff
+//! submodule shows the graph of the commits it moved over, and under
+//! it a summary of the uncommitted changes inside it, if any, since a
+//! move of its commit alone doesn't show that there is more to commit
+//! on its tab. A selected directory shows what is under it, with the
+//! counts. Under the diff
 //! is the commit box: a line saying where the commit goes (`Commit to
 //! main`, `Merge into main`, `Amend on main`, or the conflicts that
 //! stand in the way) with the amend toggle at its right, and the
@@ -76,7 +80,10 @@
 //! parent's a changed one too, so the tabs follow the changes down.
 //! The tabs come and go with the changes: a submodule committed clean
 //! loses its tab. Ctrl+T on the page picks a tab, as it picks a file
-//! tab in the editor.
+//! tab in the editor, and `o` on a submodule in a list goes to its tab
+//! rather than opening it as a file; a submodule with no tab (its
+//! commit moved, but nothing is changed inside it) has nothing to go
+//! to, and the status bar says so.
 
 use crate::clipboard::Clipboard;
 use crate::diff_pane::{
@@ -543,7 +550,35 @@ impl ChangesTabs {
     pub fn handle_key(&mut self, key: KeyEvent, clipboard: &mut Clipboard) -> ChangesOutcome {
         let outcome = self.active().handle_key(key, clipboard);
         self.refresh_others();
-        outcome
+        self.follow_submodule(outcome)
+    }
+
+    /// Show the tab of the submodule the shown page asks for, when `o`
+    /// or "Open changed file" was on a submodule in a list. The tab is
+    /// named by the submodule's path from the main repository, which
+    /// for a submodule of a submodule is the shown tab's path and then
+    /// its own. A submodule with no tab has no uncommitted changes of
+    /// its own (its commit moved, or it isn't initialized), so there
+    /// is nothing to show, and `outcome` becomes a notice saying so.
+    fn follow_submodule(&mut self, outcome: ChangesOutcome) -> ChangesOutcome {
+        let Some(path) = self.active().take_submodule_to_show() else {
+            return outcome;
+        };
+        let tab = &self.tabs[self.active];
+        let title = if tab.submodule {
+            format!("{}/{}", tab.title, path)
+        } else {
+            path.clone()
+        };
+        match self.tabs.iter().position(|tab| tab.title == title) {
+            Some(index) => {
+                self.set_active(index);
+                outcome
+            }
+            None => ChangesOutcome::Notice(StatusLine::info(format!(
+                "{path} has no uncommitted changes of its own"
+            ))),
+        }
     }
 
     /// Turn amending on or off on the shown page.
@@ -574,9 +609,11 @@ impl ChangesTabs {
         outcome
     }
 
-    /// Open the file selected on the shown page, as its `o` does.
+    /// Open the file selected on the shown page, as its `o` does, or
+    /// show the selected submodule's tab.
     pub fn open_selected(&mut self) -> ChangesOutcome {
-        self.active().open_selected()
+        let outcome = self.active().open_selected();
+        self.follow_submodule(outcome)
     }
 
     /// Give the shown page a mouse event. Returns whether the page's
@@ -663,6 +700,10 @@ pub struct ChangesView {
     /// Whether an action changed the repository since last asked, so
     /// that the other repositories' pages can scan again.
     acted: bool,
+    /// The submodule whose tab the page asks to have shown, by its
+    /// path from this repository, when `o` was on one (see
+    /// [`ChangesTabs::follow_submodule`]) and not yet taken.
+    submodule_to_show: Option<String>,
     /// The page, its panes, and the rules between them from the last
     /// render.
     area: Rect,
@@ -720,6 +761,7 @@ impl ChangesView {
             commit_share: None,
             divider_drag: None,
             acted: false,
+            submodule_to_show: None,
             area: Rect::default(),
             unstaged_area: Rect::default(),
             staged_area: Rect::default(),
@@ -802,6 +844,12 @@ impl ChangesView {
     /// Whether an action changed the repository since last asked.
     fn take_acted(&mut self) -> bool {
         std::mem::take(&mut self.acted)
+    }
+
+    /// The submodule whose tab the page asks to have shown, when `o`
+    /// was on one and this wasn't asked since.
+    fn take_submodule_to_show(&mut self) -> Option<String> {
+        self.submodule_to_show.take()
     }
 
     /// The submodules with uncommitted changes, as the last scan found
@@ -1158,7 +1206,9 @@ impl ChangesView {
         }
     }
 
-    /// Open the selected file in the editor.
+    /// Open the selected file in the editor. A submodule isn't a file
+    /// to open: its changes are on its own tab, which the page asks to
+    /// have shown (see [`ChangesTabs::follow_submodule`]).
     pub fn open_selected(&mut self) -> ChangesOutcome {
         let Some((_, change)) = self.selected_change() else {
             return ChangesOutcome::Continue;
@@ -1167,10 +1217,8 @@ impl ChangesView {
             return ChangesOutcome::Continue;
         };
         if change.submodule {
-            return ChangesOutcome::Notice(StatusLine::info(format!(
-                "{} is a submodule: its changes are on its own tab",
-                change.path
-            )));
+            self.submodule_to_show = Some(change.path.clone());
+            return ChangesOutcome::Continue;
         }
         if change.kind == ChangeKind::Deleted {
             return ChangesOutcome::Notice(StatusLine::info(format!("{} is deleted", change.path)));
@@ -2033,6 +2081,7 @@ fn counts_of(file: &FileChange) -> String {
 mod tests {
     use super::*;
     use crate::commit_row::HEAD_NODE;
+    use crate::diff_pane::UNCOMMITTED_HEADING;
     use crossterm::event::{KeyEventKind, KeyEventState};
     use git2::{Repository, Signature};
     use ninjaedit_core::git::NODE;
@@ -2326,6 +2375,74 @@ mod tests {
         assert_eq!(head_message(&dir), "Change things\n\nA body, with the why.");
     }
 
+    /// Wait for every opened page's scan.
+    fn settle_tabs(tabs: &mut ChangesTabs) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while tabs.is_loading() && std::time::Instant::now() < deadline {
+            tabs.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!tabs.is_loading());
+        tabs.poll();
+    }
+
+    fn press_tabs(tabs: &mut ChangesTabs, code: KeyCode) -> ChangesOutcome {
+        let mut clipboard = Clipboard::local_only();
+        tabs.handle_key(key(code, KeyModifiers::NONE), &mut clipboard)
+    }
+
+    #[test]
+    fn opening_a_submodule_goes_to_its_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        configure_user(&repo);
+        commit_files(&repo, &[("a.rs", "fn main() {}\n")], "Base");
+        let mut submodule = repo
+            .submodule("https://example.com/sub.git", Path::new("sub"), true)
+            .unwrap();
+        let sub = submodule.open().unwrap();
+        configure_user(&sub);
+        commit_files(&sub, &[("inner.txt", "one\n")], "Inner commit");
+        submodule.add_finalize().unwrap();
+        commit_files(&repo, &[], "Add submodule");
+
+        // A change inside the submodule gives it a tab; `o` on it in
+        // the parent's list goes there rather than opening it.
+        fs::write(dir.path().join("sub").join("inner.txt"), "dirty\n").unwrap();
+        let mut tabs = ChangesTabs::new(dir.path(), GitChangesLayout::default());
+        settle_tabs(&mut tabs);
+        assert_eq!(tabs.titles().collect::<Vec<_>>(), vec![TITLE, "sub"]);
+        let outcome = press_tabs(&mut tabs, KeyCode::Char('o'));
+        assert_eq!(outcome, ChangesOutcome::Continue);
+        assert_eq!(tabs.active_index(), 1);
+        settle_tabs(&mut tabs);
+        let screen = draw(tabs.active(), 100, 30);
+        assert!(
+            screen.iter().any(|r| r.contains("M inner.txt")),
+            "{screen:#?}"
+        );
+        // The command palette's "Open changed file" does the same.
+        tabs.set_active(0);
+        let outcome = tabs.open_selected();
+        assert_eq!(outcome, ChangesOutcome::Continue);
+        assert_eq!(tabs.active_index(), 1);
+
+        // Committed inside the submodule, it has no tab: the parent's
+        // change is the move to the new commit, and `o` says there is
+        // nothing to go to.
+        commit_files(&sub, &[("inner.txt", "two\n")], "Inner two");
+        tabs.set_active(0);
+        tabs.refresh();
+        settle_tabs(&mut tabs);
+        assert_eq!(tabs.titles().collect::<Vec<_>>(), vec![TITLE]);
+        let outcome = press_tabs(&mut tabs, KeyCode::Char('o'));
+        assert!(
+            matches!(&outcome, ChangesOutcome::Notice(m) if m.text().contains("sub has no uncommitted changes")),
+            "{outcome:?}"
+        );
+        assert_eq!(tabs.active_index(), 0);
+    }
+
     #[test]
     fn a_submodule_change_shows_its_commits_as_a_graph() {
         let dir = tempfile::tempdir().unwrap();
@@ -2342,8 +2459,8 @@ mod tests {
         commit_files(&repo, &[], "Add submodule");
 
         // A change inside the submodule leaves the parent at the same
-        // commit: nothing to graph, and a note saying where the change
-        // is.
+        // commit: nothing to graph, a note saying so, and the change
+        // inside listed under it.
         fs::write(dir.path().join("sub").join("inner.txt"), "dirty\n").unwrap();
         let mut view = view(&dir);
         let screen = draw(&mut view, 100, 30);
@@ -2356,10 +2473,19 @@ mod tests {
             heading.contains(&format!("{} → {}", short_id(s1), short_id(s1))),
             "{heading}"
         );
-        assert!(row_with(&screen, "Still at this commit").contains("inside the submodule"));
+        row_with(&screen, "Still at this commit");
+        let heading_row = screen
+            .iter()
+            .position(|r| r.contains(UNCOMMITTED_HEADING))
+            .unwrap_or_else(|| panic!("{screen:#?}"));
+        assert!(
+            screen[heading_row + 1].contains("M inner.txt"),
+            "{screen:#?}"
+        );
 
         // Committed inside the submodule, the parent's unstaged change
-        // is the move to the new commit, drawn as HEAD.
+        // is the move to the new commit, drawn as HEAD; the submodule
+        // is clean, so there is no summary.
         let s2 = commit_files(&sub, &[("inner.txt", "two\n")], "Inner two");
         view.refresh();
         settle(&mut view);
@@ -2378,6 +2504,30 @@ mod tests {
             "{screen:#?}"
         );
         assert!(!screen.iter().any(|r| r.contains("Still at this commit")));
+        assert!(!screen.iter().any(|r| r.contains(UNCOMMITTED_HEADING)));
+
+        // A new file inside on top of the move: the graph stays, and
+        // the summary follows it.
+        fs::write(dir.path().join("sub").join("extra.txt"), "extra\n").unwrap();
+        view.refresh();
+        settle(&mut view);
+        let screen = draw(&mut view, 100, 30);
+        let graph_row = screen
+            .iter()
+            .position(|r| r.contains("Inner commit"))
+            .unwrap();
+        let heading_row = screen
+            .iter()
+            .position(|r| r.contains(UNCOMMITTED_HEADING))
+            .unwrap_or_else(|| panic!("{screen:#?}"));
+        assert!(heading_row > graph_row, "{screen:#?}");
+        assert!(
+            screen[heading_row + 1].contains("? extra.txt"),
+            "{screen:#?}"
+        );
+        fs::remove_file(dir.path().join("sub").join("extra.txt")).unwrap();
+        view.refresh();
+        settle(&mut view);
 
         // Staged, the same range shows against HEAD; Down from the
         // now empty unstaged list goes to it.

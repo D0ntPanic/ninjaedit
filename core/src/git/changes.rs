@@ -47,7 +47,7 @@
 use super::diff::{
     self, CONTEXT_LINES, ChangeKind, Contents, FileChange, FileDiff, STATS_LIMIT, Unshown,
 };
-use super::submodules::{Submodule, changed_submodules};
+use super::submodules::{Submodule, changed_submodules, uncommitted_changes};
 use git2::{
     Delta, DiffFindOptions, DiffOptions, ErrorCode, Oid, Patch, Repository, RepositoryState, Tree,
 };
@@ -391,18 +391,28 @@ impl Changes {
         if change.submodule {
             // The index's commit against the submodule's HEAD, which
             // libgit2 puts on the working directory's side.
-            return Ok(diff::submodule_diff(
-                &self.repo,
-                change.kind,
-                &change.path,
-                None,
-                &delta,
-            ));
+            return Ok(self.submodule_diff(change, None, &delta));
         }
         let old = diff::blob_contents(&self.repo, delta.old_file())?;
         let new = diff::workdir_contents(&self.workdir.join(&change.path));
         let patch = Patch::from_diff(&diff, index)?;
         FileDiff::build(change.kind, &change.path, None, &old, &new, patch.as_ref())
+    }
+
+    /// The diff of a submodule change: the commits it moved over, and
+    /// the uncommitted changes inside the submodule, which are as much
+    /// a part of what the working tree holds as the move.
+    fn submodule_diff(
+        &self,
+        change: &FileChange,
+        old_path: Option<&str>,
+        delta: &git2::DiffDelta<'_>,
+    ) -> FileDiff {
+        let mut diff = diff::submodule_diff(&self.repo, change.kind, &change.path, old_path, delta);
+        if let Some(range) = &mut diff.submodule {
+            range.uncommitted = uncommitted_changes(&self.workdir.join(&change.path));
+        }
+        diff
     }
 
     /// The commit the staged changes are against: HEAD, or its parent
@@ -435,13 +445,7 @@ impl Changes {
         let index = diff::delta_at(&diff, &change.path)?;
         let delta = diff.get_delta(index).expect("found above");
         if change.submodule {
-            return Ok(diff::submodule_diff(
-                &self.repo,
-                change.kind,
-                &change.path,
-                change.old_path.as_deref(),
-                &delta,
-            ));
+            return Ok(self.submodule_diff(change, change.old_path.as_deref(), &delta));
         }
         let old = diff::blob_contents(&self.repo, delta.old_file())?;
         let new = diff::blob_contents(&self.repo, delta.new_file())?;
@@ -1145,6 +1149,14 @@ mod tests {
             (Some(first_inner), Some(first_inner))
         );
         assert!(range.commits.is_empty());
+        // The uncommitted change inside is listed, so that it isn't
+        // missed behind the graph.
+        let inner_changes: Vec<(char, &str, bool)> = range
+            .uncommitted
+            .iter()
+            .map(|c| (c.kind.letter(), c.path.as_str(), c.staged))
+            .collect();
+        assert_eq!(inner_changes, [('M', "inner.txt", false)]);
 
         // Commit inside the submodule, from its own page.
         let mut inner = Changes::open_repository(sub.workdir().unwrap()).unwrap();
@@ -1177,6 +1189,20 @@ mod tests {
         );
         let names: Vec<&str> = range.commits.iter().map(|c| c.summary.as_str()).collect();
         assert_eq!(names, ["Inner change", "Inner commit"]);
+        assert!(range.uncommitted.is_empty());
+        // A new file inside, on top of the move, is listed under the
+        // same commits.
+        fs::write(sub.workdir().unwrap().join("extra.txt"), "extra\n").unwrap();
+        let diff = changes.unstaged_diff(&changes.unstaged()[0]).unwrap();
+        let range = diff.submodule.as_ref().unwrap();
+        assert_eq!(range.commits.len(), 2);
+        let inner_changes: Vec<(char, &str)> = range
+            .uncommitted
+            .iter()
+            .map(|c| (c.kind.letter(), c.path.as_str()))
+            .collect();
+        assert_eq!(inner_changes, [('?', "extra.txt")]);
+        fs::remove_file(sub.workdir().unwrap().join("extra.txt")).unwrap();
         changes.stage(["libs/sub"]).unwrap();
         confirmed(&mut changes);
         assert_eq!(listed(changes.staged()), [('M', "libs/sub", 0, 0)]);

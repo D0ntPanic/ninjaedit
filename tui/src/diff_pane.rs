@@ -15,7 +15,11 @@
 //! commits the change moved over, drawn as the log draws its commits
 //! (see the `commit_row` module), the commit the submodule now points
 //! at styled as HEAD is in the log, under a line saying which commit
-//! it moved from and to.
+//! it moved from and to. On the changes page the submodule may hold
+//! uncommitted changes of its own as well, which are easy to miss
+//! behind the graph, so they are listed under it, a file a row with
+//! its status letter as the file lists have them, and where to go to
+//! commit them.
 //!
 //! [`HScroll`] is the sideways scrolling of a pane, with the editor's
 //! rules (see `EditorView`): the limit is set by the longest line
@@ -30,7 +34,8 @@ use crate::commit_row::{CommitLine, Highlight, commit_extent, draw_commit_line, 
 use crate::palette::palette_background;
 use crate::theme::Theme;
 use ninjaedit_core::git::{
-    ChangeKind, Commit, DiffRow, FileDiff, LineKind, RANGE_LIMIT, SubmoduleRange, Unshown, short_id,
+    ChangeKind, Commit, DiffRow, FileDiff, LineKind, RANGE_LIMIT, SubmoduleRange,
+    UncommittedChange, Unshown, short_id,
 };
 use ninjaedit_core::{Token, TokenKind, text};
 use ratatui::buffer::Buffer;
@@ -401,24 +406,37 @@ pub(crate) fn render_diff(
     }
 }
 
+/// How many of a submodule's uncommitted changes are listed, at most.
+pub(crate) const UNCOMMITTED_LIMIT: usize = 50;
+/// The heading over a submodule's uncommitted changes.
+pub(crate) const UNCOMMITTED_HEADING: &str =
+    "Uncommitted changes inside the submodule, on its tab:";
+
 /// One row of a submodule's diff.
 enum SubmoduleRow<'a> {
     /// The line saying from which commit to which.
     Heading,
     Note(String),
     Commit(&'a Commit, CommitLine),
+    /// An uncommitted change inside the submodule.
+    Change(&'a UncommittedChange),
 }
 
 /// The rows of a submodule's diff: the heading, a note when there are
-/// no commits to show, and two rows a commit.
+/// no commits to show, two rows a commit, and then, after a blank
+/// row, the uncommitted changes inside the submodule under a heading
+/// of their own, when there are any.
 fn submodule_rows(range: &SubmoduleRange) -> Vec<SubmoduleRow<'_>> {
     let mut rows = vec![SubmoduleRow::Heading];
     if let Some(error) = &range.error {
         rows.push(SubmoduleRow::Note(error.clone()));
     } else if range.commits.is_empty() && range.old.is_some() && range.old == range.new {
-        rows.push(SubmoduleRow::Note(
-            "Still at this commit: the changes are inside the submodule, on its tab".to_owned(),
-        ));
+        let note = if range.uncommitted.is_empty() {
+            "Still at this commit: the changes are inside the submodule, on its tab"
+        } else {
+            "Still at this commit"
+        };
+        rows.push(SubmoduleRow::Note(note.to_owned()));
     }
     for commit in &range.commits {
         rows.push(SubmoduleRow::Commit(commit, CommitLine::Node));
@@ -429,7 +447,57 @@ fn submodule_rows(range: &SubmoduleRange) -> Vec<SubmoduleRow<'_>> {
             "⋯ only the newest {RANGE_LIMIT} commits are shown"
         )));
     }
+    if !range.uncommitted.is_empty() {
+        rows.push(SubmoduleRow::Note(String::new()));
+        rows.push(SubmoduleRow::Note(UNCOMMITTED_HEADING.to_owned()));
+        rows.extend(
+            range
+                .uncommitted
+                .iter()
+                .take(UNCOMMITTED_LIMIT)
+                .map(SubmoduleRow::Change),
+        );
+        let more = range.uncommitted.len().saturating_sub(UNCOMMITTED_LIMIT);
+        if more > 0 {
+            rows.push(SubmoduleRow::Note(format!("⋯ and {more} more")));
+        }
+    }
     rows
+}
+
+/// The text of an uncommitted change's row: its letter, its path, and
+/// whether it is staged. Styled with the theme's colors over `(plain,
+/// dim)` when given, its letter colored as the file lists color
+/// theirs; plain for measuring.
+fn uncommitted_pieces(
+    change: &UncommittedChange,
+    styles: Option<(&Theme, Style, Style)>,
+) -> Vec<Piece> {
+    let (plain, dim) = styles
+        .map(|(_, plain, dim)| (plain, dim))
+        .unwrap_or_default();
+    let letter = match styles {
+        None => plain,
+        Some((theme, _, _)) => match change.kind {
+            ChangeKind::Added | ChangeKind::Copied | ChangeKind::Untracked => {
+                plain.fg(theme.diff_added_text)
+            }
+            ChangeKind::Deleted => plain.fg(theme.diff_removed_text),
+            ChangeKind::Conflicted => plain
+                .fg(theme.diff_removed_text)
+                .add_modifier(Modifier::BOLD),
+            _ => plain.fg(theme.git_tag_text),
+        },
+    };
+    let mut pieces = vec![
+        ("  ".to_owned(), plain),
+        (change.kind.letter().to_string(), letter),
+        (format!(" {}", change.path), plain),
+    ];
+    if change.staged {
+        pieces.push(("  staged".to_owned(), dim));
+    }
+    pieces
 }
 
 /// The heading of a submodule's diff: which commit it moved from and
@@ -471,6 +539,7 @@ fn submodule_row_extent(
     match row {
         SubmoduleRow::Heading => pieces_width(&submodule_heading(diff, range, None)),
         SubmoduleRow::Note(note) => display_width(note),
+        SubmoduleRow::Change(change) => pieces_width(&uncommitted_pieces(change, None)),
         SubmoduleRow::Commit(commit, _) => commit_extent(
             commit,
             Highlight::target_if(range.new == Some(commit.id)),
@@ -535,6 +604,10 @@ fn render_submodule(
             }
             SubmoduleRow::Note(note) => {
                 let pieces = [(note.clone(), dim)];
+                draw_pieces(buf, row_area.x, row_area.y, capacity, &pieces, h.col);
+            }
+            SubmoduleRow::Change(change) => {
+                let pieces = uncommitted_pieces(change, Some((theme, background, dim)));
                 draw_pieces(buf, row_area.x, row_area.y, capacity, &pieces, h.col);
             }
             SubmoduleRow::Commit(commit, line) => draw_commit_line(
