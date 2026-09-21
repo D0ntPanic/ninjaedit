@@ -543,6 +543,14 @@ impl GitLogTabs {
         self.tabs[self.active].view.as_ref()
     }
 
+    /// The shown tab's repository as its page opens it: the working
+    /// directory, and whether as exactly that directory (a
+    /// submodule's) rather than whatever repository contains it.
+    pub fn active_repository(&self) -> (PathBuf, bool) {
+        let tab = &self.tabs[self.active];
+        (tab.workdir.clone(), tab.submodule)
+    }
+
     /// Take in commits the shown page's walk has produced. Returns
     /// whether the page needs redrawing.
     pub fn poll(&mut self) -> bool {

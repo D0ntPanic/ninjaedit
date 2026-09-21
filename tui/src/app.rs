@@ -109,7 +109,11 @@
 //! and `CMakeLists.txt` are found and set up with their defaults, and
 //! every load looks at the project again for the targets it finds
 //! there. The status bar shows the current configuration and target; clicking
-//! either opens a palette to pick another. Ctrl+B builds the current
+//! either opens a palette to pick another. To their left it shows the
+//! branch of the repository the user is in (the submodule the file
+//! being edited is in, or a git page's shown tab; the project's own
+//! elsewhere), or the commit when HEAD is detached; see the `heads`
+//! module. Ctrl+B builds the current
 //! target with the current configuration and Ctrl+R builds and runs it,
 //! from the editor, a mode, or (after the prefix, or straight away when
 //! nothing is running in it) a tool. Each job runs in the output tool:
@@ -180,6 +184,7 @@ use crate::editor_view::EditorView;
 use crate::git_layout;
 use crate::git_view::{self, GitLogTabs};
 use crate::goto_line::{GoToLineBox, GoToLineOutcome};
+use crate::heads::{Heads, Repository};
 use crate::palette::{Palette, PaletteAction, PaletteItem, PaletteOutcome, Prefix};
 use crate::project_search::{ProjectSearchDialog, ProjectSearchOutcome};
 use crate::search_box::{self, SearchBox, SearchOutcome};
@@ -192,6 +197,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ninjaedit_core::build::root_candidates;
+use ninjaedit_core::git::Head;
 use ninjaedit_core::search::literal_query;
 use ninjaedit_core::terminal::{ExitStatus, Output, Session, SessionId};
 use ninjaedit_core::{
@@ -477,6 +483,8 @@ pub struct App {
     /// render, to hit-test clicks.
     status_config_area: Rect,
     status_target_area: Rect,
+    /// Where HEAD is in the repositories the status bar has shown.
+    heads: Heads,
     /// What the threads finding roots' targets report back, taken in
     /// by [`tick`](Self::tick); see [`start_discoveries`](Self::start_discoveries).
     discoveries: Receiver<DiscoveryResult>,
@@ -608,6 +616,7 @@ impl App {
             job_dirs: Vec::new(),
             status_config_area: Rect::default(),
             status_target_area: Rect::default(),
+            heads: Heads::new(),
             discoveries: discovery_rx,
             discovery_tx,
             theme: Theme::default(),
@@ -2737,6 +2746,8 @@ impl App {
     pub fn tick(&mut self) -> bool {
         let mut redraw = self.check_open_files_if_due();
         redraw |= self.take_discoveries();
+        let repository = self.status_repository();
+        redraw |= self.heads.look_if_due(repository);
         // A selection dragged past the tool's edge keeps scrolling.
         if let Some(tool) = self.tool_pane.active_mut()
             && tool.view_mut().tick()
@@ -3507,7 +3518,28 @@ impl App {
         self.tool_term_area = Rect::new(content.x, tool_top + 1, content.width, tool_rows - 1);
     }
 
+    /// The repository whose branch the status bar shows: the one the
+    /// file being edited is in (the deepest, so a submodule's when the
+    /// file is in one), the shown tab's on the git log or changes
+    /// page, and otherwise the project's own.
+    fn status_repository(&self) -> Repository {
+        let root = || (self.project.root().to_path_buf(), false);
+        match &self.mode {
+            Mode::Editor => self
+                .tabs
+                .get(self.active)
+                .and_then(Tab::path)
+                .and_then(Path::parent)
+                .map_or_else(root, |dir| (dir.to_path_buf(), false)),
+            Mode::GitLog(tabs) => tabs.active_repository(),
+            Mode::Changes(tabs) => tabs.active_repository(),
+            Mode::Settings(_) | Mode::Build(_) => root(),
+        }
+    }
+
     fn render_status(&mut self, area: Rect, buf: &mut Buffer) {
+        let repository = self.status_repository();
+        let head = self.heads.head(repository).cloned();
         let theme = &self.theme;
         let base = Style::default().bg(theme.status_bar_background);
         buf.set_style(area, base);
@@ -3565,11 +3597,21 @@ impl App {
                     String::new()
                 }
             });
+        // The branch the repository is on, or the commit it is
+        // detached at, each in its own color.
+        let (mut branch, branch_color) = match &head {
+            Some(Head::Branch(name)) => (format!(" {name} "), theme.status_bar_branch_text),
+            Some(Head::Commit(id)) => (format!(" {id} "), theme.status_bar_commit_text),
+            None => (String::new(), theme.status_bar_branch_text),
+        };
         let width_of = |text: &str| Span::raw(text).width() as u16;
         let position_width = position.as_deref().map_or(0, width_of);
-        // Drop the build segments when there's no room for them beside
-        // the position.
-        if position_width + width_of(&configuration) + width_of(&target) + 20 > area.width {
+        // Drop the branch and build segments when there's no room for
+        // them beside the position.
+        if position_width + width_of(&branch) + width_of(&configuration) + width_of(&target) + 20
+            > area.width
+        {
+            branch.clear();
             configuration.clear();
             target.clear();
         }
@@ -3580,6 +3622,7 @@ impl App {
         };
         let right = [
             (position.unwrap_or_default(), theme.status_bar_position_text),
+            (branch, branch_color),
             (configuration, theme.status_bar_position_text),
             (target, target_color),
         ];
@@ -3627,8 +3670,8 @@ impl App {
                 buf.set_string(x, area.y, text, base.fg(*color));
                 let segment = Rect::new(x, area.y, width, 1);
                 match index {
-                    1 => self.status_config_area = segment,
-                    2 => self.status_target_area = segment,
+                    2 => self.status_config_area = segment,
+                    3 => self.status_target_area = segment,
                     _ => {}
                 }
                 x += width;
@@ -3854,6 +3897,113 @@ mod tests {
         let ln = row.find("Ln 1").unwrap() as u16;
         assert_eq!(buffer[(ln, 4)].fg, Color::Rgb(10, 11, 12));
         assert_eq!(buffer[(ln, 4)].bg, Color::Rgb(4, 5, 6));
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_branch_of_the_repository_the_user_is_in() {
+        let (dir, mut app) = app_with_files(&[("a.txt", "hello\n")]);
+        app.set_theme(
+            Theme::parse(
+                "status-bar-branch-text = \"#010101\"\nstatus-bar-commit-text = \"#020202\"\n",
+            )
+            .unwrap(),
+        );
+        // The status bar's row, and the color of the text at `needle`.
+        let status_row = |app: &mut App| -> (String, Vec<Color>) {
+            let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let row: String = (0..80).map(|x| buffer[(x, 7)].symbol()).collect();
+            let colors = (0..80).map(|x| buffer[(x, 7)].fg).collect();
+            (row, colors)
+        };
+        let color_at = |row: &str, colors: &[Color], needle: &str| -> Color {
+            let at = row
+                .find(needle)
+                .unwrap_or_else(|| panic!("no {needle:?} in {row:?}"));
+            colors[row[..at].chars().count()]
+        };
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        let commit = |repo: &git2::Repository, name: &str, message: &str| -> git2::Oid {
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new(name)).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let head = repo.head().ok().and_then(|h| h.target());
+            let parents: Vec<git2::Commit<'_>> = head
+                .into_iter()
+                .map(|id| repo.find_commit(id).unwrap())
+                .collect();
+            let refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &refs)
+                .unwrap()
+        };
+
+        // Not a repository: no branch to show.
+        let (row, _) = status_row(&mut app);
+        assert!(row.ends_with(" Ln 1, Col 1 "), "{row:?}");
+
+        // The project's repository on a branch of its own name, with a
+        // submodule on another.
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let first = commit(&repo, "a.txt", "Say hello");
+        repo.branch("trunk", &repo.find_commit(first).unwrap(), false)
+            .unwrap();
+        repo.set_head("refs/heads/trunk").unwrap();
+        let mut submodule = repo
+            .submodule("https://example.com/sub.git", Path::new("sub"), true)
+            .unwrap();
+        let sub = submodule.open().unwrap();
+        std::fs::write(sub.workdir().unwrap().join("inner.txt"), "inner\n").unwrap();
+        let inner = commit(&sub, "inner.txt", "Inner commit");
+        sub.branch("subwork", &sub.find_commit(inner).unwrap(), false)
+            .unwrap();
+        sub.set_head("refs/heads/subwork").unwrap();
+        submodule.add_finalize().unwrap();
+        commit(&repo, "sub", "Add submodule");
+
+        // The file being edited is in the project's repository: its
+        // branch, in the branch color, left of the build segments.
+        app.heads = Heads::new();
+        let (row, colors) = status_row(&mut app);
+        assert!(row.ends_with(" Ln 1, Col 1  trunk "), "{row:?}");
+        assert_eq!(color_at(&row, &colors, "trunk"), Color::Rgb(1, 1, 1));
+
+        // A file in the submodule: the submodule's branch.
+        app.open_file(dir.path().join("sub/inner.txt"));
+        let (row, _) = status_row(&mut app);
+        assert!(row.contains(" subwork "), "{row:?}");
+        assert!(!row.contains("trunk"), "{row:?}");
+
+        // The git log page: the shown tab's repository.
+        ctrl(&mut app, 'l');
+        let (row, _) = status_row(&mut app);
+        assert!(row.contains(" trunk "), "{row:?}");
+        if let Mode::GitLog(tabs) = &mut app.mode {
+            tabs.set_active(1);
+        } else {
+            panic!("the git log page is showing");
+        }
+        let (row, _) = status_row(&mut app);
+        assert!(row.contains(" subwork "), "{row:?}");
+
+        // A page about neither the files nor the repository: the
+        // project's own.
+        app.open_settings();
+        let (row, _) = status_row(&mut app);
+        assert!(row.contains(" trunk "), "{row:?}");
+
+        // HEAD detached: the commit, in the commit color, once the
+        // repository has been looked at again.
+        repo.set_head_detached(first).unwrap();
+        let (row, _) = status_row(&mut app);
+        assert!(row.contains(" trunk "), "{row:?}");
+        assert!(app.heads.look(app.status_repository()));
+        let (row, colors) = status_row(&mut app);
+        let id = &first.to_string()[..8];
+        assert!(row.contains(&format!(" {id} ")), "{row:?}");
+        assert!(!row.contains("trunk"), "{row:?}");
+        assert_eq!(color_at(&row, &colors, id), Color::Rgb(2, 2, 2));
     }
 
     #[test]

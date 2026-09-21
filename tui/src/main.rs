@@ -20,6 +20,7 @@ mod fields;
 mod git_layout;
 mod git_view;
 mod goto_line;
+mod heads;
 mod input;
 mod palette;
 mod project_search;

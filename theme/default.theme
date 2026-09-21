@@ -24,6 +24,10 @@ status-bar-key-text = "blue"
 status-bar-help-text = "content"
 status-bar-error-text = "red"
 status-bar-progress-text = "yellow"
+# Where the repository the user is in is: its branch, or the commit
+# HEAD is detached at.
+status-bar-branch-text = "lavender"
+status-bar-commit-text = "orange"
 command-palette-background = "mid"
 command-palette-box-color = "dimmed"
 command-palette-placeholder-text = "dimmed"

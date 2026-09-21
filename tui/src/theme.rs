@@ -248,6 +248,11 @@ required {
     /// Something under way that the user is waiting on, such as a
     /// fetch or a checkout, which has the bar to itself meanwhile.
     status_bar_progress_text => "status-bar-progress-text",
+    /// The local branch the repository the user is in is on.
+    status_bar_branch_text => "status-bar-branch-text",
+    /// The commit HEAD is on when it is detached, shown in place of a
+    /// branch.
+    status_bar_commit_text => "status-bar-commit-text",
     command_palette_background => "command-palette-background",
     /// The border around the palette.
     command_palette_box_color => "command-palette-box-color",

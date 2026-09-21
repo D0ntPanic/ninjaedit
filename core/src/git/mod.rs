@@ -12,7 +12,8 @@
 //! those of the submodules that need it, as `git fetch`'s on-demand
 //! recursion does. The [`checkout`] module moves HEAD, and the working
 //! tree with it, to a commit picked from the log, on to whatever
-//! branch points there.
+//! branch points there. The [`head`] module says where HEAD is, the
+//! branch or the commit, for the status bar.
 //! Everything goes through libgit2, by way of the `git2` crate; nothing
 //! shells out to git.
 //!
@@ -27,6 +28,7 @@ pub mod checkout;
 pub mod diff;
 pub mod fetch;
 pub mod graph;
+pub mod head;
 pub mod history;
 pub mod submodules;
 pub mod tree;
@@ -39,6 +41,7 @@ pub use diff::{
 };
 pub use fetch::{Fetch, FetchReport};
 pub use graph::{GraphCell, GraphRow, NODE, cells_for};
+pub use head::{Head, head, head_of};
 pub use history::{Branch, Commit, CommitTime, History, Oid, RefKind, RefLabel, Remote, short_id};
 pub use submodules::{
     RANGE_LIMIT, Submodule, SubmoduleRange, UncommittedChange, changed_submodules,
