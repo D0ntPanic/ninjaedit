@@ -13,16 +13,19 @@
 //! recursion does. The [`checkout`] module moves HEAD, and the working
 //! tree with it, to a commit picked from the log, on to whatever
 //! branch points there. The [`head`] module says where HEAD is, the
-//! branch or the commit, for the status bar.
+//! branch or the commit, for the status bar, and the [`branch`] module
+//! makes a new branch there and moves HEAD on to it.
 //! Everything goes through libgit2, by way of the `git2` crate; nothing
 //! shells out to git.
 //!
-//! Only the [`changes`], [`fetch`], and [`checkout`] modules change the
-//! repository. The first two touch only its index, HEAD, and
-//! remote-tracking references; a checkout also rewrites the working
-//! directory's files and may make a local branch, and refuses to while
-//! there are changes it could lose.
+//! Only the [`changes`], [`fetch`], [`checkout`], and [`branch`]
+//! modules change the repository. The first two touch only its index,
+//! HEAD, and remote-tracking references; a checkout also rewrites the
+//! working directory's files and may make a local branch, and refuses
+//! to while there are changes it could lose; a new branch is only a
+//! reference and HEAD, never the files.
 
+pub mod branch;
 pub mod changes;
 pub mod checkout;
 pub mod diff;
@@ -33,6 +36,7 @@ pub mod history;
 pub mod submodules;
 pub mod tree;
 
+pub use branch::{BranchError, create_branch, create_branch_in};
 pub use changes::Changes;
 pub use checkout::{Checkout, CheckoutError, CheckoutJob, CheckoutOutcome, CheckoutPlan};
 pub use diff::{

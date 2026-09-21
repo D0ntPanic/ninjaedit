@@ -73,6 +73,8 @@ pub enum Command {
     RemoveBuildEntry,
     /// The settings page's Ctrl+D.
     ResetSetting,
+    /// Wherever the status bar shows a repository.
+    NewBranch,
     /// The git log page's F5.
     Fetch,
     /// The git log page's Space.
@@ -174,13 +176,18 @@ pub struct Context {
     /// On the changes page, whether a file (not a directory) is
     /// selected to open.
     pub change_selected: bool,
+    /// Whether the status bar shows a repository to make a branch in:
+    /// the one the file being edited is in, the shown git page's, or
+    /// the project's own. A property of where the user is in the
+    /// project, not of what the editor is doing.
+    pub has_repository: bool,
 }
 
 impl Command {
     /// Every command, in the order the palette lists them before
     /// anything is typed: files, searching, editing, building, the
     /// pages, views, and quitting last.
-    pub const ALL: [Command; 40] = [
+    pub const ALL: [Command; 41] = [
         Command::OpenFile,
         Command::SwitchTab,
         Command::Save,
@@ -209,6 +216,7 @@ impl Command {
         Command::DuplicateBuildEntry,
         Command::RemoveBuildEntry,
         Command::ResetSetting,
+        Command::NewBranch,
         Command::Fetch,
         Command::CheckoutCommit,
         Command::Commit,
@@ -261,6 +269,7 @@ impl Command {
             Command::DuplicateBuildEntry => on(Page::Build) && build.can_duplicate,
             Command::RemoveBuildEntry => on(Page::Build) && build.can_remove,
             Command::ResetSetting => on(Page::Settings),
+            Command::NewBranch => context.has_repository,
             Command::Fetch => on(Page::GitLog),
             Command::CheckoutCommit => on(Page::GitLog) && context.commit_selected,
             Command::Commit | Command::ToggleAmend => on(Page::Changes),
@@ -303,6 +312,7 @@ impl Command {
             Command::DuplicateBuildEntry => "Duplicate build configuration or target",
             Command::RemoveBuildEntry => "Remove build configuration, target, or root",
             Command::ResetSetting => "Reset setting to default",
+            Command::NewBranch => "Create branch",
             Command::Fetch => "Fetch from remotes",
             Command::CheckoutCommit => "Check out commit",
             Command::Commit => "Commit",
@@ -369,6 +379,9 @@ impl Command {
             }
             Command::ResetSetting => {
                 "On the settings page, put the focused setting back to its default"
+            }
+            Command::NewBranch => {
+                "Make a new branch at the current commit of the repository the status bar shows (a submodule's when in one) and switch to it, leaving every file as it is"
             }
             Command::Fetch => {
                 "On the git log page, fetch every remote of the repository in the background and refresh the page"
@@ -441,6 +454,7 @@ impl Command {
             | Command::DeleteBuildDir
             | Command::DeleteAllBuildDirs
             | Command::RemoveBuildEntry
+            | Command::NewBranch
             | Command::CheckoutCommit
             | Command::StageAll
             | Command::UnstageAll
@@ -567,6 +581,28 @@ mod tests {
         assert!(listed.contains(&Command::Fetch));
         assert!(listed.contains(&Command::CheckoutCommit));
         assert!(!listed.contains(&Command::Commit));
+    }
+
+    #[test]
+    fn a_branch_can_be_made_wherever_there_is_a_repository() {
+        assert!(!Command::NewBranch.is_available(&Context::default()));
+        for page in [
+            Page::Editor,
+            Page::Settings,
+            Page::Build,
+            Page::GitLog,
+            Page::Changes,
+        ] {
+            let context = Context {
+                page,
+                has_repository: true,
+                ..Context::default()
+            };
+            assert!(
+                available(&context).contains(&Command::NewBranch),
+                "{page:?}"
+            );
+        }
     }
 
     #[test]

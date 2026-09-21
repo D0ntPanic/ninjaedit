@@ -663,7 +663,7 @@ fn tracking_branch<'r>(
     Ok(found.map(|(_, branch)| branch))
 }
 
-fn branch_exists(repo: &Repository, name: &str) -> Result<bool, git2::Error> {
+pub(super) fn branch_exists(repo: &Repository, name: &str) -> Result<bool, git2::Error> {
     match repo.find_branch(name, BranchType::Local) {
         Ok(_) => Ok(true),
         Err(err) if err.code() == ErrorCode::NotFound => Ok(false),

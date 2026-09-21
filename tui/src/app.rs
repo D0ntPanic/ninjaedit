@@ -185,6 +185,7 @@ use crate::git_layout;
 use crate::git_view::{self, GitLogTabs};
 use crate::goto_line::{GoToLineBox, GoToLineOutcome};
 use crate::heads::{Heads, Repository};
+use crate::new_branch::{NewBranchBox, NewBranchOutcome};
 use crate::palette::{Palette, PaletteAction, PaletteItem, PaletteOutcome, Prefix};
 use crate::project_search::{ProjectSearchDialog, ProjectSearchOutcome};
 use crate::search_box::{self, SearchBox, SearchOutcome};
@@ -197,7 +198,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ninjaedit_core::build::root_candidates;
-use ninjaedit_core::git::Head;
+use ninjaedit_core::git::{BranchError, Head, create_branch};
 use ninjaedit_core::search::literal_query;
 use ninjaedit_core::terminal::{ExitStatus, Output, Session, SessionId};
 use ninjaedit_core::{
@@ -528,6 +529,9 @@ pub struct App {
     /// The go to line box, over the active tab. Never open at the same
     /// time as the palette, the search box, or the project search.
     goto_line: Option<GoToLineBox>,
+    /// The new branch box ("Create branch"), over whatever shows, never
+    /// at the same time as the other overlays.
+    new_branch: Option<NewBranchBox>,
     /// The project search dialog, kept (with its results) once opened so
     /// that it comes back as it was. Shown while `project_search_open`,
     /// never at the same time as the palette or the search box.
@@ -636,6 +640,7 @@ impl App {
             search_box: None,
             last_search: String::new(),
             goto_line: None,
+            new_branch: None,
             project_search: None,
             project_search_open: false,
             status,
@@ -974,6 +979,7 @@ impl App {
     fn open_tabs_palette(&mut self) {
         self.close_search_box(true);
         self.goto_line = None;
+        self.new_branch = None;
         self.hide_project_search();
         // On the git pages the tabs are their repositories, the shown
         // one first so that Enter alone flips to the next.
@@ -1039,6 +1045,7 @@ impl App {
     fn open_files_palette(&mut self) {
         self.close_search_box(true);
         self.goto_line = None;
+        self.new_branch = None;
         self.hide_project_search();
         // `*` first in the query brings in the ignored files: build
         // artifacts and the like, which are otherwise left out.
@@ -1135,6 +1142,7 @@ impl App {
     fn open_modes_palette(&mut self) {
         self.close_search_box(true);
         self.goto_line = None;
+        self.new_branch = None;
         self.hide_project_search();
         self.track_view();
         let current = self.current_view();
@@ -1169,6 +1177,7 @@ impl App {
     fn open_command_palette(&mut self) {
         self.close_search_box(true);
         self.goto_line = None;
+        self.new_branch = None;
         self.hide_project_search();
         let mut palette = Palette::new(COMMANDS_PLACEHOLDER, self.command_items());
         self.refresh_discovery_hint(&mut palette);
@@ -1186,7 +1195,7 @@ impl App {
 
     /// The command palette's entries; see
     /// [`open_command_palette`](Self::open_command_palette).
-    fn command_items(&self) -> Vec<PaletteItem> {
+    fn command_items(&mut self) -> Vec<PaletteItem> {
         let context = self.command_context();
         let commands = Command::ALL
             .into_iter()
@@ -1261,7 +1270,7 @@ impl App {
     /// any; the active file and its state when the editor is showing;
     /// what the build configuration has to build; and what the pages
     /// and the tool pane have selected or under way.
-    fn command_context(&self) -> CommandContext {
+    fn command_context(&mut self) -> CommandContext {
         let page = match &self.mode {
             Mode::Editor => Page::Editor,
             Mode::Settings(_) => Page::Settings,
@@ -1332,6 +1341,7 @@ impl App {
             has_unstaged: changes.is_some_and(|view| view.has_unstaged()),
             has_staged: changes.is_some_and(|view| view.has_staged()),
             change_selected: changes.is_some_and(|view| view.has_selected_change()),
+            has_repository: self.heads.head(self.status_repository()).is_some(),
         }
     }
 
@@ -1388,6 +1398,7 @@ impl App {
                     self.handle_settings_outcome(outcome);
                 }
             }
+            Command::NewBranch => self.open_new_branch(),
             Command::Fetch => {
                 if let Mode::GitLog(tabs) = &mut self.mode {
                     tabs.fetch();
@@ -1749,6 +1760,7 @@ impl App {
     fn open_add_root_palette(&mut self) {
         self.close_search_box(true);
         self.goto_line = None;
+        self.new_branch = None;
         self.hide_project_search();
         let root = self.project.root();
         let files = self.project.index().files(false);
@@ -1809,6 +1821,7 @@ impl App {
     fn open_configuration_palette(&mut self) {
         self.close_search_box(true);
         self.goto_line = None;
+        self.new_branch = None;
         self.hide_project_search();
         let current = self.build.current();
         let mut items = Vec::new();
@@ -1839,6 +1852,7 @@ impl App {
     fn open_target_palette(&mut self) {
         self.close_search_box(true);
         self.goto_line = None;
+        self.new_branch = None;
         self.hide_project_search();
         let (items, selected) = self.target_items();
         let mut palette = Palette::new(TARGET_PLACEHOLDER, items);
@@ -2153,6 +2167,7 @@ impl App {
         }
         self.palette = None;
         self.goto_line = None;
+        self.new_branch = None;
         self.hide_project_search();
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
@@ -2234,6 +2249,7 @@ impl App {
         self.palette = None;
         self.close_search_box(true);
         self.hide_project_search();
+        self.new_branch = None;
         self.goto_line = Some(GoToLineBox::new(line_count));
     }
 
@@ -2248,6 +2264,65 @@ impl App {
                     // anything past the end clamp to the first and last.
                     tab.view.go_to_line(line.saturating_sub(1));
                     self.focus = Focus::Editor;
+                }
+            }
+        }
+    }
+
+    // ----- New branch -----------------------------------------------------
+
+    /// "Create branch": open the new branch box over the screen, for
+    /// the repository the status bar shows. Does nothing with the box
+    /// already open, or with no repository to make a branch in.
+    fn open_new_branch(&mut self) {
+        if self.new_branch.is_some() {
+            return;
+        }
+        let repository = self.status_repository();
+        let Some(from) = self.heads.head(repository.clone()).cloned() else {
+            return;
+        };
+        self.palette = None;
+        self.close_search_box(true);
+        self.goto_line = None;
+        self.hide_project_search();
+        self.new_branch = Some(NewBranchBox::new(repository, from));
+    }
+
+    /// Do what the new branch box asks: make the branch where HEAD is
+    /// in the box's repository and move HEAD on to it, touching no
+    /// file. A name that won't do is refused in the box, which stays
+    /// open; anything else that goes wrong closes it and is said in the
+    /// status bar. The status bar's branch and the git pages follow.
+    fn handle_new_branch_outcome(&mut self, outcome: NewBranchOutcome) {
+        match outcome {
+            NewBranchOutcome::Continue => {}
+            NewBranchOutcome::Close => self.new_branch = None,
+            NewBranchOutcome::Accept(name) => {
+                let Some(prompt) = &mut self.new_branch else {
+                    return;
+                };
+                let (path, exact) = prompt.repository.clone();
+                match create_branch(&path, exact, &name) {
+                    Ok(()) => {
+                        self.new_branch = None;
+                        self.status =
+                            Some(StatusLine::info(format!("Switched to new branch {name}")));
+                        self.heads.look((path, exact));
+                        match &mut self.mode {
+                            Mode::GitLog(tabs) => tabs.refresh(),
+                            Mode::Changes(tabs) => tabs.refresh(),
+                            _ => {}
+                        }
+                    }
+                    Err(err @ (BranchError::InvalidName(_) | BranchError::NameTaken(_))) => {
+                        prompt.refuse(err.to_string());
+                    }
+                    Err(err) => {
+                        self.new_branch = None;
+                        self.status =
+                            Some(StatusLine::error(format!("Could not create branch: {err}")));
+                    }
                 }
             }
         }
@@ -2379,6 +2454,7 @@ impl App {
     fn show_project_search(&mut self, query: Option<String>) {
         self.palette = None;
         self.goto_line = None;
+        self.new_branch = None;
         let seed = self
             .tabs
             .get(self.active)
@@ -2579,6 +2655,7 @@ impl App {
         self.palette.is_some()
             || self.search_box.is_some()
             || self.goto_line.is_some()
+            || self.new_branch.is_some()
             || self.project_search_open
             || self.context_menu.is_some()
     }
@@ -2589,6 +2666,7 @@ impl App {
         self.palette = None;
         self.close_search_box(true);
         self.goto_line = None;
+        self.new_branch = None;
         self.hide_project_search();
         self.context_menu = None;
     }
@@ -2847,6 +2925,8 @@ impl App {
             }
         } else if let Some(goto_line) = &mut self.goto_line {
             goto_line.paste(text);
+        } else if let Some(new_branch) = &mut self.new_branch {
+            new_branch.paste(text);
         } else if self.project_search_open
             && let Some(dialog) = &mut self.project_search
         {
@@ -2932,6 +3012,11 @@ impl App {
         if let Some(goto_line) = &mut self.goto_line {
             let outcome = goto_line.handle_key(key, &mut self.clipboard);
             self.handle_goto_line_outcome(outcome);
+            return;
+        }
+        if let Some(new_branch) = &mut self.new_branch {
+            let outcome = new_branch.handle_key(key, &mut self.clipboard);
+            self.handle_new_branch_outcome(outcome);
             return;
         }
         if self.project_search_open
@@ -3082,6 +3167,17 @@ impl App {
             }
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.goto_line = None;
+                return;
+            }
+        }
+        // And the new branch box likewise.
+        if let Some(new_branch) = &mut self.new_branch {
+            if new_branch.contains(x, y) || new_branch.is_dragging() {
+                new_branch.handle_mouse(mouse);
+                return;
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.new_branch = None;
                 return;
             }
         }
@@ -3462,6 +3558,9 @@ impl App {
         }
         if let Some(goto_line) = &mut self.goto_line {
             cursor = goto_line.render(screen, buf, theme);
+        }
+        if let Some(new_branch) = &mut self.new_branch {
+            cursor = new_branch.render(screen, buf, theme);
         }
         if self.project_search_open
             && let Some(dialog) = &mut self.project_search
@@ -4004,6 +4103,155 @@ mod tests {
         assert!(row.contains(&format!(" {id} ")), "{row:?}");
         assert!(!row.contains("trunk"), "{row:?}");
         assert_eq!(color_at(&row, &colors, id), Color::Rgb(2, 2, 2));
+    }
+
+    #[test]
+    fn the_create_branch_command_makes_a_branch_where_the_status_bar_looks() {
+        let (dir, mut app) = app_with_files(&[("a.txt", "hello\n")]);
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        let commit = |repo: &git2::Repository, name: &str, message: &str| -> git2::Oid {
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new(name)).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let head = repo.head().ok().and_then(|h| h.target());
+            let parents: Vec<git2::Commit<'_>> = head
+                .into_iter()
+                .map(|id| repo.find_commit(id).unwrap())
+                .collect();
+            let refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &refs)
+                .unwrap()
+        };
+        let head_name =
+            |repo: &git2::Repository| -> String { repo.head().unwrap().name().unwrap().to_owned() };
+        let labels = |app: &mut App| -> Vec<String> {
+            app.command_items()
+                .into_iter()
+                .map(|item| item.label)
+                .collect()
+        };
+
+        // Not a repository: the command isn't listed, and does nothing.
+        assert!(!app.command_context().has_repository);
+        assert!(!labels(&mut app).contains(&"Create branch".to_owned()));
+        app.run_command(Command::NewBranch);
+        assert!(app.new_branch.is_none());
+
+        // A repository on trunk, with a submodule on a branch of its own.
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let first = commit(&repo, "a.txt", "Say hello");
+        repo.branch("trunk", &repo.find_commit(first).unwrap(), false)
+            .unwrap();
+        repo.set_head("refs/heads/trunk").unwrap();
+        let mut submodule = repo
+            .submodule("https://example.com/sub.git", Path::new("sub"), true)
+            .unwrap();
+        let sub = submodule.open().unwrap();
+        std::fs::write(sub.workdir().unwrap().join("inner.txt"), "inner\n").unwrap();
+        let inner = commit(&sub, "inner.txt", "Inner commit");
+        sub.branch("subwork", &sub.find_commit(inner).unwrap(), false)
+            .unwrap();
+        sub.set_head("refs/heads/subwork").unwrap();
+        submodule.add_finalize().unwrap();
+        let second = commit(&repo, "sub", "Add submodule");
+        app.heads = Heads::new();
+        assert!(app.command_context().has_repository);
+        assert!(labels(&mut app).contains(&"Create branch".to_owned()));
+
+        // An edit on disk that a checkout would have to deal with
+        // stays as it is: only a reference is made, and HEAD moved.
+        std::fs::write(dir.path().join("a.txt"), "edited\n").unwrap();
+        app.run_command(Command::NewBranch);
+        assert!(app.new_branch.is_some());
+        let screen = draw(&mut app, 60, 10);
+        assert!(screen[1].contains('╭'), "{screen:#?}");
+        assert!(screen[3].contains("from trunk"), "{screen:#?}");
+        // Enter with nothing typed asks for a name.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.new_branch.is_some());
+        let screen = draw(&mut app, 60, 10);
+        assert!(
+            screen[3].contains("enter a name for the branch"),
+            "{screen:#?}"
+        );
+        type_str(&mut app, "feature");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.new_branch.is_none());
+        assert_eq!(head_name(&repo), "refs/heads/feature");
+        assert_eq!(repo.head().unwrap().target(), Some(second));
+        assert_eq!(
+            repo.find_branch("trunk", git2::BranchType::Local)
+                .unwrap()
+                .get()
+                .target(),
+            Some(second)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "edited\n"
+        );
+        assert_eq!(
+            app.status.as_ref().map(StatusLine::text),
+            Some("Switched to new branch feature".to_owned())
+        );
+        // The status bar shows the new branch at once.
+        let screen = draw(&mut app, 60, 10);
+        assert!(screen[9].contains(" feature "), "{screen:#?}");
+
+        // A taken name, then a bad one, are refused in the box, which
+        // stays open until Escape.
+        app.run_command(Command::NewBranch);
+        let screen = draw(&mut app, 60, 10);
+        assert!(screen[3].contains("from feature"), "{screen:#?}");
+        type_str(&mut app, "trunk");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.new_branch.is_some());
+        let screen = draw(&mut app, 60, 10);
+        assert!(
+            screen[3].contains("branch trunk already exists"),
+            "{screen:#?}"
+        );
+        ctrl(&mut app, 'a');
+        type_str(&mut app, "bad name");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.new_branch.is_some());
+        let screen = draw(&mut app, 60, 10);
+        assert!(
+            screen[3].contains("is not a valid branch name"),
+            "{screen:#?}"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.new_branch.is_none());
+        assert_eq!(head_name(&repo), "refs/heads/feature");
+
+        // With a file in the submodule being edited, the branch is the
+        // submodule's, and the parent is untouched.
+        app.open_file(dir.path().join("sub/inner.txt"));
+        app.run_command(Command::NewBranch);
+        let screen = draw(&mut app, 60, 10);
+        assert!(screen[3].contains("from subwork"), "{screen:#?}");
+        type_str(&mut app, "subfeature");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.new_branch.is_none());
+        assert_eq!(head_name(&sub), "refs/heads/subfeature");
+        assert_eq!(sub.head().unwrap().target(), Some(inner));
+        assert_eq!(head_name(&repo), "refs/heads/feature");
+        assert!(
+            repo.find_branch("subfeature", git2::BranchType::Local)
+                .is_err()
+        );
+        let screen = draw(&mut app, 60, 10);
+        assert!(screen[9].contains(" subfeature "), "{screen:#?}");
+
+        // Opening another overlay closes the box, and the box closes
+        // the palette it was picked from.
+        app.run_command(Command::NewBranch);
+        ctrl(&mut app, 'p');
+        assert!(app.new_branch.is_none() && app.palette.is_some());
+        type_str(&mut app, "create branch");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.new_branch.is_some() && app.palette.is_none());
     }
 
     #[test]

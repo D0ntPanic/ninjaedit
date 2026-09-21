@@ -22,6 +22,7 @@ mod git_view;
 mod goto_line;
 mod heads;
 mod input;
+mod new_branch;
 mod palette;
 mod project_search;
 mod search_box;
