@@ -120,7 +120,11 @@ pub enum Movement {
     /// To the end of the next word (skipping whitespace first); at the end of
     /// a line, to the start of the next line.
     WordRight,
-    /// To the first byte of the current line.
+    /// To the first non-whitespace byte of the current line, or, when the
+    /// cursor is already at or before it, to the first byte of the line.
+    /// From the first byte the cursor moves to the first non-whitespace one
+    /// again, so pressing the key twice reaches whichever the first press
+    /// didn't. On a blank line, to the first byte.
     LineStart,
     /// To the end of the current line's content, before its terminator.
     LineEnd,
@@ -674,7 +678,7 @@ impl Editor {
             Movement::PageDown(height) => vertical_target(height.max(1) as isize),
             Movement::WordLeft => self.word_left(self.cursor),
             Movement::WordRight => self.word_right(self.cursor),
-            Movement::LineStart => self.buffer.offset_of_line(line),
+            Movement::LineStart => self.line_start_target(line),
             Movement::LineEnd => self.buffer.line_content_range(line).end,
             Movement::DocumentStart => 0,
             Movement::DocumentEnd => self.buffer.len(),
@@ -691,6 +695,24 @@ impl Editor {
         self.desired_column = column;
         self.pending = None;
         self.search = None;
+    }
+
+    /// Where [`Movement::LineStart`] goes from the cursor's line: the end of
+    /// the line's leading whitespace, unless the cursor is already at or
+    /// before it (but not at the very start of the line), in which case the
+    /// start of the line. A line that is all whitespace has no first
+    /// character to go to, so its start is the only target.
+    fn line_start_target(&self, line: usize) -> usize {
+        let indent = self.leading_whitespace(line);
+        let content = self.buffer.line_content_range(line);
+        if indent.end == content.end {
+            return indent.start;
+        }
+        if self.cursor > indent.start && self.cursor <= indent.end {
+            indent.start
+        } else {
+            indent.end
+        }
     }
 
     /// Bookkeeping shared by all explicit cursor changes: they break undo
@@ -2438,6 +2460,42 @@ mod tests {
         assert_eq!(ed.cursor(), 13);
         ed.move_cursor(DocumentStart);
         assert_eq!(ed.cursor(), 0);
+    }
+
+    #[test]
+    fn line_start_alternates_between_indent_and_column_zero() {
+        let mut ed = editor("    indented\n\t\t\nplain\n");
+        // From inside the content: to the first non-whitespace character,
+        // then to the first column, then back again.
+        ed.set_cursor(10);
+        ed.move_cursor(LineStart);
+        assert_eq!(ed.cursor(), 4, "first to the first non-blank character");
+        ed.move_cursor(LineStart);
+        assert_eq!(ed.cursor(), 0, "then to the first column");
+        ed.move_cursor(LineStart);
+        assert_eq!(ed.cursor(), 4, "and from the first column back again");
+        // From inside the indentation, the first column comes first.
+        ed.set_cursor(2);
+        ed.move_cursor(LineStart);
+        assert_eq!(ed.cursor(), 0, "within the indentation: the first column");
+        // A whitespace-only line only has a first column to go to.
+        ed.set_cursor(15);
+        ed.move_cursor(LineStart);
+        assert_eq!(ed.cursor(), 13, "a blank line: the first column");
+        ed.move_cursor(LineStart);
+        assert_eq!(ed.cursor(), 13, "and it stays there");
+        // A line without indentation behaves like a plain Home.
+        ed.set_cursor(19);
+        ed.move_cursor(LineStart);
+        assert_eq!(ed.cursor(), 16, "no indentation: the first column");
+        ed.move_cursor(LineStart);
+        assert_eq!(ed.cursor(), 16, "and it stays there");
+        // Extending a selection follows the same rule.
+        ed.set_cursor(10);
+        ed.extend_selection(LineStart);
+        assert_eq!(ed.selection(), Some(4..10));
+        ed.extend_selection(LineStart);
+        assert_eq!(ed.selection(), Some(0..10));
     }
 
     #[test]
