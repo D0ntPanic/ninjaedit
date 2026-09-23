@@ -41,14 +41,20 @@ Crates:
   use.
 
 * `infer` — the dedicated CPU engine, with minimal dependencies. It loads the
-  f16 safetensors directly, keeps weights in f16 and converts inside a NEON
-  dot-product kernel, stores each projection transposed so every output is a
-  contiguous dot product, fuses the q/k/v and gate/up projections, batches
-  prefill, and runs attention over a flat f32 cache. It keeps two thread
-  pools: four threads for decode, which is memory-bound and saturates early,
-  and every core for prefill, which is compute-bound. Decode on the 34M model
-  is 0.65 ms/token (131 GB/s of weights), and prefill runs at about
-  5,400 tok/s. `Session::complete` returns a completion as lines, each with
+  f16 safetensors directly, keeps weights in f16 and converts inside the
+  dot-product kernel (NEON on arm64; AVX2, FMA and F16C on x86_64, detected
+  at run time with a portable fallback), stores each projection transposed so
+  every output is a contiguous dot product, fuses the q/k/v and gate/up
+  projections, batches prefill, and runs attention over an f32 cache kept
+  contiguous per head. Prefill converts blocks of weight rows to f32 once and
+  runs a register-tiled kernel over them (on arm64, rows packed eight wide
+  and accumulated as outer products). It keeps two thread
+  pools: a few threads for decode, which is memory-bound and saturates early
+  (four on Apple silicon, eight on x86_64), and one per physical core for
+  prefill, which is compute-bound and gains nothing from SMT siblings. On an
+  M5 Max the 70M model decodes at 1.1 ms/token (140 GB/s of weights) and
+  prefills at about 8,000 tok/s. On a Threadripper 3970X it decodes at
+  4.5 ms/token (36 GB/s) and prefills at about 4,400 tok/s. `Session::complete` returns a completion as lines, each with
   a confidence (geometric mean token probability), the least likely token's
   probability, and the end-of-middle probability at its end; it stops at the
   end token, at a line end where the end token clears a threshold, when the

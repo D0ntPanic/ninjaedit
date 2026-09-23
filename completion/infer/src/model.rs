@@ -1,7 +1,7 @@
 //! The model: weight loading, the forward pass over a key/value cache, and the session that
 //! keeps the cache aligned with an editor's token sequence.
 
-use crate::kernels::{Matrix, matmul, matvec, rms_norm, rope, silu, softmax};
+use crate::kernels::{Matrix, attend, matmul, matvec, rms_norm, rope, silu};
 use anyhow::{Context, Result, bail};
 use half::f16;
 use rayon::prelude::*;
@@ -261,31 +261,36 @@ impl Model {
         let mut gu = vec![0f32; n * 2 * c.d_ff];
         let mut act = vec![0f32; n * c.d_ff];
 
+        // The per-token work between projections is split across tokens; in a long prefill it
+        // would otherwise leave every other core idle.
         for (li, layer) in self.layers.iter().enumerate() {
-            for t in 0..n {
-                rms_norm(
-                    &x[t * d..(t + 1) * d],
-                    &layer.attn_norm,
-                    RMS_EPS,
-                    &mut h[t * d..(t + 1) * d],
-                );
-            }
+            norm_rows(&x, &layer.attn_norm, &mut h, d);
             project(&layer.wqkv, &h, &mut qkv, n);
             // Rotary embeddings on q and k, then k and v into the cache.
-            let (k_cache, v_cache) = cache.layer_mut(li);
-            for t in 0..n {
+            qkv.par_chunks_mut(3 * d).enumerate().for_each(|(t, row)| {
                 let pos = start + t;
                 let (cos, sin) = (
                     &self.rope_cos[pos * half_dim..(pos + 1) * half_dim],
                     &self.rope_sin[pos * half_dim..(pos + 1) * half_dim],
                 );
-                let row = &mut qkv[t * 3 * d..(t + 1) * 3 * d];
                 for head in 0..heads {
                     rope(&mut row[head * hd..(head + 1) * hd], cos, sin);
                     rope(&mut row[d + head * hd..d + (head + 1) * hd], cos, sin);
                 }
-                k_cache[pos * d..(pos + 1) * d].copy_from_slice(&row[d..2 * d]);
-                v_cache[pos * d..(pos + 1) * d].copy_from_slice(&row[2 * d..3 * d]);
+            });
+            // Each head's cache is contiguous, `[max_seq_len, head_dim]`, so attention streams
+            // through it; interleaving the heads would put every key on its own page and defeat
+            // the hardware prefetchers.
+            let slot = |head: usize, pos: usize| (head * c.max_seq_len + pos) * hd;
+            let (k_cache, v_cache) = cache.layer_mut(li);
+            for (t, row) in qkv.chunks(3 * d).enumerate() {
+                let pos = start + t;
+                for head in 0..heads {
+                    let at = slot(head, pos);
+                    k_cache[at..at + hd].copy_from_slice(&row[d + head * hd..d + (head + 1) * hd]);
+                    v_cache[at..at + hd]
+                        .copy_from_slice(&row[2 * d + head * hd..2 * d + (head + 1) * hd]);
+                }
             }
             // Attention: every (token, head) pair is independent.
             let k_cache: &[f32] = k_cache;
@@ -295,47 +300,25 @@ impl Model {
                 let (t, head) = (idx / heads, idx % heads);
                 let pos = start + t;
                 let q = &qkv_ref[t * 3 * d + head * hd..t * 3 * d + (head + 1) * hd];
+                let keys = &k_cache[slot(head, 0)..slot(head, pos + 1)];
+                let values = &v_cache[slot(head, 0)..slot(head, pos + 1)];
                 let mut scores = vec![0f32; pos + 1];
-                for (p, s) in scores.iter_mut().enumerate() {
-                    let k = &k_cache[p * d + head * hd..p * d + (head + 1) * hd];
-                    *s = q.iter().zip(k).map(|(a, b)| a * b).sum::<f32>() * scale;
-                }
-                softmax(&mut scores);
-                out.fill(0.0);
-                for (p, &w) in scores.iter().enumerate() {
-                    let v = &v_cache[p * d + head * hd..p * d + (head + 1) * hd];
-                    for (o, &vv) in out.iter_mut().zip(v) {
-                        *o += w * vv;
-                    }
-                }
+                attend(q, keys, values, scale, &mut scores, out);
             });
             project(&layer.wo, &attn, &mut o, n);
-            for (xv, ov) in x.iter_mut().zip(&o) {
-                *xv += ov;
-            }
-            for t in 0..n {
-                rms_norm(
-                    &x[t * d..(t + 1) * d],
-                    &layer.ffn_norm,
-                    RMS_EPS,
-                    &mut h[t * d..(t + 1) * d],
-                );
-            }
+            add_rows(&mut x, &o, d);
+            norm_rows(&x, &layer.ffn_norm, &mut h, d);
             project(&layer.wgu, &h, &mut gu, n);
             let ff = c.d_ff;
-            for t in 0..n {
-                let row = &gu[t * 2 * ff..(t + 1) * 2 * ff];
-                for (a, (&g, &u)) in act[t * ff..(t + 1) * ff]
-                    .iter_mut()
-                    .zip(row[..ff].iter().zip(&row[ff..]))
-                {
-                    *a = silu(g) * u;
-                }
-            }
+            act.par_chunks_mut(ff)
+                .zip(gu.par_chunks(2 * ff))
+                .for_each(|(a, row)| {
+                    for (a, (&g, &u)) in a.iter_mut().zip(row[..ff].iter().zip(&row[ff..])) {
+                        *a = silu(g) * u;
+                    }
+                });
             project(&layer.wdown, &act, &mut o, n);
-            for (xv, ov) in x.iter_mut().zip(&o) {
-                *xv += ov;
-            }
+            add_rows(&mut x, &o, d);
         }
         cache.len += n;
 
@@ -354,23 +337,27 @@ impl Model {
     }
 }
 
-/// Threads for decode, beyond which memory bandwidth on Apple silicon is already saturated
-/// and dispatch overhead grows. Overridable with `INFER_DECODE_THREADS`.
-const DECODE_THREADS: usize = 4;
+/// Threads for decode, beyond which memory bandwidth is already saturated and dispatch
+/// overhead grows: four on Apple silicon, while x86 cores each pull less bandwidth and need
+/// about eight (measured on Zen 2). Overridable with `INFER_DECODE_THREADS`.
+const DECODE_THREADS: usize = if cfg!(target_arch = "x86_64") { 8 } else { 4 };
 
 fn thread_pools() -> (rayon::ThreadPool, rayon::ThreadPool) {
     let available = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
+    let cores = physical_cores().unwrap_or(available).min(available);
     let decode = std::env::var("INFER_DECODE_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(DECODE_THREADS)
+        .unwrap_or(DECODE_THREADS.min(cores))
         .clamp(1, available);
+    // Prefill saturates the FMA units, so SMT siblings only contend for them and add
+    // synchronization; one thread per physical core is markedly faster.
     let prefill = std::env::var("INFER_PREFILL_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(available)
+        .unwrap_or(cores)
         .clamp(1, available);
     let build = |n: usize| {
         rayon::ThreadPoolBuilder::new()
@@ -379,6 +366,31 @@ fn thread_pools() -> (rayon::ThreadPool, rayon::ThreadPool) {
             .expect("thread pool")
     };
     (build(decode), build(prefill))
+}
+
+/// The number of physical cores, not counting SMT siblings, where the OS says.
+#[cfg(target_os = "linux")]
+fn physical_cores() -> Option<usize> {
+    let mut cores = std::collections::HashSet::new();
+    for entry in fs::read_dir("/sys/devices/system/cpu").ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|n| n.strip_prefix("cpu")) else {
+            continue;
+        };
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let read = |f: &str| fs::read_to_string(entry.path().join("topology").join(f)).ok();
+        if let (Some(package), Some(core)) = (read("physical_package_id"), read("core_id")) {
+            cores.insert((package.trim().to_owned(), core.trim().to_owned()));
+        }
+    }
+    (!cores.is_empty()).then_some(cores.len())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn physical_cores() -> Option<usize> {
+    None
 }
 
 /// Cosine and sine tables for the interleaved rotary embedding, `[max_seq_len, head_dim / 2]`.
@@ -398,6 +410,22 @@ fn rope_tables(config: &Config) -> (Vec<f32>, Vec<f32>) {
     (cos, sin)
 }
 
+/// RMS-normalizes each `d`-wide row of `x` into `out`.
+fn norm_rows(x: &[f32], gamma: &[f32], out: &mut [f32], d: usize) {
+    x.par_chunks(d)
+        .zip(out.par_chunks_mut(d))
+        .for_each(|(x, out)| rms_norm(x, gamma, RMS_EPS, out));
+}
+
+/// `x += y`, a row at a time.
+fn add_rows(x: &mut [f32], y: &[f32], d: usize) {
+    x.par_chunks_mut(d).zip(y.par_chunks(d)).for_each(|(x, y)| {
+        for (a, b) in x.iter_mut().zip(y) {
+            *a += b;
+        }
+    });
+}
+
 /// Applies a weight matrix to `n` vectors, using the single-vector path when `n == 1`.
 fn project(w: &Matrix, xs: &[f32], ys: &mut [f32], n: usize) {
     if n == 1 {
@@ -407,7 +435,7 @@ fn project(w: &Matrix, xs: &[f32], ys: &mut [f32], n: usize) {
     }
 }
 
-/// Keys and values for every layer, `[max_seq_len, d_model]` per layer, f32.
+/// Keys and values for every layer, `[n_heads, max_seq_len, head_dim]` per layer, f32.
 pub struct KvCache {
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
