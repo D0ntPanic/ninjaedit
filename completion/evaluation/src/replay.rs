@@ -17,19 +17,50 @@
 //! cursor, until the hole is written. Lines are scored as they are
 //! finished, by the completion that finished them; see [`crate::stats`]
 //! for what is counted.
+//!
+//! What is compared is the model's whole completion (as the editor has
+//! it in [`Editor::full_suggestion`]), not only the part its confidence
+//! thresholds offer, so that the scores are the model's own; the offered
+//! part is counted apart, to see how much of the model a user would be
+//! shown and how often that is right. The same completion can be offered
+//! at other thresholds too, to compare them on the same completions.
 
 use crate::document::{self, Document};
 use crate::holes::Hole;
 use crate::stats::Stats;
 use anyhow::Result;
-use ninjaedit_core::Editor;
+use ninjaedit_core::{ConfidenceThresholds, Editor, LineConfidence};
+
+/// A completion, as the editor's completer reports it.
+pub struct Answer {
+    /// The serial of the request it answers.
+    pub serial: u64,
+    pub text: String,
+    /// How many bytes of `text` the thresholds in use offer.
+    pub offered: usize,
+    /// How sure the model was of each line.
+    pub lines: Vec<LineConfidence>,
+}
+
+impl Answer {
+    /// Whether offering `offered` bytes of it offers only the start of
+    /// its first line with text.
+    fn partial(&self, offered: usize) -> bool {
+        let first = self.lines.iter().find(|line| !line.blank);
+        offered > 0 && first.is_some_and(|line| offered < line.end)
+    }
+}
 
 /// Where completions come from: the model, or in tests a stand-in.
 pub trait Source {
-    /// Answer the completion request the editor has made wanted, and
-    /// offer the answer to the editor, as a frontend would.
-    fn complete(&mut self, editor: &mut Editor) -> Result<()>;
+    /// Answer the completion request the editor has made wanted, if it
+    /// has, leaving it to the caller to offer the answer to the editor.
+    fn complete(&mut self, editor: &mut Editor) -> Result<Option<Answer>>;
 }
+
+/// What other thresholds would have offered: each with the offers counted
+/// at it.
+pub type Sweep = [(ConfidenceThresholds, Stats)];
 
 /// A line of a hole that has words in it, by the indices of its first
 /// and last words.
@@ -42,14 +73,17 @@ struct HoleLine {
 }
 
 /// Delete `hole` from the editor over `doc` and write it back with the
-/// help of `source`, returning what was counted. The buffer holds what
-/// it did before when this returns. With `trace`, every completion is
-/// printed to stderr next to what was expected.
+/// help of `source`, returning what was counted. Each completion is also
+/// offered at each thresholds of `sweep`, and what they offer counted
+/// there. The buffer holds what it did before when this returns. With
+/// `trace`, every completion is printed to stderr next to what was
+/// expected.
 pub fn reimplement(
     editor: &mut Editor,
     doc: &Document,
     hole: &Hole,
     source: &mut dyn Source,
+    sweep: &mut Sweep,
     trace: bool,
 ) -> Result<Stats> {
     let target = &doc.text[hole.start..hole.end];
@@ -101,9 +135,26 @@ pub fn reimplement(
     while next < words.len() {
         let at = words[next].start;
         editor.request_completion();
-        source.complete(editor)?;
-        stats.completions += 1;
-        let suggestion = editor.suggestion().unwrap_or("").to_owned();
+        let answer = source.complete(editor)?;
+        // What is offered is right if the text goes on with it, past the
+        // end of the hole if it goes that far.
+        let text_on = &doc.text[hole.start + at..];
+        for (thresholds, swept) in sweep.iter_mut() {
+            let mut partial = false;
+            if let Some(answer) = &answer {
+                let offered = thresholds.offered(&answer.lines);
+                editor.offer_completion_clipped(answer.serial, &answer.text, offered);
+                partial = answer.partial(offered);
+            }
+            count_offer(swept, editor.suggestion(), partial, text_on);
+        }
+        let mut partial = false;
+        if let Some(answer) = &answer {
+            editor.offer_completion_clipped(answer.serial, &answer.text, answer.offered);
+            partial = answer.partial(answer.offered);
+        }
+        let offered_right = count_offer(&mut stats, editor.suggestion(), partial, text_on);
+        let suggestion = editor.full_suggestion().unwrap_or("").to_owned();
         let common = common_prefix(&suggestion, &target[at..]);
 
         let mut predicted = next;
@@ -151,8 +202,14 @@ pub fn reimplement(
             } else {
                 "typed a word".to_owned()
             };
+            let offered = match editor.suggestion() {
+                None => "nothing".to_owned(),
+                Some(o) if o.len() == suggestion.len() => "all".to_owned(),
+                Some(o) => format!("{:?}", head(o)),
+            };
+            let right = if offered_right { ", right" } else { "" };
             eprintln!(
-                "    {verdict}\n      suggested {:?}\n      expected  {:?}",
+                "    {verdict}\n      suggested {:?}\n      offered   {offered}{right}\n      expected  {:?}",
                 head(&suggestion),
                 head(&target[at..])
             );
@@ -162,6 +219,27 @@ pub fn reimplement(
         next = taken;
     }
     Ok(stats)
+}
+
+/// Count a completion, and what it offered, into `stats`: `partial` if
+/// that was only the start of its first line. Returns whether what it
+/// offered was right as far as it went, `text_on` being the text that was
+/// there from the cursor on.
+fn count_offer(stats: &mut Stats, offered: Option<&str>, partial: bool, text_on: &str) -> bool {
+    stats.completions += 1;
+    let Some(offered) = offered else {
+        return false;
+    };
+    let right = right_so_far(offered, text_on);
+    stats.offered += 1;
+    stats.offered_right += usize::from(right);
+    stats.offered_chars += offered.chars().filter(|c| !c.is_whitespace()).count();
+    stats.offered_lines += offered.lines().filter(|l| !l.trim().is_empty()).count();
+    if partial {
+        stats.offered_partial += 1;
+        stats.offered_partial_right += usize::from(right);
+    }
+    right
 }
 
 /// The length of the longest common prefix of `a` and `b`, in bytes, at
@@ -187,6 +265,22 @@ fn predicts_word(completion: &str, common: usize, end: usize, word: &str) -> boo
         .is_none_or(|c| document::class(c) != class)
 }
 
+/// Whether `offered`, text offered at the start of `text`, is right as far
+/// as it goes: `text` goes on with it, and not with more of the word it
+/// ends in.
+fn right_so_far(offered: &str, text: &str) -> bool {
+    let Some(rest) = text.strip_prefix(offered) else {
+        return false;
+    };
+    let last = offered
+        .chars()
+        .next_back()
+        .expect("offered text isn't empty");
+    rest.chars()
+        .next()
+        .is_none_or(|c| document::class(c) != document::class(last))
+}
+
 /// Whether a completion ends its line `end` bytes into it, but for
 /// trailing whitespace: it stops there, or goes on to the next line.
 fn ends_line(completion: &str, end: usize) -> bool {
@@ -207,7 +301,7 @@ fn head(text: &str) -> &str {
 mod tests {
     use super::*;
     use crate::holes::{self, HoleKind, Rng};
-    use ninjaedit_core::{FileBuffer, Language};
+    use ninjaedit_core::{FileBuffer, Language, TokenConfidence};
 
     const SOURCE: &str = "\
 fn main() {
@@ -220,18 +314,22 @@ fn main() {
     /// A stand-in for the model that knows the text that is missing at
     /// the cursor, and answers with what `answer` makes of it. With
     /// `run_on`, it is given the rest of the file from the cursor
-    /// instead, as a model goes on past the hole.
+    /// instead, as a model goes on past the hole. `confidence` says how
+    /// sure it is of each word of an answer, each word being a token,
+    /// and `thresholds` how sure it must be to offer one.
     struct Oracle<F> {
         original: String,
         answer: F,
         run_on: bool,
+        confidence: fn(&str) -> f32,
+        thresholds: ConfidenceThresholds,
         asked: Vec<String>,
     }
 
     impl<F: FnMut(&str) -> String> Source for Oracle<F> {
-        fn complete(&mut self, editor: &mut Editor) -> Result<()> {
+        fn complete(&mut self, editor: &mut Editor) -> Result<Option<Answer>> {
             let Some(request) = editor.take_completion_request() else {
-                return Ok(());
+                return Ok(None);
             };
             let cursor = editor.cursor();
             let missing = self.original.len() - editor.buffer().len();
@@ -244,12 +342,56 @@ fn main() {
             // What the cursor's line holds before it.
             let line = request.prefix.rsplit('\n').next().unwrap();
             self.asked.push(line.to_owned());
-            editor.offer_completion(request.serial, &answer);
-            Ok(())
+            let mut start = 0;
+            let lines: Vec<LineConfidence> = answer
+                .split('\n')
+                .map(|line| {
+                    let tokens: Vec<TokenConfidence> = document::words(line)
+                        .into_iter()
+                        .map(|word| TokenConfidence {
+                            end: start + word.end,
+                            prob: (self.confidence)(&line[word]),
+                            word_end: true,
+                        })
+                        .collect();
+                    let logprob_sum: f32 = tokens.iter().map(|t| t.prob.ln()).sum();
+                    let line = LineConfidence {
+                        end: start + line.len(),
+                        confidence: (logprob_sum / tokens.len().max(1) as f32).exp(),
+                        min_prob: tokens.iter().map(|t| t.prob).fold(1.0, f32::min),
+                        blank: tokens.is_empty(),
+                        tokens,
+                    };
+                    start = line.end + 1;
+                    line
+                })
+                .collect();
+            Ok(Some(Answer {
+                serial: request.serial,
+                offered: self.thresholds.offered(&lines),
+                text: answer,
+                lines,
+            }))
         }
     }
 
+    /// Every line of an answer, sure or not.
+    const EVERYTHING: ConfidenceThresholds = ConfidenceThresholds {
+        line: 0.0,
+        token: 0.0,
+    };
+
     fn run(hole_text: &str, answer: impl FnMut(&str) -> String) -> (Stats, Vec<String>) {
+        run_offering(hole_text, answer, |_| 1.0, EVERYTHING, &mut [])
+    }
+
+    fn run_offering(
+        hole_text: &str,
+        answer: impl FnMut(&str) -> String,
+        confidence: fn(&str) -> f32,
+        thresholds: ConfidenceThresholds,
+        sweep: &mut Sweep,
+    ) -> (Stats, Vec<String>) {
         let doc = Document::new(SOURCE.to_owned(), Language::Rust);
         let start = SOURCE.find(hole_text).unwrap();
         let hole = Hole {
@@ -263,9 +405,11 @@ fn main() {
             original: SOURCE.to_owned(),
             answer,
             run_on: false,
+            confidence,
+            thresholds,
             asked: Vec::new(),
         };
-        let stats = reimplement(&mut editor, &doc, &hole, &mut oracle, false).unwrap();
+        let stats = reimplement(&mut editor, &doc, &hole, &mut oracle, sweep, false).unwrap();
         assert_eq!(
             editor.buffer().to_bytes(),
             SOURCE.as_bytes(),
@@ -295,8 +439,60 @@ fn main() {
                 partial_lines: 0,
                 multi_line_chances: 1,
                 multi_lines: 1,
+                offered: 1,
+                offered_right: 1,
+                offered_chars: 36,
+                offered_lines: 3,
+                offered_partial: 0,
+                offered_partial_right: 0,
             }
         );
+    }
+
+    #[test]
+    fn the_whole_completion_is_scored_and_what_it_offers_counted_apart() {
+        // Right about all three lines, but sure enough to offer only the
+        // first: the second has `y` in it, which it is unsure of.
+        let unsure_of_y = |word: &str| if word == "y" { 0.3 } else { 0.9 };
+        let at = |line| ConfidenceThresholds { line, token: 0.5 };
+        let mut sweep = [(at(0.0), Stats::default()), (at(0.95), Stats::default())];
+        sweep[0].0.token = 0.0;
+        let (stats, asked) =
+            run_offering(THREE_LINES, str::to_owned, unsure_of_y, at(0.5), &mut sweep);
+        assert_eq!(asked, ["    "]);
+        assert_eq!((stats.words_accepted, stats.whole_lines), (20, 3));
+        assert_eq!((stats.offered, stats.offered_right), (1, 1));
+        assert_eq!(stats.offered_chars, "letx=compute(a,b);".len());
+        assert_eq!(stats.offered_lines, 1);
+        assert_eq!(stats.offered_partial, 0, "the whole first line");
+        // The same completion at other thresholds: all of it, or none.
+        let [(_, all), (_, none)] = sweep;
+        assert_eq!((all.completions, all.offered, all.offered_right), (1, 1, 1));
+        assert_eq!(all.offered_lines, 3);
+        assert_eq!((none.completions, none.offered), (1, 0));
+        assert_eq!(none.offered_chars().display(), "-");
+
+        // Unsure of `a` in the first line: the start of it is offered,
+        // up to the word before.
+        let unsure_of_a = |word: &str| if word == "a" { 0.3 } else { 0.9 };
+        let (stats, _) = run_offering(THREE_LINES, str::to_owned, unsure_of_a, at(0.5), &mut []);
+        assert_eq!(stats.offered_chars, "letx=compute(".len());
+        assert_eq!((stats.offered_partial, stats.offered_partial_right), (1, 1));
+        assert_eq!(stats.partial_offers().percent(), "100.0%");
+
+        // Something wrong offered.
+        let (stats, _) = run(THREE_LINES, |missing| missing.replace("x + 1", "x + 2"));
+        assert_eq!(
+            stats.offered_right().percent(),
+            "50.0%",
+            "right once it was typed"
+        );
+
+        // Right as far as it goes, where a word ends.
+        assert!(right_so_far("let x", "let x = 1"));
+        assert!(right_so_far("x = 1;\n    y", "x = 1;\n    y()"));
+        assert!(!right_so_far("let x", "let xy = 1"));
+        assert!(!right_so_far("let y", "let x = 1"));
     }
 
     #[test]
@@ -388,6 +584,8 @@ fn go(v: Vec<u32>, n: u32) {
             original: SCOPES.to_owned(),
             answer: str::to_owned,
             run_on: true,
+            confidence: |_| 1.0,
+            thresholds: EVERYTHING,
             asked: Vec::new(),
         };
         let mut cut_short = 0;
@@ -395,7 +593,8 @@ fn go(v: Vec<u32>, n: u32) {
             for hole in holes::choose(&doc, 4, &mut Rng::new(seed)) {
                 let (last, _) = doc.line_and_column(hole.end);
                 cut_short += usize::from(doc.lines[last].content_end != hole.end);
-                let stats = reimplement(&mut editor, &doc, &hole, &mut oracle, false).unwrap();
+                let stats =
+                    reimplement(&mut editor, &doc, &hole, &mut oracle, &mut [], false).unwrap();
                 let text = &SCOPES[hole.start..hole.end];
                 assert_eq!(stats.words_accepted, stats.words, "{text:?}");
                 assert_eq!(stats.whole_lines, stats.whole_line_chances, "{text:?}");
