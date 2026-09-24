@@ -183,6 +183,21 @@ impl Highlighter {
     /// As [`tokens`](Self::tokens), for a caller that already has the
     /// line's content (without its terminator) in hand.
     pub fn tokens_of(&self, buffer: &FileBuffer, line: usize, content: &[u8]) -> Vec<Token> {
+        self.tokens_of_lines(buffer, line, &[content])
+            .pop()
+            .unwrap_or_default()
+    }
+
+    /// The tokens of lines not (yet) in the buffer: the first of
+    /// `contents` lexed from `line`'s cached state as in
+    /// [`tokens_of`](Self::tokens_of), and each one after it from the
+    /// state the one before leaves, as if they followed it in the buffer.
+    pub fn tokens_of_lines(
+        &self,
+        buffer: &FileBuffer,
+        line: usize,
+        contents: &[&[u8]],
+    ) -> Vec<Vec<Token>> {
         self.catch_up(buffer, line);
         let state = {
             let shared = self.shared.lock().unwrap();
@@ -192,14 +207,19 @@ impl Highlighter {
                 .copied()
                 .unwrap_or(LexState::UNKNOWN)
         };
-        let state = if state.is_unknown() {
+        let mut state = if state.is_unknown() {
             LexState::default()
         } else {
             state
         };
-        let mut tokens = Vec::new();
-        self.lexer.lex_line(state, content, &mut tokens);
-        tokens
+        contents
+            .iter()
+            .map(|content| {
+                let mut tokens = Vec::new();
+                state = self.lexer.lex_line(state, content, &mut tokens);
+                tokens
+            })
+            .collect()
     }
 
     /// The side of a merge conflict that `line` is on, if any. A marker

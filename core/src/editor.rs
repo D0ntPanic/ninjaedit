@@ -116,7 +116,9 @@
 //! next Tab back to taking a single line, so any number of lines can be
 //! taken with Tab, Enter, Tab, Enter and so on. Once a suggestion has
 //! been taken in full, or typed through to its end, the next completion
-//! is asked for.
+//! is asked for. A suggestion never goes past the end of the scope the
+//! cursor is in, so it can't propose a closing bracket that pairing has
+//! already typed (see [`Editor::offer_completion`]).
 
 use crate::auto_indent::{self, CodeLine, CodeStyle, Indenter, Rules};
 use crate::buffer::{BufferSnapshot, DiskChange, FileBuffer};
@@ -247,6 +249,24 @@ struct Suggestion {
     /// Whether Tab has taken its first line, so that the next Tab takes
     /// all the rest.
     accepted_line: bool,
+    /// Where the suggestion was cut short of a closing bracket the buffer
+    /// already has, the whitespace it put before that bracket, which
+    /// taking the last of the suggestion puts there in place of what
+    /// the buffer has (so the bracket of a block goes on a line of its
+    /// own); see [`Editor::offer_completion`].
+    before_closer: Option<String>,
+}
+
+/// Where a suggestion confined to the cursor's scope ends; see
+/// [`Editor::confine_to_scope`].
+enum ScopeEnd<'a> {
+    /// It stays within the scope.
+    Open,
+    /// It ends with the closing bracket of the scope.
+    Closed,
+    /// It ends before the closing bracket of the scope, which the buffer
+    /// has next; the whitespace is what it put before its own.
+    BeforeCloser(&'a str),
 }
 
 /// The layout of one line's content: its characters with their byte ranges
@@ -991,32 +1011,41 @@ impl Editor {
     /// [module documentation](self).
     ///
     /// Typing what the suggestion at the cursor proposes consumes it from
-    /// the suggestion and keeps the rest, and is inserted as typed, with
-    /// no brackets paired (the suggestion has its own closing brackets);
-    /// typing anything else drops the suggestion. Either way this is
+    /// the suggestion and keeps the rest; typing anything else drops the
+    /// suggestion. Either way the character is typed as it would be with
+    /// no suggestion, brackets paired and all, so what a bracket does
+    /// doesn't depend on whether a suggestion happened to arrive before
+    /// it; the rest of the suggestion is then confined to the new scope
+    /// (see [`offer_completion`](Self::offer_completion)), which leaves
+    /// out its closing bracket where the pair supplied one. This is
     /// typing, which asks for a completion unless a suggestion remains.
     pub fn insert_char(&mut self, c: char) {
         let newline = c == '\n' || c == '\r';
-        if let Some(suggestion) = self.suggestion.take() {
-            if newline && suggestion.text.starts_with('\n') {
-                self.insert_newline();
-                self.continue_suggestion_on_next_line(&suggestion.text[1..]);
-                return;
-            }
-            let mut bytes = [0u8; 4];
-            let typed = c.encode_utf8(&mut bytes);
-            if !newline && suggestion.text.starts_with(&*typed) {
-                self.type_char(c);
-                self.keep_suggestion(&suggestion.text[typed.len()..]);
-                return;
-            }
+        let suggestion = self.suggestion.take();
+        if let Some(suggestion) = &suggestion
+            && newline
+            && suggestion.text.starts_with('\n')
+        {
+            self.insert_newline();
+            let before_closer = suggestion.before_closer.clone();
+            self.continue_suggestion_on_next_line(&suggestion.text[1..], before_closer);
+            return;
         }
+        let mut bytes = [0u8; 4];
+        let typed = c.encode_utf8(&mut bytes);
+        let rest = suggestion.filter(|_| !newline).and_then(|s| {
+            let rest = s.text.strip_prefix(&*typed)?.to_owned();
+            Some((rest, s.before_closer))
+        });
         if newline {
             self.insert_newline();
         } else if self.selection().is_some() || !c.is_ascii() || !self.type_code_char(c as u8) {
             self.type_char(c);
         }
-        self.completion_wanted = true;
+        match rest {
+            Some((rest, before_closer)) => self.keep_suggestion(&rest, before_closer),
+            None => self.completion_wanted = true,
+        }
     }
 
     /// Insert a typed character other than a line break, committing
@@ -1084,12 +1113,8 @@ impl Editor {
             }
         }
         .filter(|indent| indent[..] != *current_indent);
-        let pair = closer.filter(|_| {
-            let before_text = next.is_none_or(|b| {
-                b.is_ascii_whitespace() || matches!(b, b')' | b']' | b'}' | b',' | b';')
-            });
-            before_text && self.typed_as_code(line, &text[..col], c)
-        });
+        let pair =
+            closer.filter(|_| pairs_before(next) && self.typed_as_code(line, &text[..col], c));
         if reindent.is_none() && pair.is_none() {
             return false;
         }
@@ -1657,6 +1682,14 @@ impl Editor {
     /// counts them as part of its first line, since taking nothing
     /// would be no use. Returns whether there was a suggestion. Taking
     /// the last of it asks for the next completion.
+    ///
+    /// Text taken that ends with an opening bracket has it paired as
+    /// typing it would, and the rest of the suggestion is confined to
+    /// the new scope, so a second Tab takes the body of a block and
+    /// leaves the paired closing bracket after it. Taking the last of a
+    /// suggestion cut short of a closing bracket the buffer has puts the
+    /// whitespace the suggestion had before its own bracket in front of
+    /// the buffer's, so that the bracket goes where it proposed.
     pub fn accept_suggestion(&mut self) -> bool {
         let Some(suggestion) = self.suggestion.take() else {
             return false;
@@ -1667,16 +1700,53 @@ impl Editor {
         } else {
             first_line_end(&text)
         };
-        self.insert_text_quietly(&text[..end]);
-        if end == text.len() {
+        let (taken, rest) = text.split_at(end);
+        let pair = self.closer_to_pair(taken);
+        let eol = self.buffer.eol().as_str().to_owned();
+        let mut inserted = self.pending.take().unwrap_or_default();
+        inserted.push_str(&normalize_line_endings(taken, &eol));
+        let cursor = self.cursor + inserted.len();
+        let mut replaced = self.cursor..self.cursor;
+        if let Some(closer) = pair {
+            inserted.push(closer as char);
+        } else if rest.is_empty()
+            && let Some(whitespace) = &suggestion.before_closer
+            && let Some((at, b)) = self.next_text_after_cursor()
+            && auto_indent::is_closer(b)
+        {
+            inserted.push_str(&normalize_line_endings(whitespace, &eol));
+            replaced.end = at;
+        }
+        self.commit_with_cursor(
+            replaced,
+            inserted.into_bytes(),
+            EditKind::Other,
+            cursor,
+            None,
+        );
+        self.suggestion = self.confine_to_scope(rest, suggestion.before_closer, true);
+        if self.suggestion.is_none() {
             self.completion_wanted = true;
-        } else {
-            self.suggestion = Some(Suggestion {
-                text: text[end..].to_owned(),
-                accepted_line: true,
-            });
         }
         true
+    }
+
+    /// The closing bracket to pair with `taken`, text about to be
+    /// inserted at the cursor, when it ends with an opening bracket in
+    /// code that typing would pair.
+    fn closer_to_pair(&self, taken: &str) -> Option<u8> {
+        let last = taken.len().checked_sub(1)?;
+        let closer = auto_indent::closer_of(taken.as_bytes()[last])?;
+        let next = self
+            .buffer
+            .bytes_in_range(self.cursor..(self.cursor + 1).min(self.buffer.len()))
+            .first()
+            .copied();
+        let in_code = self
+            .brackets_of_insertion(taken)
+            .last()
+            .is_some_and(|&(at, _)| at == last);
+        (pairs_before(next) && in_code).then_some(closer)
     }
 
     /// Whether the user has typed since a completion was last asked for,
@@ -1738,21 +1808,27 @@ impl Editor {
     /// model proposes inserting at the cursor. Becomes the suggestion if
     /// the request is still the latest and the text says something;
     /// returns whether it did.
+    ///
+    /// A suggestion stays within the scope the cursor is in: it is cut
+    /// at its first closing bracket that closes a bracket opened before
+    /// the cursor. When the buffer closes that bracket next (after
+    /// nothing but whitespace), as it does after typing the bracket
+    /// paired, the suggestion ends before its own closing bracket, which
+    /// would double it; otherwise it ends with it. Brackets in strings
+    /// and comments don't count.
+    ///
+    /// A suggestion whose first line ends by opening a block that Tab
+    /// would pair (see [`accept_suggestion`](Self::accept_suggestion))
+    /// ends with that block: once the first line is taken, the rest is
+    /// confined to the block, so anything after it would be shown but
+    /// never taken.
     pub fn offer_completion(&mut self, serial: u64, text: &str) -> bool {
         if serial != self.completion_serial || self.selection().is_some() {
             return false;
         }
         let text = text.replace('\r', "");
-        let text = text.trim_end();
-        if text.is_empty() {
-            self.suggestion = None;
-            return false;
-        }
-        self.suggestion = Some(Suggestion {
-            text: text.to_owned(),
-            accepted_line: false,
-        });
-        true
+        self.suggestion = self.confine_to_scope(&text, None, false);
+        self.suggestion.is_some()
     }
 
     /// Forget the suggestion, and any answer still to come to the last
@@ -1763,17 +1839,127 @@ impl Editor {
         self.completion_wanted = false;
     }
 
-    /// What is left of a suggestion after typing part of it: kept as the
-    /// suggestion, or, when it has all been typed, gone, with the next
-    /// completion asked for.
-    fn keep_suggestion(&mut self, rest: &str) {
-        if rest.is_empty() {
-            self.completion_wanted = true;
+    /// `text`, proposed at the cursor, as a suggestion confined to the
+    /// cursor's scope (see [`offer_completion`](Self::offer_completion)),
+    /// or `None` if nothing is left of it. `before_closer` is what the
+    /// suggestion `text` is the rest of had, kept if `text` doesn't reach
+    /// the end of the scope.
+    ///
+    /// `accepted_line` is whether Tab has already taken a line, so that
+    /// the next takes all the rest and there is no block to end with.
+    fn confine_to_scope(
+        &self,
+        text: &str,
+        before_closer: Option<String>,
+        accepted_line: bool,
+    ) -> Option<Suggestion> {
+        let brackets = self.brackets_of_insertion(text);
+        let (kept, end) = self.scope_end(text, &brackets);
+        let mut kept = kept.trim_end();
+        let mut before_closer = match end {
+            ScopeEnd::Open => before_closer,
+            ScopeEnd::Closed => None,
+            ScopeEnd::BeforeCloser(whitespace) => Some(whitespace.to_owned()),
+        };
+        let first_end = first_line_end(kept);
+        if !accepted_line
+            && first_end < kept.len()
+            && self.closer_to_pair(&kept[..first_end]).is_some()
+            && let Some(end) = block_end(&brackets, first_end - 1).filter(|&end| end < kept.len())
+        {
+            kept = &kept[..=end];
+            before_closer = None;
+        }
+        (!kept.is_empty()).then(|| Suggestion {
+            text: kept.to_owned(),
+            accepted_line,
+            before_closer,
+        })
+    }
+
+    /// The part of `text`, proposed at the cursor, within the cursor's
+    /// scope, and how it ends. `brackets` are its brackets, as
+    /// [`brackets_of_insertion`](Self::brackets_of_insertion) finds them.
+    fn scope_end<'a>(&self, text: &'a str, brackets: &[(usize, u8)]) -> (&'a str, ScopeEnd<'a>) {
+        let mut depth = 0usize;
+        let mut closer = None;
+        for &(at, b) in brackets {
+            if auto_indent::closer_of(b).is_some() {
+                depth += 1;
+            } else if depth == 0 {
+                closer = Some(at);
+                break;
+            } else {
+                depth -= 1;
+            }
+        }
+        let Some(closer) = closer else {
+            return (text, ScopeEnd::Open);
+        };
+        let next = self.next_text_after_cursor().map(|(_, b)| b);
+        if next == Some(text.as_bytes()[closer]) {
+            let kept = text[..closer].trim_end();
+            (kept, ScopeEnd::BeforeCloser(&text[kept.len()..closer]))
         } else {
-            self.suggestion = Some(Suggestion {
-                text: rest.to_owned(),
-                accepted_line: false,
-            });
+            (&text[..=closer], ScopeEnd::Closed)
+        }
+    }
+
+    /// The brackets in code in `text`, about to be inserted at the
+    /// cursor, with their offsets in it, as the text before the cursor
+    /// on its line (and pending indentation) would have them lexed.
+    fn brackets_of_insertion(&self, text: &str) -> Vec<(usize, u8)> {
+        let line = self.buffer.line_of_offset(self.cursor);
+        let start = self.buffer.offset_of_line(line);
+        let mut first = self.buffer.bytes_in_range(start..self.cursor);
+        if let Some(pending) = &self.pending {
+            first.extend_from_slice(pending.as_bytes());
+        }
+        let first_offset = first.len();
+        let mut lines: Vec<Vec<u8>> = text.split('\n').map(|l| l.as_bytes().to_vec()).collect();
+        first.append(&mut lines[0]);
+        lines[0] = first;
+        let contents: Vec<&[u8]> = lines.iter().map(Vec::as_slice).collect();
+        let tokens = self
+            .highlighter
+            .tokens_of_lines(&self.buffer, line, &contents);
+        let mut brackets = Vec::new();
+        let mut at = 0; // offset in `text` of the current line
+        for (n, (content, tokens)) in lines.into_iter().zip(&tokens).enumerate() {
+            let skip = if n == 0 { first_offset } else { 0 };
+            let code_line = CodeLine::new(content, tokens);
+            for i in skip..code_line.text.len() {
+                let b = code_line.text[i];
+                let bracket = auto_indent::closer_of(b).is_some() || auto_indent::is_closer(b);
+                if bracket && code_line.code[i] {
+                    brackets.push((at + i - skip, b));
+                }
+            }
+            at += code_line.text.len() - skip + 1;
+        }
+        brackets
+    }
+
+    /// The offset and byte of the first text after the cursor other than
+    /// whitespace, within the lines a completion request's suffix covers.
+    fn next_text_after_cursor(&self) -> Option<(usize, u8)> {
+        let line = self.buffer.line_of_offset(self.cursor);
+        let last = (line + COMPLETION_SUFFIX_LINES).min(self.buffer.line_count() - 1);
+        self.buffer
+            .bytes_in_range(self.cursor..self.buffer.line_content_range(last).end)
+            .into_iter()
+            .enumerate()
+            .find(|(_, b)| !b.is_ascii_whitespace())
+            .map(|(i, b)| (self.cursor + i, b))
+    }
+
+    /// What is left of a suggestion after typing part of it: kept as the
+    /// suggestion, confined to the scope the cursor is now in, or, when
+    /// it has all been typed, gone, with the next completion asked for.
+    fn keep_suggestion(&mut self, rest: &str, before_closer: Option<String>) {
+        self.suggestion = self.confine_to_scope(rest, before_closer, false);
+        if self.suggestion.is_none() {
+            self.completion_wanted = true;
         }
     }
 
@@ -1784,7 +1970,7 @@ impl Editor {
     /// shows where the suggestion goes on; where the line break split a
     /// line and indentation was written out, the suggestion has to
     /// agree with it.
-    fn continue_suggestion_on_next_line(&mut self, rest: &str) {
+    fn continue_suggestion_on_next_line(&mut self, rest: &str, before_closer: Option<String>) {
         let indent_len = rest
             .bytes()
             .take_while(|&b| b == b' ' || b == b'\t')
@@ -1795,12 +1981,12 @@ impl Editor {
             .offset_of_line(self.buffer.line_of_offset(self.cursor));
         if self.pending.is_some() || self.cursor == line_start {
             self.pending = (!indent.is_empty()).then(|| indent.to_owned());
-            self.keep_suggestion(body);
+            self.keep_suggestion(body, before_closer);
             return;
         }
         let written = self.buffer.bytes_in_range(line_start..self.cursor);
         match rest.as_bytes().strip_prefix(written.as_slice()) {
-            Some(_) => self.keep_suggestion(&rest[written.len()..]),
+            Some(_) => self.keep_suggestion(&rest[written.len()..], before_closer),
             None => self.completion_wanted = true,
         }
     }
@@ -2073,6 +2259,30 @@ fn text_of(bytes: &[u8]) -> String {
 
 /// Where the first line of a suggestion ends: at its first line break
 /// after any it begins with, or at its end.
+/// The offset of the closing bracket that matches the opening one at
+/// `opener`, among `brackets` (offsets and bytes, in order).
+fn block_end(brackets: &[(usize, u8)], opener: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for &(at, b) in brackets.iter().skip_while(|&&(at, _)| at < opener) {
+        if auto_indent::closer_of(b).is_some() {
+            depth += 1;
+        } else {
+            depth -= 1;
+            if depth == 0 {
+                return Some(at);
+            }
+        }
+    }
+    None
+}
+
+/// Whether an opening bracket is paired when `next` follows it: at the
+/// end of a line, or before whitespace or the end of an expression, but
+/// not right before other text.
+fn pairs_before(next: Option<u8>) -> bool {
+    next.is_none_or(|b| b.is_ascii_whitespace() || matches!(b, b')' | b']' | b'}' | b',' | b';'))
+}
+
 fn first_line_end(text: &str) -> usize {
     let skipped = text.len() - text.trim_start_matches('\n').len();
     text[skipped..]
@@ -4182,6 +4392,172 @@ mod tests {
         assert!(ed.completion_wanted());
     }
 
+    /// Answer the request typing made with `completion`, returning the
+    /// suggestion it becomes.
+    fn offer(ed: &mut Editor, completion: &str) -> Option<String> {
+        let serial = ed.take_completion_request().unwrap().serial;
+        ed.offer_completion(serial, completion);
+        ed.suggestion().map(str::to_owned)
+    }
+
+    #[test]
+    fn brackets_pair_the_same_whether_or_not_a_suggestion_came_first() {
+        // Typed before the suggestion arrives: paired, and the answer
+        // stops short of the closing bracket the pair supplied.
+        let mut ed = code(Language::Rust, "fn f() {\n    let v = foo‸\n}");
+        ed.insert_char('(');
+        assert_eq!(
+            offer(&mut ed, "a, b);\n    bar();").as_deref(),
+            Some("a, b")
+        );
+        assert_eq!(shown(&ed), "fn f() {\n    let v = foo(‸)\n}");
+
+        // Typed along with a suggestion that has it: paired all the same,
+        // and the rest of the suggestion stays inside.
+        let mut ed = code(Language::Rust, "fn f() {\n    let v = fo‸\n}");
+        ed.insert_char('o');
+        assert_eq!(
+            offer(&mut ed, "(a, [b]);\n    bar();").as_deref(),
+            Some("(a, [b]);\n    bar();")
+        );
+        ed.insert_char('(');
+        assert_eq!(shown(&ed), "fn f() {\n    let v = foo(‸)\n}");
+        assert_eq!(ed.suggestion(), Some("a, [b]"));
+        type_str(&mut ed, "a, [");
+        assert_eq!(shown(&ed), "fn f() {\n    let v = foo(a, [‸])\n}");
+        assert_eq!(ed.suggestion(), Some("b"));
+        type_str(&mut ed, "b");
+        assert!(ed.suggestion().is_none());
+        assert!(ed.completion_wanted(), "typed through it");
+
+        // A suggestion that is only the closing bracket is no suggestion.
+        let mut ed = code(Language::Rust, "foo‸");
+        ed.insert_char('(');
+        assert_eq!(offer(&mut ed, ");"), None);
+    }
+
+    #[test]
+    fn taking_a_line_that_opens_a_block_pairs_its_bracket() {
+        // Tab, Tab: the first pairs the brace, the second takes the body
+        // and puts the brace on a line of its own, as suggested.
+        let mut ed = code(Language::Rust, "fn f() {\n    ‸\n}");
+        ed.insert_char('i');
+        assert!(offer(&mut ed, "f x {\n        y();\n    }\n    z();").is_some());
+        ed.accept_suggestion();
+        assert_eq!(shown(&ed), "fn f() {\n    if x {‸}\n}");
+        assert_eq!(ed.suggestion(), Some("\n        y();"));
+        assert!(ed.suggestion_continues());
+        ed.accept_suggestion();
+        assert_eq!(shown(&ed), "fn f() {\n    if x {\n        y();‸\n    }\n}");
+        assert!(ed.completion_wanted());
+        // One undo step each.
+        ed.undo();
+        assert_eq!(shown(&ed), "fn f() {\n    if x {‸}\n}");
+
+        // Tab, Enter, Tab: Enter between the pair makes the lines, and
+        // the suggestion goes on in between.
+        let mut ed = code(Language::Rust, "fn f() {\n    ‸\n}");
+        ed.insert_char('i');
+        offer(&mut ed, "f x {\n        y();\n    }");
+        ed.accept_suggestion();
+        ed.insert_char('\n');
+        assert_eq!(shown(&ed), "fn f() {\n    if x {\n        ‸\n    }\n}");
+        assert_eq!(ed.suggestion(), Some("y();"));
+        ed.accept_suggestion();
+        assert_eq!(shown(&ed), "fn f() {\n    if x {\n        y();‸\n    }\n}");
+
+        // An opening bracket in a string isn't paired.
+        let mut ed = code(Language::Rust, "‸");
+        ed.insert_char('f');
+        offer(&mut ed, "(\"{\");");
+        ed.dismiss_suggestion();
+        ed.insert_char('(');
+        ed.insert_char('"');
+        offer(&mut ed, "{\n");
+        ed.accept_suggestion();
+        assert_eq!(shown(&ed), "f(\"{‸)");
+    }
+
+    #[test]
+    fn a_suggestion_that_opens_a_block_ends_with_it() {
+        // Taking the first line pairs the brace and confines the rest to
+        // the block, so what follows the block isn't shown.
+        let mut ed = code(Language::Rust, "fn f() {\n    ‸\n}");
+        ed.insert_char('i');
+        assert_eq!(
+            offer(&mut ed, "f (a) {\n        return;\n    }\n    foo();\n}").as_deref(),
+            Some("f (a) {\n        return;\n    }")
+        );
+        ed.accept_suggestion();
+        ed.accept_suggestion();
+        assert_eq!(
+            shown(&ed),
+            "fn f() {\n    if (a) {\n        return;‸\n    }\n}"
+        );
+        assert!(ed.completion_wanted(), "foo(); comes next");
+
+        // A block the first line opens but that Tab wouldn't pair, before
+        // other text, doesn't end it; nor does one on a later line.
+        let mut ed = code(Language::Rust, "‸x");
+        ed.insert_char('a');
+        assert_eq!(
+            offer(&mut ed, " {\n}\nb();").as_deref(),
+            Some(" {\n}\nb();")
+        );
+        let mut ed = code(Language::Rust, "‸");
+        ed.insert_char('a');
+        assert_eq!(
+            offer(&mut ed, "();\nif b {\n}\nc();").as_deref(),
+            Some("();\nif b {\n}\nc();")
+        );
+    }
+
+    #[test]
+    fn a_block_typed_before_its_suggestion_gets_the_suggested_layout() {
+        let mut ed = code(Language::Rust, "‸");
+        type_str(&mut ed, "if x {");
+        assert_eq!(shown(&ed), "if x {‸}");
+        assert_eq!(
+            offer(&mut ed, "\n    y();\n}\nz();").as_deref(),
+            Some("\n    y();")
+        );
+        ed.accept_suggestion();
+        assert_eq!(shown(&ed), "if x {\n    y();‸\n}");
+    }
+
+    #[test]
+    fn suggestions_stay_within_the_scope_at_the_cursor() {
+        // The block's closing brace is already there: the suggestion
+        // stops before the model's.
+        let mut ed = code(Language::Rust, "fn f() {\n    ‸\n}\n");
+        ed.insert_char('x');
+        assert_eq!(
+            offer(&mut ed, " = 1;\n}\n\nfn g() {\n}").as_deref(),
+            Some(" = 1;")
+        );
+        // Nested scopes in the suggestion are its own.
+        ed.dismiss_suggestion();
+        ed.insert_char(' ');
+        assert_eq!(
+            offer(&mut ed, "= if a { (1) } else { 2 };\n    y();\n}").as_deref(),
+            Some("= if a { (1) } else { 2 };\n    y();")
+        );
+
+        // Nothing closes the bracket after the cursor, as when it was
+        // typed before other text: the suggestion closes it, and stops.
+        let mut ed = code(Language::Rust, "foo(‸x");
+        ed.insert_char('a');
+        assert_eq!(offer(&mut ed, ", b);\nbar();").as_deref(), Some(", b)"));
+
+        // Brackets in strings and comments don't count.
+        let mut ed = code(Language::Rust, "foo(‸)");
+        ed.insert_char('"');
+        assert_eq!(
+            offer(&mut ed, ")\", 1 /* ) */);").as_deref(),
+            Some(")\", 1 /* ) */")
+        );
+    }
+
     #[test]
     fn enter_along_with_a_suggestion_takes_its_indentation() {
         // The next line of the suggestion is indented more than the
@@ -4190,24 +4566,24 @@ mod tests {
         let mut ed = editor("");
         type_str(&mut ed, "fn f() {");
         ed.delete_forward();
-        suggest(&mut ed, "\n    body();\n}");
+        suggest(&mut ed, "\n    body;\n}");
         ed.insert_char('\n');
         assert_eq!(text(&ed), "fn f() {\n");
         assert_eq!(ed.pending_indentation(), Some("    "));
-        assert_eq!(ed.suggestion(), Some("body();\n}"));
+        assert_eq!(ed.suggestion(), Some("body;\n}"));
         assert_eq!(ed.cursor_position(), Position { line: 1, column: 4 });
         type_str(&mut ed, "bo");
         assert_eq!(text(&ed), "fn f() {\n    bo");
-        assert_eq!(ed.suggestion(), Some("dy();\n}"));
+        assert_eq!(ed.suggestion(), Some("dy;\n}"));
         // Less indented: Enter inside the braces would indent the new
         // line, but the suggestion says none.
-        type_str(&mut ed, "dy();");
+        type_str(&mut ed, "dy;");
         assert_eq!(ed.suggestion(), Some("\n}"));
         ed.insert_char('\n');
         assert_eq!(ed.pending_indentation(), None);
         assert_eq!(ed.suggestion(), Some("}"));
         ed.insert_char('}');
-        assert_eq!(text(&ed), "fn f() {\n    body();\n}");
+        assert_eq!(text(&ed), "fn f() {\n    body;\n}");
         assert!(ed.suggestion().is_none());
         assert!(ed.completion_wanted(), "typed through it all");
 
@@ -4286,8 +4662,8 @@ mod tests {
         ed.insert_char(';');
         suggest(&mut ed, "\n\nfn g() {\n}");
         ed.accept_suggestion();
-        assert_eq!(text(&ed), "a1\nb2;\n\nfn g() {");
-        assert_eq!(ed.suggestion(), Some("\n}"));
+        assert_eq!(text(&ed), "a1\nb2;\n\nfn g() {}", "the brace paired");
+        assert!(ed.suggestion().is_none(), "nothing left but the brace");
         // Pending indentation is written out with the accepted text.
         let mut ed = editor("");
         type_str(&mut ed, "{\n");
