@@ -22,6 +22,7 @@
 //!
 //! [completion]
 //! rust-model = "~/models/rust-70m"
+//! min-line-confidence = 0.8
 //! ```
 //!
 //! Keys the editor doesn't know are kept as they are and written back, so
@@ -42,6 +43,7 @@
 
 use crate::auto_indent::{CodeStyle, ContinuationIndent};
 use crate::build::DEFAULT_CMAKE_GENERATOR;
+use crate::completion::ConfidenceThresholds;
 use crate::project_search::MAX_MATCHES;
 use crate::syntax::Language;
 use crate::terminal::emulator::DEFAULT_SCROLLBACK;
@@ -55,7 +57,8 @@ pub enum Category {
     Terminal,
     Search,
     Build,
-    /// Code completion: the model for each language it is available in.
+    /// Code completion: the model for each language it is available in,
+    /// and how sure a model must be to offer a completion.
     Completion,
 }
 
@@ -153,18 +156,28 @@ pub enum SettingKey {
     /// for no completion in them. Completion models are trained per
     /// language, so each language that has one gets a setting like this.
     RustCompletionModel,
+    /// How sure the model must be of a line of a completion, on average
+    /// over its tokens, for the line to be offered; see
+    /// [`ConfidenceThresholds::line`].
+    CompletionLineConfidence,
+    /// How sure the model must be of every token of a line of a
+    /// completion for the line to be offered; see
+    /// [`ConfidenceThresholds::token`].
+    CompletionTokenConfidence,
 }
 
 impl SettingKey {
     /// Every setting, in the order a settings page lists them (grouped by
     /// category, in [`Category::ALL`]'s order).
-    pub const ALL: [SettingKey; 6] = [
+    pub const ALL: [SettingKey; 8] = [
         SettingKey::ContinuationIndent,
         SettingKey::Shell,
         SettingKey::TerminalScrollback,
         SettingKey::SearchMaxResults,
         SettingKey::CMakeGenerator,
         SettingKey::RustCompletionModel,
+        SettingKey::CompletionLineConfidence,
+        SettingKey::CompletionTokenConfidence,
     ];
 
     pub fn category(self) -> Category {
@@ -173,7 +186,9 @@ impl SettingKey {
             SettingKey::Shell | SettingKey::TerminalScrollback => Category::Terminal,
             SettingKey::SearchMaxResults => Category::Search,
             SettingKey::CMakeGenerator => Category::Build,
-            SettingKey::RustCompletionModel => Category::Completion,
+            SettingKey::RustCompletionModel
+            | SettingKey::CompletionLineConfidence
+            | SettingKey::CompletionTokenConfidence => Category::Completion,
         }
     }
 
@@ -194,7 +209,9 @@ impl SettingKey {
             | SettingKey::TerminalScrollback
             | SettingKey::SearchMaxResults
             | SettingKey::CMakeGenerator
-            | SettingKey::RustCompletionModel => SettingKind::Text,
+            | SettingKey::RustCompletionModel
+            | SettingKey::CompletionLineConfidence
+            | SettingKey::CompletionTokenConfidence => SettingKind::Text,
         }
     }
 
@@ -207,6 +224,8 @@ impl SettingKey {
             SettingKey::SearchMaxResults => "Maximum search results",
             SettingKey::CMakeGenerator => "CMake generator",
             SettingKey::RustCompletionModel => "Rust model",
+            SettingKey::CompletionLineConfidence => "Line confidence",
+            SettingKey::CompletionTokenConfidence => "Token confidence",
         }
     }
 
@@ -227,6 +246,12 @@ impl SettingKey {
             SettingKey::RustCompletionModel => {
                 "The checkpoint directory (config.json, model.safetensors, tokenizer.json) of the completion model for Rust files; blank for no completion in them"
             }
+            SettingKey::CompletionLineConfidence => {
+                "How sure the model must be of a line, on average over its tokens, to offer it: 0 to 1, lower for more eager completion, higher for more cautious"
+            }
+            SettingKey::CompletionTokenConfidence => {
+                "How sure the model must be of every token of a line to offer it: 0 to 1, lower for more eager completion, higher for more cautious"
+            }
         }
     }
 
@@ -239,6 +264,8 @@ impl SettingKey {
             SettingKey::SearchMaxResults => "max-results",
             SettingKey::CMakeGenerator => "cmake-generator",
             SettingKey::RustCompletionModel => "rust-model",
+            SettingKey::CompletionLineConfidence => "min-line-confidence",
+            SettingKey::CompletionTokenConfidence => "min-token-confidence",
         }
     }
 
@@ -260,6 +287,10 @@ impl SettingKey {
             SettingKey::SearchMaxResults => MAX_MATCHES.to_string(),
             SettingKey::CMakeGenerator => DEFAULT_CMAKE_GENERATOR.to_owned(),
             SettingKey::RustCompletionModel => String::new(),
+            SettingKey::CompletionLineConfidence => ConfidenceThresholds::DEFAULT.line.to_string(),
+            SettingKey::CompletionTokenConfidence => {
+                ConfidenceThresholds::DEFAULT.token.to_string()
+            }
         }
     }
 
@@ -302,6 +333,8 @@ pub struct Settings {
     search_max_results: Option<usize>,
     cmake_generator: Option<String>,
     rust_completion_model: Option<String>,
+    completion_line_confidence: Option<f64>,
+    completion_token_confidence: Option<f64>,
     /// Whatever else the settings file held: tables and keys this version
     /// of the editor doesn't know, kept to write back.
     unknown: Table,
@@ -360,6 +393,15 @@ impl Settings {
         }
     }
 
+    /// How sure a completion model must be of a line to offer it.
+    pub fn completion_thresholds(&self) -> ConfidenceThresholds {
+        let default = ConfidenceThresholds::DEFAULT;
+        ConfidenceThresholds {
+            line: self.completion_line_confidence.unwrap_or(default.line),
+            token: self.completion_token_confidence.unwrap_or(default.token),
+        }
+    }
+
     // ----- Text form ------------------------------------------------------
 
     /// A setting's value as text: what a field holds. Blank for a shell
@@ -376,6 +418,8 @@ impl Settings {
             SettingKey::RustCompletionModel => {
                 self.rust_completion_model.clone().unwrap_or_default()
             }
+            SettingKey::CompletionLineConfidence => self.completion_thresholds().line.to_string(),
+            SettingKey::CompletionTokenConfidence => self.completion_thresholds().token.to_string(),
         }
     }
 
@@ -409,6 +453,16 @@ impl Settings {
             SettingKey::RustCompletionModel => {
                 self.rust_completion_model = (!text.is_empty()).then(|| text.to_owned());
             }
+            SettingKey::CompletionLineConfidence => {
+                let line = parse_fraction(text)?;
+                self.completion_line_confidence =
+                    (line != ConfidenceThresholds::DEFAULT.line).then_some(line);
+            }
+            SettingKey::CompletionTokenConfidence => {
+                let token = parse_fraction(text)?;
+                self.completion_token_confidence =
+                    (token != ConfidenceThresholds::DEFAULT.token).then_some(token);
+            }
         }
         Ok(*self != before)
     }
@@ -424,6 +478,12 @@ impl Settings {
             SettingKey::SearchMaxResults => self.search_max_results() == MAX_MATCHES,
             SettingKey::CMakeGenerator => self.cmake_generator() == DEFAULT_CMAKE_GENERATOR,
             SettingKey::RustCompletionModel => self.rust_completion_model.is_none(),
+            SettingKey::CompletionLineConfidence => {
+                self.completion_thresholds().line == ConfidenceThresholds::DEFAULT.line
+            }
+            SettingKey::CompletionTokenConfidence => {
+                self.completion_thresholds().token == ConfidenceThresholds::DEFAULT.token
+            }
         }
     }
 
@@ -438,6 +498,8 @@ impl Settings {
             SettingKey::SearchMaxResults => self.search_max_results = None,
             SettingKey::CMakeGenerator => self.cmake_generator = None,
             SettingKey::RustCompletionModel => self.rust_completion_model = None,
+            SettingKey::CompletionLineConfidence => self.completion_line_confidence = None,
+            SettingKey::CompletionTokenConfidence => self.completion_token_confidence = None,
         }
         !was_default
     }
@@ -516,6 +578,12 @@ impl Settings {
                     .trim();
                 self.rust_completion_model = (!path.is_empty()).then(|| path.to_owned());
             }
+            SettingKey::CompletionLineConfidence => {
+                self.completion_line_confidence = Some(read_fraction(key, value)?);
+            }
+            SettingKey::CompletionTokenConfidence => {
+                self.completion_token_confidence = Some(read_fraction(key, value)?);
+            }
         }
         Ok(())
     }
@@ -535,6 +603,12 @@ impl Settings {
                 SettingKey::SearchMaxResults => Value::Integer(self.search_max_results() as i64),
                 SettingKey::CMakeGenerator | SettingKey::RustCompletionModel => {
                     Value::String(self.text(key))
+                }
+                SettingKey::CompletionLineConfidence => {
+                    Value::Float(self.completion_thresholds().line)
+                }
+                SettingKey::CompletionTokenConfidence => {
+                    Value::Float(self.completion_thresholds().token)
                 }
             };
             let category = table
@@ -598,6 +672,27 @@ fn read_count(key: SettingKey, value: &Value, min: usize) -> Result<usize, Setti
             ))
         })?;
     Ok(count)
+}
+
+/// Parse a fraction typed into a field: a number from 0 to 1.
+fn parse_fraction(text: &str) -> Result<f64, String> {
+    if text.is_empty() {
+        return Err("enter a number".to_owned());
+    }
+    match text.parse::<f64>() {
+        Ok(fraction) if (0.0..=1.0).contains(&fraction) => Ok(fraction),
+        _ => Err("must be a number from 0 to 1".to_owned()),
+    }
+}
+
+/// A fraction from the file: a number from 0 to 1, which may be written
+/// as a whole number.
+fn read_fraction(key: SettingKey, value: &Value) -> Result<f64, SettingsError> {
+    value
+        .as_float()
+        .or_else(|| value.as_integer().map(|n| n as f64))
+        .filter(|fraction| (0.0..=1.0).contains(fraction))
+        .ok_or_else(|| SettingsError(format!("`{}` must be a number from 0 to 1", key.path())))
 }
 
 #[cfg(test)]
@@ -745,6 +840,71 @@ mod tests {
         );
         assert_eq!(settings.completion_model(Language::Rust), None);
         assert!(settings.is_default(SettingKey::RustCompletionModel));
+    }
+
+    #[test]
+    fn completion_thresholds_are_fractions() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.completion_thresholds(),
+            ConfidenceThresholds::DEFAULT
+        );
+        assert_eq!(
+            settings.set_text(SettingKey::CompletionLineConfidence, " 0.75 "),
+            Ok(true)
+        );
+        assert_eq!(settings.completion_thresholds().line, 0.75);
+        assert_eq!(
+            settings.completion_thresholds().token,
+            ConfidenceThresholds::DEFAULT.token,
+            "the other is untouched"
+        );
+        assert_eq!(settings.text(SettingKey::CompletionLineConfidence), "0.75");
+        assert!(!settings.is_default(SettingKey::CompletionLineConfidence));
+        for (text, err) in [
+            ("", "enter a number"),
+            ("1.5", "must be a number from 0 to 1"),
+            ("-0.1", "must be a number from 0 to 1"),
+            ("NaN", "must be a number from 0 to 1"),
+            ("most", "must be a number from 0 to 1"),
+        ] {
+            assert_eq!(
+                settings.set_text(SettingKey::CompletionTokenConfidence, text),
+                Err(err.to_owned()),
+                "{text:?}"
+            );
+        }
+        assert_eq!(
+            settings.set_text(SettingKey::CompletionTokenConfidence, "1"),
+            Ok(true)
+        );
+        assert_eq!(settings.completion_thresholds().token, 1.0);
+
+        let text = settings.to_toml();
+        assert!(text.contains("[completion]"), "{text}");
+        assert!(text.contains("min-line-confidence = 0.75"), "{text}");
+        assert!(text.contains("min-token-confidence = 1.0"), "{text}");
+        assert_eq!(Settings::parse(&text).unwrap(), settings);
+        // Written by hand as a whole number, or at the default.
+        let settings = Settings::parse(&format!(
+            "[completion]\nmin-line-confidence = 0\nmin-token-confidence = {}\n",
+            ConfidenceThresholds::DEFAULT.token
+        ))
+        .unwrap();
+        assert_eq!(settings.completion_thresholds().line, 0.0);
+        assert!(settings.is_default(SettingKey::CompletionTokenConfidence));
+        assert_eq!(
+            Settings::parse("[completion]\nmin-line-confidence = 2\n")
+                .unwrap_err()
+                .to_string(),
+            "`completion.min-line-confidence` must be a number from 0 to 1"
+        );
+        assert_eq!(
+            Settings::parse("[completion]\nmin-token-confidence = \"high\"\n")
+                .unwrap_err()
+                .to_string(),
+            "`completion.min-token-confidence` must be a number from 0 to 1"
+        );
     }
 
     #[test]

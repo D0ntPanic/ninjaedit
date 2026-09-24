@@ -11,6 +11,12 @@
 //! [`holes`] for which, and [`replay`] for how), and what the model wrote
 //! is counted (see [`stats`]). Everything random is seeded, so the same
 //! arguments give the same evaluation.
+//!
+//! The model's whole completions are scored, whatever its confidence;
+//! how much of them the editor's confidence thresholds would offer is
+//! reported beside, for the thresholds of the default settings or those
+//! given, and with `--sweep` for a range of others, so that thresholds
+//! can be compared on the same completions.
 
 mod document;
 mod holes;
@@ -23,9 +29,10 @@ use document::Document;
 use holes::{HoleKind, Rng};
 use ninjaedit_core::completion::expand_home;
 use ninjaedit_core::{
-    Completer, CompletionOutcome, Editor, Language, Project, ProjectKind, Settings,
+    Completer, CompletionOutcome, ConfidenceThresholds, Editor, Language, Project, ProjectKind,
+    SettingKey, Settings,
 };
-use replay::Source;
+use replay::{Answer, Source};
 use stats::Stats;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +46,10 @@ const INDEX_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long to wait for a completion, the first of which loads the
 /// model, before deciding the worker is stuck.
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
+/// The thresholds `--sweep` tries, every line confidence with every
+/// token confidence.
+const SWEEP_LINE: [f64; 6] = [0.0, 0.5, 0.6, 0.7, 0.8, 0.9];
+const SWEEP_TOKEN: [f64; 6] = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5];
 
 #[derive(Parser, Debug)]
 #[command(about = "Evaluate a code completion model on a project, through the editor")]
@@ -75,6 +86,22 @@ struct Args {
     #[arg(long)]
     json: Option<PathBuf>,
 
+    /// How sure the model must be of a line, on average over its
+    /// tokens, for it to be offered (0 to 1), in place of the default
+    /// setting.
+    #[arg(long)]
+    min_line_confidence: Option<String>,
+
+    /// How sure the model must be of every token of a line for it to be
+    /// offered (0 to 1), in place of the default setting.
+    #[arg(long)]
+    min_token_confidence: Option<String>,
+
+    /// Also report what a range of other thresholds would offer of the
+    /// same completions.
+    #[arg(long)]
+    sweep: bool,
+
     /// Print every completion next to what was expected.
     #[arg(long)]
     trace: bool,
@@ -108,6 +135,35 @@ fn main() -> Result<()> {
         bail!("{} is not a model checkpoint directory", args.model);
     }
 
+    // The editor's settings as they are by default, so the user's own
+    // can't change the results, but for the thresholds given.
+    let mut settings = Settings::default();
+    for (key, value) in [
+        (
+            SettingKey::CompletionLineConfidence,
+            &args.min_line_confidence,
+        ),
+        (
+            SettingKey::CompletionTokenConfidence,
+            &args.min_token_confidence,
+        ),
+    ] {
+        if let Some(value) = value {
+            settings
+                .set_text(key, value)
+                .map_err(|err| anyhow!("{}: {err}", key.name().to_lowercase()))?;
+        }
+    }
+    let thresholds = settings.completion_thresholds();
+    let mut sweep: Vec<(ConfidenceThresholds, Stats)> = Vec::new();
+    if args.sweep {
+        for line in SWEEP_LINE {
+            for token in SWEEP_TOKEN {
+                sweep.push((ConfidenceThresholds { line, token }, Stats::default()));
+            }
+        }
+    }
+
     let project = open_project(&dir)?;
     let files = choose_files(&project, &dir, &args)?;
     if files.is_empty() {
@@ -124,11 +180,10 @@ fn main() -> Result<()> {
         args.language.name()
     );
 
-    // The completer as the editor has it, with its settings (the
-    // defaults, so the user's own can't change the results), and the
+    // The completer as the editor has it, with those settings, and the
     // model under evaluation over them.
     let mut completer = Completer::new();
-    completer.apply_settings(&Settings::default());
+    completer.apply_settings(&settings);
     completer.override_model(args.language, &args.model);
     let mut source = ModelSource {
         completer,
@@ -142,17 +197,20 @@ fn main() -> Result<()> {
     for (i, path) in files.iter().enumerate() {
         let name = path.strip_prefix(project.root()).unwrap_or(path);
         let name = name.to_string_lossy();
-        let Some((stats, kinds)) = evaluate_file(&project, path, &name, &args, &mut source)? else {
+        let Some((stats, kinds)) =
+            evaluate_file(&project, path, &name, &args, &mut source, &mut sweep)?
+        else {
             eprintln!("[{}/{}] {name}: skipped, not UTF-8", i + 1, files.len());
             continue;
         };
         eprintln!(
-            "[{}/{}] {name}: {} holes, next word {}, whole line {}",
+            "[{}/{}] {name}: {} holes, next word {}, whole line {}, offered {}",
             i + 1,
             files.len(),
             stats.holes,
             stats.next_word().percent(),
-            stats.whole_line().percent()
+            stats.whole_line().percent(),
+            stats.offered_rate().percent()
         );
         total += stats;
         for (kind, stats) in kinds {
@@ -165,6 +223,8 @@ fn main() -> Result<()> {
         &total,
         &by_kind,
         per_file.len(),
+        thresholds,
+        &sweep,
         &source.latencies,
         started.elapsed(),
     );
@@ -176,6 +236,8 @@ fn main() -> Result<()> {
             "project": project.root(),
             "seed": args.seed,
             "hole_rate": args.hole_rate,
+            "min_line_confidence": thresholds.line,
+            "min_token_confidence": thresholds.token,
             "files": per_file.len(),
             "latency_ms": latency_summary(&source.latencies),
             "total": total.to_json(),
@@ -183,6 +245,19 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|k| (k.key().to_owned(), by_kind.get(k).copied().unwrap_or_default().to_json()))
                 .collect::<serde_json::Map<_, _>>(),
+            "sweep": sweep
+                .iter()
+                .map(|(t, stats)| serde_json::json!({
+                    "min_line_confidence": t.line,
+                    "min_token_confidence": t.token,
+                    "offered": stats.offered_rate().value(),
+                    "offered_right": stats.offered_right().value(),
+                    "offered_chars": stats.offered_chars().value(),
+                    "offered_lines": stats.offered_lines().value(),
+                    "partial_offers": stats.partial_offers().value(),
+                    "partial_right": stats.partial_right().value(),
+                }))
+                .collect::<Vec<_>>(),
             "per_file": per_file
                 .iter()
                 .map(|(name, stats)| (name.clone(), stats.to_json()))
@@ -229,13 +304,15 @@ fn choose_files(project: &Project, dir: &Path, args: &Args) -> Result<Vec<PathBu
 }
 
 /// Evaluate one file: open it as the editor does, and delete and write
-/// back each of its holes in turn. `None` if it isn't text.
+/// back each of its holes in turn, counting what the thresholds of
+/// `sweep` offer there too. `None` if it isn't text.
 fn evaluate_file(
     project: &Project,
     path: &Path,
     name: &str,
     args: &Args,
     source: &mut ModelSource,
+    sweep: &mut replay::Sweep,
 ) -> Result<Option<(Stats, HashMap<HoleKind, Stats>)>> {
     let buffer = project
         .open_file(path)
@@ -259,7 +336,7 @@ fn evaluate_file(
             let (line, _) = doc.line_and_column(hole.start);
             eprintln!("{name}:{} {} hole", line + 1, hole.kind.name());
         }
-        let hole_stats = replay::reimplement(&mut editor, &doc, &hole, source, args.trace)?;
+        let hole_stats = replay::reimplement(&mut editor, &doc, &hole, source, sweep, args.trace)?;
         if editor.buffer().to_bytes() != original {
             bail!("{name} wasn't written back as it was after a hole: {hole:?}");
         }
@@ -277,9 +354,9 @@ struct ModelSource {
 }
 
 impl Source for ModelSource {
-    fn complete(&mut self, editor: &mut Editor) -> Result<()> {
+    fn complete(&mut self, editor: &mut Editor) -> Result<Option<Answer>> {
         let Some(request) = editor.take_completion_request() else {
-            return Ok(());
+            return Ok(None);
         };
         let serial = request.serial;
         let started = Instant::now();
@@ -294,11 +371,17 @@ impl Source for ModelSource {
                     CompletionOutcome::Completed {
                         serial: answered,
                         text,
+                        offered,
+                        lines,
                         ..
                     } if answered == serial => {
                         self.latencies.push(started.elapsed());
-                        editor.offer_completion(serial, &text);
-                        return Ok(());
+                        return Ok(Some(Answer {
+                            serial,
+                            text,
+                            offered,
+                            lines,
+                        }));
                     }
                     CompletionOutcome::Completed { .. } => {}
                     CompletionOutcome::Failed { error, .. } => {
@@ -324,6 +407,8 @@ fn print_report(
     total: &Stats,
     by_kind: &HashMap<HoleKind, Stats>,
     files: usize,
+    thresholds: ConfidenceThresholds,
+    sweep: &[(ConfidenceThresholds, Stats)],
     latencies: &[Duration],
     elapsed: Duration,
 ) {
@@ -332,6 +417,10 @@ fn print_report(
     println!(
         "{files} files, {} holes, {} completions in {:.0?}",
         total.holes, total.completions, elapsed
+    );
+    println!(
+        "offered at line confidence {} and token confidence {}",
+        thresholds.line, thresholds.token
     );
     if !latency.is_null() {
         println!(
@@ -358,6 +447,13 @@ fn print_report(
         }
         println!();
     }
+    for (row, (name, _, average)) in total.averages().into_iter().enumerate() {
+        print!("{name:<14}{:>16}", average.display());
+        for stats in &kinds {
+            print!("{:>14}", stats.averages()[row].2.display());
+        }
+        println!();
+    }
     println!();
     println!("next word:    words accepted from completions, of all words written");
     println!(
@@ -368,4 +464,32 @@ fn print_report(
     );
     println!("multi-line:   completions right about 2+ lines, of those asked with 2+ lines left");
     println!("characters:   non-whitespace characters accepted, of all written");
+    println!();
+    println!("Those score the model's whole completions; the rest, what the thresholds offer:");
+    println!("offered:       completions that offered anything, of all");
+    println!("offered right: offers right as far as they went, of all offers");
+    println!("offered chars: non-whitespace characters per offer, on average");
+    println!("offered lines: lines with text per offer, on average");
+    println!("partial offers: offers of only the start of a first line, of all offers");
+    println!("partial right:  those right as far as they went");
+    if sweep.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{:>6}{:>7}{:>10}{:>8}{:>8}{:>9}{:>8}",
+        "line", "token", "offered", "right", "chars", "partial", "right"
+    );
+    for (t, stats) in sweep {
+        println!(
+            "{:>6}{:>7}{:>10}{:>8}{:>8}{:>9}{:>8}",
+            t.line,
+            t.token,
+            stats.offered_rate().percent(),
+            stats.offered_right().percent(),
+            stats.offered_chars().display(),
+            stats.partial_offers().percent(),
+            stats.partial_right().percent()
+        );
+    }
 }

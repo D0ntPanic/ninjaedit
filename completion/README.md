@@ -81,8 +81,15 @@ Crates:
   filling in a block body. Where a completion is right, its correct words
   are accepted in one go; where it's wrong, the next word is typed.
   The report gives the next word, partial line, whole line, multi-line
-  and character acceptance rates, overall and by kind of section.
-  Everything random is seeded, so a run can be repeated exactly.
+  and character acceptance rates, overall and by kind of section. These
+  score the model's whole completions, whatever its confidence; beside
+  them, the report gives how often the editor's confidence thresholds
+  would offer a completion at all, how often what they offer is right,
+  and its average length. The thresholds are the default settings' unless
+  `--min-line-confidence` and `--min-token-confidence` are given, and
+  `--sweep` reports the same for a grid of other thresholds, from the same
+  completions. Everything random is seeded, so a run can be repeated
+  exactly.
   `cargo run --release -p evaluation -- core/src --model ~/models/rust-70m
   --language rust` evaluates on the files under `core/src`. Sections are
   sampled in proportion to file size, `--hole-rate` per 100 lines of code

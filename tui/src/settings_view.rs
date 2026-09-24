@@ -640,6 +640,10 @@ mod tests {
             SettingsOutcome::Continue
         );
         assert_eq!(view.focused_key(), SettingKey::RustCompletionModel);
+        for _ in 0..2 {
+            press(&mut view, &mut settings, KeyCode::Tab);
+        }
+        assert_eq!(view.focused_key(), SettingKey::CompletionTokenConfidence);
         assert_eq!(
             press(&mut view, &mut settings, KeyCode::Tab),
             SettingsOutcome::Continue
@@ -653,7 +657,7 @@ mod tests {
             press(&mut view, &mut settings, KeyCode::BackTab),
             SettingsOutcome::Continue
         );
-        assert_eq!(view.focused_key(), SettingKey::RustCompletionModel);
+        assert_eq!(view.focused_key(), SettingKey::CompletionTokenConfidence);
     }
 
     #[test]

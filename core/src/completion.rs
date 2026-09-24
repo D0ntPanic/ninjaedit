@@ -37,6 +37,14 @@
 //! only when the text has outgrown the budget (and then far enough ahead
 //! to last a while), so the prompt doesn't change at its start with
 //! every line typed.
+//!
+//! The model is always asked for its whole completion, but only as much
+//! of it as the model is sure enough of is offered: the lines from the
+//! start up to the first it isn't, or when that is the first, as much of
+//! it as it is sure of, by the [`ConfidenceThresholds`] the settings
+//! give. The outcome carries both, and how sure the model was of each
+//! line and token, so that a tool measuring the model can see all it
+//! said and how much of it the user would see at any thresholds.
 
 use crate::indent::Indentation;
 use crate::settings::Settings;
@@ -76,16 +84,22 @@ pub struct CompletionRequest {
 }
 
 /// What a worker reports back.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CompletionOutcome {
     /// A completion for the request `serial` from the editor `owner`. The
     /// text is what the model proposes inserting at the cursor, with
     /// `\n` line breaks; it may be empty when the model had nothing to
-    /// add.
+    /// add. `offered` is how many bytes of it, from the start, the model
+    /// is sure enough of to offer (see [`ConfidenceThresholds`]); the
+    /// rest is what it went on to say, which only tools measuring the
+    /// model look at. `lines` is how sure it was of each line of the
+    /// text, for such a tool to see what other thresholds would offer.
     Completed {
         owner: u64,
         serial: u64,
         text: String,
+        offered: usize,
+        lines: Vec<LineConfidence>,
     },
     /// A language's model could not be loaded. Reported once per
     /// configured path; requests for the language are then dropped until
@@ -93,10 +107,120 @@ pub enum CompletionOutcome {
     Failed { language: Language, error: String },
 }
 
+/// How sure the model was of one line of a completion.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LineConfidence {
+    /// Where the line ends in the completion's text, in bytes, before its
+    /// line break. Zero for a line that ends in text the user had
+    /// already typed.
+    pub end: usize,
+    /// The geometric mean of the probabilities of its tokens, 0 to 1.
+    pub confidence: f32,
+    /// The probability of its least likely token, 0 to 1.
+    pub min_prob: f32,
+    /// Whether it has only whitespace, which the model can't be said to
+    /// be sure of or not (its confidence is zero).
+    pub blank: bool,
+    /// How sure it was of each of the line's tokens, in order.
+    pub tokens: Vec<TokenConfidence>,
+}
+
+/// How sure the model was of one token of a completion.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TokenConfidence {
+    /// Where the token ends in the completion's text, in bytes. Zero for
+    /// a token that ends in text the user had already typed.
+    pub end: usize,
+    /// Its probability, 0 to 1.
+    pub prob: f32,
+    /// Whether the text may be cut after it: it doesn't end partway
+    /// through a word that the text goes on with.
+    pub word_end: bool,
+}
+
+/// How sure the model must be of a line of a completion for the line to
+/// be offered, from the settings: lower for a more eager completer,
+/// higher for a more cautious one. A completion is offered from its
+/// start up to the first line that falls short of either threshold.
+/// Blank lines have no tokens to be sure of, so they don't count either
+/// way: they are offered only on the way to a line that is.
+///
+/// When the first line with text falls short, the start of it may be
+/// offered instead, as when the model is sure which function is called
+/// but not what with: the tokens before the first that falls short of
+/// the token threshold, as far as they meet the line threshold together
+/// and end a word.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConfidenceThresholds {
+    /// The least geometric mean of the probabilities of a line's tokens,
+    /// 0 to 1.
+    pub line: f64,
+    /// The least probability of any one token of a line, 0 to 1.
+    pub token: f64,
+}
+
+impl ConfidenceThresholds {
+    /// A middle course, from the completion evaluation's `--sweep` of
+    /// the first Rust model: it offers more than half the completions, a
+    /// third of them right in full, where offering everything is right in
+    /// full one time in fifteen or so.
+    pub const DEFAULT: ConfidenceThresholds = ConfidenceThresholds {
+        line: 0.7,
+        token: 0.4,
+    };
+
+    /// How many bytes of a completion whose lines are `lines` to offer:
+    /// up to the end of the last line before the first with text that
+    /// isn't confident enough, so blank lines are offered only before a
+    /// line that is, or when that is the first, the start of it the
+    /// model is sure of.
+    pub fn offered(self, lines: &[LineConfidence]) -> usize {
+        let mut offered = 0;
+        for (i, line) in lines.iter().filter(|line| !line.blank).enumerate() {
+            if f64::from(line.confidence) < self.line || f64::from(line.min_prob) < self.token {
+                if i == 0 {
+                    offered = self.confident_start(line);
+                }
+                break;
+            }
+            offered = line.end;
+        }
+        offered
+    }
+
+    /// Where the start of `line` that the model is sure enough of ends:
+    /// at the last word end among the tokens before the first that falls
+    /// short of the token threshold where the tokens up to it meet the
+    /// line threshold together. Zero if there is none.
+    fn confident_start(self, line: &LineConfidence) -> usize {
+        let mut end = 0;
+        let mut logprob_sum = 0.0;
+        for (i, token) in line.tokens.iter().enumerate() {
+            let prob = f64::from(token.prob);
+            if prob < self.token {
+                break;
+            }
+            logprob_sum += prob.max(1e-30).ln();
+            let confidence = (logprob_sum / (i + 1) as f64).exp();
+            if confidence >= self.line && token.word_end {
+                end = token.end;
+            }
+        }
+        end
+    }
+}
+
+impl Default for ConfidenceThresholds {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// A job for a worker.
 struct Job {
     owner: u64,
     request: CompletionRequest,
+    thresholds: ConfidenceThresholds,
 }
 
 struct Worker {
@@ -113,6 +237,8 @@ pub struct Completer {
     /// Model paths set with [`override_model`](Self::override_model),
     /// which the settings don't replace.
     overrides: HashMap<Language, String>,
+    /// How much of each completion to offer, from the settings.
+    thresholds: ConfidenceThresholds,
     outcomes: Receiver<CompletionOutcome>,
     outcome_tx: Sender<CompletionOutcome>,
     waker: Option<Waker>,
@@ -131,6 +257,7 @@ impl Completer {
         Completer {
             workers: HashMap::new(),
             overrides: HashMap::new(),
+            thresholds: ConfidenceThresholds::default(),
             outcomes,
             outcome_tx,
             waker: None,
@@ -168,9 +295,12 @@ impl Completer {
 
     /// Use the model the settings name for each language, or none where
     /// they name none, except for languages whose model has been
-    /// [overridden](Self::override_model). Models that haven't changed
-    /// are kept, so this can be called whenever the settings change.
+    /// [overridden](Self::override_model), and the confidence thresholds
+    /// they give for the requests from now on. Models that haven't
+    /// changed are kept, so this can be called whenever the settings
+    /// change.
     pub fn apply_settings(&mut self, settings: &Settings) {
+        self.thresholds = settings.completion_thresholds();
         for language in Language::ALL {
             if !self.overrides.contains_key(&language) {
                 self.set_model(language, settings.completion_model(language));
@@ -228,7 +358,12 @@ impl Completer {
         let Some(worker) = self.workers.get(&language) else {
             return;
         };
-        if worker.jobs.send(Job { owner, request }).is_err() {
+        let job = Job {
+            owner,
+            request,
+            thresholds: self.thresholds,
+        };
+        if worker.jobs.send(job).is_err() {
             // The worker's thread is gone, which only happens if it
             // panicked; don't keep sending into the void.
             self.workers.remove(&language);
@@ -351,12 +486,14 @@ fn run_worker(
             }
             Err(_) => false,
         };
-        let text = engine.complete(&job.request, &mut cancel);
-        if let Some(text) = text {
+        let answer = engine.complete(&job.request, &mut cancel);
+        if let Some((text, lines)) = answer {
             let _ = outcomes.send(CompletionOutcome::Completed {
                 owner: job.owner,
                 serial: job.request.serial,
                 text,
+                offered: job.thresholds.offered(&lines),
+                lines,
             });
             wake();
         }
@@ -412,12 +549,13 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Run one request. `None` if it was cancelled.
+    /// Run one request: the text of the completion and how sure the
+    /// model was of each of its lines. `None` if it was cancelled.
     fn complete(
         &mut self,
         request: &CompletionRequest,
         cancel: &mut dyn FnMut() -> bool,
-    ) -> Option<String> {
+    ) -> Option<(String, Vec<LineConfidence>)> {
         let tok = self.tokenizer;
         let (indent, indent_str) = match request.indentation {
             Indentation::Spaces(n) => (Indent::Spaces(n.max(1)), " ".repeat(n.max(1))),
@@ -473,7 +611,55 @@ impl<'a> Engine<'a> {
         }
         // The generated text begins with the partial the user typed.
         let text = tok.decode(&completion.tokens(), &indent_str);
-        Some(text.get(partial.len()..).unwrap_or("").to_owned())
+        let text = text.get(partial.len()..).unwrap_or("").to_owned();
+        // Each token's end, and each line's, is where the text up to it
+        // ends.
+        let mut ids = Vec::new();
+        let end_of = |ids: &[u32]| {
+            let mut end = tok
+                .decode(ids, &indent_str)
+                .len()
+                .saturating_sub(partial.len())
+                .min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            end
+        };
+        let lines = completion
+            .lines
+            .iter()
+            .map(|line| {
+                let tokens = line
+                    .tokens
+                    .iter()
+                    .zip(&line.probs)
+                    .map(|(&id, &prob)| {
+                        ids.push(id);
+                        let end = end_of(&ids);
+                        TokenConfidence {
+                            end,
+                            prob,
+                            word_end: !splits_word(&text, end),
+                        }
+                    })
+                    .collect();
+                let end = end_of(&ids);
+                ids.extend(line.newline);
+                LineConfidence {
+                    end,
+                    confidence: line.confidence,
+                    min_prob: line.min_prob,
+                    blank: line.tokens.iter().all(|&t| {
+                        token_set.render[t as usize]
+                            .iter()
+                            .all(u8::is_ascii_whitespace)
+                    }),
+                    tokens,
+                }
+            })
+            .collect();
+        Some((text, lines))
     }
 
     /// Where in `context` the window that goes into the prompt starts:
@@ -540,6 +726,13 @@ impl<'a> Engine<'a> {
         self.anchor = Some(start + candidates[low]);
         candidates[low]
     }
+}
+
+/// Whether cutting `text` at `at` would split a word: the characters on
+/// either side are both of an identifier or a number.
+fn splits_word(text: &str, at: usize) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    text[..at].chars().next_back().is_some_and(word) && text[at..].chars().next().is_some_and(word)
 }
 
 #[cfg(test)]
@@ -695,8 +888,8 @@ mod tests {
         });
         eprintln!("first answer after {:?}", started.elapsed());
         match &outcomes[0] {
-            CompletionOutcome::Completed { text, .. } => {
-                eprintln!("completion: {text:?}");
+            CompletionOutcome::Completed { text, offered, .. } => {
+                eprintln!("completion: {text:?}, offering {:?}", &text[..*offered]);
                 assert!(!text.is_empty());
             }
             CompletionOutcome::Failed { error, .. } => panic!("{error}"),
@@ -769,6 +962,208 @@ mod tests {
                 [CompletionOutcome::Completed { serial: 1, .. }]
             ),
             "{outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn lines_are_offered_up_to_the_first_the_model_is_unsure_of() {
+        // Each line two bytes long and followed by a line break, so the
+        // n-th (from 1) ends at 3n - 1.
+        let lines = |lines: &[(f32, f32)]| -> Vec<LineConfidence> {
+            lines
+                .iter()
+                .enumerate()
+                .map(|(i, &(confidence, min_prob))| LineConfidence {
+                    end: 3 * i + 2,
+                    confidence,
+                    min_prob,
+                    blank: confidence == 0.0,
+                    tokens: Vec::new(),
+                })
+                .collect()
+        };
+        let offered = |sure: &[(f32, f32)], line: f64, token: f64| {
+            ConfidenceThresholds { line, token }.offered(&lines(sure))
+        };
+        let (sure, unsure, blank) = ((0.9, 0.6), (0.4, 0.1), (0.0, 0.0));
+        assert_eq!(offered(&[sure, sure, unsure, sure], 0.5, 0.0), 5);
+        // Either threshold can stop it.
+        assert_eq!(offered(&[sure, (0.9, 0.2)], 0.5, 0.0), 5);
+        assert_eq!(offered(&[sure, (0.9, 0.2)], 0.5, 0.3), 2);
+        assert_eq!(offered(&[unsure, sure], 0.5, 0.0), 0);
+        assert_eq!(offered(&[unsure, sure], 0.0, 0.0), 5);
+        // Blank lines, whose confidence is zero, are passed over on the
+        // way to a line the model is sure of, but never end what is
+        // offered, nor make up all of it.
+        assert_eq!(offered(&[blank, sure], 0.5, 0.5), 5);
+        assert_eq!(offered(&[sure, blank, sure], 0.5, 0.5), 8);
+        assert_eq!(offered(&[sure, blank, unsure], 0.5, 0.0), 2);
+        assert_eq!(offered(&[sure, blank], 0.0, 0.0), 2);
+        assert_eq!(offered(&[blank, blank], 0.0, 0.0), 0);
+        assert_eq!(offered(&[], 0.0, 0.0), 0);
+    }
+
+    #[test]
+    fn the_start_of_a_first_line_the_model_is_sure_of_is_offered() {
+        // `    foo_bar(x, y);` after a blank line, a token at a time with
+        // how sure the model was of each, and a line after it.
+        let text = "\n    foo_bar(x, y);\n    done();";
+        let probs = [
+            ("foo", 0.99),
+            ("_bar", 0.95),
+            ("(", 0.9),
+            ("x", 0.3),
+            (",", 0.9),
+            (" y", 0.9),
+            (");", 0.9),
+        ];
+        let mut end = "\n    ".len();
+        let tokens: Vec<TokenConfidence> = probs
+            .iter()
+            .map(|&(token, prob)| {
+                end += token.len();
+                TokenConfidence {
+                    end,
+                    prob,
+                    word_end: !splits_word(text, end),
+                }
+            })
+            .collect();
+        let line = |tokens: &[TokenConfidence]| {
+            let logprob_sum: f32 = tokens.iter().map(|t| t.prob.ln()).sum();
+            LineConfidence {
+                end: tokens.last().unwrap().end,
+                confidence: (logprob_sum / tokens.len() as f32).exp(),
+                min_prob: tokens.iter().map(|t| t.prob).fold(1.0, f32::min),
+                blank: false,
+                tokens: tokens.to_vec(),
+            }
+        };
+        let blank = LineConfidence {
+            end: 0,
+            confidence: 0.0,
+            min_prob: 0.0,
+            blank: true,
+            tokens: Vec::new(),
+        };
+        let lines = [blank, line(&tokens)];
+        let at = |line, token| ConfidenceThresholds { line, token };
+        let offered = |t: ConfidenceThresholds| &text[..t.offered(&lines)];
+        // Up to the token that falls short, with the blank line before.
+        assert_eq!(offered(at(0.7, 0.4)), "\n    foo_bar(");
+        // Never partway through a word: `foo` alone would be.
+        assert!(!tokens[0].word_end && tokens[1].word_end);
+        assert_eq!(offered(at(0.7, 0.96)), "");
+        // Only as far as the tokens meet the line threshold together.
+        assert_eq!(offered(at(0.96, 0.4)), "\n    foo_bar");
+        assert_eq!(offered(at(0.99, 0.4)), "");
+        // Only the first line with text is offered in part: after a line
+        // it is sure of, one it isn't is left out whole.
+        let (first, second) = (line(&tokens[..3]), line(&tokens[3..]));
+        let lines = [first, second];
+        assert_eq!(at(0.7, 0.4).offered(&lines), "\n    foo_bar(".len());
+        // The second averages (0.3 * 0.9^3)^(1/4), about 0.68.
+        assert_eq!(at(0.6, 0.2).offered(&lines), text.find(';').unwrap() + 1);
+    }
+
+    #[test]
+    fn a_word_is_not_split() {
+        assert!(splits_word("foo_bar", 3));
+        assert!(splits_word("x1", 1));
+        assert!(!splits_word("foo(", 3));
+        assert!(!splits_word("foo bar", 3));
+        assert!(!splits_word("foo", 3));
+        assert!(!splits_word("foo", 0));
+        assert!(splits_word("héllo", 1));
+    }
+
+    #[test]
+    fn the_offered_part_is_the_start_of_the_text() {
+        let (model, tokenizer) = tiny_model();
+        let mut engine = Engine::new(&model, &tokenizer);
+        let everything = ConfidenceThresholds {
+            line: 0.0,
+            token: 0.0,
+        };
+        let nothing = ConfidenceThresholds {
+            line: 1.0,
+            token: 1.0,
+        };
+        // Ending at a token boundary, partway through one, and with a
+        // line break and indentation still to be covered.
+        for prefix in [
+            "fn main() {\n    let x = ",
+            "fn main() {\n    let xy",
+            "fn main() {\n    ",
+        ] {
+            let request = request(1, prefix, "\n}\n");
+            let (text, lines) = engine.complete(&request, &mut || false).unwrap();
+            let mut last = 0;
+            for line in &lines {
+                assert!(
+                    line.end >= last && text.is_char_boundary(line.end),
+                    "{prefix:?}"
+                );
+                // The line break before it, then the line.
+                let content = &text[last..line.end];
+                assert!(
+                    content.matches('\n').count() <= 1,
+                    "{prefix:?}: {content:?}"
+                );
+                assert!(
+                    !content.trim_start().contains('\n'),
+                    "{prefix:?}: {content:?}"
+                );
+                assert_eq!(
+                    line.blank,
+                    content.trim().is_empty(),
+                    "{prefix:?}: {content:?}"
+                );
+                // Its tokens end in order through it, and at its end.
+                let mut token_end = last;
+                for token in &line.tokens {
+                    assert!(
+                        token.end >= token_end && token.end <= line.end,
+                        "{prefix:?}"
+                    );
+                    assert_eq!(token.word_end, !splits_word(&text, token.end));
+                    token_end = token.end;
+                }
+                if !line.tokens.is_empty() {
+                    assert_eq!(token_end, line.end, "{prefix:?}");
+                }
+                last = line.end;
+            }
+            // All but blank lines at the end are offered.
+            let offered = everything.offered(&lines);
+            assert!(
+                text[offered..].trim().is_empty(),
+                "{prefix:?}: {text:?} {offered}"
+            );
+            assert_eq!(nothing.offered(&lines), 0, "{prefix:?}");
+        }
+    }
+
+    #[test]
+    fn the_thresholds_come_from_the_settings_with_each_request() {
+        use crate::settings::SettingKey;
+        let mut settings = Settings::default();
+        let mut completer = Completer::new();
+        completer.apply_settings(&settings);
+        assert_eq!(completer.thresholds, ConfidenceThresholds::DEFAULT);
+        settings
+            .set_text(SettingKey::CompletionLineConfidence, "0.25")
+            .unwrap();
+        settings
+            .set_text(SettingKey::CompletionTokenConfidence, "0.125")
+            .unwrap();
+        completer.apply_settings(&settings);
+        assert_eq!(
+            completer.thresholds,
+            ConfidenceThresholds {
+                line: 0.25,
+                token: 0.125,
+            }
         );
     }
 

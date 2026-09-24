@@ -1681,12 +1681,14 @@ impl App {
                     owner,
                     serial,
                     text,
+                    offered,
+                    ..
                 } => {
                     if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == owner)
                         && tab
                             .view
                             .editor_mut_in_place()
-                            .offer_completion(serial, &text)
+                            .offer_completion_clipped(serial, &text, offered)
                     {
                         tab.view.reveal_suggestion();
                         redraw = true;
@@ -8472,14 +8474,20 @@ mod tests {
             owner,
             serial: serial - 1,
             text: "stale".to_owned(),
+            offered: 5,
+            lines: Vec::new(),
         });
         assert!(!app.handle_app_event(AppEvent::CompletionReady));
         assert!(app.tabs[0].view.editor().suggestion().is_none());
-        // The answer to the latest one is the suggestion.
+        // The answer to the latest one is the suggestion, as far as the
+        // model was sure enough to offer it.
+        let offered = "et a = 1;\n    let b = 2;";
         app.completer.inject(CompletionOutcome::Completed {
             owner,
             serial,
-            text: "et a = 1;\n    let b = 2;".to_owned(),
+            text: format!("{offered}\n    unsure();"),
+            offered: offered.len(),
+            lines: Vec::new(),
         });
         assert!(app.handle_app_event(AppEvent::CompletionReady));
         let screen = draw(&mut app, 30, 8);
@@ -8504,6 +8512,8 @@ mod tests {
             owner: owner + 100,
             serial: 1,
             text: "x".to_owned(),
+            offered: 1,
+            lines: Vec::new(),
         });
         assert!(!app.take_completions());
     }

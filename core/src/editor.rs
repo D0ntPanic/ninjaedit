@@ -119,6 +119,13 @@
 //! is asked for. A suggestion never goes past the end of the scope the
 //! cursor is in, so it can't propose a closing bracket that pairing has
 //! already typed (see [`Editor::offer_completion`]).
+//!
+//! A completion comes with how much of it the model is sure enough of
+//! to offer (see [`ConfidenceThresholds`](crate::ConfidenceThresholds)),
+//! and only that much is the suggestion: shown, taken, and typed along
+//! with. The rest is kept with it for tools that measure the model, as
+//! [`Editor::full_suggestion`], but is never shown, and once the offered
+//! part is used up the next completion is asked for as usual.
 
 use crate::auto_indent::{self, CodeLine, CodeStyle, Indenter, Rules};
 use crate::buffer::{BufferSnapshot, DiskChange, FileBuffer};
@@ -243,9 +250,14 @@ struct UndoEntry {
 /// A completion proposed at the cursor; see the [module
 /// documentation](self).
 struct Suggestion {
-    /// What is left to insert at the cursor, with `\n` line breaks.
-    /// Never empty.
+    /// What is left of the completion to insert at the cursor, with `\n`
+    /// line breaks, offered or not. Never empty.
     text: String,
+    /// How many bytes of `text`, from its start, are offered. Zero only
+    /// for a completion that offered nothing, kept for
+    /// [`Editor::full_suggestion`] until anything happens; a suggestion
+    /// whose offered part is used up is dropped.
+    offered: usize,
     /// Whether Tab has taken its first line, so that the next Tab takes
     /// all the rest.
     accepted_line: bool,
@@ -1021,21 +1033,24 @@ impl Editor {
     /// typing, which asks for a completion unless a suggestion remains.
     pub fn insert_char(&mut self, c: char) {
         let newline = c == '\n' || c == '\r';
-        let suggestion = self.suggestion.take();
+        let suggestion = self.take_offered_suggestion();
         if let Some(suggestion) = &suggestion
             && newline
             && suggestion.text.starts_with('\n')
         {
             self.insert_newline();
             let before_closer = suggestion.before_closer.clone();
-            self.continue_suggestion_on_next_line(&suggestion.text[1..], before_closer);
+            let offered = suggestion.offered - 1;
+            self.continue_suggestion_on_next_line(&suggestion.text[1..], offered, before_closer);
             return;
         }
         let mut bytes = [0u8; 4];
         let typed = c.encode_utf8(&mut bytes);
+        // The suggestion offers at least its first character, so the
+        // character typed along with it was offered.
         let rest = suggestion.filter(|_| !newline).and_then(|s| {
             let rest = s.text.strip_prefix(&*typed)?.to_owned();
-            Some((rest, s.before_closer))
+            Some((rest, s.offered - typed.len(), s.before_closer))
         });
         if newline {
             self.insert_newline();
@@ -1043,7 +1058,9 @@ impl Editor {
             self.type_char(c);
         }
         match rest {
-            Some((rest, before_closer)) => self.keep_suggestion(&rest, before_closer),
+            Some((rest, offered, before_closer)) => {
+                self.keep_suggestion(&rest, offered, before_closer)
+            }
             None => self.completion_wanted = true,
         }
     }
@@ -1652,26 +1669,46 @@ impl Editor {
 
     /// The completion proposed at the cursor, for a frontend to show as
     /// ghost text: what would be inserted there, with `\n` line breaks.
-    /// `None` when there is none. Never empty.
+    /// Only the part the model is sure enough of to offer; `None` when
+    /// there is none. Never empty.
     pub fn suggestion(&self) -> Option<&str> {
-        self.suggestion.as_ref().map(|s| s.text.as_str())
+        self.offered_suggestion().map(|s| &s.text[..s.offered])
     }
 
     pub fn has_suggestion(&self) -> bool {
-        self.suggestion.is_some()
+        self.offered_suggestion().is_some()
+    }
+
+    /// The completion proposed at the cursor in full, offered or not,
+    /// confined to the cursor's scope as the suggestion is: what the
+    /// model said, for a tool that measures it.
+    /// [`suggestion`](Self::suggestion), when there is one, is the start
+    /// of it. `None` when there is none, or the model said nothing.
+    pub fn full_suggestion(&self) -> Option<&str> {
+        self.suggestion.as_ref().map(|s| s.text.as_str())
+    }
+
+    /// The suggestion, if it offers anything.
+    fn offered_suggestion(&self) -> Option<&Suggestion> {
+        self.suggestion.as_ref().filter(|s| s.offered > 0)
+    }
+
+    /// Take the suggestion, if it offers anything, leaving none.
+    fn take_offered_suggestion(&mut self) -> Option<Suggestion> {
+        self.suggestion.take().filter(|s| s.offered > 0)
     }
 
     /// Whether the next [`accept_suggestion`](Self::accept_suggestion)
     /// takes all of the suggestion rather than its first line, because
     /// the last one took a line and nothing has been typed since.
     pub fn suggestion_continues(&self) -> bool {
-        self.suggestion.as_ref().is_some_and(|s| s.accepted_line)
+        self.offered_suggestion().is_some_and(|s| s.accepted_line)
     }
 
     /// Drop the suggestion without asking for another. Returns whether
     /// there was one.
     pub fn dismiss_suggestion(&mut self) -> bool {
-        let had = self.suggestion.is_some();
+        let had = self.has_suggestion();
         self.drop_suggestion();
         had
     }
@@ -1691,14 +1728,15 @@ impl Editor {
     /// whitespace the suggestion had before its own bracket in front of
     /// the buffer's, so that the bracket goes where it proposed.
     pub fn accept_suggestion(&mut self) -> bool {
-        let Some(suggestion) = self.suggestion.take() else {
+        let Some(suggestion) = self.take_offered_suggestion() else {
             return false;
         };
         let text = suggestion.text;
+        let offered = suggestion.offered;
         let end = if suggestion.accepted_line {
-            text.len()
+            offered
         } else {
-            first_line_end(&text)
+            first_line_end(&text[..offered])
         };
         let (taken, rest) = text.split_at(end);
         let pair = self.closer_to_pair(taken);
@@ -1724,7 +1762,9 @@ impl Editor {
             cursor,
             None,
         );
-        self.suggestion = self.confine_to_scope(rest, suggestion.before_closer, true);
+        self.suggestion = self
+            .confine_to_scope(rest, offered - end, suggestion.before_closer, true)
+            .filter(|s| s.offered > 0);
         if self.suggestion.is_none() {
             self.completion_wanted = true;
         }
@@ -1814,9 +1854,11 @@ impl Editor {
     }
 
     /// The answer to the request numbered `serial`: `text` is what the
-    /// model proposes inserting at the cursor. Becomes the suggestion if
-    /// the request is still the latest and the text says something;
-    /// returns whether it did.
+    /// model proposes inserting at the cursor, all of it offered. Becomes
+    /// the suggestion if the request is still the latest and the text
+    /// says something; returns whether it did. See
+    /// [`offer_completion_clipped`](Self::offer_completion_clipped) for
+    /// a completion only the start of which is offered.
     ///
     /// A suggestion stays within the scope the cursor is in: it is cut
     /// at its first closing bracket that closes a bracket opened before
@@ -1832,12 +1874,28 @@ impl Editor {
     /// confined to the block, so anything after it would be shown but
     /// never taken.
     pub fn offer_completion(&mut self, serial: u64, text: &str) -> bool {
+        self.offer_completion_clipped(serial, text, text.len())
+    }
+
+    /// As [`offer_completion`](Self::offer_completion), for a completion
+    /// of which only the first `offered` bytes are offered, the rest being
+    /// what the model is less sure of (see the [module
+    /// documentation](self)). Returns whether anything is offered; the
+    /// whole completion is kept for
+    /// [`full_suggestion`](Self::full_suggestion) even if nothing is.
+    pub fn offer_completion_clipped(&mut self, serial: u64, text: &str, offered: usize) -> bool {
         if serial != self.completion_serial || self.selection().is_some() {
             return false;
         }
-        let text = text.replace('\r', "");
-        self.suggestion = self.confine_to_scope(&text, None, false);
-        self.suggestion.is_some()
+        let mut offered = offered.min(text.len());
+        while !text.is_char_boundary(offered) {
+            offered -= 1;
+        }
+        let (head, tail) = text.split_at(offered);
+        let head = head.replace('\r', "");
+        let text = head.clone() + &tail.replace('\r', "");
+        self.suggestion = self.confine_to_scope(&text, head.len(), None, false);
+        self.has_suggestion()
     }
 
     /// Forget the suggestion, and any answer still to come to the last
@@ -1850,7 +1908,9 @@ impl Editor {
 
     /// `text`, proposed at the cursor, as a suggestion confined to the
     /// cursor's scope (see [`offer_completion`](Self::offer_completion)),
-    /// or `None` if nothing is left of it. `before_closer` is what the
+    /// or `None` if nothing is left of it. Its first `offered` bytes are
+    /// offered, less what is cut off or left as trailing whitespace; the
+    /// suggestion may offer nothing. `before_closer` is what the
     /// suggestion `text` is the rest of had, kept if `text` doesn't reach
     /// the end of the scope.
     ///
@@ -1859,6 +1919,7 @@ impl Editor {
     fn confine_to_scope(
         &self,
         text: &str,
+        offered: usize,
         before_closer: Option<String>,
         accepted_line: bool,
     ) -> Option<Suggestion> {
@@ -1879,8 +1940,10 @@ impl Editor {
             kept = &kept[..=end];
             before_closer = None;
         }
+        let offered = kept[..offered.min(kept.len())].trim_end().len();
         (!kept.is_empty()).then(|| Suggestion {
             text: kept.to_owned(),
+            offered,
             accepted_line,
             before_closer,
         })
@@ -1962,24 +2025,33 @@ impl Editor {
             .map(|(i, b)| (self.cursor + i, b))
     }
 
-    /// What is left of a suggestion after typing part of it: kept as the
-    /// suggestion, confined to the scope the cursor is now in, or, when
-    /// it has all been typed, gone, with the next completion asked for.
-    fn keep_suggestion(&mut self, rest: &str, before_closer: Option<String>) {
-        self.suggestion = self.confine_to_scope(rest, before_closer, false);
+    /// What is left of a suggestion after typing part of it, of which
+    /// the first `offered` bytes are offered: kept as the suggestion,
+    /// confined to the scope the cursor is now in, or, when all it
+    /// offered has been typed, gone, with the next completion asked for.
+    fn keep_suggestion(&mut self, rest: &str, offered: usize, before_closer: Option<String>) {
+        self.suggestion = self
+            .confine_to_scope(rest, offered, before_closer, false)
+            .filter(|s| s.offered > 0);
         if self.suggestion.is_none() {
             self.completion_wanted = true;
         }
     }
 
     /// After a line break typed along with a suggestion: `rest` is the
-    /// suggestion from its next line on. The line's indentation in the
+    /// suggestion from its next line on, of which the first `offered`
+    /// bytes are offered. The line's indentation in the
     /// suggestion becomes the pending indentation of the new line (in
     /// place of the one copied from the line above), so the cursor
     /// shows where the suggestion goes on; where the line break split a
     /// line and indentation was written out, the suggestion has to
     /// agree with it.
-    fn continue_suggestion_on_next_line(&mut self, rest: &str, before_closer: Option<String>) {
+    fn continue_suggestion_on_next_line(
+        &mut self,
+        rest: &str,
+        offered: usize,
+        before_closer: Option<String>,
+    ) {
         let indent_len = rest
             .bytes()
             .take_while(|&b| b == b' ' || b == b'\t')
@@ -1990,12 +2062,16 @@ impl Editor {
             .offset_of_line(self.buffer.line_of_offset(self.cursor));
         if self.pending.is_some() || self.cursor == line_start {
             self.pending = (!indent.is_empty()).then(|| indent.to_owned());
-            self.keep_suggestion(body, before_closer);
+            self.keep_suggestion(body, offered.saturating_sub(indent_len), before_closer);
             return;
         }
         let written = self.buffer.bytes_in_range(line_start..self.cursor);
         match rest.as_bytes().strip_prefix(written.as_slice()) {
-            Some(_) => self.keep_suggestion(&rest[written.len()..], before_closer),
+            Some(_) => self.keep_suggestion(
+                &rest[written.len()..],
+                offered.saturating_sub(written.len()),
+                before_closer,
+            ),
             None => self.completion_wanted = true,
         }
     }
@@ -4416,6 +4492,85 @@ mod tests {
         type_str(&mut ed, "bc");
         assert!(ed.suggestion().is_none());
         assert!(ed.completion_wanted());
+    }
+
+    /// Answer the request typing made with `completion`, of which the
+    /// first `offered` bytes are offered; returns whether any are.
+    fn offer_clipped(ed: &mut Editor, completion: &str, offered: usize) -> bool {
+        let serial = ed.take_completion_request().unwrap().serial;
+        ed.offer_completion_clipped(serial, completion, offered)
+    }
+
+    #[test]
+    fn only_the_offered_part_of_a_completion_is_suggested() {
+        let mut ed = editor("");
+        type_str(&mut ed, "let");
+        let full = " x = 1;\nlet y = 2;\nlet z = 3;";
+        assert!(offer_clipped(&mut ed, full, " x = 1;\nlet y = 2;".len()));
+        assert_eq!(ed.suggestion(), Some(" x = 1;\nlet y = 2;"));
+        assert_eq!(ed.full_suggestion(), Some(full));
+        // Typing along consumes the start of both.
+        type_str(&mut ed, " x = 1;\n");
+        assert_eq!(ed.suggestion(), Some("let y = 2;"));
+        assert_eq!(ed.full_suggestion(), Some("let y = 2;\nlet z = 3;"));
+        assert!(!ed.completion_wanted());
+        // Typing all that was offered asks for the next completion,
+        // though the model said more.
+        type_str(&mut ed, "let y = 2;");
+        assert_eq!(ed.full_suggestion(), None);
+        assert!(ed.completion_wanted());
+
+        // Tab takes a line of what is offered, then the rest of it, and
+        // nothing that wasn't.
+        let mut ed = editor("");
+        type_str(&mut ed, "a");
+        assert!(offer_clipped(&mut ed, "b;\nc;\nd;", "b;\nc;".len()));
+        assert!(ed.accept_suggestion());
+        assert_eq!(text(&ed), "ab;");
+        assert_eq!(ed.suggestion(), Some("\nc;"));
+        assert!(ed.accept_suggestion());
+        assert_eq!(text(&ed), "ab;\nc;");
+        assert!(!ed.has_suggestion());
+        assert!(ed.completion_wanted());
+    }
+
+    #[test]
+    fn a_completion_that_offers_nothing_is_kept_only_to_be_looked_at() {
+        let mut ed = editor("");
+        type_str(&mut ed, "a");
+        assert!(!offer_clipped(&mut ed, "bc", 0));
+        assert!(!ed.has_suggestion());
+        assert_eq!(ed.suggestion(), None);
+        assert_eq!(ed.full_suggestion(), Some("bc"));
+        assert!(!ed.suggestion_continues());
+        assert!(!ed.accept_suggestion());
+        assert_eq!(text(&ed), "a");
+        // Typing what it says isn't typing along with a suggestion.
+        ed.insert_char('b');
+        assert_eq!(ed.full_suggestion(), None);
+        assert!(ed.completion_wanted());
+
+        // Offering only line breaks, or whitespace, is offering nothing;
+        // what is offered ends where its text does.
+        let mut ed = editor("");
+        type_str(&mut ed, "a");
+        assert!(!offer_clipped(&mut ed, "\n\nb", 2));
+        assert_eq!(ed.full_suggestion(), Some("\n\nb"));
+        ed.request_completion();
+        assert!(offer_clipped(&mut ed, "b;\n  \nc;", 6));
+        assert_eq!(ed.suggestion(), Some("b;"));
+        ed.request_completion();
+        assert!(offer_clipped(&mut ed, "b;\r\nc;\r\nd;", 7));
+        assert_eq!(ed.suggestion(), Some("b;\nc;"));
+        assert_eq!(ed.full_suggestion(), Some("b;\nc;\nd;"));
+        // An offered length past the text, or inside a character, is
+        // taken as far as it can be.
+        ed.request_completion();
+        assert!(offer_clipped(&mut ed, "bé", 2));
+        assert_eq!(ed.suggestion(), Some("b"));
+        ed.request_completion();
+        assert!(offer_clipped(&mut ed, "b", 10));
+        assert_eq!(ed.suggestion(), Some("b"));
     }
 
     /// Answer the request typing made with `completion`, returning the

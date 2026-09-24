@@ -32,7 +32,10 @@ pub use build::{
     BuildConfig, BuildRoot, BuildSystem, ConfigurationKey, DEFAULT_CMAKE_GENERATOR, Directories,
     Discovery, DiscoveryResult, Job, Selection, Step, TargetKey, Variable,
 };
-pub use completion::{Completer, CompletionOutcome, CompletionRequest};
+pub use completion::{
+    Completer, CompletionOutcome, CompletionRequest, ConfidenceThresholds, LineConfidence,
+    TokenConfidence,
+};
 pub use diagnostics::{SourceLink, SourceLocation, find_source_links};
 pub use editor::{Cell, ConflictStep, Editor, ExternalChange, Movement, Position};
 pub use highlight_cache::HighlightCache;

@@ -601,6 +601,8 @@ impl Default for CompletionOptions {
 #[derive(Clone, Debug, Default)]
 pub struct Line {
     pub tokens: Vec<u32>,
+    /// The probability of each content token, 0 to 1.
+    pub probs: Vec<f32>,
     pub newline: Option<u32>,
     /// Geometric mean of the content tokens' probabilities, 0 to 1.
     pub confidence: f32,
@@ -614,6 +616,7 @@ pub struct Line {
 impl Line {
     fn push(&mut self, token: u32, prob: f32) {
         self.tokens.push(token);
+        self.probs.push(prob);
         self.logprob_sum += prob.max(1e-30).ln();
         self.min_prob = if self.tokens.len() == 1 {
             prob
@@ -988,6 +991,13 @@ mod tests {
                 .find(|l| !l.tokens.is_empty())
                 .unwrap();
             assert!(first.confidence > 0.0 && first.confidence <= 1.0);
+            for line in &completion.lines {
+                assert_eq!(line.probs.len(), line.tokens.len());
+                if !line.probs.is_empty() {
+                    let min = line.probs.iter().copied().fold(1.0, f32::min);
+                    assert_eq!(line.min_prob, min);
+                }
+            }
         }
     }
 }
