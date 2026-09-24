@@ -7,6 +7,9 @@
 //! categories, one table each:
 //!
 //! ```toml
+//! [editor]
+//! continuation-indent = "indent"
+//!
 //! [terminal]
 //! shell = "/opt/homebrew/bin/fish"
 //! scrollback = 50000
@@ -23,15 +26,18 @@
 //! older one.
 //!
 //! Frontends work through [`SettingKey`], which lists every setting with
-//! its category, name, and description, and through the text form of
-//! each value: a setting is read as text and set from text (a number's
-//! digits, a program's path), with the parsing and the checking done
-//! here. A settings page is so a list of text fields whatever the
-//! settings are, and adding a setting means a variant here and nothing in
-//! the frontend. Code that uses a setting reads it through its typed
+//! its category, name, description, and [kind](SettingKind), and through
+//! the text form of each value: a setting is read as text and set from
+//! text (a number's digits, a program's path, the value of one of its
+//! choices), with the parsing and the checking done here. The kind tells
+//! a frontend which control suits the setting, a text field or a choice
+//! among a fixed set of options, and a settings page is so a list of
+//! such controls whatever the settings are: adding a setting means a
+//! variant here and nothing in the frontend. Code that uses a setting reads it through its typed
 //! accessor, [`terminal_scrollback`](Settings::terminal_scrollback) and
 //! the like.
 
+use crate::auto_indent::{CodeStyle, ContinuationIndent};
 use crate::build::DEFAULT_CMAKE_GENERATOR;
 use crate::project_search::MAX_MATCHES;
 use crate::terminal::emulator::DEFAULT_SCROLLBACK;
@@ -41,6 +47,7 @@ use toml::{Table, Value};
 /// A group of related settings, shown together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Category {
+    Editor,
     Terminal,
     Search,
     Build,
@@ -48,10 +55,16 @@ pub enum Category {
 
 impl Category {
     /// Every category, in the order a settings page shows them.
-    pub const ALL: [Category; 3] = [Category::Terminal, Category::Search, Category::Build];
+    pub const ALL: [Category; 4] = [
+        Category::Editor,
+        Category::Terminal,
+        Category::Search,
+        Category::Build,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
+            Category::Editor => "Editor",
             Category::Terminal => "Terminal",
             Category::Search => "Search",
             Category::Build => "Build",
@@ -61,6 +74,7 @@ impl Category {
     /// The category's table in the settings file.
     fn table(self) -> &'static str {
         match self {
+            Category::Editor => "editor",
             Category::Terminal => "terminal",
             Category::Search => "search",
             Category::Build => "build",
@@ -75,10 +89,48 @@ impl Category {
     }
 }
 
+/// What kind of value a setting holds, for a frontend to pick a control
+/// for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingKind {
+    /// Text typed by the user, checked when it is set: a path, a name, a
+    /// number.
+    Text,
+    /// One of a fixed set of options, listed in the order a frontend
+    /// shows them.
+    Choice(&'static [SettingChoice]),
+}
+
+/// One option of a [`SettingKind::Choice`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettingChoice {
+    /// The option's value in text form: what [`Settings::text`] reports
+    /// when it is chosen, [`Settings::set_text`] takes to choose it, and
+    /// the settings file holds.
+    pub value: &'static str,
+    /// The option as a frontend shows it.
+    pub label: &'static str,
+}
+
+/// The options of [`SettingKey::ContinuationIndent`].
+const CONTINUATION_CHOICES: [SettingChoice; 2] = [
+    SettingChoice {
+        value: "align",
+        label: "Align with the bracket",
+    },
+    SettingChoice {
+        value: "indent",
+        label: "Indent one level",
+    },
+];
+
 /// One setting. Each variant has a field in [`Settings`] and a key in
 /// the settings file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingKey {
+    /// How lines continuing inside brackets are indented as code is
+    /// typed; see [`ContinuationIndent`].
+    ContinuationIndent,
     /// The program the shell tool runs; blank to detect the user's shell.
     Shell,
     /// How many lines of output a terminal keeps to scroll back through.
@@ -93,7 +145,8 @@ pub enum SettingKey {
 impl SettingKey {
     /// Every setting, in the order a settings page lists them (grouped by
     /// category, in [`Category::ALL`]'s order).
-    pub const ALL: [SettingKey; 4] = [
+    pub const ALL: [SettingKey; 5] = [
+        SettingKey::ContinuationIndent,
         SettingKey::Shell,
         SettingKey::TerminalScrollback,
         SettingKey::SearchMaxResults,
@@ -102,15 +155,28 @@ impl SettingKey {
 
     pub fn category(self) -> Category {
         match self {
+            SettingKey::ContinuationIndent => Category::Editor,
             SettingKey::Shell | SettingKey::TerminalScrollback => Category::Terminal,
             SettingKey::SearchMaxResults => Category::Search,
             SettingKey::CMakeGenerator => Category::Build,
         }
     }
 
+    /// What kind of value the setting holds.
+    pub fn kind(self) -> SettingKind {
+        match self {
+            SettingKey::ContinuationIndent => SettingKind::Choice(&CONTINUATION_CHOICES),
+            SettingKey::Shell
+            | SettingKey::TerminalScrollback
+            | SettingKey::SearchMaxResults
+            | SettingKey::CMakeGenerator => SettingKind::Text,
+        }
+    }
+
     /// The short name shown beside the setting's field.
     pub fn name(self) -> &'static str {
         match self {
+            SettingKey::ContinuationIndent => "Continuation indent",
             SettingKey::Shell => "Shell executable",
             SettingKey::TerminalScrollback => "Scrollback lines",
             SettingKey::SearchMaxResults => "Maximum search results",
@@ -121,6 +187,7 @@ impl SettingKey {
     /// A line about what the setting does.
     pub fn description(self) -> &'static str {
         match self {
+            SettingKey::ContinuationIndent => "How a line continuing inside brackets is indented",
             SettingKey::Shell => "The program the shell tool runs; blank to use your login shell",
             SettingKey::TerminalScrollback => {
                 "Lines of output each terminal keeps to scroll back through"
@@ -137,6 +204,7 @@ impl SettingKey {
     /// The key within the category's table in the settings file.
     fn key(self) -> &'static str {
         match self {
+            SettingKey::ContinuationIndent => "continuation-indent",
             SettingKey::Shell => "shell",
             SettingKey::TerminalScrollback => "scrollback",
             SettingKey::SearchMaxResults => "max-results",
@@ -154,6 +222,9 @@ impl SettingKey {
     /// and what the file leaves out.
     pub fn default_text(self) -> String {
         match self {
+            SettingKey::ContinuationIndent => {
+                continuation_name(ContinuationIndent::default()).to_owned()
+            }
             SettingKey::Shell => String::new(),
             SettingKey::TerminalScrollback => DEFAULT_SCROLLBACK.to_string(),
             SettingKey::SearchMaxResults => MAX_MATCHES.to_string(),
@@ -193,6 +264,7 @@ impl std::error::Error for SettingsError {}
 /// is `None` at its default.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
+    continuation_indent: Option<ContinuationIndent>,
     shell: Option<String>,
     terminal_scrollback: Option<usize>,
     search_max_results: Option<usize>,
@@ -207,6 +279,18 @@ const FILE_HEADER: &str =
 
 impl Settings {
     // ----- Typed accessors ------------------------------------------------
+
+    /// How lines continuing inside brackets are indented.
+    pub fn continuation_indent(&self) -> ContinuationIndent {
+        self.continuation_indent.unwrap_or_default()
+    }
+
+    /// The code style settings together, for an editor to lay out code by.
+    pub fn code_style(&self) -> CodeStyle {
+        CodeStyle {
+            continuation: self.continuation_indent(),
+        }
+    }
 
     /// The program the shell tool runs, or `None` to detect the user's
     /// shell.
@@ -238,6 +322,9 @@ impl Settings {
     /// left to be detected.
     pub fn text(&self, key: SettingKey) -> String {
         match key {
+            SettingKey::ContinuationIndent => {
+                continuation_name(self.continuation_indent()).to_owned()
+            }
             SettingKey::Shell => self.shell().unwrap_or_default().to_owned(),
             SettingKey::TerminalScrollback => self.terminal_scrollback().to_string(),
             SettingKey::SearchMaxResults => self.search_max_results().to_string(),
@@ -253,6 +340,11 @@ impl Settings {
         let text = text.trim();
         let before = self.clone();
         match key {
+            SettingKey::ContinuationIndent => {
+                let continuation = parse_continuation(text)?;
+                self.continuation_indent =
+                    (continuation != ContinuationIndent::default()).then_some(continuation);
+            }
             SettingKey::Shell => {
                 self.shell = (!text.is_empty()).then(|| text.to_owned());
             }
@@ -274,6 +366,9 @@ impl Settings {
     /// Whether a setting is at its default.
     pub fn is_default(&self, key: SettingKey) -> bool {
         match key {
+            SettingKey::ContinuationIndent => {
+                self.continuation_indent() == ContinuationIndent::default()
+            }
             SettingKey::Shell => self.shell.is_none(),
             SettingKey::TerminalScrollback => self.terminal_scrollback() == DEFAULT_SCROLLBACK,
             SettingKey::SearchMaxResults => self.search_max_results() == MAX_MATCHES,
@@ -286,6 +381,7 @@ impl Settings {
     pub fn reset(&mut self, key: SettingKey) -> bool {
         let was_default = self.is_default(key);
         match key {
+            SettingKey::ContinuationIndent => self.continuation_indent = None,
             SettingKey::Shell => self.shell = None,
             SettingKey::TerminalScrollback => self.terminal_scrollback = None,
             SettingKey::SearchMaxResults => self.search_max_results = None,
@@ -331,6 +427,16 @@ impl Settings {
     /// Take a setting's value from the file.
     fn read_value(&mut self, key: SettingKey, value: &Value) -> Result<(), SettingsError> {
         match key {
+            SettingKey::ContinuationIndent => {
+                let continuation = value
+                    .as_str()
+                    .and_then(|text| parse_continuation(text.trim()).ok())
+                    .ok_or_else(|| {
+                        SettingsError(format!("`{}` must be \"align\" or \"indent\"", key.path()))
+                    })?;
+                self.continuation_indent =
+                    (continuation != ContinuationIndent::default()).then_some(continuation);
+            }
             SettingKey::Shell => {
                 let shell = value
                     .as_str()
@@ -365,7 +471,7 @@ impl Settings {
                 continue;
             }
             let value = match key {
-                SettingKey::Shell => Value::String(self.text(key)),
+                SettingKey::ContinuationIndent | SettingKey::Shell => Value::String(self.text(key)),
                 SettingKey::TerminalScrollback => Value::Integer(self.terminal_scrollback() as i64),
                 SettingKey::SearchMaxResults => Value::Integer(self.search_max_results() as i64),
                 SettingKey::CMakeGenerator => Value::String(self.text(key)),
@@ -379,6 +485,28 @@ impl Settings {
         }
         format!("{FILE_HEADER}\n{table}")
     }
+}
+
+/// Each [`ContinuationIndent`], in the order of [`CONTINUATION_CHOICES`].
+const CONTINUATIONS: [ContinuationIndent; 2] =
+    [ContinuationIndent::Align, ContinuationIndent::Indent];
+
+/// The text form of a [`ContinuationIndent`]: its choice's value.
+fn continuation_name(continuation: ContinuationIndent) -> &'static str {
+    let index = CONTINUATIONS
+        .iter()
+        .position(|c| *c == continuation)
+        .expect("every continuation is listed");
+    CONTINUATION_CHOICES[index].value
+}
+
+/// Parse the text form of a [`ContinuationIndent`], in any case.
+fn parse_continuation(text: &str) -> Result<ContinuationIndent, String> {
+    CONTINUATION_CHOICES
+        .iter()
+        .position(|choice| choice.value.eq_ignore_ascii_case(text))
+        .map(|index| CONTINUATIONS[index])
+        .ok_or_else(|| "must be align or indent".to_owned())
 }
 
 /// Parse a count typed into a field: a whole number of at least `min`.
@@ -528,6 +656,65 @@ mod tests {
             Ok(true)
         );
         assert!(settings.is_default(SettingKey::CMakeGenerator));
+    }
+
+    #[test]
+    fn continuation_indent_is_a_choice() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.continuation_indent(), ContinuationIndent::Indent);
+        assert_eq!(settings.text(SettingKey::ContinuationIndent), "indent");
+        assert_eq!(
+            settings.set_text(SettingKey::ContinuationIndent, " Align "),
+            Ok(true)
+        );
+        assert_eq!(settings.continuation_indent(), ContinuationIndent::Align);
+        assert_eq!(
+            settings.code_style().continuation,
+            ContinuationIndent::Align
+        );
+        assert_eq!(settings.text(SettingKey::ContinuationIndent), "align");
+        assert_eq!(
+            settings.set_text(SettingKey::ContinuationIndent, "tab"),
+            Err("must be align or indent".to_owned())
+        );
+        assert_eq!(settings.continuation_indent(), ContinuationIndent::Align);
+
+        let text = settings.to_toml();
+        assert!(text.contains("[editor]"), "{text}");
+        assert!(text.contains("continuation-indent = \"align\""), "{text}");
+        assert_eq!(Settings::parse(&text).unwrap(), settings);
+
+        assert_eq!(
+            settings.set_text(SettingKey::ContinuationIndent, "indent"),
+            Ok(true)
+        );
+        assert!(settings.is_default(SettingKey::ContinuationIndent));
+        assert!(!settings.to_toml().contains("[editor]"));
+        assert_eq!(
+            Settings::parse("[editor]\ncontinuation-indent = \"sideways\"\n")
+                .unwrap_err()
+                .to_string(),
+            "`editor.continuation-indent` must be \"align\" or \"indent\""
+        );
+    }
+
+    #[test]
+    fn every_choice_sets_its_value() {
+        for key in SettingKey::ALL {
+            let SettingKind::Choice(choices) = key.kind() else {
+                continue;
+            };
+            assert!(
+                choices.iter().any(|c| c.value == key.default_text()),
+                "{key:?}: the default is one of the choices"
+            );
+            let mut settings = Settings::default();
+            for choice in choices {
+                assert!(settings.set_text(key, choice.value).is_ok(), "{choice:?}");
+                assert_eq!(settings.text(key), choice.value);
+            }
+        }
+        assert_eq!(SettingKey::Shell.kind(), SettingKind::Text);
     }
 
     #[test]

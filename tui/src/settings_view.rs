@@ -4,27 +4,29 @@
 //! (Ctrl+E) like a tool, and left the same way, or by anything that
 //! brings a file to the front: Ctrl+O, Ctrl+T, a project search match.
 //!
-//! The page lists every [`SettingKey`] under its category as a text
-//! field with the setting's name above it and a line about it below
-//! (wrapped to the page's width).
-//! The fields are a [`Fields`], so Tab and the arrows move between them
-//! and each edits like any text field. A value is applied when its
-//! field is left (Tab, an arrow, a click elsewhere, leaving the page)
-//! or with Enter; Ctrl+S applies every field. Text that isn't a valid
-//! value is refused: the setting keeps its value and the reason shows
-//! under the field until the text changes. Escape puts the field's text
-//! back to the setting's value. A setting changed from its default is
+//! The page lists every [`SettingKey`] under its category as a field
+//! with the setting's name above it and a line about it below (wrapped
+//! to the page's width). The field is a control for the setting's
+//! [kind](SettingKind): a text field, or for a setting with a fixed set
+//! of options, a choice showing them all.
+//! The fields are a [`Fields`], so Tab and Up and Down move between them.
+//! A choice is applied as soon as another option is chosen. Text is
+//! applied when its field is left (Tab, an arrow, a click elsewhere,
+//! leaving the page) or with Enter; Ctrl+S applies every field. Text that
+//! isn't a valid value is refused: the setting keeps its value and the
+//! reason shows under the field until the text changes. Escape puts the
+//! field's text back to the setting's value. A setting changed from its default is
 //! tagged, and Ctrl+D puts the focused one back to its default.
 //!
 //! The page only edits the [`Settings`]; the application saves them and
 //! applies them to what is running whenever the page reports a change.
 
 use crate::clipboard::Clipboard;
-use crate::fields::{FieldKey, Fields, wrap_words};
+use crate::fields::{FieldKey, FieldKind, Fields, wrap_words};
 use crate::palette::palette_background;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use ninjaedit_core::{Category, SettingKey, Settings};
+use ninjaedit_core::{Category, SettingKey, SettingKind, Settings};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
 use ratatui::style::Modifier;
@@ -112,7 +114,17 @@ impl SettingsView {
             }
         }
         let mut view = SettingsView {
-            fields: Fields::new(SettingKey::ALL.len()),
+            fields: Fields::with_kinds(
+                SettingKey::ALL
+                    .into_iter()
+                    .map(|key| match key.kind() {
+                        SettingKind::Text => FieldKind::Text,
+                        SettingKind::Choice(choices) => {
+                            FieldKind::Choice(choices.iter().map(|c| c.label.to_owned()).collect())
+                        }
+                    })
+                    .collect(),
+            ),
             errors: vec![None; SettingKey::ALL.len()],
             lines,
             scroll: 0,
@@ -126,10 +138,43 @@ impl SettingsView {
     /// Show every setting's current value, dropping any text typed into
     /// the fields.
     pub fn refresh(&mut self, settings: &Settings) {
-        for (index, key) in SettingKey::ALL.into_iter().enumerate() {
-            self.fields.set_text(index, &settings.text(key));
-            self.errors[index] = None;
+        for index in 0..SettingKey::ALL.len() {
+            self.show(index, settings);
         }
+    }
+
+    /// Show a setting's current value in its field, dropping any text
+    /// typed into it and the note about refused text.
+    fn show(&mut self, index: usize, settings: &Settings) {
+        let key = SettingKey::ALL[index];
+        let value = settings.text(key);
+        match key.kind() {
+            SettingKind::Text => self.fields.set_text(index, &value),
+            SettingKind::Choice(choices) => {
+                if let Some(option) = choices.iter().position(|c| c.value == value) {
+                    self.fields.choose(index, option);
+                }
+            }
+        }
+        self.errors[index] = None;
+    }
+
+    /// A field's value in the setting's text form: the text typed, or
+    /// the chosen option's value.
+    fn value(&self, index: usize) -> String {
+        match SettingKey::ALL[index].kind() {
+            SettingKind::Text => self.fields.text(index).to_owned(),
+            SettingKind::Choice(choices) => self
+                .fields
+                .chosen(index)
+                .map(|option| choices[option].value.to_owned())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Whether a field is a choice, which applies as soon as it changes.
+    fn is_choice(index: usize) -> bool {
+        matches!(SettingKey::ALL[index].kind(), SettingKind::Choice(_))
     }
 
     /// The setting whose field has the focus.
@@ -138,10 +183,10 @@ impl SettingsView {
         SettingKey::ALL[self.fields.focused()]
     }
 
-    /// The text in a setting's field.
+    /// The value in a setting's field, in the setting's text form.
     #[cfg(test)]
-    pub fn text(&self, key: SettingKey) -> &str {
-        self.fields.text(index_of(key))
+    pub fn text(&self, key: SettingKey) -> String {
+        self.value(index_of(key))
     }
 
     /// Why a setting's text was refused, if it was.
@@ -152,15 +197,14 @@ impl SettingsView {
 
     // ----- Applying values ------------------------------------------------
 
-    /// Apply a field's text to its setting. Text that isn't a valid
+    /// Apply a field's value to its setting. Text that isn't a valid
     /// value is refused and the reason kept for the note under the field.
     fn commit(&mut self, index: usize, settings: &mut Settings) -> SettingsOutcome {
         let key = SettingKey::ALL[index];
-        match settings.set_text(key, self.fields.text(index)) {
+        match settings.set_text(key, &self.value(index)) {
             Ok(changed) => {
-                // The text as the setting has it: trimmed, and so on.
-                self.fields.set_text(index, &settings.text(key));
-                self.errors[index] = None;
+                // The value as the setting has it: trimmed, and so on.
+                self.show(index, settings);
                 if changed {
                     SettingsOutcome::Changed
                 } else {
@@ -188,10 +232,8 @@ impl SettingsView {
     /// Ctrl+D: put the focused setting back to its default.
     pub fn reset_focused(&mut self, settings: &mut Settings) -> SettingsOutcome {
         let index = self.fields.focused();
-        let key = SettingKey::ALL[index];
-        let changed = settings.reset(key);
-        self.fields.set_text(index, &settings.text(key));
-        self.errors[index] = None;
+        let changed = settings.reset(SettingKey::ALL[index]);
+        self.show(index, settings);
         if changed {
             SettingsOutcome::Changed
         } else {
@@ -201,10 +243,7 @@ impl SettingsView {
 
     /// Escape: put the focused field's text back to the setting's value.
     fn revert_focused(&mut self, settings: &Settings) {
-        let index = self.fields.focused();
-        self.fields
-            .set_text(index, &settings.text(SettingKey::ALL[index]));
-        self.errors[index] = None;
+        self.show(self.fields.focused(), settings);
     }
 
     // ----- Input ----------------------------------------------------------
@@ -236,6 +275,9 @@ impl SettingsView {
                 FieldKey::Moved { from, .. } => {
                     self.reveal = true;
                     self.commit(from, settings)
+                }
+                FieldKey::Changed if Self::is_choice(self.fields.focused()) => {
+                    self.commit(self.fields.focused(), settings)
                 }
                 FieldKey::Changed => {
                     self.errors[self.fields.focused()] = None;
@@ -274,10 +316,20 @@ impl SettingsView {
                 self.scroll += WHEEL_LINES;
                 SettingsOutcome::Continue
             }
-            _ => match self.fields.handle_mouse(mouse) {
-                Some(from) => self.commit(from, settings),
-                None => SettingsOutcome::Continue,
-            },
+            _ => {
+                let mut outcome = match self.fields.handle_mouse(mouse) {
+                    Some(from) => self.commit(from, settings),
+                    None => SettingsOutcome::Continue,
+                };
+                // A click on a choice's option chooses it.
+                let focused = self.fields.focused();
+                if Self::is_choice(focused)
+                    && self.commit(focused, settings) == SettingsOutcome::Changed
+                {
+                    outcome = SettingsOutcome::Changed;
+                }
+                outcome
+            }
         }
     }
 
@@ -325,9 +377,13 @@ impl SettingsView {
                         Some(reason) => (reason.clone(), true),
                         None if settings.is_default(key) => (key.description().to_owned(), false),
                         None => {
-                            let default = match key.default_text() {
-                                text if text.is_empty() => "blank".to_owned(),
-                                text => text,
+                            let default = match (key.kind(), key.default_text()) {
+                                (SettingKind::Choice(choices), text) => choices
+                                    .iter()
+                                    .find(|c| c.value == text)
+                                    .map_or(text, |c| c.label.to_owned()),
+                                (_, text) if text.is_empty() => "blank".to_owned(),
+                                (_, text) => text,
                             };
                             (format!("{} (default: {default})", key.description()), false)
                         }
@@ -432,6 +488,7 @@ fn index_of(key: SettingKey) -> usize {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState, MouseButton};
+    use ninjaedit_core::ContinuationIndent;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {
@@ -529,8 +586,13 @@ mod tests {
     fn enter_applies_a_value_and_moving_on_applies_the_field_left() {
         let mut settings = Settings::default();
         let mut view = SettingsView::new(&settings);
-        // Down to the scrollback field; the shell field, left blank, is
-        // applied without changing anything.
+        // Down past the continuation indent and shell fields to the
+        // scrollback field; the fields left as they were are applied
+        // without changing anything.
+        assert_eq!(
+            press(&mut view, &mut settings, KeyCode::Down),
+            SettingsOutcome::Continue
+        );
         assert_eq!(
             press(&mut view, &mut settings, KeyCode::Down),
             SettingsOutcome::Continue
@@ -577,7 +639,11 @@ mod tests {
             press(&mut view, &mut settings, KeyCode::Tab),
             SettingsOutcome::Continue
         );
-        assert_eq!(view.focused_key(), SettingKey::Shell, "Tab wraps");
+        assert_eq!(
+            view.focused_key(),
+            SettingKey::ContinuationIndent,
+            "Tab wraps"
+        );
         assert_eq!(
             press(&mut view, &mut settings, KeyCode::BackTab),
             SettingsOutcome::Continue
@@ -586,9 +652,80 @@ mod tests {
     }
 
     #[test]
+    fn a_choice_shows_its_options_and_applies_as_soon_as_it_changes() {
+        let mut settings = Settings::default();
+        let mut view = SettingsView::new(&settings);
+        assert_eq!(view.focused_key(), SettingKey::ContinuationIndent);
+        let screen = draw(&mut view, &settings, 80, 24);
+        let row = row_with(&screen, "Align with the bracket");
+        assert!(row.contains("○ Align with the bracket"), "{screen:#?}");
+        assert!(row.contains("● Indent one level"), "{screen:#?}");
+
+        assert_eq!(
+            press(&mut view, &mut settings, KeyCode::Left),
+            SettingsOutcome::Changed
+        );
+        assert_eq!(settings.continuation_indent(), ContinuationIndent::Align);
+        let screen = draw(&mut view, &settings, 80, 24);
+        assert!(
+            row_with(&screen, "Continuation indent").contains(MODIFIED_TAG),
+            "{screen:#?}"
+        );
+        assert!(
+            row_with(&screen, "(default:").contains("(default: Indent one level)"),
+            "the default by its label: {screen:#?}"
+        );
+        assert_eq!(
+            press(&mut view, &mut settings, KeyCode::Left),
+            SettingsOutcome::Continue,
+            "already the last"
+        );
+        assert_eq!(
+            press(&mut view, &mut settings, KeyCode::Down),
+            SettingsOutcome::Continue,
+            "leaving it applies nothing more"
+        );
+
+        // A click on an option chooses it, focusing the field.
+        let screen = draw(&mut view, &settings, 80, 24);
+        let y = screen
+            .iter()
+            .position(|r| r.contains("Indent one level"))
+            .unwrap();
+        let x = screen[y].find("Indent").unwrap() as u16;
+        let outcome = view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y as u16,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut settings,
+        );
+        assert_eq!(outcome, SettingsOutcome::Changed);
+        assert_eq!(view.focused_key(), SettingKey::ContinuationIndent);
+        assert_eq!(settings.continuation_indent(), ContinuationIndent::Indent);
+
+        // Ctrl+D and a refresh show the setting's option.
+        press(&mut view, &mut settings, KeyCode::Char(' '));
+        assert_eq!(settings.continuation_indent(), ContinuationIndent::Align);
+        assert_eq!(
+            ctrl(&mut view, &mut settings, 'd'),
+            SettingsOutcome::Changed
+        );
+        assert_eq!(view.text(SettingKey::ContinuationIndent), "indent");
+        settings
+            .set_text(SettingKey::ContinuationIndent, "align")
+            .unwrap();
+        view.refresh(&settings);
+        assert_eq!(view.text(SettingKey::ContinuationIndent), "align");
+    }
+
+    #[test]
     fn bad_text_is_refused_with_a_note_and_escape_reverts() {
         let mut settings = Settings::default();
         let mut view = SettingsView::new(&settings);
+        press(&mut view, &mut settings, KeyCode::Down);
         press(&mut view, &mut settings, KeyCode::Down);
         ctrl(&mut view, &mut settings, 'a');
         type_str(&mut view, &mut settings, "many");
@@ -637,6 +774,7 @@ mod tests {
             .unwrap();
         let mut view = SettingsView::new(&settings);
         assert_eq!(view.text(SettingKey::Shell), "fish");
+        press(&mut view, &mut settings, KeyCode::Down);
         assert_eq!(
             ctrl(&mut view, &mut settings, 'd'),
             SettingsOutcome::Changed
@@ -667,6 +805,7 @@ mod tests {
     fn clicking_a_field_focuses_it_and_applies_the_one_left() {
         let mut settings = Settings::default();
         let mut view = SettingsView::new(&settings);
+        press(&mut view, &mut settings, KeyCode::Down);
         type_str(&mut view, &mut settings, "/bin/sh");
         let screen = draw(&mut view, &settings, 80, 24);
         let row = screen
@@ -724,8 +863,9 @@ mod tests {
 
         // Moving to the field on a short screen scrolls so the whole
         // note shows, not just its first row.
-        press(&mut view, &mut settings, KeyCode::Down);
-        press(&mut view, &mut settings, KeyCode::Down);
+        for _ in 0..3 {
+            press(&mut view, &mut settings, KeyCode::Down);
+        }
         let screen = draw(&mut view, &settings, 40, 5);
         assert!(
             screen.iter().any(|r| r.contains("this many matches")),
@@ -753,15 +893,16 @@ mod tests {
         let mut view = SettingsView::new(&settings);
         let screen = draw(&mut view, &settings, 60, 6);
         assert!(
-            screen.iter().any(|r| r.contains("Shell executable")),
+            screen.iter().any(|r| r.contains("Continuation indent")),
             "{screen:#?}"
         );
         assert!(
             !screen.iter().any(|r| r.contains("Maximum search")),
             "{screen:#?}"
         );
-        press(&mut view, &mut settings, KeyCode::Down);
-        press(&mut view, &mut settings, KeyCode::Down);
+        for _ in 0..3 {
+            press(&mut view, &mut settings, KeyCode::Down);
+        }
         let screen = draw(&mut view, &settings, 60, 6);
         assert!(
             screen.iter().any(|r| r.contains("Maximum search")),
@@ -772,7 +913,7 @@ mod tests {
             "the note is shown with the field: {screen:#?}"
         );
         // The wheel scrolls back up without moving the focus.
-        for _ in 0..5 {
+        for _ in 0..10 {
             view.handle_mouse(
                 MouseEvent {
                     kind: MouseEventKind::ScrollUp,
@@ -785,7 +926,7 @@ mod tests {
         }
         let screen = draw(&mut view, &settings, 60, 6);
         assert!(
-            screen.iter().any(|r| r.contains("Shell executable")),
+            screen.iter().any(|r| r.contains("Continuation indent")),
             "{screen:#?}"
         );
         assert_eq!(view.focused_key(), SettingKey::SearchMaxResults);

@@ -41,6 +41,34 @@ impl Indentation {
             Indentation::Spaces(n) => n.max(1),
         }
     }
+
+    /// The number of bytes to drop from the end of `indent` (spaces and
+    /// tabs) to reach the previous indentation stop: a trailing tab, or the
+    /// spaces past the previous multiple of the indentation width.
+    pub fn outdent_len(self, indent: &[u8], tab_width: usize) -> usize {
+        if indent.last() == Some(&b'\t') {
+            return 1;
+        }
+        let spaces = indent.iter().rev().take_while(|&&b| b == b' ').count();
+        if spaces == 0 {
+            return 0;
+        }
+        let width = self.width(tab_width);
+        ((columns(indent, tab_width) - 1) % width + 1).min(spaces)
+    }
+}
+
+/// The display width of text starting at column 0, with tabs extending to
+/// the next multiple of `tab_width`. Every other character counts as one
+/// column, which is exact for the indentation and code this is used on.
+pub fn columns(text: &[u8], tab_width: usize) -> usize {
+    let tab_width = tab_width.max(1);
+    text.iter().fold(0, |column, &b| match b {
+        b'\t' => column + tab_width - column % tab_width,
+        // UTF-8 continuation bytes belong to the character before them.
+        0x80..=0xbf => column,
+        _ => column + 1,
+    })
 }
 
 impl Default for Indentation {

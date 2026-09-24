@@ -785,7 +785,8 @@ impl App {
         }
         match self.project.open_file(&path) {
             Ok(buffer) => {
-                let editor = Editor::new(buffer);
+                let mut editor = Editor::new(buffer);
+                editor.set_code_style(self.settings.code_style());
                 self.tabs.push(Tab {
                     highlight_generation: editor.highlight_generation(),
                     search_generation: 0,
@@ -1599,10 +1600,14 @@ impl App {
         }
     }
 
-    /// Apply the settings to what is running: every terminal's scrollback
-    /// and the project search's limit. The shell setting applies to the
-    /// next shell started.
+    /// Apply the settings to what is running: every open editor's code
+    /// style, every terminal's scrollback, and the project search's
+    /// limit. The shell setting applies to the next shell started.
     fn apply_settings(&mut self) {
+        let style = self.settings.code_style();
+        for tab in &mut self.tabs {
+            tab.view.editor_mut().set_code_style(style);
+        }
         let scrollback = self.settings.terminal_scrollback();
         for tool in self.tool_pane.tools_mut() {
             tool.set_scrollback_limit(scrollback);
@@ -3936,7 +3941,7 @@ mod tests {
 
     use super::*;
     use crossterm::event::KeyEventState;
-    use ninjaedit_core::Position;
+    use ninjaedit_core::{ContinuationIndent, Position, SettingKey};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
@@ -4408,6 +4413,7 @@ mod tests {
         // saved to the storage, where nothing was before.
         assert_eq!(settings_file(&app), None);
         press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
         ctrl(&mut app, 'a');
         type_str(&mut app, "250");
         press(&mut app, KeyCode::Enter);
@@ -4449,9 +4455,34 @@ mod tests {
     }
 
     #[test]
+    fn code_style_setting_applies_to_open_and_new_editors() {
+        let (_dir, mut app) = app_with_files(&[("a.rs", "\n"), ("b.rs", "\n")]);
+        app.open_file(app.project.root().join("a.rs"));
+        let style = |app: &App, index: usize| app.tabs[index].view.editor().code_style();
+        assert_eq!(style(&app, 0).continuation, ContinuationIndent::Indent);
+
+        app.open_settings();
+        let Mode::Settings(view) = &app.mode else {
+            panic!("the settings page is open");
+        };
+        assert_eq!(view.focused_key(), SettingKey::ContinuationIndent);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(style(&app, 0).continuation, ContinuationIndent::Align);
+        assert!(
+            settings_file(&app)
+                .unwrap()
+                .contains("continuation-indent = \"align\"")
+        );
+
+        app.open_file(app.project.root().join("b.rs"));
+        assert_eq!(style(&app, 1).continuation, ContinuationIndent::Align);
+    }
+
+    #[test]
     fn ctrl_d_resets_and_ctrl_o_or_ctrl_t_leave_the_settings_page() {
         let (dir, mut app) = app_with_files(&[("a.txt", "hi\n"), ("b.txt", "yo\n")]);
         app.open_settings();
+        press(&mut app, KeyCode::Down);
         type_str(&mut app, "/bin/dash");
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.settings.shell(), Some("/bin/dash"));
@@ -4960,8 +4991,9 @@ mod tests {
         assert!(screen[9].contains("search.max-results"), "{screen:#?}");
 
         app.open_settings();
-        press(&mut app, KeyCode::Down);
-        press(&mut app, KeyCode::Down);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
         ctrl(&mut app, 'a');
         type_str(&mut app, "5");
         press(&mut app, KeyCode::Enter);
@@ -5740,6 +5772,7 @@ mod tests {
         assert!(matches!(app.mode, Mode::Settings(_)));
         assert_eq!(app.focus, Focus::Editor);
         assert!(app.tool_pane.is_visible());
+        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         ctrl(&mut app, 'a');
         type_str(&mut app, "3");

@@ -60,6 +60,17 @@
 //! no trailing whitespace, and carries the same pending indentation on.
 //! Moving the cursor, or any other edit, discards it.
 //!
+//! Typing code: the indentation of a new line is predicted from the code
+//! before it (see the [`auto_indent`](crate::auto_indent) module), so a
+//! line after `if x {` or `def f():` is indented a level deeper, and one
+//! after the end of a statement goes back to the level the statement
+//! started at. Typing an opening bracket inserts its closing one after the
+//! cursor, and typing a closing bracket over the same bracket steps over
+//! it. A line break between a pair, as in `{}`, puts the closing bracket
+//! on a line of its own below an indented blank line for the cursor.
+//! Closing brackets (and `{` in C-like languages) typed at the start of a
+//! line move the line to the level they belong at.
+//!
 //! Search: [`Editor::start_search`] begins a [`Search`] of the buffer from
 //! the cursor, and [`Editor::set_search_query`] updates it as the query is
 //! typed; the frontend reads the matches back through [`Editor::search`]
@@ -87,6 +98,7 @@
 //! step. The other way round, [`Editor::discard_changes`] reloads the
 //! file over any unsaved edits, and is undoable too.
 
+use crate::auto_indent::{self, CodeLine, CodeStyle, Indenter, Rules};
 use crate::buffer::{BufferSnapshot, DiskChange, FileBuffer};
 use crate::indent::{self, Indentation};
 use crate::merge;
@@ -306,6 +318,9 @@ pub struct Editor {
     tab_width: usize,
     /// How lines are indented; see [`indentation`](Self::indentation).
     indentation: Indentation,
+    /// Layout preferences for typing code; see
+    /// [`code_style`](Self::code_style).
+    code_style: CodeStyle,
     /// Indentation the cursor is shown at but that isn't in the buffer
     /// yet; see the [module documentation](self). Only ever spaces and
     /// tabs. When set, the cursor is at the start of an empty line.
@@ -343,6 +358,7 @@ impl Editor {
             save_point,
             tab_width: DEFAULT_TAB_WIDTH,
             indentation,
+            code_style: CodeStyle::default(),
             pending: None,
             highlighter,
             search: None,
@@ -915,10 +931,15 @@ impl Editor {
     /// there is one. `'\n'` and `'\r'` insert the buffer's line ending and
     /// carry the line's indentation on as pending indentation (see the
     /// [module documentation](self)); any other character first commits
-    /// pending indentation to the buffer.
+    /// pending indentation to the buffer. Brackets are paired and
+    /// stepped over, and some characters reindent their line; see the
+    /// [module documentation](self).
     pub fn insert_char(&mut self, c: char) {
         if c == '\n' || c == '\r' {
             self.insert_newline();
+            return;
+        }
+        if self.selection().is_none() && c.is_ascii() && self.type_code_char(c as u8) {
             return;
         }
         let mut inserted = self.pending.take().unwrap_or_default().into_bytes();
@@ -927,35 +948,185 @@ impl Editor {
         self.replace_selection_with(inserted, EditKind::Typing);
     }
 
-    /// Insert a line break at the cursor (replacing the selection). When
-    /// nothing follows the cursor on its line, the line's indentation
-    /// becomes pending on the new line; otherwise the text moving to the
-    /// new line is indented right away. With indentation already pending,
-    /// the current line is left blank and the pending indentation moves on.
+    /// Type a character that means something for the structure of code,
+    /// with no selection. Returns whether it was handled; if not, it is
+    /// for the caller to insert as usual.
+    ///
+    /// * A closing bracket typed over the same bracket steps over it.
+    /// * An opening bracket gets its closing bracket inserted after the
+    ///   cursor, unless it is typed in a string or comment, or right
+    ///   before other text.
+    /// * A closing bracket typed at the start of a line (after nothing but
+    ///   indentation) moves the line level with the statement of the
+    ///   bracket it closes; likewise `{` in C-like languages, level with
+    ///   the statement it opens the body of. See the
+    ///   [`auto_indent`](crate::auto_indent) module.
+    /// * A `:` completing a `case` label or a Python `else:` (and the like)
+    ///   moves the line level with the label or block it continues.
+    fn type_code_char(&mut self, c: u8) -> bool {
+        let closer = auto_indent::closer_of(c);
+        if closer.is_none() && !auto_indent::is_closer(c) && c != b':' {
+            return false;
+        }
+        let line = self.buffer.line_of_offset(self.cursor);
+        let start = self.buffer.offset_of_line(line);
+        let col = self.cursor - start;
+        let code_line = self.code_line(line);
+        let text = &code_line.text;
+        let next = text.get(col).copied();
+        if auto_indent::is_closer(c) && next == Some(c) && code_line.code[col] {
+            self.cursor += 1;
+            self.grouping = false;
+            self.desired_column = None;
+            self.search = None;
+            return true;
+        }
+
+        let is_blank = |b: &u8| *b == b' ' || *b == b'\t';
+        let at_line_start = text[..col].iter().all(is_blank);
+        let rest_blank = text[col..].iter().all(is_blank);
+        let lead_len = code_line.leading().len().min(col);
+        let current_indent = match &self.pending {
+            Some(pending) => pending.as_bytes(),
+            None => &text[..lead_len],
+        };
+        let rules = Rules::for_language(self.language());
+        let reindent = {
+            let mut indenter = self.indenter();
+            if at_line_start && auto_indent::is_closer(c) {
+                indenter.closer_indent(line, col)
+            } else if at_line_start && c == b'{' && rules.c_like {
+                indenter.brace_line_indent(line)
+            } else if c == b':' && !at_line_start && rest_blank {
+                indenter.label_indent(line)
+            } else {
+                None
+            }
+        }
+        .filter(|indent| indent[..] != *current_indent);
+        let pair = closer.filter(|_| {
+            let before_text = next.is_none_or(|b| {
+                b.is_ascii_whitespace() || matches!(b, b')' | b']' | b'}' | b',' | b';')
+            });
+            before_text && self.typed_as_code(line, &text[..col], c)
+        });
+        if reindent.is_none() && pair.is_none() {
+            return false;
+        }
+
+        let (from, mut inserted) = match reindent {
+            Some(mut indent) => {
+                indent.extend_from_slice(&text[lead_len..col]);
+                (start, indent)
+            }
+            None => (
+                self.cursor,
+                self.pending.clone().unwrap_or_default().into_bytes(),
+            ),
+        };
+        inserted.push(c);
+        let cursor = from + inserted.len();
+        inserted.extend(pair);
+        self.commit_with_cursor(from..self.cursor, inserted, EditKind::Typing, cursor, None);
+        true
+    }
+
+    /// Whether `c`, typed on `line` after `before`, would be code rather
+    /// than part of a string or comment.
+    fn typed_as_code(&self, line: usize, before: &[u8], c: u8) -> bool {
+        let mut probe = before.to_vec();
+        probe.push(c);
+        let at = before.len();
+        self.highlighter
+            .tokens_of(&self.buffer, line, &probe)
+            .iter()
+            .find(|token| token.range.contains(&at))
+            .is_none_or(|token| auto_indent::is_code(token.kind))
+    }
+
+    /// A line's content, with which bytes are code, as the
+    /// [`auto_indent`](crate::auto_indent) rules read it.
+    fn code_line(&self, line: usize) -> CodeLine {
+        let content = self
+            .buffer
+            .bytes_in_range(self.buffer.line_content_range(line));
+        let tokens = self.highlighter.tokens_of(&self.buffer, line, &content);
+        CodeLine::new(content, &tokens)
+    }
+
+    fn indenter(&self) -> Indenter<impl FnMut(usize) -> CodeLine + '_> {
+        Indenter::new(
+            Rules::for_language(self.language()),
+            self.code_style,
+            self.indentation,
+            self.tab_width,
+            |line| self.code_line(line),
+        )
+    }
+
+    /// Insert a line break at the cursor (replacing the selection),
+    /// indenting the new line by the rules of the
+    /// [`auto_indent`](crate::auto_indent) module. When the cursor is in
+    /// a line's leading whitespace, the whitespace before it is carried on
+    /// instead. When nothing follows the cursor on its line, the
+    /// indentation becomes pending on the new line; otherwise the text
+    /// moving to the new line is indented right away. Between a pair of
+    /// brackets, as in `{}`, the closing bracket moves down a further line,
+    /// leaving the cursor on an indented blank line between the two. With
+    /// indentation already pending, the current line is left blank and
+    /// the pending indentation moves on.
     fn insert_newline(&mut self) {
-        let eol = self.buffer.eol().as_str().as_bytes();
+        let eol = self.buffer.eol().as_str().as_bytes().to_vec();
         if let Some(pending) = self.pending.take() {
-            self.replace_selection_with(eol.to_vec(), EditKind::Other);
+            self.replace_selection_with(eol, EditKind::Other);
             self.pending = Some(pending);
             return;
         }
         let range = self.selection().unwrap_or(self.cursor..self.cursor);
-        let leading = self.leading_whitespace(self.buffer.line_of_offset(range.start));
-        let indent = self
-            .buffer
-            .bytes_in_range(leading.start..leading.end.min(range.start));
+        let line = self.buffer.line_of_offset(range.start);
+        let col = range.start - self.buffer.offset_of_line(line);
+        let code_line = self.code_line(line);
+        let before = &code_line.text[..col];
         let end_line = self.buffer.line_of_offset(range.end);
-        let at_end = range.end == self.buffer.line_content_range(end_line).end;
-        let mut inserted = eol.to_vec();
-        if at_end {
-            self.commit(range, inserted, EditKind::Other);
-            if !indent.is_empty() {
-                // Leading whitespace is only ever spaces and tabs.
-                self.pending = String::from_utf8(indent).ok();
+        let rest = self
+            .buffer
+            .bytes_in_range(range.end..self.buffer.line_content_range(end_line).end);
+        let next = rest.first().copied();
+        let (indent, closer_indent) = if before.iter().all(|&b| b == b' ' || b == b'\t') {
+            (before.to_vec(), None)
+        } else {
+            let paired = code_line.code[col - 1]
+                && next.is_some()
+                && auto_indent::closer_of(before[col - 1]) == next;
+            let mut indenter = self.indenter();
+            if paired {
+                let inner = indenter.newline_indent(line, col, None);
+                (inner, indenter.closer_indent(line, col))
+            } else {
+                (indenter.newline_indent(line, col, next), None)
             }
+        };
+        let mut inserted = eol.clone();
+        if let Some(closer_indent) = closer_indent {
+            inserted.extend_from_slice(&eol);
+            inserted.extend_from_slice(&closer_indent);
+            let cursor = range.start + eol.len();
+            self.commit_with_cursor(range, inserted, EditKind::Other, cursor, None);
+            self.set_pending(indent);
+        } else if rest.is_empty() {
+            self.commit(range, inserted, EditKind::Other);
+            self.set_pending(indent);
         } else {
             inserted.extend_from_slice(&indent);
             self.commit(range, inserted, EditKind::Other);
+        }
+    }
+
+    /// Make `indent` (spaces and tabs) the pending indentation, if there
+    /// is any.
+    fn set_pending(&mut self, indent: Vec<u8>) {
+        if !indent.is_empty() {
+            self.pending = String::from_utf8(indent).ok();
         }
     }
 
@@ -974,7 +1145,8 @@ impl Editor {
 
     /// Delete the selection, or the character before the cursor if nothing
     /// is selected. With pending indentation, removes one level of it
-    /// instead. In a space-indented buffer, when only spaces precede the
+    /// instead. Between an empty pair of brackets, as in `(|)`, removes
+    /// both. In a space-indented buffer, when only spaces precede the
     /// cursor on its line, removes back to the previous indentation stop.
     pub fn backspace(&mut self) {
         if let Some(mut pending) = self.pending.take() {
@@ -986,6 +1158,20 @@ impl Editor {
         }
         if self.delete_selection() {
             return;
+        }
+        if self.cursor > 0 {
+            // Between an empty pair of brackets, delete both.
+            let around = self
+                .buffer
+                .bytes_in_range(self.cursor - 1..(self.cursor + 1).min(self.buffer.len()));
+            if around.len() == 2 && auto_indent::closer_of(around[0]) == Some(around[1]) {
+                self.commit(
+                    self.cursor - 1..self.cursor + 1,
+                    Vec::new(),
+                    EditKind::Backspace,
+                );
+                return;
+            }
         }
         let start = self
             .indentation_stop_before_cursor()
@@ -1152,6 +1338,18 @@ impl Editor {
         };
     }
 
+    /// The user's preferences for laying out code where the code itself
+    /// doesn't say, such as how lines continuing inside brackets are
+    /// indented. Defaults to [`CodeStyle::default`] until the frontend
+    /// passes on the user's settings.
+    pub fn code_style(&self) -> CodeStyle {
+        self.code_style
+    }
+
+    pub fn set_code_style(&mut self, style: CodeStyle) {
+        self.code_style = style;
+    }
+
     /// Indentation the cursor is shown at but that hasn't been written to
     /// the buffer; see the [module documentation](self). `None` when there
     /// is none.
@@ -1200,17 +1398,9 @@ impl Editor {
         self.shift_lines(range, false);
     }
 
-    /// The width of one indentation level in columns.
-    fn indent_width(&self) -> usize {
-        self.indentation.width(self.tab_width)
-    }
-
     /// The display width of a run of spaces and tabs starting at column 0.
     fn indent_columns(&self, indent: &str) -> usize {
-        indent.chars().fold(0, |column, c| match c {
-            '\t' => column + self.tab_width - column % self.tab_width,
-            _ => column + 1,
-        })
+        indent::columns(indent.as_bytes(), self.tab_width)
     }
 
     /// The text that takes indentation from `column` to the next stop.
@@ -1221,20 +1411,10 @@ impl Editor {
         }
     }
 
-    /// The number of bytes to drop from the end of `indent` (spaces and
-    /// tabs) to reach the previous indentation stop: a trailing tab, or the
-    /// spaces past the previous multiple of the indentation width.
+    /// The number of bytes to drop from the end of `indent` to reach the
+    /// previous indentation stop; see [`Indentation::outdent_len`].
     fn outdent_len(&self, indent: &[u8]) -> usize {
-        if indent.last() == Some(&b'\t') {
-            return 1;
-        }
-        let spaces = indent.iter().rev().take_while(|&&b| b == b' ').count();
-        if spaces == 0 {
-            return 0;
-        }
-        let width = self.indent_width();
-        let columns = self.indent_columns(&String::from_utf8_lossy(indent));
-        ((columns - 1) % width + 1).min(spaces)
+        self.indentation.outdent_len(indent, self.tab_width)
     }
 
     /// Take one level off a run of spaces and tabs.
@@ -3187,5 +3367,378 @@ mod tests {
         assert!(ed.is_modified());
         assert!(ed.undo());
         assert_eq!(text(&ed), "xone\ntwo\nthree\nfour\n");
+    }
+
+    // ----- Typing code ----------------------------------------------------
+
+    /// An editor over `text` highlighted as `language`, with the cursor
+    /// at the `‸` in it.
+    fn code(language: Language, text: &str) -> Editor {
+        let at = text.find('‸').expect("a cursor");
+        let mut ed = editor(&text.replace('‸', ""));
+        ed.set_language(language);
+        ed.set_cursor(at);
+        ed
+    }
+
+    /// The buffer with `‸` at the cursor, after any pending indentation,
+    /// the way the cursor is shown.
+    fn shown(ed: &Editor) -> String {
+        let mut shown = text(ed);
+        let pending = ed.pending_indentation().unwrap_or_default();
+        shown.insert_str(ed.cursor(), &format!("{pending}‸"));
+        shown
+    }
+
+    #[test]
+    fn opening_brackets_are_paired_and_closing_ones_stepped_over() {
+        let mut ed = code(Language::Rust, "‸");
+        type_str(&mut ed, "fn main(");
+        assert_eq!(shown(&ed), "fn main(‸)");
+        type_str(&mut ed, ")");
+        assert_eq!(shown(&ed), "fn main()‸");
+        type_str(&mut ed, " { foo([a], b");
+        assert_eq!(shown(&ed), "fn main() { foo([a], b‸)}");
+        type_str(&mut ed, "); }");
+        assert_eq!(shown(&ed), "fn main() { foo([a], b); }‸");
+
+        ed.undo();
+        assert_eq!(
+            shown(&ed),
+            "fn main() { foo([a], b)‸}",
+            "stepping over a bracket isn't an edit"
+        );
+    }
+
+    #[test]
+    fn brackets_are_not_paired_before_text_or_in_strings_and_comments() {
+        let mut ed = code(Language::Rust, "let x = ‸foo;");
+        type_str(&mut ed, "(");
+        assert_eq!(shown(&ed), "let x = (‸foo;");
+
+        let mut ed = code(Language::Rust, "let s = \"a‸\";");
+        type_str(&mut ed, "{");
+        assert_eq!(shown(&ed), "let s = \"a{‸\";");
+        type_str(&mut ed, "}");
+        assert_eq!(shown(&ed), "let s = \"a{}‸\";");
+
+        let mut ed = code(Language::Rust, "// see ‸");
+        type_str(&mut ed, "(");
+        assert_eq!(shown(&ed), "// see (‸");
+
+        let mut ed = code(Language::Rust, "let s = \"‸)\";");
+        type_str(&mut ed, ")");
+        assert_eq!(
+            shown(&ed),
+            "let s = \")‸)\";",
+            "a bracket in a string isn't stepped over"
+        );
+
+        let mut ed = code(Language::Rust, "‸");
+        ed.insert_char('(');
+        ed.move_cursor(Movement::Right);
+        ed.set_selection(0, 2);
+        ed.insert_char('[');
+        assert_eq!(shown(&ed), "[‸", "a selection is replaced as usual");
+    }
+
+    #[test]
+    fn backspace_deletes_an_empty_pair() {
+        let mut ed = code(Language::Rust, "foo‸");
+        type_str(&mut ed, "(");
+        ed.backspace();
+        assert_eq!(shown(&ed), "foo‸");
+        type_str(&mut ed, "(a");
+        ed.backspace();
+        ed.backspace();
+        assert_eq!(shown(&ed), "foo‸");
+        ed.undo();
+        assert_eq!(shown(&ed), "foo(‸)");
+        ed.undo();
+        assert_eq!(shown(&ed), "foo(a‸)");
+    }
+
+    #[test]
+    fn newline_between_braces_puts_the_closing_one_on_its_own_line() {
+        let mut ed = code(Language::Rust, "‸");
+        type_str(&mut ed, "fn main() {\n");
+        assert_eq!(shown(&ed), "fn main() {\n    ‸\n}");
+        type_str(&mut ed, "if x {\n");
+        assert_eq!(shown(&ed), "fn main() {\n    if x {\n        ‸\n    }\n}");
+        ed.undo();
+        assert_eq!(
+            shown(&ed),
+            "fn main() {\n    if x {‸}\n}",
+            "the line break is one undo step"
+        );
+
+        // Parentheses and square brackets too, in any language.
+        let mut ed = code(Language::Python, "‸");
+        type_str(&mut ed, "x = foo(\n");
+        assert_eq!(shown(&ed), "x = foo(\n    ‸\n)");
+        type_str(&mut ed, "[\n");
+        assert_eq!(shown(&ed), "x = foo(\n    [\n        ‸\n    ]\n)");
+
+        // The closing brace goes level with the statement, not with a
+        // continuation line.
+        let mut ed = code(Language::C, "‸");
+        type_str(&mut ed, "if (a &&\n");
+        assert_eq!(shown(&ed), "if (a &&\n    ‸)");
+        type_str(&mut ed, "b) {\n");
+        assert_eq!(shown(&ed), "if (a &&\n    b) {\n    ‸\n}");
+
+        let mut ed = code(Language::Rust, "‸");
+        type_str(&mut ed, "items.iter().for_each(|x| {\n");
+        assert_eq!(shown(&ed), "items.iter().for_each(|x| {\n    ‸\n})");
+    }
+
+    #[test]
+    fn braces_on_their_own_line() {
+        let mut ed = code(Language::C, "‸");
+        type_str(&mut ed, "void f()\n");
+        assert_eq!(shown(&ed), "void f()\n‸");
+        type_str(&mut ed, "{\n");
+        assert_eq!(shown(&ed), "void f()\n{\n    ‸\n}");
+        type_str(&mut ed, "if (x)\n");
+        assert_eq!(
+            shown(&ed),
+            "void f()\n{\n    if (x)\n        ‸\n}",
+            "a brace-less body is indented"
+        );
+        type_str(&mut ed, "{");
+        assert_eq!(
+            shown(&ed),
+            "void f()\n{\n    if (x)\n    {‸}\n}",
+            "until a brace goes back level with the `if`"
+        );
+        type_str(&mut ed, "\n");
+        assert_eq!(
+            shown(&ed),
+            "void f()\n{\n    if (x)\n    {\n        ‸\n    }\n}"
+        );
+
+        // Typed at the right level, a brace stays put.
+        let mut ed = code(Language::C, "int x;\n‸");
+        type_str(&mut ed, "{");
+        assert_eq!(shown(&ed), "int x;\n{‸}");
+    }
+
+    #[test]
+    fn brace_less_bodies_go_back_to_the_statement_level() {
+        let mut ed = code(Language::C, "‸");
+        type_str(&mut ed, "if (x)\n");
+        assert_eq!(shown(&ed), "if (x)\n    ‸");
+        type_str(&mut ed, "y();\n");
+        assert_eq!(shown(&ed), "if (x)\n    y();\n‸");
+
+        let mut ed = code(Language::C, "if (a &&\n    b)\n    y();‸");
+        ed.insert_char('\n');
+        assert_eq!(shown(&ed), "if (a &&\n    b)\n    y();\n‸");
+
+        let mut ed = code(Language::C, "if (a) {\n} else\n    y();‸");
+        ed.insert_char('\n');
+        assert_eq!(shown(&ed), "if (a) {\n} else\n    y();\n‸");
+    }
+
+    #[test]
+    fn multi_line_conditions_in_rustfmt_style() {
+        let mut ed = code(Language::Rust, "fn f() {\n    ‸\n}");
+        type_str(&mut ed, "if a\n");
+        assert_eq!(shown(&ed), "fn f() {\n    if a\n        ‸\n}");
+        type_str(&mut ed, "&& b\n");
+        assert_eq!(shown(&ed), "fn f() {\n    if a\n        && b\n        ‸\n}");
+        type_str(&mut ed, "{\n");
+        assert_eq!(
+            shown(&ed),
+            "fn f() {\n    if a\n        && b\n    {\n        ‸\n    }\n}"
+        );
+    }
+
+    #[test]
+    fn indentation_follows_the_statement_not_its_continuations() {
+        // Arguments spread over lines line up with the first.
+        let mut ed = code(Language::Rust, "    let x = foo(a,‸");
+        ed.insert_char('\n');
+        assert_eq!(shown(&ed), "    let x = foo(a,\n        ‸");
+        type_str(&mut ed, "b);\n");
+        assert_eq!(
+            shown(&ed),
+            "    let x = foo(a,\n        b);\n    ‸",
+            "and the statement after goes back to the level of the first line"
+        );
+
+        let mut ed = code(Language::Rust, "let x = foo\n    .bar()\n    .baz();‸");
+        ed.insert_char('\n');
+        assert_eq!(shown(&ed), "let x = foo\n    .bar()\n    .baz();\n‸");
+
+        let mut ed = code(Language::Rust, "let x = foo\n    .bar()‸");
+        ed.insert_char('\n');
+        assert_eq!(
+            shown(&ed),
+            "let x = foo\n    .bar()\n    ‸",
+            "an unfinished statement keeps its continuation level"
+        );
+
+        let mut ed = code(
+            Language::Rust,
+            "let v = vec![\n    Foo {\n        a: 1,\n    },‸",
+        );
+        ed.insert_char('\n');
+        assert_eq!(
+            shown(&ed),
+            "let v = vec![\n    Foo {\n        a: 1,\n    },\n    ‸"
+        );
+
+        let mut ed = code(Language::Rust, "if x { // why‸");
+        ed.insert_char('\n');
+        assert_eq!(shown(&ed), "if x { // why\n    ‸", "comments don't count");
+        let mut ed = code(Language::Rust, "foo(\"(\"‸");
+        ed.insert_char('\n');
+        assert_eq!(shown(&ed), "foo(\"(\"\n    ‸", "nor brackets in strings");
+    }
+
+    #[test]
+    fn continuation_lines_can_be_aligned_instead_of_indented() {
+        let indent = CodeStyle {
+            continuation: auto_indent::ContinuationIndent::Align,
+        };
+        let mut ed = code(Language::Rust, "fn f() {\n    let x = foo(a,‸\n}");
+        ed.set_code_style(indent);
+        ed.insert_char('\n');
+        assert_eq!(
+            shown(&ed),
+            "fn f() {\n    let x = foo(a,\n                ‸\n}"
+        );
+        type_str(&mut ed, "b,\n");
+        assert_eq!(
+            shown(&ed),
+            "fn f() {\n    let x = foo(a,\n                b,\n                ‸\n}",
+            "later lines keep the level"
+        );
+        type_str(&mut ed, "c);\n");
+        assert_eq!(
+            shown(&ed),
+            "fn f() {\n    let x = foo(a,\n                b,\n                c);\n    ‸\n}"
+        );
+    }
+
+    #[test]
+    fn nested_continuation_with_indentation() {
+        // Brackets nested in a continuation go a level past it.
+        let mut ed = code(Language::C, "if (a &&\n    foo(b,‸");
+        ed.insert_char('\n');
+        assert_eq!(shown(&ed), "if (a &&\n    foo(b,\n        ‸");
+
+        // A bracket ending its line is indented the same either way.
+        let mut ed = code(Language::Rust, "let x = foo(\n    a,\n    bar(b,‸");
+        ed.insert_char('\n');
+        assert_eq!(shown(&ed), "let x = foo(\n    a,\n    bar(b,\n        ‸");
+    }
+
+    #[test]
+    fn python_method_continuation_with_indentation() {
+        let mut ed = code(Language::Python, "‸");
+        type_str(&mut ed, "def f(a,\n");
+        assert_eq!(shown(&ed), "def f(a,\n    ‸)");
+        type_str(&mut ed, "b):\n");
+        assert_eq!(shown(&ed), "def f(a,\n    b):\n    ‸");
+    }
+
+    #[test]
+    fn closing_brackets_typed_at_line_start_go_to_the_statement_level() {
+        let mut ed = code(Language::Rust, "let v = [\n    1,\n    2,‸");
+        type_str(&mut ed, "\n]");
+        assert_eq!(shown(&ed), "let v = [\n    1,\n    2,\n]‸");
+
+        let mut ed = code(Language::C, "if (a) {\n    x();\n        ‸");
+        type_str(&mut ed, "}");
+        assert_eq!(shown(&ed), "if (a) {\n    x();\n}‸");
+        ed.undo();
+        assert_eq!(shown(&ed), "if (a) {\n    x();\n        ‸");
+
+        let mut ed = code(Language::Rust, "x();\n    ‸");
+        type_str(&mut ed, ")");
+        assert_eq!(
+            shown(&ed),
+            "x();\n    )‸",
+            "with nothing to close, left alone"
+        );
+    }
+
+    #[test]
+    fn colons_open_scopes() {
+        let mut ed = code(Language::Python, "‸");
+        type_str(&mut ed, "def f(a,\n");
+        assert_eq!(shown(&ed), "def f(a,\n    ‸)");
+        type_str(&mut ed, "b):\n");
+        assert_eq!(shown(&ed), "def f(a,\n    b):\n    ‸");
+        type_str(&mut ed, "if a:\nx = 1\n");
+        assert_eq!(
+            shown(&ed),
+            "def f(a,\n    b):\n    if a:\n        x = 1\n        ‸"
+        );
+        type_str(&mut ed, "else:");
+        assert_eq!(
+            shown(&ed),
+            "def f(a,\n    b):\n    if a:\n        x = 1\n    else:‸",
+            "`else` goes level with its `if`"
+        );
+        type_str(&mut ed, "\nreturn b\n");
+        assert_eq!(
+            shown(&ed),
+            "def f(a,\n    b):\n    if a:\n        x = 1\n    else:\n        return b\n    ‸",
+            "a block ends after `return`"
+        );
+
+        let mut ed = code(Language::Python, "x = 1 + \\‸");
+        type_str(&mut ed, "\n2\n");
+        assert_eq!(shown(&ed), "x = 1 + \\\n    2\n‸");
+
+        let mut ed = code(Language::Markdown, "Notes:‸");
+        ed.insert_char('\n');
+        assert_eq!(shown(&ed), "Notes:\n‸", "not in prose");
+    }
+
+    #[test]
+    fn case_labels() {
+        let mut ed = code(Language::C, "‸");
+        type_str(&mut ed, "switch (x) {\ncase 1:\n");
+        assert_eq!(shown(&ed), "switch (x) {\n    case 1:\n        ‸\n}");
+        type_str(&mut ed, "break;\ncase 2:");
+        assert_eq!(
+            shown(&ed),
+            "switch (x) {\n    case 1:\n        break;\n    case 2:‸\n}",
+            "a label goes level with the one before"
+        );
+
+        // Labels of a nested switch don't count.
+        let mut ed = code(
+            Language::Cpp,
+            "switch (a) {\ncase 1:\n    switch (b) {\n    case 2:\n        break;\n    }\n    ‸\n}",
+        );
+        type_str(&mut ed, "default:");
+        assert_eq!(
+            shown(&ed),
+            "switch (a) {\ncase 1:\n    switch (b) {\n    case 2:\n        break;\n    }\ndefault:‸\n}"
+        );
+    }
+
+    #[test]
+    fn smart_indentation_uses_the_buffer_style() {
+        let mut ed = code(Language::Rust, "fn f() {\n\tx();\n}\n‸");
+        type_str(&mut ed, "fn g() {\n");
+        assert_eq!(shown(&ed), "fn f() {\n\tx();\n}\nfn g() {\n\t‸\n}");
+
+        let indent = CodeStyle {
+            continuation: auto_indent::ContinuationIndent::Align,
+        };
+        let mut ed = code(Language::Rust, "fn f() {\n\tlet x = foo(a,‸");
+        ed.set_code_style(indent);
+        ed.insert_char('\n');
+        assert_eq!(
+            shown(&ed),
+            "fn f() {\n\tlet x = foo(a,\n\t            ‸",
+            "tabs to indent, spaces to align"
+        );
     }
 }

@@ -4,6 +4,7 @@
 //! in, and the project's git history. The TUI layer in the `tui` crate
 //! builds on these types.
 
+pub mod auto_indent;
 pub mod buffer;
 pub mod build;
 pub mod diagnostics;
@@ -24,6 +25,7 @@ pub mod syntax;
 pub mod terminal;
 pub mod text;
 
+pub use auto_indent::{CodeStyle, ContinuationIndent};
 pub use buffer::{BufferSnapshot, DiskChange, FileBuffer, LineEnding};
 pub use build::{
     BuildConfig, BuildRoot, BuildSystem, ConfigurationKey, DEFAULT_CMAKE_GENERATOR, Directories,
@@ -38,7 +40,7 @@ pub use line_edit::LineEdit;
 pub use project::{Project, ProjectKind};
 pub use project_search::{ProjectMatch, ProjectSearch};
 pub use search::{Search, SearchStep};
-pub use settings::{Category, SettingKey, Settings, SettingsError};
+pub use settings::{Category, SettingChoice, SettingKey, SettingKind, Settings, SettingsError};
 pub use storage::Storage;
 pub use syntax::{ConflictSide, Highlighter, Language, Token, TokenKind};
 pub use terminal::Terminal;
