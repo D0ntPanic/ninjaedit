@@ -1756,6 +1756,15 @@ impl Editor {
         self.completion_wanted
     }
 
+    /// Ask for a completion at the cursor as typing would, for a command
+    /// that asks explicitly, or a tool that puts the cursor somewhere
+    /// and wants to know what the model says there. Drops any
+    /// suggestion.
+    pub fn request_completion(&mut self) {
+        self.drop_suggestion();
+        self.completion_wanted = true;
+    }
+
     /// The request for the completion typing has made wanted, if any,
     /// for the frontend to send to the [`Completer`](crate::Completer).
     /// Taking it settles the want; the answer is expected back through
@@ -4364,6 +4373,23 @@ mod tests {
         );
         assert!(request.suffix.starts_with("line 2\nline 3\n"));
         assert!(!request.suffix.contains('\r'));
+    }
+
+    #[test]
+    fn a_completion_can_be_asked_for_without_typing() {
+        let mut ed = editor("fn main() {\n    \n}\n");
+        ed.set_cursor(16);
+        assert!(ed.take_completion_request().is_none());
+        ed.request_completion();
+        let request = ed.take_completion_request().unwrap();
+        assert_eq!(request.prefix, "fn main() {\n    ");
+        assert_eq!(request.suffix, "\n}\n");
+        // Asking again drops the suggestion the last request made.
+        assert!(ed.offer_completion(request.serial, "run();"));
+        ed.request_completion();
+        assert!(ed.suggestion().is_none());
+        assert!(!ed.offer_completion(request.serial, "run();"), "stale");
+        assert!(ed.take_completion_request().is_some());
     }
 
     #[test]

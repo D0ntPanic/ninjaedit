@@ -203,8 +203,8 @@ use ninjaedit_core::search::literal_query;
 use ninjaedit_core::terminal::{ExitStatus, Output, Session, SessionId};
 use ninjaedit_core::{
     BuildConfig, BuildRoot, Completer, CompletionOutcome, ConflictStep, Discovery, DiscoveryResult,
-    Editor, ExternalChange, Job, Language, Project, ProjectKind, ProjectMatch, SearchStep,
-    Selection, Settings, SourceLocation, Step, Storage,
+    Editor, ExternalChange, Job, Project, ProjectKind, ProjectMatch, SearchStep, Selection,
+    Settings, SourceLocation, Step, Storage,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -1645,10 +1645,7 @@ impl App {
     /// Give the completer the model path of every language the settings
     /// have one for, and take away those they don't.
     fn apply_completion_models(&mut self) {
-        for language in Language::ALL {
-            self.completer
-                .set_model(language, self.settings.completion_model(language));
-        }
+        self.completer.apply_settings(&self.settings);
     }
 
     // ----- Code completion ------------------------------------------------
@@ -4034,7 +4031,7 @@ mod tests {
 
     use super::*;
     use crossterm::event::KeyEventState;
-    use ninjaedit_core::{ContinuationIndent, Position, SettingKey};
+    use ninjaedit_core::{ContinuationIndent, Language, Position, SettingKey};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
