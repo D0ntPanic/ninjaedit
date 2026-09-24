@@ -114,11 +114,14 @@
 //! first line, and a second press straight after takes all the rest.
 //! Typing in between (Enter, to go on to the next line, say) puts the
 //! next Tab back to taking a single line, so any number of lines can be
-//! taken with Tab, Enter, Tab, Enter and so on. Once a suggestion has
-//! been taken in full, or typed through to its end, the next completion
-//! is asked for. A suggestion never goes past the end of the scope the
-//! cursor is in, so it can't propose a closing bracket that pairing has
-//! already typed (see [`Editor::offer_completion`]).
+//! taken with Tab, Enter, Tab, Enter and so on. Shift+Tab takes less:
+//! just the next word ([`Editor::accept_suggestion_word`]), for a
+//! suggestion that starts out right and then goes wrong, and a Tab after
+//! it takes a line, as after typing. Once a suggestion has been taken in
+//! full, or typed through to its end, the next completion is asked for.
+//! A suggestion never goes past the end of the scope the cursor is in,
+//! so it can't propose a closing bracket that pairing has already typed
+//! (see [`Editor::offer_completion`]).
 //!
 //! A completion comes with how much of it the model is sure enough of
 //! to offer (see [`ConfidenceThresholds`](crate::ConfidenceThresholds)),
@@ -259,7 +262,7 @@ struct Suggestion {
     /// whose offered part is used up is dropped.
     offered: usize,
     /// Whether Tab has taken its first line, so that the next Tab takes
-    /// all the rest.
+    /// all the rest. Taking a word puts it back.
     accepted_line: bool,
     /// Where the suggestion was cut short of a closing bracket the buffer
     /// already has, the whitespace it put before that bracket, which
@@ -1728,16 +1731,49 @@ impl Editor {
     /// whitespace the suggestion had before its own bracket in front of
     /// the buffer's, so that the bracket goes where it proposed.
     pub fn accept_suggestion(&mut self) -> bool {
+        self.take_suggestion_to(
+            |s| {
+                if s.accepted_line {
+                    s.offered
+                } else {
+                    first_line_end(&s.text[..s.offered])
+                }
+            },
+            true,
+        )
+    }
+
+    /// Take the next word of the suggestion into the buffer: any
+    /// whitespace (line breaks included) it begins with, then the run of
+    /// characters of one class after it, as moving a word right would
+    /// cross (see [`text::next_word_boundary`]). For taking the start of
+    /// a suggestion that goes wrong further on. Returns whether there
+    /// was a suggestion. The rest stays the suggestion, and the next
+    /// Tab takes a line of it, as after typing; taking the last of it
+    /// asks for the next completion. Brackets are paired as
+    /// [`accept_suggestion`](Self::accept_suggestion) pairs them.
+    pub fn accept_suggestion_word(&mut self) -> bool {
+        self.take_suggestion_to(
+            |s| text::next_word_boundary(&s.text.as_bytes()[..s.offered], 0),
+            false,
+        )
+    }
+
+    /// Take the suggestion into the buffer up to the offset `end` gives
+    /// in its text, leaving the rest the suggestion. `took_line` is
+    /// whether this is Tab taking a line, so that the next takes all the
+    /// rest (see [`accept_suggestion`](Self::accept_suggestion)).
+    fn take_suggestion_to(
+        &mut self,
+        end: impl FnOnce(&Suggestion) -> usize,
+        took_line: bool,
+    ) -> bool {
         let Some(suggestion) = self.take_offered_suggestion() else {
             return false;
         };
+        let end = end(&suggestion);
         let text = suggestion.text;
         let offered = suggestion.offered;
-        let end = if suggestion.accepted_line {
-            offered
-        } else {
-            first_line_end(&text[..offered])
-        };
         let (taken, rest) = text.split_at(end);
         let pair = self.closer_to_pair(taken);
         let eol = self.buffer.eol().as_str().to_owned();
@@ -1763,7 +1799,7 @@ impl Editor {
             None,
         );
         self.suggestion = self
-            .confine_to_scope(rest, offered - end, suggestion.before_closer, true)
+            .confine_to_scope(rest, offered - end, suggestion.before_closer, took_line)
             .filter(|s| s.offered > 0);
         if self.suggestion.is_none() {
             self.completion_wanted = true;
@@ -4852,6 +4888,78 @@ mod tests {
         suggest(&mut ed, "x");
         ed.accept_suggestion();
         assert_eq!(text(&ed), "{\n    x\n}");
+    }
+
+    #[test]
+    fn shift_tab_takes_a_word_at_a_time() {
+        let mut ed = editor("fn f() {\n    \n}\n");
+        ed.go_to_line(1);
+        ed.move_cursor(LineEnd);
+        ed.insert_char('l');
+        suggest(&mut ed, "et map = HashMap::new();\n    let b = 2;");
+        assert!(ed.accept_suggestion_word());
+        assert_eq!(text(&ed), "fn f() {\n    let\n}\n");
+        assert_eq!(
+            ed.suggestion(),
+            Some(" map = HashMap::new();\n    let b = 2;")
+        );
+        assert!(!ed.completion_wanted());
+        // Leading spaces go with the word after them; punctuation is a
+        // word of its own.
+        ed.accept_suggestion_word();
+        assert_eq!(ed.suggestion(), Some(" = HashMap::new();\n    let b = 2;"));
+        ed.accept_suggestion_word();
+        ed.accept_suggestion_word();
+        assert_eq!(text(&ed), "fn f() {\n    let map = HashMap\n}\n");
+        assert_eq!(ed.suggestion(), Some("::new();\n    let b = 2;"));
+        // Tab after a word takes the rest of the line, not all the rest.
+        assert!(!ed.suggestion_continues());
+        ed.accept_suggestion();
+        assert_eq!(text(&ed), "fn f() {\n    let map = HashMap::new();\n}\n");
+        assert_eq!(ed.suggestion(), Some("\n    let b = 2;"));
+        // A word after a line break takes the break and indentation too.
+        assert!(ed.suggestion_continues());
+        ed.accept_suggestion_word();
+        assert_eq!(
+            text(&ed),
+            "fn f() {\n    let map = HashMap::new();\n    let\n}\n"
+        );
+        assert!(!ed.suggestion_continues());
+        // Each word is one undo step.
+        assert!(ed.undo());
+        assert_eq!(text(&ed), "fn f() {\n    let map = HashMap::new();\n}\n");
+        // Taking the last word asks for the next completion.
+        let mut ed = editor("");
+        type_str(&mut ed, "a");
+        suggest(&mut ed, " b");
+        ed.accept_suggestion_word();
+        assert_eq!(text(&ed), "a b");
+        assert!(ed.suggestion().is_none());
+        assert!(ed.completion_wanted());
+        assert!(!ed.accept_suggestion_word());
+
+        // Only what is offered is taken.
+        let mut ed = editor("");
+        type_str(&mut ed, "a");
+        assert!(offer_clipped(&mut ed, "bc de", 2));
+        ed.accept_suggestion_word();
+        assert_eq!(text(&ed), "abc");
+        assert!(ed.suggestion().is_none());
+        assert!(ed.completion_wanted());
+    }
+
+    #[test]
+    fn shift_tab_pairs_an_opening_bracket() {
+        let mut ed = code(Language::Rust, "fn f() {\n    ‸\n}");
+        ed.insert_char('f');
+        assert!(offer(&mut ed, "oo(bar, baz);").is_some());
+        ed.accept_suggestion_word();
+        ed.accept_suggestion_word();
+        assert_eq!(shown(&ed), "fn f() {\n    foo(‸)\n}");
+        assert_eq!(ed.suggestion(), Some("bar, baz"));
+        ed.accept_suggestion_word();
+        assert_eq!(shown(&ed), "fn f() {\n    foo(bar‸)\n}");
+        assert_eq!(ed.suggestion(), Some(", baz"));
     }
 
     #[test]

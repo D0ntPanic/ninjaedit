@@ -33,8 +33,9 @@
 //! own below. Those rows are not lines of the file, so they carry no line
 //! number and the lines after keep theirs; when the cursor is followed,
 //! the view scrolls so that they are in view as well. Tab accepts a
-//! suggestion and Escape dismisses it; otherwise the keys do what they
-//! always do, and the editor decides what becomes of the suggestion.
+//! suggestion, Shift+Tab accepts just its next word, and Escape dismisses
+//! it; otherwise the keys do what they always do, and the editor decides
+//! what becomes of the suggestion.
 //!
 //! The gutter to the left of the text is laid out as
 //! `[breakpoint][line number][space][guide]`. The breakpoint column is
@@ -868,8 +869,12 @@ impl EditorView {
             KeyCode::Enter => self.editor.insert_char('\n'),
             // Shift+Tab arrives as BackTab from most terminals, or as Tab
             // with the shift modifier under enhanced keyboard protocols.
-            KeyCode::BackTab => self.editor.outdent(),
-            KeyCode::Tab if shift => self.editor.outdent(),
+            // It takes the next word of the suggestion when there is one.
+            KeyCode::BackTab | KeyCode::Tab if shift || key.code == KeyCode::BackTab => {
+                if !self.editor.accept_suggestion_word() {
+                    self.editor.outdent();
+                }
+            }
             // Tab takes the suggestion when there is one: its first line,
             // then the rest (see the editor).
             KeyCode::Tab if self.editor.has_suggestion() => {
@@ -1253,6 +1258,27 @@ mod tests {
             view.editor().buffer().to_text(),
             "fn f() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n}\n"
         );
+    }
+
+    #[test]
+    fn shift_tab_takes_a_word_of_the_suggestion() {
+        let mut view = EditorView::new(Editor::new(FileBuffer::from_text("fn f() {\n    \n}\n")));
+        key(&mut view, KeyCode::Down);
+        key(&mut view, KeyCode::End);
+        suggest(&mut view, "et a = foo();");
+        key(&mut view, KeyCode::BackTab);
+        assert_eq!(view.editor().buffer().to_text(), "fn f() {\n    let\n}\n");
+        assert_eq!(view.editor().suggestion(), Some(" a = foo();"));
+        // As Tab with the shift modifier, under enhanced keyboard protocols.
+        view.handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+            &mut Clipboard::new(),
+        );
+        assert_eq!(view.editor().buffer().to_text(), "fn f() {\n    let a\n}\n");
+        // Without a suggestion, Shift+Tab outdents as ever.
+        key(&mut view, KeyCode::Esc);
+        key(&mut view, KeyCode::BackTab);
+        assert_eq!(view.editor().buffer().to_text(), "fn f() {\nlet a\n}\n");
     }
 
     #[test]
