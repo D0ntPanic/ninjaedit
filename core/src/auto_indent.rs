@@ -82,7 +82,7 @@ const PYTHON_COMPOUNDS: [&[u8]; 7] = [b"if", b"elif", b"else", b"for", b"while",
 const CASE_LABELS: [&[u8]; 2] = [b"case", b"default"];
 
 /// The closing bracket for an opening one.
-pub(crate) fn closer_of(b: u8) -> Option<u8> {
+pub fn closer_of(b: u8) -> Option<u8> {
     match b {
         b'(' => Some(b')'),
         b'[' => Some(b']'),
@@ -91,7 +91,7 @@ pub(crate) fn closer_of(b: u8) -> Option<u8> {
     }
 }
 
-pub(crate) fn is_closer(b: u8) -> bool {
+pub fn is_closer(b: u8) -> bool {
     matches!(b, b')' | b']' | b'}')
 }
 
@@ -216,7 +216,7 @@ impl CodeLine {
 }
 
 /// Whether a token is code, as opposed to a comment or a literal.
-pub(crate) fn is_code(kind: TokenKind) -> bool {
+pub fn is_code(kind: TokenKind) -> bool {
     !matches!(
         kind,
         TokenKind::Comment

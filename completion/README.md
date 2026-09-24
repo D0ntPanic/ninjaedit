@@ -72,6 +72,24 @@ Crates:
   `infer sample` completes a prefix/suffix pair; `--no-heal` feeds the prefix
   as typed for comparison.
 
+* `evaluation` — measures a model end to end, through the editor core: the
+  project is opened as the editor opens it, files come from its index (so
+  ignored files are skipped), and completions are requested by the editor
+  model and answered by its `Completer`, with the model under evaluation
+  overriding the settings. In each file, sections are deleted and written
+  back a word at a time: finishing a line, writing a few new lines, and
+  filling in a block body. Where a completion is right, its correct words
+  are accepted in one go; where it's wrong, the next word is typed.
+  The report gives the next word, partial line, whole line, multi-line
+  and character acceptance rates, overall and by kind of section.
+  Everything random is seeded, so a run can be repeated exactly.
+  `cargo run --release -p evaluation -- core/src --model ~/models/rust-70m
+  --language rust` evaluates on the files under `core/src`. Sections are
+  sampled in proportion to file size, `--hole-rate` per 100 lines of code
+  (2 by default); it and `--max-files` bound the run. `--json` saves the
+  results for comparison, and `--trace` prints every completion next to
+  what was expected.
+
 Model shapes live in `shapes/*.json`: each names an architecture and its
 planned training run (batch, token budget, learning rate, warmup, intervals).
 `train.py --shape 70m` uses one, deriving the step count from the token

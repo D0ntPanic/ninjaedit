@@ -1,0 +1,12 @@
+[package]
+name = "evaluation"
+version = "0.1.0"
+edition = "2024"
+description = "Measures a completion model end to end, through the editor, on a real project"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ninjaedit-core = { path = "../../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

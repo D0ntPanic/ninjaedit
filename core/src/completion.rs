@@ -18,7 +18,14 @@
 //! frontend hands to that editor as
 //! [`Editor::offer_completion`](crate::Editor::offer_completion). A
 //! frontend that wants to be woken when an answer is ready rather than
-//! polling gives the completer a waker.
+//! polling gives the completer a waker, and one that has nothing else to
+//! do, like the completion evaluation, can block on
+//! [`Completer::wait_for_outcomes`].
+//!
+//! Which model a language uses comes from the settings, given to
+//! [`Completer::apply_settings`]; a model set with
+//! [`Completer::override_model`] takes precedence over them, for tools
+//! that run a model of their choosing through the editor.
 //!
 //! The model's context is limited, and prefilling it is the expensive
 //! part of a completion, so the worker keeps a session whose cache is
@@ -32,6 +39,7 @@
 //! every line typed.
 
 use crate::indent::Indentation;
+use crate::settings::Settings;
 use crate::syntax::Language;
 use anyhow::{Context, Result, anyhow};
 use infer::{CompletionOptions, Model, Session, StopReason, TokenSet};
@@ -40,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
+use std::time::Duration;
 use tokenizer::Tokenizer;
 use tokenizer::pretok::{self, Indent};
 
@@ -101,6 +110,9 @@ type Waker = Arc<dyn Fn() + Send + Sync>;
 /// [module documentation](self).
 pub struct Completer {
     workers: HashMap<Language, Worker>,
+    /// Model paths set with [`override_model`](Self::override_model),
+    /// which the settings don't replace.
+    overrides: HashMap<Language, String>,
     outcomes: Receiver<CompletionOutcome>,
     outcome_tx: Sender<CompletionOutcome>,
     waker: Option<Waker>,
@@ -118,6 +130,7 @@ impl Completer {
         let (outcome_tx, outcomes) = mpsc::channel();
         Completer {
             workers: HashMap::new(),
+            overrides: HashMap::new(),
             outcomes,
             outcome_tx,
             waker: None,
@@ -151,6 +164,27 @@ impl Completer {
         }
         let checkpoint = path.clone();
         self.spawn(language, path, move || load_checkpoint(&checkpoint));
+    }
+
+    /// Use the model the settings name for each language, or none where
+    /// they name none, except for languages whose model has been
+    /// [overridden](Self::override_model). Models that haven't changed
+    /// are kept, so this can be called whenever the settings change.
+    pub fn apply_settings(&mut self, settings: &Settings) {
+        for language in Language::ALL {
+            if !self.overrides.contains_key(&language) {
+                self.set_model(language, settings.completion_model(language));
+            }
+        }
+    }
+
+    /// Use the model in the checkpoint directory `path` for `language`
+    /// whatever the settings say: [`apply_settings`](Self::apply_settings)
+    /// leaves it in place. For tools that run a model of their choosing,
+    /// such as the completion evaluation.
+    pub fn override_model(&mut self, language: Language, path: &str) {
+        self.overrides.insert(language, path.to_owned());
+        self.set_model(language, Some(path));
     }
 
     /// Whether completions can be asked for in `language`.
@@ -213,10 +247,26 @@ impl Completer {
     /// Every outcome reported since the last call, oldest first.
     pub fn take_outcomes(&mut self) -> Vec<CompletionOutcome> {
         let mut outcomes = Vec::new();
+        self.drain_outcomes(&mut outcomes);
+        outcomes
+    }
+
+    /// Like [`take_outcomes`](Self::take_outcomes), but blocks until
+    /// there is at least one outcome or `timeout` has passed; empty only
+    /// on a timeout. For callers with nothing to do but wait.
+    pub fn wait_for_outcomes(&mut self, timeout: Duration) -> Vec<CompletionOutcome> {
+        let mut outcomes = Vec::new();
+        if let Ok(outcome) = self.outcomes.recv_timeout(timeout) {
+            outcomes.push(outcome);
+            self.drain_outcomes(&mut outcomes);
+        }
+        outcomes
+    }
+
+    fn drain_outcomes(&mut self, outcomes: &mut Vec<CompletionOutcome>) {
         while let Ok(outcome) = self.outcomes.try_recv() {
             outcomes.push(outcome);
         }
-        outcomes
     }
 }
 
@@ -664,6 +714,62 @@ mod tests {
         if let Some(CompletionOutcome::Completed { text, .. }) = outcomes.last() {
             eprintln!("completion: {text:?}");
         }
+    }
+
+    #[test]
+    fn an_overridden_model_outlasts_the_settings() {
+        use crate::settings::SettingKey;
+        let mut settings = Settings::default();
+        let mut completer = Completer::new();
+        completer.apply_settings(&settings);
+        assert!(!completer.has_model(Language::Rust));
+        settings
+            .set_text(SettingKey::RustCompletionModel, "/settings/model")
+            .unwrap();
+        completer.apply_settings(&settings);
+        assert_eq!(
+            completer.workers[&Language::Rust].path,
+            PathBuf::from("/settings/model")
+        );
+
+        completer.override_model(Language::Rust, "/override/model");
+        assert_eq!(
+            completer.workers[&Language::Rust].path,
+            PathBuf::from("/override/model")
+        );
+        // Neither the settings naming another model nor naming none
+        // replaces the override.
+        completer.apply_settings(&settings);
+        settings.reset(SettingKey::RustCompletionModel);
+        completer.apply_settings(&settings);
+        assert_eq!(
+            completer.workers[&Language::Rust].path,
+            PathBuf::from("/override/model")
+        );
+        // A language the settings have no model for can be given one.
+        completer.override_model(Language::C, "/override/c");
+        completer.apply_settings(&settings);
+        assert!(completer.has_model(Language::C));
+    }
+
+    #[test]
+    fn waiting_for_outcomes_blocks_until_one_arrives() {
+        let mut completer = Completer::new();
+        assert!(
+            completer
+                .wait_for_outcomes(Duration::from_millis(10))
+                .is_empty()
+        );
+        completer.spawn(Language::Rust, PathBuf::from("tiny"), || Ok(tiny_model()));
+        completer.request(1, request(1, "fn main() {\n    let x = ", "\n}\n"));
+        let outcomes = completer.wait_for_outcomes(Duration::from_secs(30));
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [CompletionOutcome::Completed { serial: 1, .. }]
+            ),
+            "{outcomes:?}"
+        );
     }
 
     #[test]
