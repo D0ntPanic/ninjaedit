@@ -209,10 +209,7 @@ fn pack_crate<W: Write>(
     for file in &record.files {
         // Header: crate and file name, excluded from the loss.
         ids.clear();
-        ids.push(tok.special("<crate_name>"));
-        encoder.encode_with(&record.name, pretok::Indent::Spaces(4), &mut ids);
-        ids.push(tok.special("<file_name>"));
-        encoder.encode_with(&file.path, pretok::Indent::Spaces(4), &mut ids);
+        encoder.encode_header(&record.name, &file.path, &mut ids);
         let header: Vec<u16> = ids.iter().map(|&id| id as u16 | MASK_BIT).collect();
         let max_content = match args.seq_len.checked_sub(header.len() + FIM_OVERHEAD + 2) {
             Some(n) if n >= 16 => n,

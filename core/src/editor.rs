@@ -1880,6 +1880,7 @@ impl Editor {
             prefix_start,
             suffix,
             indentation: self.indentation,
+            path: self.buffer.path().map(Path::to_path_buf),
         })
     }
 
