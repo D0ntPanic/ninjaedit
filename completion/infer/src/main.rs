@@ -53,6 +53,13 @@ struct SampleArgs {
     /// and constraining generation to cover what was typed past it.
     #[arg(long)]
     no_heal: bool,
+    /// The module the text is from, for the header training documents open with. The header is
+    /// only given with both this and `--file-name`.
+    #[arg(long, requires = "file_name")]
+    module_name: Option<String>,
+    /// The path of the text's file within its module, such as `src/lib.rs`.
+    #[arg(long, requires = "module_name")]
+    file_name: Option<String>,
     #[arg(long)]
     threads: Option<usize>,
 }
@@ -152,7 +159,11 @@ fn main() -> Result<()> {
             };
             let (context, partial) = prefix.split_at(boundary);
             let mut encoder = tok.encoder();
-            let mut ids = vec![tok.special("<fim_prefix>"), tok.special("<fim_suffix>")];
+            let mut ids = Vec::new();
+            if let (Some(module_name), Some(file_name)) = (&args.module_name, &args.file_name) {
+                encoder.encode_header(module_name, file_name, &mut ids);
+            }
+            ids.extend([tok.special("<fim_prefix>"), tok.special("<fim_suffix>")]);
             encoder.encode_with(&suffix, indent, &mut ids);
             ids.push(tok.special("<fim_middle>"));
             encoder.encode_with(context, indent, &mut ids);

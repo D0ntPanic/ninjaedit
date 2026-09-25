@@ -16,15 +16,15 @@ use std::path::Path;
 /// Names of the special tokens, in id order.
 pub const SPECIALS: &[&str] = &[
     "<pad>",
-    "<bos>",
+    "<lang>",
     "<eos>",
     "<fim_prefix>",
     "<fim_middle>",
     "<fim_suffix>",
     "<eom>",
-    "<file_sep>",
+    "<context>",
     "<file_name>",
-    "<crate_name>",
+    "<module_name>",
 ];
 
 const NEWLINE_COUNT: u32 = MAX_INDENT as u32 + 1;
@@ -207,6 +207,16 @@ impl Encoder<'_> {
                 Piece::Bytes(bytes) => self.encode_piece(bytes, out),
             }
         }
+    }
+
+    /// Appends the header each training document opens with: the module's name and the file's
+    /// path within the module, each after its special token. Prompts open with the same header
+    /// so the model sees what it was trained on.
+    pub fn encode_header(&mut self, module_name: &str, file_path: &str, out: &mut Vec<u32>) {
+        out.push(self.tok.special("<module_name>"));
+        self.encode_with(module_name, Indent::Spaces(4), out);
+        out.push(self.tok.special("<file_name>"));
+        self.encode_with(file_path, Indent::Spaces(4), out);
     }
 
     /// Encodes one pre-token's bytes with BPE, without line or indentation handling.

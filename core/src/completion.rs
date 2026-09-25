@@ -81,6 +81,11 @@ pub struct CompletionRequest {
     /// The buffer's indentation style, which the model's output is
     /// rendered in.
     pub indentation: Indentation,
+    /// The file the buffer was loaded from, if any. The model was trained
+    /// with each file opening with the name of its crate and its path in
+    /// the crate, so the prompt opens with them too when the file is in
+    /// a Cargo package.
+    pub path: Option<PathBuf>,
 }
 
 /// What a worker reports back.
@@ -524,7 +529,7 @@ fn latest_job(jobs: &Receiver<Job>, first: Option<Job>) -> Option<Job> {
 const GENERATION_BUDGET: usize = 256;
 /// The most tokens of the text after the cursor that go in the prompt.
 const SUFFIX_BUDGET: usize = 512;
-/// The special tokens the prompt is framed with.
+/// The special tokens the prompt is framed with, besides the header.
 const FRAME_TOKENS: usize = 3;
 
 /// A loaded model with the session that keeps its cache between
@@ -537,6 +542,9 @@ struct Engine<'a> {
     /// (or of the start of the buffer), kept across requests while it
     /// still fits; see the [module documentation](self).
     anchor: Option<usize>,
+    /// The header tokens for each file asked about, empty for one in no
+    /// Cargo package; see [`crate_of`].
+    headers: HashMap<PathBuf, Vec<u32>>,
 }
 
 impl<'a> Engine<'a> {
@@ -546,7 +554,31 @@ impl<'a> Engine<'a> {
             session: Session::new(model),
             max_seq_len: model.config.max_seq_len,
             anchor: None,
+            headers: HashMap::new(),
         }
+    }
+
+    /// The tokens naming the crate and file the request is in, which the
+    /// prompt opens with as training documents do. Read from the
+    /// package's manifest once per file.
+    fn header(&mut self, request: &CompletionRequest) -> Vec<u32> {
+        let Some(path) = &request.path else {
+            return Vec::new();
+        };
+        if request.language != Language::Rust {
+            return Vec::new();
+        }
+        let tok = self.tokenizer;
+        self.headers
+            .entry(path.clone())
+            .or_insert_with(|| {
+                let mut ids = Vec::new();
+                if let Some((name, file)) = crate_of(path) {
+                    tok.encoder().encode_header(&name, &file, &mut ids);
+                }
+                ids
+            })
+            .clone()
     }
 
     /// Run one request: the text of the completion and how sure the
@@ -585,13 +617,14 @@ impl<'a> Engine<'a> {
             .take_while(|t| !token_set.newline.contains(t))
             .collect();
 
+        let mut ids = self.header(request);
         let prefix_budget = self
             .max_seq_len
-            .saturating_sub(GENERATION_BUDGET + FRAME_TOKENS + suffix_ids.len())
+            .saturating_sub(GENERATION_BUDGET + FRAME_TOKENS + ids.len() + suffix_ids.len())
             .max(1);
         let window = self.window(context, request.prefix_start, prefix_budget, &mut encoder);
 
-        let mut ids = vec![tok.special("<fim_prefix>"), tok.special("<fim_suffix>")];
+        ids.extend([tok.special("<fim_prefix>"), tok.special("<fim_suffix>")]);
         ids.extend_from_slice(&suffix_ids);
         ids.push(tok.special("<fim_middle>"));
         encoder.encode_with(&context[window..], indent, &mut ids);
@@ -728,6 +761,28 @@ impl<'a> Engine<'a> {
     }
 }
 
+/// The crate a file is in and its path within it, as the training data
+/// names them: the package name in the nearest `Cargo.toml` above the
+/// file, and the path from that manifest's directory with `/` between
+/// its parts. `None` when the nearest manifest has no package (a virtual
+/// workspace) or there is none.
+fn crate_of(path: &Path) -> Option<(String, String)> {
+    let path = std::path::absolute(path).ok()?;
+    let (dir, manifest) = path.ancestors().skip(1).find_map(|dir| {
+        let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+        Some((dir, manifest))
+    })?;
+    let manifest: toml::Table = toml::from_str(&manifest).ok()?;
+    let name = manifest.get("package")?.get("name")?.as_str()?.to_owned();
+    let parts: Vec<_> = path
+        .strip_prefix(dir)
+        .ok()?
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect();
+    Some((name, parts.join("/")))
+}
+
 /// Whether cutting `text` at `at` would split a word: the characters on
 /// either side are both of an identifier or a number.
 fn splits_word(text: &str, at: usize) -> bool {
@@ -783,6 +838,7 @@ mod tests {
             prefix_start: 0,
             suffix: suffix.to_owned(),
             indentation: Indentation::Spaces(4),
+            path: None,
         }
     }
 
@@ -1165,6 +1221,29 @@ mod tests {
                 token: 0.125,
             }
         );
+    }
+
+    #[test]
+    fn a_file_is_named_by_its_nearest_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("app/src/ui")).unwrap();
+        std::fs::write(
+            root.join("app/Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            crate_of(&root.join("app/src/ui/view.rs")),
+            Some(("my-app".to_owned(), "src/ui/view.rs".to_owned()))
+        );
+        // A file under only a virtual workspace is in no crate.
+        assert_eq!(crate_of(&root.join("build.rs")), None);
     }
 
     #[test]

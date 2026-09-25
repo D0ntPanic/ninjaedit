@@ -70,7 +70,9 @@ Crates:
   it rarely saw in training, and keystrokes inside a token leave the fed
   context, and its cache, untouched. `infer bench` measures throughput,
   `infer sample` completes a prefix/suffix pair; `--no-heal` feeds the prefix
-  as typed for comparison.
+  as typed for comparison, and `--module-name` with `--file-name` opens the
+  prompt with the module/file header every training document has (the
+  editor gives it from the nearest `Cargo.toml`).
 
 * `evaluation` — measures a model end to end, through the editor core: the
   project is opened as the editor opens it, files come from its index (so
