@@ -25,6 +25,11 @@ impl Reject {
         Reject::Repetitive,
     ];
 
+    /// Position in `ALL`, for per-reason counters.
+    pub fn index(self) -> usize {
+        Reject::ALL.iter().position(|&r| r == self).unwrap()
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Reject::NotUtf8 => "not_utf8",
@@ -84,40 +89,78 @@ pub fn normalize(bytes: &[u8]) -> Option<String> {
     Some(out)
 }
 
+/// How a language writes comments, for reading the banner at the top of a file.
+pub struct CommentStyle {
+    /// Line comment openers.
+    pub line: &'static [&'static str],
+    /// Line comment openers that mark documentation; checked before `line`.
+    pub doc_line: &'static [&'static str],
+    /// Block comment opener and closer.
+    pub block: Option<(&'static str, &'static str)>,
+    /// Characters right after the block opener that make it a documentation comment.
+    pub doc_block: &'static [char],
+    /// Prefixes of a first line that is not code, such as a shebang.
+    pub preamble: &'static [&'static str],
+}
+
+impl CommentStyle {
+    /// Rust, and the C family with the same doc comment conventions.
+    pub const C: CommentStyle = CommentStyle {
+        line: &["//"],
+        doc_line: &["///", "//!"],
+        block: Some(("/*", "*/")),
+        doc_block: &['*', '!'],
+        preamble: &[],
+    };
+    /// Shell, Python, Perl, Ruby, Make and the other `#` languages.
+    pub const HASH: CommentStyle = CommentStyle {
+        line: &["#"],
+        doc_line: &[],
+        block: None,
+        doc_block: &[],
+        preamble: &["#!"],
+    };
+}
+
 /// The banner of a file: the plain comments before the first line of code, lowercased.
 /// Doc comments are skipped because they are prose about the code rather than a
 /// statement about how the file was produced.
-fn banner(content: &str) -> String {
+fn banner(content: &str, style: &CommentStyle) -> String {
     let mut out = String::new();
     // Inside a block comment; the flag says whether its contents should be scanned.
     let mut in_block: Option<bool> = None;
-    for line in content.lines().take(BANNER_MAX_LINES) {
+    for (i, line) in content.lines().take(BANNER_MAX_LINES).enumerate() {
         let t = line.trim_start();
         if let Some(scan) = in_block {
             if scan {
                 out.push_str(t);
                 out.push('\n');
             }
-            if t.contains("*/") {
+            if style.block.is_some_and(|(_, close)| t.contains(close)) {
                 in_block = None;
             }
             continue;
         }
-        if t.is_empty() || t.starts_with("///") || t.starts_with("//!") {
+        if t.is_empty()
+            || style.doc_line.iter().any(|p| t.starts_with(p))
+            || (i == 0 && style.preamble.iter().any(|p| t.starts_with(p)))
+        {
             continue;
         }
-        if t.starts_with("//") {
+        if style.line.iter().any(|p| t.starts_with(p)) {
             out.push_str(t);
             out.push('\n');
             continue;
         }
-        if let Some(rest) = t.strip_prefix("/*") {
-            let doc = rest.starts_with('*') || rest.starts_with('!');
+        if let Some((open, close)) = style.block
+            && let Some(rest) = t.strip_prefix(open)
+        {
+            let doc = rest.starts_with(style.doc_block);
             if !doc {
                 out.push_str(t);
                 out.push('\n');
             }
-            if !rest.contains("*/") {
+            if !rest.contains(close) {
                 in_block = Some(!doc);
             }
             continue;
@@ -129,8 +172,8 @@ fn banner(content: &str) -> String {
 }
 
 /// Returns the marker phrase that identifies a file as machine-generated, if any.
-pub fn generated_marker(content: &str) -> Option<&'static str> {
-    let banner = banner(content);
+pub fn generated_marker_with(content: &str, style: &CommentStyle) -> Option<&'static str> {
+    let banner = banner(content, style);
     if banner.is_empty() {
         return None;
     }
@@ -140,8 +183,8 @@ pub fn generated_marker(content: &str) -> Option<&'static str> {
         .find(|m| banner.contains(m))
 }
 
-/// Applies every quality filter to a normalized file.
-pub fn check(content: &str) -> Result<(), Reject> {
+/// Applies every quality filter to a normalized file whose comments look like `style`.
+pub fn check_with(content: &str, style: &CommentStyle) -> Result<(), Reject> {
     if content.len() < MIN_FILE_BYTES {
         return Err(Reject::TooSmall);
     }
@@ -149,7 +192,7 @@ pub fn check(content: &str) -> Result<(), Reject> {
         return Err(Reject::TooLarge);
     }
 
-    if generated_marker(content).is_some() {
+    if generated_marker_with(content, style).is_some() {
         return Err(Reject::Generated);
     }
 
@@ -224,6 +267,11 @@ pub fn excluded_path(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Applies every quality filter to a normalized Rust file.
+    fn check(content: &str) -> Result<(), Reject> {
+        check_with(content, &CommentStyle::C)
+    }
+
     #[test]
     fn normalizes_endings() {
         assert_eq!(normalize(b"a  \r\nb\r\n\r\n\r\n").unwrap(), "a\nb\n");
@@ -250,6 +298,18 @@ mod tests {
         let src = "#![allow(clippy::all)] // clippy warns about code generated by #[pymethods]\npub struct A;\n";
         assert_eq!(check(src), Ok(()));
         let src = "/** Docs: do not edit the returned buffer. */\npub struct A;\n";
+        assert_eq!(check(src), Ok(()));
+    }
+
+    #[test]
+    fn hash_comment_banners() {
+        let src =
+            "#!/bin/sh\n# Generated by the protocol buffer compiler.  DO NOT EDIT!\nimport x\n";
+        assert_eq!(check_with(src, &CommentStyle::HASH), Err(Reject::Generated));
+        let src = "import os\n# this file is generated by the build\n";
+        assert_eq!(check_with(src, &CommentStyle::HASH), Ok(()));
+        // A Rust inner attribute is code, not a shebang, so the banner ends there.
+        let src = "#![allow(dead_code)]\n// @generated\npub struct A;\n";
         assert_eq!(check(src), Ok(()));
     }
 

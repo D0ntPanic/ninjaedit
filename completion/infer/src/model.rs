@@ -21,11 +21,51 @@ pub struct Config {
     pub d_ff: usize,
     pub max_seq_len: usize,
     pub rope_theta: f32,
+    /// The languages the model was trained on, by the names their corpus directories were
+    /// tagged with (`rust`, `c`, `cpp`). Every model lists at least one. A model of several has
+    /// training documents and prompts that open with `<lang>` and the language (see
+    /// `tokenizer::Encoder::encode_header`); a model of one is trained without it.
+    #[serde(default)]
+    pub languages: Vec<String>,
 }
 
 impl Config {
+    /// Reads `config.json` in a checkpoint directory, without the weights.
+    pub fn load(dir: &Path) -> Result<Config> {
+        let path = dir.join("config.json");
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let config: Config =
+            serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
+        if config.languages.is_empty() {
+            bail!(
+                "{} lists no languages; every model names the languages it was trained on",
+                path.display()
+            );
+        }
+        Ok(config)
+    }
+
     pub fn head_dim(&self) -> usize {
         self.d_model / self.n_heads
+    }
+
+    /// Whether the model was trained on `language`.
+    pub fn knows(&self, language: &str) -> bool {
+        self.languages.iter().any(|l| l == language)
+    }
+
+    /// What a prompt's header names as the language of text in `language`, which must be one
+    /// the model was trained on: the language itself for a model of several, and nothing for
+    /// a model of one, which was trained without it.
+    pub fn header_language<'a>(&self, language: &'a str) -> Result<Option<&'a str>> {
+        if !self.knows(language) {
+            bail!(
+                "the model was trained on {}, not {language}",
+                self.languages.join(", ")
+            );
+        }
+        Ok((self.languages.len() > 1).then_some(language))
     }
 }
 
@@ -158,7 +198,7 @@ impl Model {
 
     /// Loads `config.json` and `model.safetensors` from a checkpoint directory.
     pub fn load(dir: &Path) -> Result<Model> {
-        let config: Config = serde_json::from_str(&fs::read_to_string(dir.join("config.json"))?)?;
+        let config = Config::load(dir)?;
         let bytes = fs::read(dir.join("model.safetensors"))
             .with_context(|| format!("reading weights in {}", dir.display()))?;
         let tensors = SafeTensors::deserialize(&bytes)?;
@@ -877,9 +917,36 @@ mod tests {
                 d_ff: 64,
                 max_seq_len: 64,
                 rope_theta: 10000.0,
+                languages: vec!["rust".to_owned()],
             },
             7,
         )
+    }
+
+    #[test]
+    fn config_languages() {
+        let dir = std::env::temp_dir().join(format!("infer-config-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let json = r#"{"vocab_size": 64, "d_model": 32, "n_layers": 2, "n_heads": 4,
+            "d_ff": 64, "max_seq_len": 64, "rope_theta": 10000.0"#;
+        let write = |languages: &str| {
+            fs::write(dir.join("config.json"), format!("{json}{languages}}}")).unwrap();
+            Config::load(&dir)
+        };
+        // Every model names its languages.
+        let err = write("").unwrap_err().to_string();
+        assert!(err.contains("lists no languages"), "{err}");
+        assert!(write(r#", "languages": []"#).is_err());
+        // One language: no language in the header, and no other language served.
+        let single = write(r#", "languages": ["rust"]"#).unwrap();
+        assert_eq!(single.header_language("rust").unwrap(), None);
+        assert!(single.header_language("c").is_err());
+        // Several: the language in the header.
+        let multi = write(r#", "languages": ["c", "cpp"]"#).unwrap();
+        assert_eq!(multi.header_language("cpp").unwrap(), Some("cpp"));
+        assert!(multi.knows("c") && !multi.knows("rust"));
+        assert!(multi.header_language("rust").is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn tokens(n: usize, seed: u32) -> Vec<u32> {

@@ -2,7 +2,7 @@
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use corpus::{Split, expand_home, read_shard, shard_paths};
+use corpus::{FileRecord, Split, expand_home, parse_languages, read_shard, shard_paths};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::io::Write;
@@ -14,7 +14,7 @@ use tokenizer::{Tokenizer, bpe};
 use twox_hash::XxHash3_64;
 
 #[derive(Parser)]
-#[command(about = "Train, evaluate and inspect the Rust source tokenizer")]
+#[command(about = "Train, evaluate and inspect the source code tokenizer")]
 enum Command {
     /// Learn BPE merges from a sample of the training split.
     Train(TrainArgs),
@@ -30,22 +30,33 @@ enum Command {
 
 #[derive(Parser)]
 struct TrainArgs {
-    #[arg(long, default_value = "~/corpus/rust-crates")]
-    corpus: String,
+    /// Corpus directories, comma-separated; a model for several languages trains on all of
+    /// them (`~/corpus/debian-packages/c,~/corpus/debian-packages/cpp`).
+    #[arg(long, value_delimiter = ',', required = true)]
+    corpus: Vec<String>,
+    /// Languages to learn merges from, comma-separated, as the corpus names them (`rust`,
+    /// `cargo`, `c`, `cpp`). Files in other languages are left out.
+    #[arg(long, value_delimiter = ',', required = true)]
+    languages: Vec<String>,
     #[arg(long)]
     out: String,
     /// Total vocabulary size including special, line-break and byte tokens.
-    #[arg(long, default_value_t = 32768)]
+    #[arg(long, default_value_t = 16384)]
     vocab_size: usize,
-    /// Use one of every N training crates.
-    #[arg(long, default_value_t = 16)]
+    /// Use one of every N training records (crates or packages).
+    #[arg(long, default_value_t = 1)]
     sample: u64,
 }
 
 #[derive(Parser)]
 struct EvalArgs {
-    #[arg(long, default_value = "~/corpus/rust-crates")]
-    corpus: String,
+    /// Corpus directories, comma-separated.
+    #[arg(long, value_delimiter = ',', required = true)]
+    corpus: Vec<String>,
+    /// Languages to measure, comma-separated, as the corpus names them. Files in other
+    /// languages are left out.
+    #[arg(long, value_delimiter = ',', required = true)]
+    languages: Vec<String>,
     #[arg(long)]
     model: String,
     #[arg(long, default_value = "valid")]
@@ -89,34 +100,75 @@ fn sampled(name: &str, every: u64) -> bool {
     Split::of(name) == Split::Train && XxHash3_64::oneshot(name.as_bytes()).is_multiple_of(every)
 }
 
+/// The shards of every corpus directory. Records are split and sampled by name, so a
+/// package's files in several languages are all in or all out.
+fn corpus_shards(dirs: &[String]) -> Result<Vec<PathBuf>> {
+    let mut shards = Vec::new();
+    for dir in dirs {
+        let found = shard_paths(&expand_home(dir))?;
+        if found.is_empty() {
+            bail!("no shards in {dir}");
+        }
+        shards.extend(found);
+    }
+    Ok(shards)
+}
+
+/// The files of a record in the languages given, counting them by language (in `counts`, in
+/// the order of `languages`).
+fn files_in<'a>(
+    files: &'a [FileRecord],
+    languages: &'a [String],
+    counts: &'a mut [u64],
+) -> impl Iterator<Item = &'a FileRecord> {
+    files.iter().filter(move |file| {
+        let index = languages.iter().position(|l| *l == file.language);
+        if let Some(i) = index {
+            counts[i] += 1;
+        }
+        index.is_some()
+    })
+}
+
+/// Fails on a language that had no files, which is most likely misspelled.
+fn check_counts(languages: &[String], counts: &[u64]) -> Result<()> {
+    match languages.iter().zip(counts).find(|&(_, &n)| n == 0) {
+        Some((missing, _)) => bail!("the corpus has no files in {missing}"),
+        None => Ok(()),
+    }
+}
+
 fn train(args: TrainArgs) -> Result<()> {
     let started = Instant::now();
+    let languages = parse_languages(&args.languages)?;
     let num_merges = args
         .vocab_size
         .checked_sub(Tokenizer::MERGE_BASE as usize)
         .filter(|&n| n > 0)
         .unwrap_or_else(|| panic!("vocab size must exceed {}", Tokenizer::MERGE_BASE));
-    let shards = shard_paths(&expand_home(&args.corpus))?;
+    let shards = corpus_shards(&args.corpus)?;
     eprintln!(
-        "counting pre-tokens in 1/{} of training crates across {} shards...",
+        "counting pre-tokens in 1/{} of training records across {} shards...",
         args.sample,
         shards.len()
     );
 
-    /// Pre-token counts of one shard's sample, with its byte and line-break totals.
-    type ShardCounts = (FxHashMap<Vec<u8>, u64>, u64, u64);
+    /// Pre-token counts of one shard's sample, with its byte and line-break totals and its
+    /// files by language.
+    type ShardCounts = (FxHashMap<Vec<u8>, u64>, u64, u64, Vec<u64>);
     let counted: Vec<Result<ShardCounts>> = shards
         .par_iter()
         .map(|shard| {
             let mut counts: FxHashMap<Vec<u8>, u64> = FxHashMap::default();
             let mut bytes = 0u64;
             let mut newlines = 0u64;
+            let mut files = vec![0u64; languages.len()];
             for record in read_shard(shard)? {
                 let record = record?;
                 if !sampled(&record.name, args.sample) {
                     continue;
                 }
-                for file in &record.files {
+                for file in files_in(&record.files, &languages, &mut files) {
                     bytes += file.content.len() as u64;
                     let indent = pretok::detect_indent(&file.content);
                     for piece in pretok::pretokenize(&file.content, indent) {
@@ -132,20 +184,31 @@ fn train(args: TrainArgs) -> Result<()> {
                     }
                 }
             }
-            Ok((counts, bytes, newlines))
+            Ok((counts, bytes, newlines, files))
         })
         .collect();
     let mut counts: FxHashMap<Vec<u8>, u64> = FxHashMap::default();
     let mut sample_bytes = 0u64;
     let mut sample_newlines = 0u64;
+    let mut sample_files = vec![0u64; languages.len()];
     for result in counted {
-        let (c, b, n) = result?;
+        let (c, b, n, f) = result?;
         sample_bytes += b;
         sample_newlines += n;
+        for (total, n) in sample_files.iter_mut().zip(f) {
+            *total += n;
+        }
         for (k, v) in c {
             *counts.entry(k).or_default() += v;
         }
     }
+    let files: Vec<String> = languages
+        .iter()
+        .zip(&sample_files)
+        .map(|(l, n)| format!("{l} {n}"))
+        .collect();
+    eprintln!("files: {}", files.join(", "));
+    check_counts(&languages, &sample_files)?;
     let pre_tokens: u64 = counts.values().sum();
     eprintln!(
         "{} distinct pre-tokens, {} occurrences, {} bytes, {} line breaks ({:.0}s)",
@@ -229,25 +292,28 @@ fn train(args: TrainArgs) -> Result<()> {
 
 fn eval(args: EvalArgs) -> Result<()> {
     let started = Instant::now();
+    let languages = parse_languages(&args.languages)?;
     let tok = Tokenizer::load(&expand_home(&args.model))?;
-    let shards = shard_paths(&expand_home(&args.corpus))?;
+    let shards = corpus_shards(&args.corpus)?;
     let files = AtomicU64::new(0);
     let bytes = AtomicU64::new(0);
     let lines = AtomicU64::new(0);
     let tokens = AtomicU64::new(0);
-    let crates = AtomicU64::new(0);
+    let records = AtomicU64::new(0);
     let hist = std::sync::Mutex::new(vec![0u64; tok.vocab_size()]);
+    let language_files = std::sync::Mutex::new(vec![0u64; languages.len()]);
     shards.par_iter().try_for_each(|shard| -> Result<()> {
         let mut encoder = tok.encoder();
         let mut buf = Vec::new();
         let mut local_hist = vec![0u64; tok.vocab_size()];
+        let mut local_files = vec![0u64; languages.len()];
         for record in read_shard(shard)? {
             let record = record?;
             if Split::of(&record.name) != args.split {
                 continue;
             }
-            crates.fetch_add(1, Ordering::Relaxed);
-            for file in &record.files {
+            records.fetch_add(1, Ordering::Relaxed);
+            for file in files_in(&record.files, &languages, &mut local_files) {
                 buf.clear();
                 encoder.encode(&file.content, &mut buf);
                 files.fetch_add(1, Ordering::Relaxed);
@@ -263,8 +329,13 @@ fn eval(args: EvalArgs) -> Result<()> {
         for (h, l) in hist.iter_mut().zip(&local_hist) {
             *h += l;
         }
+        let mut language_files = language_files.lock().unwrap();
+        for (total, n) in language_files.iter_mut().zip(&local_files) {
+            *total += n;
+        }
         Ok(())
     })?;
+    check_counts(&languages, &language_files.into_inner().unwrap())?;
     let hist = hist.into_inner().unwrap();
     let tokens = tokens.load(Ordering::Relaxed);
     let bytes = bytes.load(Ordering::Relaxed);
@@ -279,7 +350,7 @@ fn eval(args: EvalArgs) -> Result<()> {
         .filter(|&&c| c == 0)
         .count();
     println!("split               {}", args.split.name());
-    println!("crates              {}", crates.load(Ordering::Relaxed));
+    println!("records             {}", records.load(Ordering::Relaxed));
     println!("files               {}", files.load(Ordering::Relaxed));
     println!("bytes               {bytes}");
     println!("lines               {}", lines.load(Ordering::Relaxed));

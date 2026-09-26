@@ -20,7 +20,8 @@ def main():
     out = Path(args.out).expanduser()
     model, step = load_checkpoint(src)
     save_checkpoint(model, out, step, dtype=getattr(mx, args.dtype))
-    # The tokenizer and its fingerprint belong with the weights.
+    # The config, languages included, comes with the weights; the tokenizer and its fingerprint
+    # belong with them too.
     if (src / "tokenizer.json").exists():
         shutil.copy(src / "tokenizer.json", out / "tokenizer.json")
     state = json.loads((src / "state.json").read_text())

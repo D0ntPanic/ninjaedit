@@ -148,16 +148,50 @@ fn choose_span(text: &str, positions: &[usize], rng: &mut Rng) -> (usize, usize,
     )
 }
 
-/// Appends the FIM form of `text` to `out`. Returns the span kind used, or `None` if the
-/// text has no usable split.
+/// Tokens `frame` puts before the text.
+pub const FRAME_TOKENS: usize = 3;
+
+/// Appends a plain document in the SPM layout with an empty suffix and the whole text as the
+/// prefix: `<fim_prefix> <fim_suffix> <fim_middle> T <eom>`. That is the prompt the editor
+/// sends with the cursor at the end of a file, so plain documents train on the format the
+/// model is used in: the header is closed by `<fim_prefix>` as in every prompt, the text is
+/// predicted as a continuation after `<fim_middle>`, and the end of the file teaches the model
+/// where a completion stops.
+pub fn frame(
+    tok: &Tokenizer,
+    encoder: &mut Encoder,
+    text: &str,
+    indent: Indent,
+    out: &mut Vec<u32>,
+) {
+    out.extend([
+        tok.special("<fim_prefix>"),
+        tok.special("<fim_suffix>"),
+        tok.special("<fim_middle>"),
+    ]);
+    encoder.encode_with(text, indent, out);
+    out.push(tok.special("<eom>"));
+}
+
+/// How a FIM document was made.
+#[derive(Clone, Copy, Debug)]
+pub struct Fim {
+    pub kind: SpanKind,
+    /// The PSM layout rather than SPM.
+    pub psm: bool,
+}
+
+/// Appends the FIM form of `text` to `out`, in the PSM layout with probability `psm_rate` and
+/// otherwise SPM. Returns how it was made, or `None` if the text has no usable split.
 pub fn transform(
     tok: &Tokenizer,
     encoder: &mut Encoder,
     text: &str,
     indent: Indent,
+    psm_rate: f64,
     rng: &mut Rng,
     out: &mut Vec<u32>,
-) -> Option<SpanKind> {
+) -> Option<Fim> {
     let positions = cursor_positions(text, indent);
     if positions.len() < 2 {
         return None;
@@ -178,7 +212,8 @@ pub fn transform(
     let fim_suffix = tok.special("<fim_suffix>");
     let fim_middle = tok.special("<fim_middle>");
     let eom = tok.special("<eom>");
-    if rng.chance(0.5) {
+    let psm = rng.chance(psm_rate);
+    if psm {
         // PSM: <fim_prefix> P <fim_suffix> S <fim_middle> M <eom>
         out.push(fim_prefix);
         out.extend_from_slice(&p);
@@ -198,7 +233,7 @@ pub fn transform(
         out.extend_from_slice(&m);
     }
     out.push(eom);
-    Some(kind)
+    Some(Fim { kind, psm })
 }
 
 #[cfg(test)]

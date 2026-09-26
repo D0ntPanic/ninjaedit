@@ -2,7 +2,7 @@
 name = "tokenizer"
 version = "0.1.0"
 edition = "2024"
-description = "Byte-level BPE tokenizer for Rust source with indentation-aware line tokens"
+description = "Byte-level BPE tokenizer for source code with indentation-aware line tokens"
 
 [features]
 default = ["cli"]

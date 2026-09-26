@@ -34,16 +34,24 @@ pub struct Stats {
 
     pub rejected_licenses: Mutex<HashMap<String, u64>>,
     pub editions: Mutex<HashMap<String, u64>>,
+    /// Files and bytes kept, by language.
+    pub languages: Mutex<HashMap<String, (u64, u64)>>,
 }
 
 impl Stats {
     pub fn reject(&self, reason: Reject) {
-        let idx = Reject::ALL.iter().position(|&r| r == reason).unwrap();
-        self.files_rejected[idx].fetch_add(1, Ordering::Relaxed);
+        self.files_rejected[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn count(&self, map: &Mutex<HashMap<String, u64>>, key: &str) {
         *map.lock().unwrap().entry(key.to_owned()).or_default() += 1;
+    }
+
+    pub fn count_language(&self, language: &str, bytes: u64) {
+        let mut languages = self.languages.lock().unwrap();
+        let entry = languages.entry(language.to_owned()).or_default();
+        entry.0 += 1;
+        entry.1 += bytes;
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -65,6 +73,14 @@ impl Stats {
             .map(|(k, v)| (k.clone(), *v))
             .collect();
         editions.sort();
+        let mut languages: Vec<(String, u64, u64)> = self
+            .languages
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, &(files, bytes))| (k.clone(), files, bytes))
+            .collect();
+        languages.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
         Snapshot {
             crates: [
                 ("in_index", g(&self.crates_in_index)),
@@ -106,6 +122,7 @@ impl Stats {
             tokens_kept: g(&self.tokens_kept),
             rejected_licenses,
             editions,
+            languages,
         }
     }
 }
@@ -122,6 +139,8 @@ pub struct Snapshot {
     pub tokens_kept: u64,
     pub rejected_licenses: Vec<(String, u64)>,
     pub editions: Vec<(String, u64)>,
+    /// Language, files and bytes kept.
+    pub languages: Vec<(String, u64, u64)>,
 }
 
 impl Snapshot {
@@ -139,6 +158,10 @@ impl Snapshot {
         println!("  {:<28}{:>14}", "bytes_kept", self.bytes_kept);
         println!("  {:<28}{:>14}", "lines_kept", self.lines_kept);
         println!("  {:<28}{:>14}", "tokens_kept (rough)", self.tokens_kept);
+        println!("languages (kept files, bytes)");
+        for (language, files, bytes) in &self.languages {
+            println!("  {language:<16}{files:>12}{bytes:>14}");
+        }
         table("editions (kept crates)", &self.editions);
         table("rejected licenses (top)", &self.rejected_licenses);
     }
