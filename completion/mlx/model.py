@@ -3,7 +3,7 @@ SwiGLU feed-forward, no biases, and tied input/output embeddings."""
 
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import mlx.core as mx
@@ -22,13 +22,22 @@ class ModelConfig:
     d_ff: int = 1024
     max_seq_len: int = 2048
     rope_theta: float = 10000.0
+    # The languages the model is trained on, from the packed data's `meta.json`. Every model
+    # lists at least one: the editor picks a model for a file by them. With several, training
+    # documents open with `<lang>` and the language, and so must prompts.
+    languages: list[str] = field(default_factory=list)
 
     def save(self, path: Path) -> None:
+        if not self.languages:
+            raise ValueError("a model config must list the languages it is trained on")
         path.write_text(json.dumps(asdict(self), indent=2))
 
     @staticmethod
     def load(path: Path) -> "ModelConfig":
-        return ModelConfig(**json.loads(path.read_text()))
+        config = ModelConfig(**json.loads(path.read_text()))
+        if not config.languages:
+            raise SystemExit(f"{path} lists no languages; add the ones the model was trained on, as \"languages\": [\"rust\"]")
+        return config
 
     @property
     def head_dim(self) -> int:

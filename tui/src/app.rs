@@ -1664,7 +1664,9 @@ impl App {
         }
         let owner = tab.id;
         if let Some(request) = editor.take_completion_request()
-            && self.completer.has_model(request.language)
+            && self
+                .completer
+                .has_model(request.language, request.path.as_deref())
         {
             self.completer.request(owner, request);
         }
@@ -1694,10 +1696,9 @@ impl App {
                         redraw = true;
                     }
                 }
-                CompletionOutcome::Failed { language, error } => {
+                CompletionOutcome::Failed { model, error } => {
                     self.status = Some(StatusLine::error(format!(
-                        "{} completion model: {error}",
-                        language.name()
+                        "Completion model {model}: {error}"
                     )));
                     redraw = true;
                 }
@@ -8518,15 +8519,52 @@ mod tests {
         assert!(!app.take_completions());
     }
 
+    /// Tick until the status line says `text`.
+    fn wait_for_status(app: &mut App, text: &str) {
+        let started = Instant::now();
+        loop {
+            app.tick();
+            if app.status.as_ref().is_some_and(|s| s.text().contains(text)) {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "no status with {text:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn a_completion_model_that_cannot_load_is_reported() {
         let (_dir, mut app) = app_with_files(&[("a.rs", "fn f() {}\n"), ("b.txt", "text\n")]);
+        // A model whose config can't be read serves nothing, and is
+        // reported as soon as it is set.
         app.settings
-            .set_text(SettingKey::RustCompletionModel, "/nonexistent/model")
+            .set_text(SettingKey::CompletionModels, "/nonexistent/model")
             .unwrap();
         app.settings_changed();
-        assert!(app.completer.has_model(Language::Rust));
-        assert!(!app.completer.has_model(Language::Plain));
+        assert!(!app.completer.has_model(Language::Rust, None));
+        wait_for_status(&mut app, "Completion model /nonexistent/model");
+
+        // A model whose config says Rust serves Rust files; its weights
+        // are only loaded, and found missing, at the first request.
+        let model =
+            std::env::temp_dir().join(format!("ninjaedit-app-model-{}", std::process::id()));
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(
+            model.join("config.json"),
+            r#"{"vocab_size": 64, "d_model": 16, "n_layers": 1, "n_heads": 2, "d_ff": 32,
+                "max_seq_len": 64, "rope_theta": 10000.0, "languages": ["rust"]}"#,
+        )
+        .unwrap();
+        app.status = None;
+        app.settings
+            .set_text(SettingKey::CompletionModels, &model.to_string_lossy())
+            .unwrap();
+        app.settings_changed();
+        assert!(app.completer.has_model(Language::Rust, None));
+        assert!(!app.completer.has_model(Language::Plain, None));
         // Typing in the text file asks nothing of the model.
         type_str(&mut app, "x");
         assert!(!app.tabs[1].view.editor().completion_wanted());
@@ -8535,29 +8573,15 @@ mod tests {
         assert!(app.tabs[0].title().ends_with(".rs"));
         press(&mut app, KeyCode::End);
         type_str(&mut app, "x");
-        let started = Instant::now();
-        loop {
-            app.tick();
-            if app
-                .status
-                .as_ref()
-                .is_some_and(|s| s.text().contains("completion model"))
-            {
-                break;
-            }
-            assert!(started.elapsed() < Duration::from_secs(10), "no report");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_for_status(&mut app, "loading the tokenizer");
         let screen = draw(&mut app, 80, 6);
-        assert!(
-            screen[5].contains("Rust completion model") && screen[5].contains("not a directory"),
-            "{screen:#?}"
-        );
-        // Taking the path away takes the model away.
+        assert!(screen[5].contains("Completion model"), "{screen:#?}");
+        // Taking the model away takes completion away.
         app.settings
-            .set_text(SettingKey::RustCompletionModel, "")
+            .set_text(SettingKey::CompletionModels, "")
             .unwrap();
         app.settings_changed();
-        assert!(!app.completer.has_model(Language::Rust));
+        assert!(!app.completer.has_model(Language::Rust, None));
+        std::fs::remove_dir_all(&model).unwrap();
     }
 }

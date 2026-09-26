@@ -31,7 +31,7 @@ DEFAULTS = {
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train the code completion model with MLX")
-    p.add_argument("--data", default="~/corpus/packed/s2048-16k")
+    p.add_argument("--data")
     p.add_argument("--shape", help="shape file or name (see ../shapes); model flags below override it")
     p.add_argument("--out", help="checkpoint directory (default: ~/corpus/checkpoints/<shape name>)")
     p.add_argument("--d-model", type=int)
@@ -49,7 +49,7 @@ def parse_args():
     p.add_argument("--save-every", type=int)
     p.add_argument("--resume", action="store_true", help="continue from the checkpoint in --out")
     p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16", help="compute dtype; parameters stay float32")
+    p.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32", help="compute dtype; parameters stay float32")
     p.add_argument("--no-compile", action="store_true", help="run the training step eagerly")
     args = p.parse_args()
     resolve_plan(args)
@@ -68,10 +68,8 @@ def resolve_plan(args):
     if args.shape:
         args.shape_data = load_shape(args.shape)
         plan = dict(args.shape_data["train"])
-        if args.out is None:
-            args.out = f"~/corpus/checkpoints/{args.shape_data['name']}"
-    elif args.out is None:
-        raise SystemExit("--out is required without --shape")
+    if args.out is None:
+        raise SystemExit("--out is required")
     if args.resume:
         state = json.loads((Path(args.out).expanduser() / "state.json").read_text())
         plan.update(state.get("plan", {}))
@@ -137,6 +135,8 @@ def format_duration(secs: float) -> str:
 
 def main():
     args = parse_args()
+    if args.data is None:
+        raise SystemExit("--data is required")
     data_dir = Path(args.data).expanduser()
     out = Path(args.out).expanduser()
     meta = read_meta(data_dir)
@@ -149,9 +149,14 @@ def main():
         args.steps = planned_steps(args.shape_data, args.batch, meta["seq_len"])
         print(f"shape {args.shape_data['name']}: {args.shape_data['train']['tokens'] / 1e9:.2f}B tokens planned -> {args.steps} steps of {args.batch} x {meta['seq_len'] - 1}")
 
+    languages = meta.get("languages")
+    if not languages:
+        raise SystemExit(f"{data_dir / 'meta.json'} lists no languages; repack, or add the corpus's, as \"languages\": [\"rust\"]")
     if args.resume:
         model, start_step = load_checkpoint(out)
         config = model.config
+        if config.languages != languages:
+            raise SystemExit(f"the checkpoint was trained on languages {config.languages}, but {data_dir} has {languages}")
     else:
         if args.shape_data is not None:
             config = model_config(args.shape_data, meta["vocab_size"], meta["seq_len"])
@@ -167,6 +172,7 @@ def main():
                 d_ff=args.d_ff,
                 max_seq_len=meta["seq_len"],
             )
+        config.languages = languages
         mx.random.seed(args.seed)
         model = Model(config)
         model.init_weights()
@@ -177,6 +183,7 @@ def main():
     print(
         f"model: {config.n_layers} layers, d_model {config.d_model}, {config.n_heads} heads, d_ff {config.d_ff}: "
         f"{params / 1e6:.1f}M parameters ({(params - config.vocab_size * config.d_model) / 1e6:.1f}M without embeddings), {args.dtype} compute"
+        + f", languages {', '.join(config.languages)}"
     )
 
     optimizer = optim.AdamW(

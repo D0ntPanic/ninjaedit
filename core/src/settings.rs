@@ -21,7 +21,7 @@
 //! cmake-generator = "Xcode"
 //!
 //! [completion]
-//! rust-model = "~/models/rust-70m"
+//! models = ["~/models/c-70m", "~/models/c-cpp-70m"]
 //! min-line-confidence = 0.8
 //! ```
 //!
@@ -33,11 +33,13 @@
 //! its category, name, description, and [kind](SettingKind), and through
 //! the text form of each value: a setting is read as text and set from
 //! text (a number's digits, a program's path, the value of one of its
-//! choices), with the parsing and the checking done here. The kind tells
-//! a frontend which control suits the setting, a text field or a choice
-//! among a fixed set of options, and a settings page is so a list of
-//! such controls whatever the settings are: adding a setting means a
-//! variant here and nothing in the frontend. Code that uses a setting reads it through its typed
+//! choices), with the parsing and the checking done here; a list's items
+//! are each read and set as text the same way. The kind tells a
+//! frontend which control suits the setting, a text field, a choice
+//! among a fixed set of options, or a list of text fields, and a
+//! settings page is so a list of such controls whatever the settings
+//! are: adding a setting means a variant here and nothing in the
+//! frontend. Code that uses a setting reads it through its typed
 //! accessor, [`terminal_scrollback`](Settings::terminal_scrollback) and
 //! the like.
 
@@ -45,7 +47,6 @@ use crate::auto_indent::{CodeStyle, ContinuationIndent};
 use crate::build::DEFAULT_CMAKE_GENERATOR;
 use crate::completion::ConfidenceThresholds;
 use crate::project_search::MAX_MATCHES;
-use crate::syntax::Language;
 use crate::terminal::emulator::DEFAULT_SCROLLBACK;
 use std::fmt;
 use toml::{Table, Value};
@@ -57,8 +58,8 @@ pub enum Category {
     Terminal,
     Search,
     Build,
-    /// Code completion: the model for each language it is available in,
-    /// and how sure a model must be to offer a completion.
+    /// Code completion: the models, and how sure a model must be to
+    /// offer a completion.
     Completion,
 }
 
@@ -111,6 +112,11 @@ pub enum SettingKind {
     /// One of a fixed set of options, listed in the order a frontend
     /// shows them.
     Choice(&'static [SettingChoice]),
+    /// An ordered list of text items, each typed like a text field; see
+    /// [`Settings::list`] and [`Settings::set_list`]. A frontend shows a
+    /// field per item and one more to add an item, and lets items be
+    /// moved and removed.
+    List,
 }
 
 /// One option of a [`SettingKind::Choice`].
@@ -152,10 +158,11 @@ pub enum SettingKey {
     /// The generator CMake configures with, passed as `-G`; blank to let
     /// CMake choose its own.
     CMakeGenerator,
-    /// The directory of the code completion model for Rust files; blank
-    /// for no completion in them. Completion models are trained per
-    /// language, so each language that has one gets a setting like this.
-    RustCompletionModel,
+    /// The checkpoint directories of the code completion models, highest
+    /// priority first: a file's language goes to the first model trained
+    /// on it. So a model for one language can sit above a broader model
+    /// that covers it too, which then serves only its other languages.
+    CompletionModels,
     /// How sure the model must be of a line of a completion, on average
     /// over its tokens, for the line to be offered; see
     /// [`ConfidenceThresholds::line`].
@@ -175,7 +182,7 @@ impl SettingKey {
         SettingKey::TerminalScrollback,
         SettingKey::SearchMaxResults,
         SettingKey::CMakeGenerator,
-        SettingKey::RustCompletionModel,
+        SettingKey::CompletionModels,
         SettingKey::CompletionLineConfidence,
         SettingKey::CompletionTokenConfidence,
     ];
@@ -186,18 +193,9 @@ impl SettingKey {
             SettingKey::Shell | SettingKey::TerminalScrollback => Category::Terminal,
             SettingKey::SearchMaxResults => Category::Search,
             SettingKey::CMakeGenerator => Category::Build,
-            SettingKey::RustCompletionModel
+            SettingKey::CompletionModels
             | SettingKey::CompletionLineConfidence
             | SettingKey::CompletionTokenConfidence => Category::Completion,
-        }
-    }
-
-    /// The completion model setting for a language, if completion can be
-    /// had for it at all.
-    pub fn completion_model(language: Language) -> Option<SettingKey> {
-        match language {
-            Language::Rust => Some(SettingKey::RustCompletionModel),
-            _ => None,
         }
     }
 
@@ -205,11 +203,11 @@ impl SettingKey {
     pub fn kind(self) -> SettingKind {
         match self {
             SettingKey::ContinuationIndent => SettingKind::Choice(&CONTINUATION_CHOICES),
+            SettingKey::CompletionModels => SettingKind::List,
             SettingKey::Shell
             | SettingKey::TerminalScrollback
             | SettingKey::SearchMaxResults
             | SettingKey::CMakeGenerator
-            | SettingKey::RustCompletionModel
             | SettingKey::CompletionLineConfidence
             | SettingKey::CompletionTokenConfidence => SettingKind::Text,
         }
@@ -223,7 +221,7 @@ impl SettingKey {
             SettingKey::TerminalScrollback => "Scrollback lines",
             SettingKey::SearchMaxResults => "Maximum search results",
             SettingKey::CMakeGenerator => "CMake generator",
-            SettingKey::RustCompletionModel => "Rust model",
+            SettingKey::CompletionModels => "Models",
             SettingKey::CompletionLineConfidence => "Line confidence",
             SettingKey::CompletionTokenConfidence => "Token confidence",
         }
@@ -243,8 +241,8 @@ impl SettingKey {
             SettingKey::CMakeGenerator => {
                 "Passed as -G when CMake configures: Ninja, \"Unix Makefiles\", Xcode, and the like; blank for CMake's own choice"
             }
-            SettingKey::RustCompletionModel => {
-                "The checkpoint directory (config.json, model.safetensors, tokenizer.json) of the completion model for Rust files; blank for no completion in them"
+            SettingKey::CompletionModels => {
+                "Checkpoint directories (config.json, model.safetensors, tokenizer.json), highest priority first: each language goes to the first model trained on it. Alt+Up and Alt+Down move a model, Ctrl+D removes it"
             }
             SettingKey::CompletionLineConfidence => {
                 "How sure the model must be of a line, on average over its tokens, to offer it: 0 to 1, lower for more eager completion, higher for more cautious"
@@ -263,7 +261,7 @@ impl SettingKey {
             SettingKey::TerminalScrollback => "scrollback",
             SettingKey::SearchMaxResults => "max-results",
             SettingKey::CMakeGenerator => "cmake-generator",
-            SettingKey::RustCompletionModel => "rust-model",
+            SettingKey::CompletionModels => "models",
             SettingKey::CompletionLineConfidence => "min-line-confidence",
             SettingKey::CompletionTokenConfidence => "min-token-confidence",
         }
@@ -286,7 +284,7 @@ impl SettingKey {
             SettingKey::TerminalScrollback => DEFAULT_SCROLLBACK.to_string(),
             SettingKey::SearchMaxResults => MAX_MATCHES.to_string(),
             SettingKey::CMakeGenerator => DEFAULT_CMAKE_GENERATOR.to_owned(),
-            SettingKey::RustCompletionModel => String::new(),
+            SettingKey::CompletionModels => String::new(),
             SettingKey::CompletionLineConfidence => ConfidenceThresholds::DEFAULT.line.to_string(),
             SettingKey::CompletionTokenConfidence => {
                 ConfidenceThresholds::DEFAULT.token.to_string()
@@ -297,7 +295,8 @@ impl SettingKey {
     /// What a field shows while its text is empty. For the shell, whose
     /// default is to detect the user's shell, this says which one that is
     /// on this machine; for the CMake generator, that a blank leaves the
-    /// choice to CMake; for the others it is the default value.
+    /// choice to CMake; for a list, the field that adds an item, what to
+    /// type there; for the others it is the default value.
     pub fn placeholder(self) -> String {
         match self {
             SettingKey::Shell => format!(
@@ -305,7 +304,7 @@ impl SettingKey {
                 crate::terminal::detected_shell().to_string_lossy()
             ),
             SettingKey::CMakeGenerator => "CMake's default generator".to_owned(),
-            SettingKey::RustCompletionModel => "no completion for Rust files".to_owned(),
+            SettingKey::CompletionModels => "add a model".to_owned(),
             _ => self.default_text(),
         }
     }
@@ -332,7 +331,7 @@ pub struct Settings {
     terminal_scrollback: Option<usize>,
     search_max_results: Option<usize>,
     cmake_generator: Option<String>,
-    rust_completion_model: Option<String>,
+    completion_models: Vec<String>,
     completion_line_confidence: Option<f64>,
     completion_token_confidence: Option<f64>,
     /// Whatever else the settings file held: tables and keys this version
@@ -382,15 +381,11 @@ impl Settings {
             .unwrap_or(DEFAULT_CMAKE_GENERATOR)
     }
 
-    /// The checkpoint directory of the code completion model for a
-    /// language, as the user typed it (a leading `~` stands for the home
-    /// directory), or `None` when there is no completion for it: none
-    /// exists for the language, or none has been set.
-    pub fn completion_model(&self, language: Language) -> Option<&str> {
-        match SettingKey::completion_model(language)? {
-            SettingKey::RustCompletionModel => self.rust_completion_model.as_deref(),
-            _ => None,
-        }
+    /// The checkpoint directories of the code completion models, highest
+    /// priority first, as the user typed them (a leading `~` stands for
+    /// the home directory).
+    pub fn completion_models(&self) -> &[String] {
+        &self.completion_models
     }
 
     /// How sure a completion model must be of a line to offer it.
@@ -404,8 +399,51 @@ impl Settings {
 
     // ----- Text form ------------------------------------------------------
 
+    /// A list setting's items, in order; for any other setting, its
+    /// text as the one item.
+    pub fn list(&self, key: SettingKey) -> Vec<String> {
+        match key {
+            SettingKey::CompletionModels => self.completion_models.clone(),
+            _ => vec![self.text(key)],
+        }
+    }
+
+    /// Set a list setting's items, as typed into its fields, in order.
+    /// Surrounding spaces are ignored, and blank items and repeats are
+    /// dropped. Returns whether the setting changed, or, when an item
+    /// isn't valid, what would be.
+    pub fn set_list(&mut self, key: SettingKey, items: &[String]) -> Result<bool, String> {
+        let mut list: Vec<String> = Vec::new();
+        for item in items {
+            let item = item.trim();
+            if !item.is_empty() && !list.iter().any(|i| i == item) {
+                list.push(item.to_owned());
+            }
+        }
+        match key {
+            SettingKey::CompletionModels => {
+                let changed = self.completion_models != list;
+                self.completion_models = list;
+                Ok(changed)
+            }
+            _ => self.set_text(key, list.first().map(String::as_str).unwrap_or("")),
+        }
+    }
+
+    /// A line about each item of a list setting, for a frontend to show
+    /// under it; empty for other settings. For the completion models,
+    /// the languages each serves, read from their configs.
+    pub fn item_notes(&self, key: SettingKey) -> Vec<String> {
+        match key {
+            SettingKey::CompletionModels => {
+                crate::completion::describe_models(&self.completion_models)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// A setting's value as text: what a field holds. Blank for a shell
-    /// left to be detected.
+    /// left to be detected, and a list's items one per line.
     pub fn text(&self, key: SettingKey) -> String {
         match key {
             SettingKey::ContinuationIndent => {
@@ -415,9 +453,7 @@ impl Settings {
             SettingKey::TerminalScrollback => self.terminal_scrollback().to_string(),
             SettingKey::SearchMaxResults => self.search_max_results().to_string(),
             SettingKey::CMakeGenerator => self.cmake_generator().to_owned(),
-            SettingKey::RustCompletionModel => {
-                self.rust_completion_model.clone().unwrap_or_default()
-            }
+            SettingKey::CompletionModels => self.completion_models.join("\n"),
             SettingKey::CompletionLineConfidence => self.completion_thresholds().line.to_string(),
             SettingKey::CompletionTokenConfidence => self.completion_thresholds().token.to_string(),
         }
@@ -450,8 +486,9 @@ impl Settings {
             SettingKey::CMakeGenerator => {
                 self.cmake_generator = (text != DEFAULT_CMAKE_GENERATOR).then(|| text.to_owned());
             }
-            SettingKey::RustCompletionModel => {
-                self.rust_completion_model = (!text.is_empty()).then(|| text.to_owned());
+            SettingKey::CompletionModels => {
+                let items: Vec<String> = text.lines().map(str::to_owned).collect();
+                return self.set_list(key, &items);
             }
             SettingKey::CompletionLineConfidence => {
                 let line = parse_fraction(text)?;
@@ -477,7 +514,7 @@ impl Settings {
             SettingKey::TerminalScrollback => self.terminal_scrollback() == DEFAULT_SCROLLBACK,
             SettingKey::SearchMaxResults => self.search_max_results() == MAX_MATCHES,
             SettingKey::CMakeGenerator => self.cmake_generator() == DEFAULT_CMAKE_GENERATOR,
-            SettingKey::RustCompletionModel => self.rust_completion_model.is_none(),
+            SettingKey::CompletionModels => self.completion_models.is_empty(),
             SettingKey::CompletionLineConfidence => {
                 self.completion_thresholds().line == ConfidenceThresholds::DEFAULT.line
             }
@@ -497,7 +534,7 @@ impl Settings {
             SettingKey::TerminalScrollback => self.terminal_scrollback = None,
             SettingKey::SearchMaxResults => self.search_max_results = None,
             SettingKey::CMakeGenerator => self.cmake_generator = None,
-            SettingKey::RustCompletionModel => self.rust_completion_model = None,
+            SettingKey::CompletionModels => self.completion_models.clear(),
             SettingKey::CompletionLineConfidence => self.completion_line_confidence = None,
             SettingKey::CompletionTokenConfidence => self.completion_token_confidence = None,
         }
@@ -529,6 +566,21 @@ impl Settings {
                     continue;
                 };
                 settings.read_value(key, &value)?;
+            }
+            // Before the model list, each language had its own setting,
+            // of which only Rust's was ever made. It becomes the last
+            // model in the list, and is written back as part of it.
+            if category == Category::Completion
+                && let Some(value) = entries.remove("rust-model")
+            {
+                let path = value.as_str().map(str::trim).ok_or_else(|| {
+                    SettingsError("`completion.rust-model` must be a string".to_owned())
+                })?;
+                let mut models = settings.completion_models.clone();
+                models.push(path.to_owned());
+                settings
+                    .set_list(SettingKey::CompletionModels, &models)
+                    .ok();
             }
             if entries.is_empty() {
                 table.remove(category.table());
@@ -571,12 +623,18 @@ impl Settings {
                 self.cmake_generator =
                     (generator != DEFAULT_CMAKE_GENERATOR).then(|| generator.to_owned());
             }
-            SettingKey::RustCompletionModel => {
-                let path = value
-                    .as_str()
-                    .ok_or_else(|| SettingsError(format!("`{}` must be a string", key.path())))?
-                    .trim();
-                self.rust_completion_model = (!path.is_empty()).then(|| path.to_owned());
+            SettingKey::CompletionModels => {
+                let paths: Option<Vec<String>> = value.as_array().and_then(|items| {
+                    items
+                        .iter()
+                        .map(|item| item.as_str().map(str::to_owned))
+                        .collect()
+                });
+                let paths = paths.ok_or_else(|| {
+                    SettingsError(format!("`{}` must be a list of paths", key.path()))
+                })?;
+                self.set_list(key, &paths)
+                    .map_err(|err| SettingsError(format!("`{}`: {err}", key.path())))?;
             }
             SettingKey::CompletionLineConfidence => {
                 self.completion_line_confidence = Some(read_fraction(key, value)?);
@@ -601,9 +659,13 @@ impl Settings {
                 SettingKey::ContinuationIndent | SettingKey::Shell => Value::String(self.text(key)),
                 SettingKey::TerminalScrollback => Value::Integer(self.terminal_scrollback() as i64),
                 SettingKey::SearchMaxResults => Value::Integer(self.search_max_results() as i64),
-                SettingKey::CMakeGenerator | SettingKey::RustCompletionModel => {
-                    Value::String(self.text(key))
-                }
+                SettingKey::CMakeGenerator => Value::String(self.text(key)),
+                SettingKey::CompletionModels => Value::Array(
+                    self.completion_models
+                        .iter()
+                        .map(|m| Value::String(m.clone()))
+                        .collect(),
+                ),
                 SettingKey::CompletionLineConfidence => {
                     Value::Float(self.completion_thresholds().line)
                 }
@@ -706,8 +768,7 @@ mod tests {
         assert_eq!(settings.terminal_scrollback(), DEFAULT_SCROLLBACK);
         assert_eq!(settings.search_max_results(), MAX_MATCHES);
         assert_eq!(settings.cmake_generator(), "Ninja");
-        assert_eq!(settings.completion_model(Language::Rust), None);
-        assert_eq!(settings.completion_model(Language::Plain), None);
+        assert!(settings.completion_models().is_empty());
         for key in SettingKey::ALL {
             assert!(settings.is_default(key), "{key:?}");
             assert_eq!(settings.text(key), key.default_text(), "{key:?}");
@@ -814,32 +875,64 @@ mod tests {
             Ok(true)
         );
         assert!(settings.is_default(SettingKey::CMakeGenerator));
+    }
 
-        // A completion model is a path as typed, blank for none.
+    #[test]
+    fn completion_models_are_a_list_in_priority_order() {
+        let mut settings = Settings::default();
+        assert_eq!(SettingKey::CompletionModels.kind(), SettingKind::List);
+        let items = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Paths as typed, trimmed; blanks and repeats dropped.
         assert_eq!(
-            settings.set_text(SettingKey::RustCompletionModel, " ~/models/rust "),
+            settings.set_list(
+                SettingKey::CompletionModels,
+                &items(&[" ~/models/c ", "", "~/models/ccpp", "~/models/c"])
+            ),
             Ok(true)
         );
         assert_eq!(
-            settings.completion_model(Language::Rust),
-            Some("~/models/rust")
+            settings.completion_models(),
+            ["~/models/c", "~/models/ccpp"]
         );
         assert_eq!(
-            settings.text(SettingKey::RustCompletionModel),
-            "~/models/rust"
+            settings.list(SettingKey::CompletionModels),
+            ["~/models/c", "~/models/ccpp"]
         );
-        assert!(!settings.is_default(SettingKey::RustCompletionModel));
+        assert!(!settings.is_default(SettingKey::CompletionModels));
+        // The same list again changes nothing; a new order does.
         assert_eq!(
-            settings.completion_model(Language::C),
-            None,
-            "no model for C"
+            settings.set_list(
+                SettingKey::CompletionModels,
+                &items(&["~/models/c", "~/models/ccpp"])
+            ),
+            Ok(false)
         );
         assert_eq!(
-            settings.set_text(SettingKey::RustCompletionModel, ""),
+            settings.set_list(
+                SettingKey::CompletionModels,
+                &items(&["~/models/ccpp", "~/models/c"])
+            ),
             Ok(true)
         );
-        assert_eq!(settings.completion_model(Language::Rust), None);
-        assert!(settings.is_default(SettingKey::RustCompletionModel));
+        // As text, one per line.
+        assert_eq!(
+            settings.text(SettingKey::CompletionModels),
+            "~/models/ccpp\n~/models/c"
+        );
+        assert_eq!(
+            settings.set_text(SettingKey::CompletionModels, "~/m"),
+            Ok(true)
+        );
+        assert_eq!(settings.completion_models(), ["~/m"]);
+        // A model that isn't there is noted as unusable.
+        assert!(
+            settings.item_notes(SettingKey::CompletionModels)[0].starts_with("Can't be used"),
+            "{:?}",
+            settings.item_notes(SettingKey::CompletionModels)
+        );
+        assert!(settings.reset(SettingKey::CompletionModels));
+        assert!(settings.completion_models().is_empty());
+        assert!(settings.item_notes(SettingKey::Shell).is_empty());
     }
 
     #[test]
@@ -1026,6 +1119,7 @@ max-results = 25
 cmake-generator = \" Unix Makefiles \"
 
 [completion]
+models = [\"~/models/c\"]
 rust-model = \"~/models/rust\"
 
 [git]
@@ -1033,9 +1127,10 @@ sign = true
 ";
         let settings = Settings::parse(text).unwrap();
         assert_eq!(settings.shell(), Some("fish"));
+        // The old per-language setting joins the list, last.
         assert_eq!(
-            settings.completion_model(Language::Rust),
-            Some("~/models/rust")
+            settings.completion_models(),
+            ["~/models/c", "~/models/rust"]
         );
         assert_eq!(settings.search_max_results(), 25);
         assert_eq!(settings.cmake_generator(), "Unix Makefiles", "trimmed");
@@ -1053,6 +1148,11 @@ sign = true
             assert!(written.contains(kept), "{written}");
         }
         assert!(!written.contains("# a comment"), "comments aren't kept");
+        assert!(
+            written.contains("models = [\"~/models/c\", \"~/models/rust\"]")
+                && !written.contains("rust-model"),
+            "{written}"
+        );
 
         // Resetting a setting takes it out but leaves the rest.
         let mut settings = settings;
@@ -1103,6 +1203,14 @@ sign = true
         assert_eq!(
             err("[completion]\nrust-model = 1\n"),
             "`completion.rust-model` must be a string"
+        );
+        assert_eq!(
+            err("[completion]\nmodels = \"~/m\"\n"),
+            "`completion.models` must be a list of paths"
+        );
+        assert_eq!(
+            err("[completion]\nmodels = [1]\n"),
+            "`completion.models` must be a list of paths"
         );
         assert_eq!(
             err("terminal = 1\n"),

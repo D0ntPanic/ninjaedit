@@ -1,11 +1,20 @@
 //! Code completion: running the completion model for the editor.
 //!
-//! The models are trained per language (see the `completion` directory
-//! of the repository), and the user gives the checkpoint directory of
-//! each in the settings. A [`Completer`] keeps one worker thread per
-//! configured language, which loads its model on the first request and
-//! then answers requests one at a time. Inference is slow next to
-//! typing, so a request supersedes any earlier one that hasn't started,
+//! Each model is trained on one language or a few (see the `completion`
+//! directory of the repository), which its config lists. The user lists
+//! the checkpoint directories of their models in the settings, highest
+//! priority first, and each language goes to the first model trained on
+//! it: a C model above a C/C++ model takes C files and leaves it C++,
+//! and a model of many languages at the bottom covers whatever no model
+//! above it does. The [`Completer`] keeps one worker thread per model in
+//! use, whatever languages it serves, which loads the model on the first
+//! request and then answers requests one at a time. The prompts of a
+//! model of several languages name the language, as its training
+//! documents do; a model of one is trained without it. Models name
+//! languages as the training corpus does (see [`model_language`]), which
+//! mostly follows the editor's syntax, but not always: a `Cargo.toml` is
+//! TOML to the editor and `cargo` to a model. Inference is
+//! slow next to typing, so a request supersedes any earlier one that hasn't started,
 //! and one that is running is cancelled as soon as a newer one arrives;
 //! only the newest request's answer is ever reported.
 //!
@@ -23,9 +32,11 @@
 //! [`Completer::wait_for_outcomes`].
 //!
 //! Which model a language uses comes from the settings, given to
-//! [`Completer::apply_settings`]; a model set with
+//! [`Completer::apply_settings`]; a model set for a language with
 //! [`Completer::override_model`] takes precedence over them, for tools
 //! that run a model of their choosing through the editor.
+//! [`describe_models`] says what each model in a list would serve, for
+//! the settings to show.
 //!
 //! The model's context is limited, and prefilling it is the expensive
 //! part of a completion, so the worker keeps a session whose cache is
@@ -50,8 +61,8 @@ use crate::indent::Indentation;
 use crate::settings::Settings;
 use crate::syntax::Language;
 use anyhow::{Context, Result, anyhow};
-use infer::{CompletionOptions, Model, Session, StopReason, TokenSet};
-use std::collections::HashMap;
+use infer::{CompletionOptions, Config, Model, Session, StopReason, TokenSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -82,9 +93,9 @@ pub struct CompletionRequest {
     /// rendered in.
     pub indentation: Indentation,
     /// The file the buffer was loaded from, if any. The model was trained
-    /// with each file opening with the name of its crate and its path in
-    /// the crate, so the prompt opens with them too when the file is in
-    /// a Cargo package.
+    /// with each file opening with the name of its module (a crate, or a
+    /// source package) and its path in it, so the prompt opens with them
+    /// too when they can be named; see [`location_of`].
     pub path: Option<PathBuf>,
 }
 
@@ -106,10 +117,13 @@ pub enum CompletionOutcome {
         offered: usize,
         lines: Vec<LineConfidence>,
     },
-    /// A language's model could not be loaded. Reported once per
-    /// configured path; requests for the language are then dropped until
-    /// its path is changed.
-    Failed { language: Language, error: String },
+    /// A model can't be used: its config can't be read, its weights
+    /// can't be loaded, or it was set for a language it wasn't trained
+    /// on. `model` is its checkpoint directory as the user gave it.
+    /// Reported once while the model stays configured; a model whose
+    /// config can't be read serves no language, and one that fails to
+    /// load drops the requests for its languages.
+    Failed { model: String, error: String },
 }
 
 /// How sure the model was of one line of a completion.
@@ -229,19 +243,28 @@ struct Job {
 }
 
 struct Worker {
-    path: PathBuf,
     jobs: Sender<Job>,
 }
 
 type Waker = Arc<dyn Fn() + Send + Sync>;
 
-/// The completion models, one worker per configured language. See the
-/// [module documentation](self).
+/// The completion models: one worker per model in use, and the model
+/// each language's requests go to. See the [module documentation](self).
 pub struct Completer {
-    workers: HashMap<Language, Worker>,
-    /// Model paths set with [`override_model`](Self::override_model),
-    /// which the settings don't replace.
-    overrides: HashMap<Language, String>,
+    /// The workers, by checkpoint directory.
+    workers: HashMap<PathBuf, Worker>,
+    /// The model each language's requests go to, by the name models know
+    /// the language by (see [`model_language`]).
+    routes: HashMap<&'static str, PathBuf>,
+    /// The models the settings list, highest priority first, as the user
+    /// typed them.
+    models: Vec<String>,
+    /// Models set with [`override_model`](Self::override_model), which
+    /// take a language whatever the settings say.
+    overrides: HashMap<&'static str, String>,
+    /// Models already reported as unusable, so each is reported once
+    /// while it stays configured.
+    reported: HashSet<PathBuf>,
     /// How much of each completion to offer, from the settings.
     thresholds: ConfidenceThresholds,
     outcomes: Receiver<CompletionOutcome>,
@@ -261,7 +284,10 @@ impl Completer {
         let (outcome_tx, outcomes) = mpsc::channel();
         Completer {
             workers: HashMap::new(),
+            routes: HashMap::new(),
+            models: Vec::new(),
             overrides: HashMap::new(),
+            reported: HashSet::new(),
             thresholds: ConfidenceThresholds::default(),
             outcomes,
             outcome_tx,
@@ -275,83 +301,152 @@ impl Completer {
         self.waker = Some(Arc::new(waker));
     }
 
-    /// Use the model in the checkpoint directory `path` for `language`,
-    /// or none. A path as the user typed it, with `~` for the home
-    /// directory. Changing a language's path replaces its worker;
-    /// setting the same path again does nothing, so this can be called
-    /// whenever the settings change.
-    pub fn set_model(&mut self, language: Language, path: Option<&str>) {
-        let path = path.map(str::trim).filter(|p| !p.is_empty());
-        let Some(path) = path else {
-            self.workers.remove(&language);
-            return;
-        };
-        let path = expand_home(path);
-        if self
-            .workers
-            .get(&language)
-            .is_some_and(|worker| worker.path == path)
-        {
-            return;
-        }
-        let checkpoint = path.clone();
-        self.spawn(language, path, move || load_checkpoint(&checkpoint));
+    /// Use the models in these checkpoint directories, highest priority
+    /// first, as the user typed them (with `~` for the home directory):
+    /// each language goes to the first that was trained on it. A model
+    /// whose config can't be read is reported and passed over. Workers
+    /// whose model still serves a language are kept, so this can be
+    /// called whenever the settings change.
+    pub fn set_models(&mut self, models: &[String]) {
+        self.models = models
+            .iter()
+            .map(|m| m.trim().to_owned())
+            .filter(|m| !m.is_empty())
+            .collect();
+        self.route();
     }
 
-    /// Use the model the settings name for each language, or none where
-    /// they name none, except for languages whose model has been
-    /// [overridden](Self::override_model), and the confidence thresholds
-    /// they give for the requests from now on. Models that haven't
-    /// changed are kept, so this can be called whenever the settings
-    /// change.
+    /// Use the models the settings list, and the confidence thresholds
+    /// they give for the requests from now on; see
+    /// [`set_models`](Self::set_models).
     pub fn apply_settings(&mut self, settings: &Settings) {
         self.thresholds = settings.completion_thresholds();
-        for language in Language::ALL {
-            if !self.overrides.contains_key(&language) {
-                self.set_model(language, settings.completion_model(language));
-            }
-        }
+        self.set_models(settings.completion_models());
     }
 
     /// Use the model in the checkpoint directory `path` for `language`
-    /// whatever the settings say: [`apply_settings`](Self::apply_settings)
-    /// leaves it in place. For tools that run a model of their choosing,
-    /// such as the completion evaluation.
+    /// whatever the settings say. For tools that run a model of their
+    /// choosing, such as the completion evaluation. The model must have
+    /// been trained on the language, or it is reported as unusable.
     pub fn override_model(&mut self, language: Language, path: &str) {
-        self.overrides.insert(language, path.to_owned());
-        self.set_model(language, Some(path));
+        self.overrides
+            .insert(model_language(language, None), path.trim().to_owned());
+        self.route();
     }
 
-    /// Whether completions can be asked for in `language`.
-    pub fn has_model(&self, language: Language) -> bool {
-        self.workers.contains_key(&language)
+    /// Whether completions can be asked for in a file in `language`, at
+    /// `path` if it was loaded from one.
+    pub fn has_model(&self, language: Language, path: Option<&Path>) -> bool {
+        self.routes.contains_key(model_language(language, path))
     }
 
-    /// Start a worker for `language` whose model comes from `load`, run
-    /// on the worker's thread at its first request. Any worker the
-    /// language had is dropped; it finishes what it is doing and exits.
+    /// Work out which model each language goes to, from the models'
+    /// configs, and start or stop workers to match.
+    fn route(&mut self) {
+        let mut configs: HashMap<PathBuf, Option<Config>> = HashMap::new();
+        let mut config = |completer: &mut Completer, typed: &str| -> Option<(PathBuf, Config)> {
+            let path = expand_home(typed);
+            let entry = configs
+                .entry(path.clone())
+                .or_insert_with(|| match Config::load(&path) {
+                    Ok(config) => Some(config),
+                    Err(err) => {
+                        completer.report_once(&path, typed, format!("{err:#}"));
+                        None
+                    }
+                });
+            entry.clone().map(|config| (path, config))
+        };
+        let models = self.models.clone();
+        let mut routes = HashMap::new();
+        for name in model_languages() {
+            let route = match self.overrides.get(name).cloned() {
+                Some(typed) => match config(self, &typed) {
+                    Some((path, config)) if config.knows(name) => Some(path),
+                    Some((path, config)) => {
+                        let error = format!(
+                            "the model was trained on {}, not {name}",
+                            config.languages.join(", ")
+                        );
+                        self.report_once(&path, &typed, error);
+                        None
+                    }
+                    None => None,
+                },
+                None => models.iter().find_map(|typed| {
+                    let (path, config) = config(self, typed)?;
+                    config.knows(name).then_some(path)
+                }),
+            };
+            if let Some(path) = route {
+                routes.insert(name, path);
+            }
+        }
+        // Forget the reports of models no longer configured, so setting
+        // one again reports it again.
+        self.reported.retain(|path| configs.contains_key(path));
+        self.workers
+            .retain(|path, _| routes.values().any(|routed| routed == path));
+        for path in routes.values() {
+            if !self.workers.contains_key(path) {
+                let checkpoint = path.clone();
+                self.spawn(path.clone(), move || load_checkpoint(&checkpoint));
+            }
+        }
+        self.routes = routes;
+    }
+
+    /// Report a model as unusable, unless it has been already.
+    fn report_once(&mut self, path: &Path, typed: &str, error: String) {
+        if self.reported.insert(path.to_path_buf()) {
+            self.inject(CompletionOutcome::Failed {
+                model: typed.to_owned(),
+                error,
+            });
+        }
+    }
+
+    /// Start a worker for the model in `path`, whose model comes from
+    /// `load`, run on the worker's thread at its first request. Any
+    /// worker the path had is dropped; it finishes what it is doing and
+    /// exits.
     fn spawn(
         &mut self,
-        language: Language,
         path: PathBuf,
         load: impl FnOnce() -> Result<(Model, Tokenizer)> + Send + 'static,
     ) {
         let (jobs_tx, jobs) = mpsc::channel();
         let outcomes = self.outcome_tx.clone();
         let waker = self.waker.clone();
+        let name = path.display().to_string();
+        let thread_name = format!(
+            "completion-{}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        );
         let spawned = thread::Builder::new()
-            .name(format!("completion-{}", language.name()))
-            .spawn(move || run_worker(language, load, jobs, outcomes, waker));
+            .name(thread_name)
+            .spawn(move || run_worker(name, load, jobs, outcomes, waker));
         if spawned.is_err() {
             return;
         }
-        self.workers.insert(
-            language,
-            Worker {
-                path,
-                jobs: jobs_tx,
-            },
-        );
+        self.workers.insert(path, Worker { jobs: jobs_tx });
+    }
+
+    /// Serve `languages` with a model from `load`, over the settings;
+    /// for tests of the plumbing with a model made on the spot.
+    #[cfg(test)]
+    fn install(
+        &mut self,
+        name: &str,
+        languages: &[Language],
+        load: impl FnOnce() -> Result<(Model, Tokenizer)> + Send + 'static,
+    ) {
+        let path = PathBuf::from(name);
+        self.spawn(path.clone(), load);
+        for &language in languages {
+            self.routes
+                .insert(model_language(language, None), path.clone());
+        }
     }
 
     /// Ask for a completion on behalf of the editor `owner`. Does nothing
@@ -359,8 +454,10 @@ impl Completer {
     /// request isn't superseded first, arrives through
     /// [`take_outcomes`](Self::take_outcomes).
     pub fn request(&mut self, owner: u64, request: CompletionRequest) {
-        let language = request.language;
-        let Some(worker) = self.workers.get(&language) else {
+        let Some(path) = self.routes.get(request.model_language()).cloned() else {
+            return;
+        };
+        let Some(worker) = self.workers.get(&path) else {
             return;
         };
         let job = Job {
@@ -371,7 +468,8 @@ impl Completer {
         if worker.jobs.send(job).is_err() {
             // The worker's thread is gone, which only happens if it
             // panicked; don't keep sending into the void.
-            self.workers.remove(&language);
+            self.workers.remove(&path);
+            self.routes.retain(|_, routed| *routed != path);
         }
     }
 
@@ -451,7 +549,7 @@ fn load_checkpoint(dir: &Path) -> Result<(Model, Tokenizer)> {
 /// A worker's thread: load the model at the first request, then answer
 /// requests until the completer drops the job channel.
 fn run_worker(
-    language: Language,
+    model_name: String,
     load: impl FnOnce() -> Result<(Model, Tokenizer)>,
     jobs: Receiver<Job>,
     outcomes: Sender<CompletionOutcome>,
@@ -469,7 +567,7 @@ fn run_worker(
         Ok(loaded) => loaded,
         Err(err) => {
             let _ = outcomes.send(CompletionOutcome::Failed {
-                language,
+                model: model_name,
                 error: format!("{err:#}"),
             });
             wake();
@@ -542,9 +640,10 @@ struct Engine<'a> {
     /// (or of the start of the buffer), kept across requests while it
     /// still fits; see the [module documentation](self).
     anchor: Option<usize>,
-    /// The header tokens for each file asked about, empty for one in no
-    /// Cargo package; see [`crate_of`].
-    headers: HashMap<PathBuf, Vec<u32>>,
+    /// The model's config, for the languages it knows.
+    config: &'a Config,
+    /// The header tokens for each file asked about, in its language.
+    headers: HashMap<(PathBuf, Language), Vec<u32>>,
 }
 
 impl<'a> Engine<'a> {
@@ -554,30 +653,36 @@ impl<'a> Engine<'a> {
             session: Session::new(model),
             max_seq_len: model.config.max_seq_len,
             anchor: None,
+            config: &model.config,
             headers: HashMap::new(),
         }
     }
 
-    /// The tokens naming the crate and file the request is in, which the
-    /// prompt opens with as training documents do. Read from the
-    /// package's manifest once per file.
+    /// The header the prompt opens with, as training documents do: the
+    /// language, for a model trained on several, then the module and
+    /// file the request is in, when they can be named (see
+    /// [`location_of`]). Worked out once per file.
     fn header(&mut self, request: &CompletionRequest) -> Vec<u32> {
-        let Some(path) = &request.path else {
-            return Vec::new();
-        };
-        if request.language != Language::Rust {
-            return Vec::new();
-        }
         let tok = self.tokenizer;
+        // Requests only come in languages the model was routed for, which
+        // it knows.
+        let language = self
+            .config
+            .header_language(request.model_language())
+            .ok()
+            .flatten();
+        let encode = |location: Option<(String, String)>| {
+            let mut ids = Vec::new();
+            let location = location.as_ref().map(|(m, f)| (m.as_str(), f.as_str()));
+            tok.encoder().encode_header(language, location, &mut ids);
+            ids
+        };
+        let Some(path) = &request.path else {
+            return encode(None);
+        };
         self.headers
-            .entry(path.clone())
-            .or_insert_with(|| {
-                let mut ids = Vec::new();
-                if let Some((name, file)) = crate_of(path) {
-                    tok.encoder().encode_header(&name, &file, &mut ids);
-                }
-                ids
-            })
+            .entry((path.clone(), request.language))
+            .or_insert_with(|| encode(location_of(path, request.language)))
             .clone()
     }
 
@@ -761,6 +866,140 @@ impl<'a> Engine<'a> {
     }
 }
 
+impl CompletionRequest {
+    /// The name models know the request's language by.
+    fn model_language(&self) -> &'static str {
+        model_language(self.language, self.path.as_deref())
+    }
+}
+
+/// What models call Cargo manifests, which the editor has as TOML.
+const CARGO: &str = "cargo";
+
+/// The name models know a file in `language` by, at `path` if it was
+/// loaded from one: the language its files were given in the corpus,
+/// which is also the directory's name in a Debian corpus (`cpp` for
+/// C++). A model's config lists the names it knows. The corpus sets
+/// Cargo manifests apart from other TOML, as it has them beside the
+/// crate's Rust.
+fn model_language(language: Language, path: Option<&Path>) -> &'static str {
+    if language == Language::Toml && path.is_some_and(is_cargo_manifest) {
+        return CARGO;
+    }
+    match language {
+        Language::Plain => "text",
+        Language::Rust => "rust",
+        Language::C => "c",
+        Language::Cpp => "cpp",
+        Language::JavaScript => "javascript",
+        Language::TypeScript => "typescript",
+        Language::Wgsl => "wgsl",
+        Language::Toml => "toml",
+        Language::Json => "json",
+        Language::Python => "python",
+        Language::Markdown => "markdown",
+        Language::CMake => "cmake",
+    }
+}
+
+/// Every name models can know a file's language by.
+fn model_languages() -> impl Iterator<Item = &'static str> {
+    Language::ALL
+        .into_iter()
+        .map(|language| model_language(language, None))
+        .chain([CARGO])
+}
+
+/// Whether `path` is a Cargo manifest.
+fn is_cargo_manifest(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "Cargo.toml")
+}
+
+/// What the settings call the files in the language a model's config
+/// names `name`, if the editor has any.
+fn language_named(name: &str) -> Option<&'static str> {
+    if name == CARGO {
+        return Some("Cargo.toml");
+    }
+    Language::ALL
+        .into_iter()
+        .find(|&language| model_language(language, None) == name)
+        .map(Language::name)
+}
+
+/// A line about each model in a priority list, as the settings show it:
+/// the languages it serves, those that go to a model above it instead,
+/// or why it can't be used. Reads the models' configs.
+pub fn describe_models(models: &[String]) -> Vec<String> {
+    let mut taken: HashSet<String> = HashSet::new();
+    models
+        .iter()
+        .map(|typed| {
+            let config = match Config::load(&expand_home(typed.trim())) {
+                Ok(config) => config,
+                Err(err) => return format!("Can't be used: {err:#}"),
+            };
+            let display = |name: &String| {
+                language_named(name)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| name.clone())
+            };
+            let (served, above): (Vec<&String>, Vec<&String>) = config
+                .languages
+                .iter()
+                .partition(|name| !taken.contains(*name));
+            let unknown: Vec<String> = served
+                .iter()
+                .filter(|name| language_named(name).is_none())
+                .map(|name| display(name))
+                .collect();
+            let served: Vec<String> = served
+                .iter()
+                .filter(|name| language_named(name).is_some())
+                .map(|name| display(name))
+                .collect();
+            let above: Vec<String> = above.into_iter().map(display).collect();
+            taken.extend(config.languages.iter().cloned());
+            let mut note = if served.is_empty() {
+                "Unused".to_owned()
+            } else {
+                served.join(", ")
+            };
+            if !above.is_empty() {
+                let verb = if above.len() == 1 { "goes" } else { "go" };
+                note.push_str(&format!("; {} {verb} to a model above", join_and(&above)));
+            }
+            if !unknown.is_empty() {
+                note.push_str(&format!(
+                    "; the editor has no files in {}",
+                    join_and(&unknown)
+                ));
+            }
+            note
+        })
+        .collect()
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn join_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// The module a file is in and its path within it, as the training data
+/// names them: for Rust and Cargo manifests, the crate (see
+/// [`crate_of`]); for the languages whose training data comes from
+/// source packages, the project (see [`project_of`]).
+fn location_of(path: &Path, language: Language) -> Option<(String, String)> {
+    match model_language(language, Some(path)) {
+        "rust" | CARGO => crate_of(path),
+        _ => project_of(path),
+    }
+}
+
 /// The crate a file is in and its path within it, as the training data
 /// names them: the package name in the nearest `Cargo.toml` above the
 /// file, and the path from that manifest's directory with `/` between
@@ -774,13 +1013,34 @@ fn crate_of(path: &Path) -> Option<(String, String)> {
     })?;
     let manifest: toml::Table = toml::from_str(&manifest).ok()?;
     let name = manifest.get("package")?.get("name")?.as_str()?.to_owned();
+    Some((name, relative_path(&path, dir)?))
+}
+
+/// The project a file is in and its path within it, for languages whose
+/// training data names each file's source package and its path in the
+/// package's source tree: the checkout holding the file (the directory
+/// of the nearest `.git` above it, which a submodule or worktree has as
+/// a file) stands in for the package, named by its directory. `None`
+/// outside a checkout.
+fn project_of(path: &Path) -> Option<(String, String)> {
+    let path = std::path::absolute(path).ok()?;
+    let dir = path
+        .ancestors()
+        .skip(1)
+        .find(|dir| dir.join(".git").exists())?;
+    let name = dir.file_name()?.to_string_lossy().into_owned();
+    Some((name, relative_path(&path, dir)?))
+}
+
+/// `path` relative to `dir`, with `/` between its parts.
+fn relative_path(path: &Path, dir: &Path) -> Option<String> {
     let parts: Vec<_> = path
         .strip_prefix(dir)
         .ok()?
         .components()
         .map(|part| part.as_os_str().to_string_lossy())
         .collect();
-    Some((name, parts.join("/")))
+    Some(parts.join("/"))
 }
 
 /// Whether cutting `text` at `at` would split a word: the characters on
@@ -796,20 +1056,46 @@ mod tests {
     use infer::Config;
     use std::time::{Duration, Instant};
 
-    /// A tiny random model over the byte-level tokenizer, for the
-    /// plumbing; what it says is noise.
-    fn tiny_model() -> (Model, Tokenizer) {
-        let tokenizer = Tokenizer::from_merges(Vec::new());
-        let config = Config {
-            vocab_size: tokenizer.vocab_size(),
+    fn tiny_config(languages: &[&str]) -> Config {
+        Config {
+            vocab_size: Tokenizer::from_merges(Vec::new()).vocab_size(),
             d_model: 16,
             n_layers: 1,
             n_heads: 2,
             d_ff: 32,
             max_seq_len: 512,
             rope_theta: 10000.0,
-        };
-        (Model::random(config, 7), tokenizer)
+            languages: languages.iter().map(|l| l.to_string()).collect(),
+        }
+    }
+
+    /// A tiny random model over the byte-level tokenizer, trained (as
+    /// its config says) on `languages`, for the plumbing; what it says
+    /// is noise.
+    fn tiny(languages: &[&str]) -> (Model, Tokenizer) {
+        let tokenizer = Tokenizer::from_merges(Vec::new());
+        (Model::random(tiny_config(languages), 7), tokenizer)
+    }
+
+    fn tiny_model() -> (Model, Tokenizer) {
+        tiny(&["rust"])
+    }
+
+    /// A checkpoint directory holding only a config, which is all the
+    /// routing reads; `test` keeps tests running at once apart.
+    fn model_dir(test: &str, name: &str, languages: &[&str]) -> String {
+        let dir = std::env::temp_dir()
+            .join(format!("ninjaedit-models-{}-{test}", std::process::id()))
+            .join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = tiny_config(languages);
+        let json = format!(
+            r#"{{"vocab_size": {}, "d_model": 16, "n_layers": 1, "n_heads": 2, "d_ff": 32,
+                "max_seq_len": 512, "rope_theta": 10000.0, "languages": {:?}}}"#,
+            config.vocab_size, config.languages
+        );
+        std::fs::write(dir.join("config.json"), json).unwrap();
+        dir.to_string_lossy().into_owned()
     }
 
     fn wait_for(
@@ -850,10 +1136,10 @@ mod tests {
         completer.set_waker(move || {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
-        assert!(!completer.has_model(Language::Rust));
-        completer.spawn(Language::Rust, PathBuf::from("tiny"), || Ok(tiny_model()));
-        assert!(completer.has_model(Language::Rust));
-        assert!(!completer.has_model(Language::C));
+        assert!(!completer.has_model(Language::Rust, None));
+        completer.install("tiny", &[Language::Rust], || Ok(tiny_model()));
+        assert!(completer.has_model(Language::Rust, None));
+        assert!(!completer.has_model(Language::C, None));
 
         // A request for a language without a model goes nowhere.
         let mut other = request(1, "int main() {\n", "}\n");
@@ -880,7 +1166,7 @@ mod tests {
     #[test]
     fn a_model_that_fails_to_load_is_reported_once() {
         let mut completer = Completer::new();
-        completer.spawn(Language::Rust, PathBuf::from("bad"), || {
+        completer.install("bad", &[Language::Rust], || {
             Err(anyhow!("no such checkpoint"))
         });
         completer.request(1, request(1, "fn a() {\n", ""));
@@ -891,7 +1177,7 @@ mod tests {
         assert_eq!(
             outcomes,
             vec![CompletionOutcome::Failed {
-                language: Language::Rust,
+                model: "bad".to_owned(),
                 error: "no such checkpoint".to_owned()
             }]
         );
@@ -902,25 +1188,182 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_checkpoint_directory_fails_to_load() {
+    fn headers_name_the_language_for_a_model_of_several() {
+        let dir = std::env::temp_dir().join(format!("ninjaedit-header-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("proj/.git")).unwrap();
+        std::fs::create_dir_all(dir.join("proj/src")).unwrap();
+        let file = dir.join("proj/src/main.cpp");
+        let text = |tok: &Tokenizer, ids: &[u32]| {
+            ids.iter().map(|&id| tok.token_text(id)).collect::<String>()
+        };
+        let mut req = request(1, "int main() {\n", "}\n");
+        req.language = Language::Cpp;
+        req.path = Some(file.clone());
+
+        let (model, tok) = tiny(&["c", "cpp"]);
+        let mut engine = Engine::new(&model, &tok);
+        assert_eq!(
+            text(&tok, &engine.header(&req)),
+            "<lang>cpp<module_name>proj<file_name>src/main.cpp"
+        );
+        // Without a file to name, the language alone.
+        req.path = None;
+        assert_eq!(text(&tok, &engine.header(&req)), "<lang>cpp");
+
+        // A single-language model gets no language, as it was trained.
+        let (model, tok) = tiny(&["cpp"]);
+        let mut engine = Engine::new(&model, &tok);
+        req.path = Some(file);
+        assert_eq!(
+            text(&tok, &engine.header(&req)),
+            "<module_name>proj<file_name>src/main.cpp"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cargo_manifests_are_named_as_cargo_in_the_crate() {
+        let dir = std::env::temp_dir().join(format!("ninjaedit-cargo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"demo\"\n").unwrap();
+        let text = |tok: &Tokenizer, ids: &[u32]| {
+            ids.iter().map(|&id| tok.token_text(id)).collect::<String>()
+        };
+        let mut req = request(1, "[dependencies]\n", "");
+        req.language = Language::Toml;
+        req.path = Some(manifest);
+
+        let (model, tok) = tiny(&["rust", "cargo"]);
+        let mut engine = Engine::new(&model, &tok);
+        assert_eq!(
+            text(&tok, &engine.header(&req)),
+            "<lang>cargo<module_name>demo<file_name>Cargo.toml"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cargo_manifests_go_to_a_model_of_cargo() {
+        let rust = model_dir("cargo", "rust", &["rust"]);
+        let cargo = model_dir("cargo", "rust-cargo", &["rust", "cargo"]);
+        let manifest = Path::new("/work/demo/Cargo.toml");
+        let other = Path::new("/work/demo/rustfmt.toml");
         let mut completer = Completer::new();
-        completer.set_model(Language::Rust, Some("/nonexistent/checkpoint"));
-        assert!(completer.has_model(Language::Rust));
-        // The same path again keeps the worker; a blank drops it.
-        completer.set_model(Language::Rust, Some(" /nonexistent/checkpoint "));
-        completer.request(1, request(1, "fn a() {\n", ""));
-        let outcomes = wait_for(&mut completer, |o| {
-            matches!(o, CompletionOutcome::Failed { .. })
-        });
-        match &outcomes[0] {
-            CompletionOutcome::Failed { language, error } => {
-                assert_eq!(*language, Language::Rust);
-                assert!(error.contains("not a directory"), "{error}");
+        // A Rust model takes no manifests.
+        completer.set_models(std::slice::from_ref(&rust));
+        assert!(completer.has_model(Language::Rust, None));
+        assert!(!completer.has_model(Language::Toml, Some(manifest)));
+        // A model of Cargo takes them, and no other TOML.
+        completer.set_models(&[rust.clone(), cargo.clone()]);
+        assert!(completer.has_model(Language::Toml, Some(manifest)));
+        assert!(!completer.has_model(Language::Toml, Some(other)));
+        assert!(!completer.has_model(Language::Toml, None));
+        assert_eq!(
+            completer.routes.get(CARGO).map(|p| p.to_string_lossy()),
+            Some(cargo.as_str().into())
+        );
+        assert_eq!(
+            describe_models(&[rust, cargo]),
+            ["Rust", "Cargo.toml; Rust goes to a model above"]
+        );
+    }
+
+    #[test]
+    fn each_language_goes_to_the_first_model_that_knows_it() {
+        let c = model_dir("routes", "c", &["c"]);
+        let ccpp = model_dir("routes", "ccpp", &["c", "cpp"]);
+        let rust = model_dir("routes", "rust", &["rust"]);
+        let mut completer = Completer::new();
+        let routed = |completer: &Completer, language| {
+            completer
+                .routes
+                .get(model_language(language, None))
+                .map(|p| p.to_string_lossy().into_owned())
+        };
+        // The C model above the C/C++ one takes C; C++ falls through.
+        completer.set_models(&[c.clone(), ccpp.clone(), rust.clone()]);
+        assert_eq!(routed(&completer, Language::C), Some(c.clone()));
+        assert_eq!(routed(&completer, Language::Cpp), Some(ccpp.clone()));
+        assert_eq!(routed(&completer, Language::Rust), Some(rust.clone()));
+        assert!(!completer.has_model(Language::Python, None));
+        assert_eq!(completer.workers.len(), 3);
+        assert_eq!(
+            describe_models(&[c.clone(), ccpp.clone(), rust.clone()]),
+            ["C", "C++; C goes to a model above", "Rust"]
+        );
+        // Moved up, the C/C++ model takes both, and the C model is left
+        // with nothing: its worker goes.
+        completer.set_models(&[ccpp.clone(), c.clone()]);
+        assert_eq!(routed(&completer, Language::C), Some(ccpp.clone()));
+        assert_eq!(routed(&completer, Language::Cpp), Some(ccpp.clone()));
+        assert!(!completer.has_model(Language::Rust, None));
+        assert_eq!(completer.workers.len(), 1);
+        assert_eq!(
+            describe_models(&[ccpp.clone(), c.clone()]),
+            ["C, C++", "Unused; C goes to a model above"]
+        );
+        assert!(completer.take_outcomes().is_empty());
+    }
+
+    #[test]
+    fn a_model_that_cannot_be_read_is_reported_once_and_passed_over() {
+        let rust = model_dir("unreadable", "rust", &["rust"]);
+        let missing = "/nonexistent/checkpoint".to_owned();
+        let mut completer = Completer::new();
+        completer.set_models(&[missing.clone(), rust.clone()]);
+        assert!(
+            completer.has_model(Language::Rust, None),
+            "the next model serves"
+        );
+        let outcomes = completer.take_outcomes();
+        match &outcomes[..] {
+            [CompletionOutcome::Failed { model, error }] => {
+                assert_eq!(model, &missing);
+                assert!(error.contains("config.json"), "{error}");
             }
             other => panic!("{other:?}"),
         }
-        completer.set_model(Language::Rust, Some(""));
-        assert!(!completer.has_model(Language::Rust));
+        // Applying the same models again doesn't report it again...
+        completer.set_models(&[missing.clone(), rust.clone()]);
+        assert!(completer.take_outcomes().is_empty());
+        // ...but taking it out and putting it back does.
+        completer.set_models(&[]);
+        assert!(!completer.has_model(Language::Rust, None));
+        completer.set_models(std::slice::from_ref(&missing));
+        assert_eq!(completer.take_outcomes().len(), 1);
+        assert!(describe_models(&[missing])[0].starts_with("Can't be used: "));
+    }
+
+    #[test]
+    fn a_model_serves_every_language_it_knows_and_no_other() {
+        let ccpp = model_dir("override", "ccpp", &["c", "cpp"]);
+        let mut completer = Completer::new();
+        // Set for a language it wasn't trained on, a model is refused.
+        completer.override_model(Language::Rust, &ccpp);
+        assert!(!completer.has_model(Language::Rust, None));
+        assert_eq!(
+            completer.take_outcomes(),
+            vec![CompletionOutcome::Failed {
+                model: ccpp.clone(),
+                error: "the model was trained on c, cpp, not rust".to_owned()
+            }]
+        );
+        // One worker answers for both of its languages.
+        let mut completer = Completer::new();
+        completer.install("ccpp", &[Language::C, Language::Cpp], || {
+            Ok(tiny(&["c", "cpp"]))
+        });
+        for (serial, language) in [(1, Language::C), (2, Language::Cpp)] {
+            let mut req = request(serial, "int main() {\n", "}\n");
+            req.language = language;
+            completer.request(1, req);
+            wait_for(
+                &mut completer,
+                |o| matches!(o, CompletionOutcome::Completed { serial: s, .. } if *s == serial),
+            );
+        }
+        assert_eq!(completer.workers.len(), 1);
     }
 
     /// Runs a real checkpoint, named by `NINJAEDIT_COMPLETION_MODEL`,
@@ -931,7 +1374,7 @@ mod tests {
     fn completes_with_a_real_checkpoint() {
         let path = std::env::var("NINJAEDIT_COMPLETION_MODEL").expect("checkpoint path");
         let mut completer = Completer::new();
-        completer.set_model(Language::Rust, Some(&path));
+        completer.set_models(&[path]);
         let prefix = "use std::collections::HashMap;\n\n/// Counts how often each word occurs in `text`.\nfn word_counts(text: &str) -> HashMap<&str, usize> {\n    let mut counts = HashMap::new();\n    for word in text.split_whitespace() {\n        *counts.en";
         let suffix = "\n    }\n    counts\n}\n";
         let started = Instant::now();
@@ -968,37 +1411,50 @@ mod tests {
     #[test]
     fn an_overridden_model_outlasts_the_settings() {
         use crate::settings::SettingKey;
+        let settings_model = model_dir("outlasts", "settings", &["rust"]);
+        let override_model = model_dir("outlasts", "override", &["rust"]);
+        let c_model = model_dir("outlasts", "c", &["c"]);
+        let routed = |completer: &Completer, language| {
+            completer
+                .routes
+                .get(model_language(language, None))
+                .map(|p| p.to_string_lossy().into_owned())
+        };
         let mut settings = Settings::default();
         let mut completer = Completer::new();
         completer.apply_settings(&settings);
-        assert!(!completer.has_model(Language::Rust));
+        assert!(!completer.has_model(Language::Rust, None));
         settings
-            .set_text(SettingKey::RustCompletionModel, "/settings/model")
+            .set_list(
+                SettingKey::CompletionModels,
+                std::slice::from_ref(&settings_model),
+            )
             .unwrap();
         completer.apply_settings(&settings);
         assert_eq!(
-            completer.workers[&Language::Rust].path,
-            PathBuf::from("/settings/model")
+            routed(&completer, Language::Rust),
+            Some(settings_model.clone())
         );
 
-        completer.override_model(Language::Rust, "/override/model");
+        completer.override_model(Language::Rust, &override_model);
         assert_eq!(
-            completer.workers[&Language::Rust].path,
-            PathBuf::from("/override/model")
+            routed(&completer, Language::Rust),
+            Some(override_model.clone())
         );
         // Neither the settings naming another model nor naming none
         // replaces the override.
         completer.apply_settings(&settings);
-        settings.reset(SettingKey::RustCompletionModel);
+        settings.reset(SettingKey::CompletionModels);
         completer.apply_settings(&settings);
         assert_eq!(
-            completer.workers[&Language::Rust].path,
-            PathBuf::from("/override/model")
+            routed(&completer, Language::Rust),
+            Some(override_model.clone())
         );
         // A language the settings have no model for can be given one.
-        completer.override_model(Language::C, "/override/c");
+        completer.override_model(Language::C, &c_model);
         completer.apply_settings(&settings);
-        assert!(completer.has_model(Language::C));
+        assert!(completer.has_model(Language::C, None));
+        assert!(completer.take_outcomes().is_empty());
     }
 
     #[test]
@@ -1009,7 +1465,7 @@ mod tests {
                 .wait_for_outcomes(Duration::from_millis(10))
                 .is_empty()
         );
-        completer.spawn(Language::Rust, PathBuf::from("tiny"), || Ok(tiny_model()));
+        completer.install("tiny", &[Language::Rust], || Ok(tiny_model()));
         completer.request(1, request(1, "fn main() {\n    let x = ", "\n}\n"));
         let outcomes = completer.wait_for_outcomes(Duration::from_secs(30));
         assert!(

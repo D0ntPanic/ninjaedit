@@ -1,4 +1,4 @@
-//! Byte-level BPE tokenizer for Rust source.
+//! Byte-level BPE tokenizer for source code.
 //!
 //! Token ids are laid out as: special tokens, then one line-break token per indent level,
 //! then the 256 byte values, then one id per learned merge.
@@ -209,14 +209,27 @@ impl Encoder<'_> {
         }
     }
 
-    /// Appends the header each training document opens with: the module's name and the file's
-    /// path within the module, each after its special token. Prompts open with the same header
-    /// so the model sees what it was trained on.
-    pub fn encode_header(&mut self, module_name: &str, file_path: &str, out: &mut Vec<u32>) {
-        out.push(self.tok.special("<module_name>"));
-        self.encode_with(module_name, Indent::Spaces(4), out);
-        out.push(self.tok.special("<file_name>"));
-        self.encode_with(file_path, Indent::Spaces(4), out);
+    /// Appends the header each training document opens with. A model trained on several
+    /// languages gets `<lang>` and the document's language first (single-language models are
+    /// trained without it); then come the module's name and the file's path within the module,
+    /// each after its special token. Prompts open with the same header so the model sees what
+    /// it was trained on; a prompt that cannot name the module leaves `location` out.
+    pub fn encode_header(
+        &mut self,
+        language: Option<&str>,
+        location: Option<(&str, &str)>,
+        out: &mut Vec<u32>,
+    ) {
+        if let Some(language) = language {
+            out.push(self.tok.special("<lang>"));
+            self.encode_with(language, Indent::Spaces(4), out);
+        }
+        if let Some((module_name, file_path)) = location {
+            out.push(self.tok.special("<module_name>"));
+            self.encode_with(module_name, Indent::Spaces(4), out);
+            out.push(self.tok.special("<file_name>"));
+            self.encode_with(file_path, Indent::Spaces(4), out);
+        }
     }
 
     /// Encodes one pre-token's bytes with BPE, without line or indentation handling.
@@ -301,5 +314,30 @@ mod tests {
             tok.decode(&ids, "    "),
             "fn main() {\n    if x {\n        y();\n    }\n}\n"
         );
+    }
+
+    #[test]
+    fn headers() {
+        let tok = Tokenizer::from_merges(Vec::new());
+        let text = |ids: &[u32]| ids.iter().map(|&id| tok.token_text(id)).collect::<String>();
+        let header = |language, location| {
+            let mut ids = Vec::new();
+            tok.encoder().encode_header(language, location, &mut ids);
+            ids
+        };
+        // Single-language models: no language.
+        let plain = header(None, Some(("zlib", "inflate.c")));
+        assert_eq!(plain[0], tok.special("<module_name>"));
+        assert_eq!(text(&plain), "<module_name>zlib<file_name>inflate.c");
+        // Several languages: the language first.
+        let tagged = header(Some("cpp"), Some(("zlib", "inflate.c")));
+        assert_eq!(tagged[0], tok.special("<lang>"));
+        assert_eq!(
+            text(&tagged),
+            "<lang>cpp<module_name>zlib<file_name>inflate.c"
+        );
+        assert_eq!(&tagged[tagged.len() - plain.len()..], &plain[..]);
+        assert_eq!(text(&header(Some("c"), None)), "<lang>c");
+        assert!(header(None, None).is_empty());
     }
 }

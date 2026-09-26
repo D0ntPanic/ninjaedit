@@ -1,20 +1,27 @@
 //! Builds a filtered, deduplicated Rust source corpus from a local Panamax mirror of crates.io.
 //!
 //! The output is a directory of zstd-compressed JSONL shards. Each line is one crate with its
-//! surviving `.rs` files, edition, license and dependency list, so later stages can build
-//! repository-aware training examples from whole crates rather than isolated files.
+//! surviving `.rs` files (language `rust`) and `Cargo.toml` manifests (language `cargo`),
+//! edition, license and dependency list, so later stages can build repository-aware training
+//! examples from whole crates rather than isolated files.
+//!
+//! `build-debian` builds the same kind of corpus for other languages from a Debian or Ubuntu
+//! source mirror, one directory of shards per language.
 
+mod debian;
 mod filter;
 mod index;
+mod lang;
 mod license;
 mod minhash;
 mod stats;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use corpus::{CrateRecord, FileRecord, expand_home, read_shard};
+use corpus::{FileRecord, PackageRecord, Split, expand_home, read_shard, shard_paths};
 use flate2::read::GzDecoder;
 use index::CrateEntry;
+use lang::{LANGS, LangId};
 use license::Policy;
 use minhash::Signature;
 use rayon::prelude::*;
@@ -34,21 +41,41 @@ use twox_hash::XxHash3_64;
 enum Command {
     /// Build the corpus from the mirror.
     Build(BuildArgs),
-    /// List the crates in a shard, or show one crate's files.
+    /// List the records in a shard, or show one record's files.
     Inspect(InspectArgs),
+    /// Build per-language corpora from a Debian or Ubuntu source mirror, with a report on
+    /// the code in every language and license.
+    BuildDebian(debian::DebianArgs),
+    /// Write the records of one split as directories of files, for evaluating a model on code
+    /// it was not trained on.
+    Extract(ExtractArgs),
+}
+
+#[derive(Parser)]
+struct ExtractArgs {
+    /// Corpus directories, comma-separated. Records of the same name from several (a
+    /// package's C and C++ files) go into one directory.
+    #[arg(value_delimiter = ',')]
+    corpus: Vec<String>,
+    /// Which split's records to write.
+    #[arg(long, default_value = "test")]
+    split: Split,
+    /// Each record's files are written under `<out>/<record name>/`.
+    #[arg(long)]
+    out: String,
 }
 
 #[derive(Parser)]
 struct InspectArgs {
     /// A `shard-NNN.jsonl.zst` file.
     shard: String,
-    /// Show the files of this crate instead of listing crates.
-    #[arg(long = "crate")]
-    krate: Option<String>,
-    /// With `--crate`, print the content of this file.
+    /// Show the files of this record (crate or package) instead of listing records.
+    #[arg(long, alias = "crate")]
+    package: Option<String>,
+    /// With `--package`, print the content of this file.
     #[arg(long)]
     file: Option<String>,
-    /// Stop after this many crates when listing.
+    /// Stop after this many records when listing.
     #[arg(long)]
     limit: Option<usize>,
 }
@@ -105,7 +132,7 @@ const SHARD_BYTES: u64 = 1024 * 1024 * 1024;
 const ZSTD_LEVEL: i32 = 3;
 
 struct Processed {
-    record: CrateRecord,
+    record: PackageRecord,
     /// One signature per file in `record.files`; `None` for files too short to compare.
     sigs: Vec<Option<Signature>>,
 }
@@ -135,7 +162,54 @@ fn main() -> Result<()> {
     match Command::parse() {
         Command::Build(args) => build(args),
         Command::Inspect(args) => inspect(args),
+        Command::BuildDebian(args) => debian::build(args),
+        Command::Extract(args) => extract(args),
     }
+}
+
+fn extract(args: ExtractArgs) -> Result<()> {
+    let out = expand_home(&args.out);
+    let mut records = 0usize;
+    let mut files = 0usize;
+    let mut skipped = 0usize;
+    for dir in &args.corpus {
+        for shard in shard_paths(&expand_home(dir))? {
+            for record in read_shard(&shard)? {
+                let record = record?;
+                if Split::of(&record.name) != args.split {
+                    continue;
+                }
+                records += 1;
+                for file in &record.files {
+                    // Paths come from archives; never write outside the record's directory.
+                    let rel = Path::new(&file.path);
+                    if !rel
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_)))
+                    {
+                        skipped += 1;
+                        continue;
+                    }
+                    let path = out.join(&record.name).join(rel);
+                    fs::create_dir_all(path.parent().unwrap())?;
+                    fs::write(&path, &file.content)
+                        .with_context(|| format!("writing {}", path.display()))?;
+                    files += 1;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "wrote {files} files of {records} {} records to {}{}",
+        args.split.name(),
+        out.display(),
+        if skipped > 0 {
+            format!(" ({skipped} with unsafe paths skipped)")
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
 }
 
 fn inspect(args: InspectArgs) -> Result<()> {
@@ -157,7 +231,7 @@ fn inspect_inner(args: InspectArgs) -> Result<()> {
     let mut shown = 0usize;
     for record in read_shard(&path)? {
         let record = record?;
-        match &args.krate {
+        match &args.package {
             None => {
                 let bytes: usize = record.files.iter().map(|f| f.content.len()).sum();
                 writeln!(
@@ -192,7 +266,13 @@ fn inspect_inner(args: InspectArgs) -> Result<()> {
                         record.deps.join(",")
                     )?;
                     for f in &record.files {
-                        writeln!(out, "  {:<60} {:>8} bytes", f.path, f.content.len())?;
+                        writeln!(
+                            out,
+                            "  {:<60} {:<8} {:>8} bytes",
+                            f.path,
+                            f.language,
+                            f.content.len()
+                        )?;
                     }
                 }
                 out.flush()?;
@@ -202,8 +282,8 @@ fn inspect_inner(args: InspectArgs) -> Result<()> {
         }
     }
     out.flush()?;
-    if let Some(name) = &args.krate {
-        bail!("crate {name} not found in {}", path.display());
+    if let Some(name) = &args.package {
+        bail!("{name} not found in {}", path.display());
     }
     Ok(())
 }
@@ -294,7 +374,32 @@ fn build(args: BuildArgs) -> Result<()> {
         clusters.dropped
     };
     drop(sigs);
-    rewrite(&out, &dropped, &stats)?;
+    rewrite(&out, &dropped, |record, near_dups| {
+        stats
+            .files_near_dup
+            .fetch_add(near_dups as u64, Ordering::Relaxed);
+        if record.files.is_empty() {
+            return;
+        }
+        for file in &record.files {
+            stats.files_kept.fetch_add(1, Ordering::Relaxed);
+            stats
+                .bytes_kept
+                .fetch_add(file.content.len() as u64, Ordering::Relaxed);
+            stats
+                .lines_kept
+                .fetch_add(file.content.lines().count() as u64, Ordering::Relaxed);
+            stats.tokens_kept.fetch_add(
+                minhash::token_count(&file.content) as u64,
+                Ordering::Relaxed,
+            );
+        }
+        for file in &record.files {
+            stats.count_language(&file.language, file.content.len() as u64);
+        }
+        stats.crates_kept.fetch_add(1, Ordering::Relaxed);
+        stats.count(&stats.editions, &record.edition);
+    })?;
 
     let snapshot = stats.snapshot();
     snapshot.print();
@@ -354,14 +459,14 @@ fn process_crate(
         }
         return None;
     }
-    if raw_files.is_empty() {
+    if !raw_files.iter().any(|(_, lang, _)| *lang == lang::RUST) {
         bump(&stats.crates_no_rust_files);
         return None;
     }
 
     let mut files = Vec::new();
     let mut sigs = Vec::new();
-    for (path, bytes) in raw_files {
+    for (path, lang, bytes) in raw_files {
         bump(&stats.files_seen);
         stats
             .bytes_seen
@@ -373,11 +478,14 @@ fn process_crate(
             }
             continue;
         };
-        if let Err(reason) = filter::check(&content) {
+        let style = LANGS[lang as usize].comments;
+        if let Err(reason) = filter::check_with(&content, style) {
             stats.reject(reason);
             if let Some(log) = reject_log {
                 let detail = match reason {
-                    filter::Reject::Generated => filter::generated_marker(&content).unwrap_or(""),
+                    filter::Reject::Generated => {
+                        filter::generated_marker_with(&content, style).unwrap_or("")
+                    }
                     _ => "",
                 };
                 log.log(&entry.name, &path, reason.name(), detail);
@@ -392,15 +500,22 @@ fn process_crate(
             continue;
         }
         sigs.push(minhash::signature(&content));
-        files.push(FileRecord { path, content });
+        files.push(FileRecord {
+            path,
+            language: LANGS[lang as usize].identifier(),
+            content,
+            license: None,
+        });
     }
-    if files.is_empty() {
+    // A manifest alone is not worth training on.
+    let rust = LANGS[lang::RUST as usize].identifier();
+    if !files.iter().any(|f| f.language == rust) {
         bump(&stats.crates_no_rust_files);
         return None;
     }
 
     Some(Processed {
-        record: CrateRecord {
+        record: PackageRecord {
             name: entry.name.clone(),
             version: version.version.to_string(),
             edition,
@@ -413,14 +528,21 @@ fn process_crate(
     })
 }
 
-/// Relative path and raw bytes of a source file inside a tarball.
-type RawFile = (String, Vec<u8>);
+/// Relative path, language (Rust or Cargo) and raw bytes of a source file inside a tarball.
+type RawFile = (String, LangId, Vec<u8>);
 
-/// Streams a `.crate` tarball, returning the manifest text and every candidate `.rs` file.
+/// Streams a `.crate` tarball, returning the manifest text and every candidate `.rs` and
+/// `Cargo.toml` file.
+///
+/// The top-level `Cargo.toml` of a published crate is the one `cargo package` rewrote, which
+/// resolves workspace inheritance for the license and edition but is marked as generated. The
+/// author's own is kept alongside as `Cargo.toml.orig`, and is the one that goes into the
+/// corpus, under the name the author gave it.
 fn read_tarball(path: &Path, stats: &Stats) -> Result<(Option<String>, Vec<RawFile>)> {
     let file = File::open(path)?;
     let mut archive = tar::Archive::new(GzDecoder::new(BufReader::with_capacity(1 << 16, file)));
     let mut manifest = None;
+    let mut original = None;
     let mut files = Vec::new();
     let mut total_bytes = 0u64;
     for entry in archive.entries()? {
@@ -439,9 +561,16 @@ fn read_tarball(path: &Path, stats: &Stats) -> Result<(Option<String>, Vec<RawFi
             manifest = Some(text);
             continue;
         }
-        if !rel.ends_with(".rs") {
+        if rel == "Cargo.toml.orig" {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            original = Some(bytes);
             continue;
         }
+        let lang = match lang::detect(rel) {
+            Some(lang::Detected::Lang(id)) if id == lang::RUST || id == lang::CARGO => id,
+            _ => continue,
+        };
         if filter::excluded_path(rel) {
             stats.files_excluded_path.fetch_add(1, Ordering::Relaxed);
             continue;
@@ -458,7 +587,11 @@ fn read_tarball(path: &Path, stats: &Stats) -> Result<(Option<String>, Vec<RawFi
         let mut bytes = Vec::with_capacity(size as usize);
         entry.read_to_end(&mut bytes)?;
         total_bytes += size;
-        files.push((rel.to_owned(), bytes));
+        files.push((rel.to_owned(), lang, bytes));
+    }
+    // Crates published before `Cargo.toml.orig` existed have only the author's manifest.
+    if let Some(bytes) = original.or_else(|| manifest.clone().map(String::into_bytes)) {
+        files.insert(0, ("Cargo.toml".to_owned(), lang::CARGO, bytes));
     }
     Ok((manifest, files))
 }
@@ -480,7 +613,7 @@ fn parse_manifest(text: &str) -> Option<(Option<String>, String)> {
     Some((license, edition))
 }
 
-/// Writes crate records as JSON lines into zstd-compressed shards of bounded size.
+/// Writes records as JSON lines into zstd-compressed shards of bounded size.
 struct ShardWriter {
     dir: PathBuf,
     prefix: &'static str,
@@ -502,7 +635,7 @@ impl ShardWriter {
         }
     }
 
-    fn write(&mut self, record: &CrateRecord) -> Result<()> {
+    fn write(&mut self, record: &PackageRecord) -> Result<()> {
         if self.current.is_none() {
             let path = self
                 .dir
@@ -541,9 +674,15 @@ impl ShardWriter {
     }
 }
 
-/// Rewrites the staging shards into final shards, dropping near-duplicate files and
-/// collecting the statistics of what survives.
-fn rewrite(out: &Path, dropped: &[bool], stats: &Stats) -> Result<()> {
+/// Rewrites the `staging-*` shards in `out` into final shards, dropping the files whose ids
+/// (their positions in the staging shards) are marked in `dropped`. `observe` sees every
+/// record with the files it keeps, and the number it dropped; records left empty are not
+/// written. Returns the number of shards written.
+fn rewrite(
+    out: &Path,
+    dropped: &[bool],
+    mut observe: impl FnMut(&PackageRecord, usize),
+) -> Result<usize> {
     let mut staging: Vec<PathBuf> = fs::read_dir(out)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
@@ -559,35 +698,21 @@ fn rewrite(out: &Path, dropped: &[bool], stats: &Stats) -> Result<()> {
         let reader = BufReader::new(zstd::stream::read::Decoder::new(File::open(path)?)?);
         for line in reader.lines() {
             let line = line?;
-            let mut record: CrateRecord = serde_json::from_str(&line)?;
-            let mut kept = Vec::with_capacity(record.files.len());
+            let mut record: PackageRecord = serde_json::from_str(&line)?;
+            let total = record.files.len();
+            let mut kept = Vec::with_capacity(total);
             for file in record.files.drain(..) {
                 let id = next_id;
                 next_id += 1;
-                if *dropped.get(id).unwrap_or(&false) {
-                    stats.files_near_dup.fetch_add(1, Ordering::Relaxed);
-                    continue;
+                if !*dropped.get(id).unwrap_or(&false) {
+                    kept.push(file);
                 }
-                stats.files_kept.fetch_add(1, Ordering::Relaxed);
-                stats
-                    .bytes_kept
-                    .fetch_add(file.content.len() as u64, Ordering::Relaxed);
-                stats
-                    .lines_kept
-                    .fetch_add(file.content.lines().count() as u64, Ordering::Relaxed);
-                stats.tokens_kept.fetch_add(
-                    minhash::token_count(&file.content) as u64,
-                    Ordering::Relaxed,
-                );
-                kept.push(file);
-            }
-            if kept.is_empty() {
-                continue;
             }
             record.files = kept;
-            stats.crates_kept.fetch_add(1, Ordering::Relaxed);
-            stats.count(&stats.editions, &record.edition);
-            writer.write(&record)?;
+            observe(&record, total - record.files.len());
+            if !record.files.is_empty() {
+                writer.write(&record)?;
+            }
         }
     }
     if next_id != dropped.len() {
@@ -600,6 +725,6 @@ fn rewrite(out: &Path, dropped: &[bool], stats: &Stats) -> Result<()> {
     for path in staging {
         fs::remove_file(path)?;
     }
-    eprintln!("wrote {} shards", shards.len());
-    Ok(())
+    eprintln!("wrote {} shards in {}", shards.len(), out.display());
+    Ok(shards.len())
 }

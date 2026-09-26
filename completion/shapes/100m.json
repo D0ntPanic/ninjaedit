@@ -9,13 +9,13 @@
     "rope_theta": 10000.0
   },
   "train": {
-    "batch": 16,
+    "batch": 8,
     "tokens": 3000000000,
     "lr": 0.0004,
     "warmup": 1500,
     "weight_decay": 0.1,
     "eval_every": 500,
-    "eval_batches": 16,
+    "eval_batches": 32,
     "save_every": 1000
   }
 }

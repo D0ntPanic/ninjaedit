@@ -60,6 +60,10 @@ struct SampleArgs {
     /// The path of the text's file within its module, such as `src/lib.rs`.
     #[arg(long, requires = "module_name")]
     file_name: Option<String>,
+    /// The text's language, one of those the model's config lists; needed for a model of
+    /// several, whose prompts open with it, as its training documents do.
+    #[arg(long)]
+    language: Option<String>,
     #[arg(long)]
     threads: Option<usize>,
 }
@@ -158,11 +162,20 @@ fn main() -> Result<()> {
                 pretok::last_piece_start(&prefix, indent)
             };
             let (context, partial) = prefix.split_at(boundary);
+            let languages = &model.config.languages;
+            let language = match &args.language {
+                Some(language) => language.as_str(),
+                None if languages.len() == 1 => languages[0].as_str(),
+                None => anyhow::bail!(
+                    "the model was trained on several languages ({}); give --language",
+                    languages.join(", ")
+                ),
+            };
+            let language = model.config.header_language(language)?;
             let mut encoder = tok.encoder();
             let mut ids = Vec::new();
-            if let (Some(module_name), Some(file_name)) = (&args.module_name, &args.file_name) {
-                encoder.encode_header(module_name, file_name, &mut ids);
-            }
+            let location = args.module_name.as_deref().zip(args.file_name.as_deref());
+            encoder.encode_header(language, location, &mut ids);
             ids.extend([tok.special("<fim_prefix>"), tok.special("<fim_suffix>")]);
             encoder.encode_with(&suffix, indent, &mut ids);
             ids.push(tok.special("<fim_middle>"));
