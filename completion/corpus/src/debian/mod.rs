@@ -19,11 +19,13 @@
 mod copyright;
 mod source;
 
+use crate::archive;
 use crate::filter::{self, CommentStyle, Reject};
 use crate::lang::{self, Detected, LANGS, LangId};
 use crate::license::{self, Policy, Tier};
 use crate::minhash::{self, Signature};
-use crate::{ShardWriter, rewrite};
+use crate::stats::{bytes, human, truncate};
+use crate::{ShardWriter, remove_shards, rewrite};
 use anyhow::{Context, Result};
 use clap::Parser;
 use copyright::Copyright;
@@ -391,7 +393,7 @@ fn scan_archive(package: &Package, archive: &source::Archive) -> ArchiveScan {
     // directory, so files are kept under their stored paths until then.
     let mut seen: Vec<(String, usize, u64, Outcome)> = Vec::new();
     let mut copyrights: Vec<(String, String)> = Vec::new();
-    let result = source::walk_tar(&path, |stored, size, reader| {
+    let result = archive::walk_tar(&path, |stored, size, reader| {
         if packaging
             && (stored == "debian/copyright"
                 || stored
@@ -455,12 +457,12 @@ fn scan_archive(package: &Package, archive: &source::Archive) -> ArchiveScan {
         }
     };
     for (stored, text) in copyrights {
-        if source::source_path(&stored, top.as_deref(), None) == "debian/copyright" {
+        if archive::source_path(&stored, top.as_deref(), None) == "debian/copyright" {
             scan.copyright_text = Some(text);
         }
     }
     for (stored, slot, size, outcome) in seen {
-        let path = source::source_path(&stored, top.as_deref(), prefix);
+        let path = archive::source_path(&stored, top.as_deref(), prefix);
         if excluded(&path) {
             continue;
         }
@@ -1190,45 +1192,6 @@ struct LangResult {
 
 fn tier_index(tier: Tier) -> usize {
     Tier::ALL.iter().position(|&t| t == tier).unwrap()
-}
-
-/// Removes the shards and staging shards of an earlier build from a language directory.
-fn remove_shards(dir: &Path) -> Result<()> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Ok(());
-    };
-    for entry in entries {
-        let path = entry?.path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if (name.starts_with("shard-") || name.starts_with("staging-"))
-            && name.ends_with(".jsonl.zst")
-        {
-            fs::remove_file(&path)?;
-        }
-    }
-    Ok(())
-}
-
-fn human(n: f64) -> String {
-    match n {
-        n if n >= 1e9 => format!("{:.2}B", n / 1e9),
-        n if n >= 1e6 => format!("{:.1}M", n / 1e6),
-        n if n >= 1e3 => format!("{:.1}K", n / 1e3),
-        n => format!("{n:.0}"),
-    }
-}
-
-fn bytes(n: u64) -> String {
-    let n = n as f64;
-    match n {
-        n if n >= 1e9 => format!("{:.2}GB", n / 1e9),
-        n if n >= 1e6 => format!("{:.1}MB", n / 1e6),
-        n => format!("{:.0}KB", n / 1e3),
-    }
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-    &s[..s.floor_char_boundary(max)]
 }
 
 #[cfg(test)]

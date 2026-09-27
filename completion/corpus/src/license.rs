@@ -253,7 +253,11 @@ pub fn tier_of(id: &str, exception: Option<&str>) -> Tier {
         && !["-sa", "-nc", "-nd"]
             .iter()
             .any(|clause| id.contains(clause));
-    let tier = if PERMISSIVE.contains(&id) || prefixed(PERMISSIVE_PREFIXES) || id == "pd" || cc_by {
+    // "Unlicensed" means no license at all, not the Unlicense.
+    let unlicensed = id.starts_with("unlicensed");
+    let tier = if unlicensed {
+        Tier::Other
+    } else if PERMISSIVE.contains(&id) || prefixed(PERMISSIVE_PREFIXES) || id == "pd" || cc_by {
         Tier::Permissive
     } else if prefixed(WEAK_COPYLEFT_PREFIXES) {
         Tier::WeakCopyleft
@@ -498,6 +502,8 @@ mod tests {
         );
         assert_eq!(tier("GPL-2+ with OpenSSL exception"), Some(Tier::Copyleft));
         assert_eq!(tier("BSD-4-clause"), Some(Tier::Other));
+        assert_eq!(tier("Unlicense"), Some(Tier::Permissive));
+        assert_eq!(tier("Unlicensed"), Some(Tier::Other));
         assert_eq!(tier("CC-BY-SA-3.0"), Some(Tier::Other));
         assert_eq!(tier("MIT and custom-thing"), Some(Tier::Other));
         assert_eq!(tier("GPL-2+ with"), None);

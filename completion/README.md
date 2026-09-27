@@ -6,9 +6,11 @@ doesn't need to embed a Python toolchain.
 
 Crates:
 
-* `corpus` — builds a filtered, deduplicated Rust source corpus from a local
-  Panamax mirror of crates.io or a Debian mirror. Output is sharded
-  zstd-compressed JSONL.
+* `corpus` — builds filtered, deduplicated source corpora: Rust from a local
+  Panamax mirror of crates.io (`build`), other languages from a Debian
+  mirror (`build-debian`), and Python from a bandersnatch mirror of PyPI
+  (`build-pypi`). Output is sharded zstd-compressed JSONL, one record per
+  crate or package.
 
 * `tokenizer` — byte-level BPE tokenizer trained on the corpus. Line breaks are
   single tokens that carry the indent level of the following line, with the

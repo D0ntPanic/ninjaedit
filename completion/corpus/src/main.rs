@@ -6,14 +6,17 @@
 //! examples from whole crates rather than isolated files.
 //!
 //! `build-debian` builds the same kind of corpus for other languages from a Debian or Ubuntu
-//! source mirror, one directory of shards per language.
+//! source mirror, one directory of shards per language, and `build-pypi` a Python corpus from
+//! a bandersnatch mirror of PyPI.
 
+mod archive;
 mod debian;
 mod filter;
 mod index;
 mod lang;
 mod license;
 mod minhash;
+mod pypi;
 mod stats;
 
 use anyhow::{Context, Result, bail};
@@ -37,7 +40,7 @@ use std::time::Instant;
 use twox_hash::XxHash3_64;
 
 #[derive(Parser)]
-#[command(about = "Build and inspect a filtered Rust source corpus from a local crates.io mirror")]
+#[command(about = "Build and inspect filtered source corpora from local package mirrors")]
 enum Command {
     /// Build the corpus from the mirror.
     Build(BuildArgs),
@@ -46,6 +49,8 @@ enum Command {
     /// Build per-language corpora from a Debian or Ubuntu source mirror, with a report on
     /// the code in every language and license.
     BuildDebian(debian::DebianArgs),
+    /// Build a Python corpus from a bandersnatch mirror of PyPI.
+    BuildPypi(pypi::PypiArgs),
     /// Write the records of one split as directories of files, for evaluating a model on code
     /// it was not trained on.
     Extract(ExtractArgs),
@@ -163,6 +168,7 @@ fn main() -> Result<()> {
         Command::Build(args) => build(args),
         Command::Inspect(args) => inspect(args),
         Command::BuildDebian(args) => debian::build(args),
+        Command::BuildPypi(args) => pypi::build(args),
         Command::Extract(args) => extract(args),
     }
 }
@@ -727,4 +733,21 @@ fn rewrite(
     }
     eprintln!("wrote {} shards in {}", shards.len(), out.display());
     Ok(shards.len())
+}
+
+/// Removes the shards and staging shards of an earlier build from a corpus directory.
+fn remove_shards(dir: &Path) -> Result<()> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if (name.starts_with("shard-") || name.starts_with("staging-"))
+            && name.ends_with(".jsonl.zst")
+        {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }

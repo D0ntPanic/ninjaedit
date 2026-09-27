@@ -361,6 +361,7 @@ pub type LangId = u8;
 
 pub const C: LangId = 0;
 pub const CPP: LangId = 1;
+pub const PYTHON: LangId = lang_id("Python");
 pub const RUST: LangId = lang_id("Rust");
 pub const CARGO: LangId = lang_id("Cargo");
 pub const TYPESCRIPT: LangId = lang_id("TypeScript");
@@ -443,6 +444,7 @@ mod tests {
     fn language_ids() {
         assert_eq!(LANGS[C as usize].name, "C");
         assert_eq!(LANGS[CPP as usize].name, "C++");
+        assert_eq!(LANGS[PYTHON as usize].name, "Python");
         assert_eq!(LANGS[RUST as usize].name, "Rust");
         assert_eq!(LANGS[CARGO as usize].name, "Cargo");
         assert_eq!(LANGS[TYPESCRIPT as usize].name, "TypeScript");

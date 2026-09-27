@@ -166,3 +166,28 @@ impl Snapshot {
         table("rejected licenses (top)", &self.rejected_licenses);
     }
 }
+
+/// A count with a metric suffix.
+pub fn human(n: f64) -> String {
+    match n {
+        n if n >= 1e9 => format!("{:.2}B", n / 1e9),
+        n if n >= 1e6 => format!("{:.1}M", n / 1e6),
+        n if n >= 1e3 => format!("{:.1}K", n / 1e3),
+        n => format!("{n:.0}"),
+    }
+}
+
+/// A byte count in KB, MB or GB.
+pub fn bytes(n: u64) -> String {
+    let n = n as f64;
+    match n {
+        n if n >= 1e9 => format!("{:.2}GB", n / 1e9),
+        n if n >= 1e6 => format!("{:.1}MB", n / 1e6),
+        n => format!("{:.0}KB", n / 1e3),
+    }
+}
+
+/// `s` cut to at most `max` bytes, at a character boundary.
+pub fn truncate(s: &str, max: usize) -> &str {
+    &s[..s.floor_char_boundary(max)]
+}
