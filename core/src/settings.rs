@@ -242,7 +242,7 @@ impl SettingKey {
                 "Passed as -G when CMake configures: Ninja, \"Unix Makefiles\", Xcode, and the like; blank for CMake's own choice"
             }
             SettingKey::CompletionModels => {
-                "Checkpoint directories (config.json, model.safetensors, tokenizer.json), highest priority first: each language goes to the first model trained on it. Alt+Up and Alt+Down move a model, Ctrl+D removes it"
+                "Model directories (config.json, model.safetensors, tokenizer.json), highest priority first: each language goes to the first model trained on it. Alt+Up and Alt+Down move a model, Ctrl+D removes it"
             }
             SettingKey::CompletionLineConfidence => {
                 "How sure the model must be of a line, on average over its tokens, to offer it: 0 to 1, lower for more eager completion, higher for more cautious"

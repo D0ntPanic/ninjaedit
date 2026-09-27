@@ -78,3 +78,6 @@ A training checkpoint directory holds `model.safetensors` (float32 master
 weights), `optimizer.safetensors` (AdamW moments), `config.json`,
 `state.json` (step, the training plan, and the tokenizer fingerprint) and a
 copy of the tokenizer as `tokenizer.json`.
+
+The current model training pipeline requires an Apple Silicon Mac with at
+least 64GB of RAM.
