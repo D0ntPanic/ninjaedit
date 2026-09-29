@@ -1,6 +1,7 @@
 //! The uncommitted changes of a working tree, as `git status` lists
 //! them, and the steps of committing them: staging, unstaging, and the
-//! commit itself. The changes page of a frontend is built on this.
+//! commit itself, and throwing away what isn't wanted. The changes page
+//! of a frontend is built on this.
 //!
 //! [`Changes::open`] opens the repository and starts a scan of it on a
 //! worker thread, since a big working tree takes a while to compare
@@ -25,11 +26,17 @@
 //! [`head_message`](Changes::head_message) is HEAD's message, to start
 //! the amended one from.
 //!
+//! [`discard`](Changes::discard) throws away unstaged changes, putting
+//! files back to the index's version (or deleting them, when untracked),
+//! the one action here that loses work: it touches the working
+//! directory and nothing else, and can't be undone.
+//!
 //! Every action ([`stage`](Changes::stage), [`unstage`](Changes::unstage),
-//! and [`commit`](Changes::commit)) changes the repository on the
-//! caller's thread and updates the lists right away with what it did:
-//! staging and unstaging compare just the files they touched again,
-//! which is quick however big the tree, and a commit empties the
+//! [`discard`](Changes::discard), and [`commit`](Changes::commit))
+//! changes the repository on the caller's thread and updates the lists
+//! right away with what it did: staging, unstaging, and discarding
+//! compare just the files they touched again, which is quick however
+//! big the tree, and a commit empties the
 //! staged list. A scan then starts to confirm the lists and catch
 //! anything else; while it runs, [`is_confirming`](Changes::is_confirming)
 //! tells a frontend it needn't say it is waiting. [`refresh`](Changes::refresh)
@@ -605,6 +612,82 @@ impl Changes {
         self.unstage(paths.iter().map(String::as_str))
     }
 
+    /// Discard the unstaged changes of `paths`, putting the files in
+    /// the working directory back to the index's version (`git restore
+    /// -- path`): what is staged, or with nothing staged, what is
+    /// committed. A deleted file comes back; an untracked file has no
+    /// version to go back to, so it is deleted, along with any
+    /// directories that leaves empty. A path with no unstaged change is
+    /// left alone. The index is untouched, so what is staged stays
+    /// staged.
+    ///
+    /// Refused, with nothing changed, when a path is in conflict (there
+    /// is no one version to go back to: resolve it, or stage it) or is
+    /// a submodule (its change is the commit checked out in it, or the
+    /// changes inside it, which are the submodule's own to discard).
+    /// There is no undoing a discard: a frontend should confirm it.
+    pub fn discard<'a>(
+        &mut self,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), git2::Error> {
+        let paths: Vec<&str> = paths.into_iter().collect();
+        if paths.is_empty() {
+            return Ok(());
+        }
+        // What the paths are now, not what the last scan said: the
+        // working directory may have changed since.
+        let mut restore = Vec::new();
+        let mut remove = Vec::new();
+        let diff = workdir_diff(&self.repo, &paths)?;
+        for index in 0..diff.deltas().len() {
+            let change = diff::file_change(&diff, index, false)?;
+            if change.kind == ChangeKind::Conflicted {
+                return Err(git2::Error::from_str(&format!(
+                    "{} is in conflict: resolve it instead",
+                    change.path
+                )));
+            }
+            if change.submodule {
+                return Err(git2::Error::from_str(&format!(
+                    "{} is a submodule: discard its changes on its own page",
+                    change.path
+                )));
+            }
+            if change.kind == ChangeKind::Untracked {
+                remove.push(change.path);
+            } else {
+                restore.push(change.path);
+            }
+        }
+        drop(diff);
+        let result = self.restore_and_remove(&restore, &remove);
+        // Whatever was done before a failure shows in the lists too.
+        self.rescan(&paths);
+        self.confirm();
+        result
+    }
+
+    /// The work of a discard: check `restore` out of the index over
+    /// what the working directory has, and delete `remove`.
+    fn restore_and_remove(&self, restore: &[String], remove: &[String]) -> Result<(), git2::Error> {
+        // An empty list of paths would check out every file.
+        if !restore.is_empty() {
+            let mut checkout = git2::build::CheckoutBuilder::new();
+            checkout.force().disable_pathspec_match(true);
+            for path in restore {
+                checkout.path(path);
+            }
+            self.repo.checkout_index(None, Some(&mut checkout))?;
+        }
+        for path in remove {
+            let file = self.workdir.join(path);
+            fs::remove_file(&file)
+                .map_err(|err| git2::Error::from_str(&format!("could not delete {path}: {err}")))?;
+            remove_empty_parents(&self.workdir, &file);
+        }
+        Ok(())
+    }
+
     /// Commit what is staged with `message`, on the current branch (or
     /// as a detached commit), as the person the repository's
     /// configuration names. A merge in progress is finished: the merged
@@ -752,6 +835,19 @@ fn count_conflicts(unstaged: &[FileChange]) -> usize {
         .iter()
         .filter(|change| change.kind == ChangeKind::Conflicted)
         .count()
+}
+
+/// Delete the directories above `file` that are left empty, up to but
+/// not including `workdir`: those an untracked file discarded was the
+/// last thing in. One that isn't empty stops it.
+pub(super) fn remove_empty_parents(workdir: &Path, file: &Path) {
+    let mut dir = file.parent();
+    while let Some(current) = dir {
+        if current == workdir || !current.starts_with(workdir) || fs::remove_dir(current).is_err() {
+            break;
+        }
+        dir = current.parent();
+    }
 }
 
 fn find_renames(diff: &mut git2::Diff<'_>) -> Result<(), git2::Error> {
@@ -1290,6 +1386,142 @@ mod tests {
         changes.set_amend(false).unwrap();
         settle(&mut changes);
         assert!(changes.staged().is_empty());
+    }
+
+    fn read(repo: &TestRepo, path: &str) -> String {
+        fs::read_to_string(repo.path().join(path)).unwrap()
+    }
+
+    #[test]
+    fn discarding_puts_files_back_to_the_index_and_deletes_untracked_ones() {
+        let mut repo = TestRepo::new();
+        repo.commit(
+            &[
+                ("a.rs", "fn a() {}\n"),
+                ("b.txt", "b\n"),
+                ("dir/c.txt", "c\n"),
+                ("dir/d.txt", "d\n"),
+                ("keep.txt", "k\n"),
+            ],
+            "Base",
+            &[],
+        );
+        // a.rs: a staged change, and an unstaged one on top of it.
+        fs::write(repo.path().join("a.rs"), "fn a() {}\nfn staged() {}\n").unwrap();
+        let mut changes = open(&repo);
+        changes.stage(["a.rs"]).unwrap();
+        confirmed(&mut changes);
+        fs::write(
+            repo.path().join("a.rs"),
+            "fn a() {}\nfn staged() {}\nfn unstaged() {}\n",
+        )
+        .unwrap();
+        // b.txt: modified, nothing staged. dir/c.txt: deleted.
+        fs::write(repo.path().join("b.txt"), "bee\n").unwrap();
+        fs::remove_file(repo.path().join("dir/c.txt")).unwrap();
+        // Untracked: one beside tracked files, one alone in directories
+        // of its own.
+        fs::write(repo.path().join("dir/e.txt"), "e\n").unwrap();
+        fs::create_dir_all(repo.path().join("new/deep")).unwrap();
+        fs::write(repo.path().join("new/deep/x.txt"), "x\n").unwrap();
+        // keep.txt: modified, and not discarded.
+        fs::write(repo.path().join("keep.txt"), "kept\n").unwrap();
+        changes.refresh();
+        settle(&mut changes);
+        assert_eq!(
+            listed(changes.unstaged()),
+            [
+                ('M', "a.rs", 1, 0),
+                ('M', "b.txt", 1, 1),
+                ('D', "dir/c.txt", 0, 1),
+                ('?', "dir/e.txt", 1, 0),
+                ('M', "keep.txt", 1, 1),
+                ('?', "new/deep/x.txt", 1, 0),
+            ]
+        );
+        assert_eq!(listed(changes.staged()), [('M', "a.rs", 1, 0)]);
+
+        changes
+            .discard(["a.rs", "b.txt", "dir/c.txt", "dir/e.txt", "new/deep/x.txt"])
+            .unwrap();
+        confirmed(&mut changes);
+        // a.rs goes back to what is staged, which stays staged; b.txt
+        // to what is committed; dir/c.txt comes back.
+        assert_eq!(read(&repo, "a.rs"), "fn a() {}\nfn staged() {}\n");
+        assert_eq!(listed(changes.staged()), [('M', "a.rs", 1, 0)]);
+        assert_eq!(read(&repo, "b.txt"), "b\n");
+        assert_eq!(read(&repo, "dir/c.txt"), "c\n");
+        // The untracked files are gone, and the directories only the
+        // one was in with them; dir still has its tracked files.
+        assert!(!repo.path().join("dir/e.txt").exists());
+        assert!(!repo.path().join("new").exists());
+        assert_eq!(read(&repo, "dir/d.txt"), "d\n");
+        // Only what was named: keep.txt is still changed.
+        assert_eq!(listed(changes.unstaged()), [('M', "keep.txt", 1, 1)]);
+        assert_eq!(read(&repo, "keep.txt"), "kept\n");
+
+        // A path with nothing to discard is left alone, as is an empty
+        // list (which mustn't mean every file).
+        changes.discard(["b.txt"]).unwrap();
+        confirmed(&mut changes);
+        changes.discard([]).unwrap();
+        assert_eq!(read(&repo, "keep.txt"), "kept\n");
+        assert_eq!(listed(changes.unstaged()), [('M', "keep.txt", 1, 1)]);
+    }
+
+    #[test]
+    fn discarding_refuses_a_conflict_changing_nothing() {
+        let mut repo = TestRepo::new();
+        let base = repo.commit(
+            &[("f.txt", "one\ntwo\nthree\n"), ("g.txt", "g\n")],
+            "Base",
+            &[],
+        );
+        let main = repo.repo.head().unwrap().shorthand().unwrap().to_owned();
+        repo.commit(&[("f.txt", "one\nours\nthree\n")], "Ours", &[base]);
+        repo.branch("side", base);
+        repo.checkout("side");
+        let theirs = repo.commit(&[("f.txt", "one\ntheirs\nthree\n")], "Theirs", &[base]);
+        repo.checkout(&main);
+        repo.repo
+            .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let annotated = repo.repo.find_annotated_commit(theirs).unwrap();
+        repo.repo.merge(&[&annotated], None, None).unwrap();
+        fs::write(repo.path().join("g.txt"), "gee\n").unwrap();
+
+        let mut changes = open(&repo);
+        assert_eq!(
+            listed(changes.unstaged()),
+            [('U', "f.txt", 0, 0), ('M', "g.txt", 1, 1)]
+        );
+        let conflicted = read(&repo, "f.txt");
+        let err = changes.discard(["g.txt", "f.txt"]).unwrap_err();
+        assert!(err.message().contains("f.txt"), "{}", err.message());
+        // Nothing was discarded, not even the file that could have been.
+        assert_eq!(read(&repo, "g.txt"), "gee\n");
+        assert_eq!(read(&repo, "f.txt"), conflicted);
+        assert_eq!(changes.conflict_count(), 1);
+        changes.discard(["g.txt"]).unwrap();
+        confirmed(&mut changes);
+        assert_eq!(read(&repo, "g.txt"), "g\n");
+        assert_eq!(listed(changes.unstaged()), [('U', "f.txt", 0, 0)]);
+    }
+
+    #[test]
+    fn discarding_refuses_a_submodule() {
+        let mut repo = TestRepo::new();
+        repo.commit(&[("a.txt", "one\n")], "Base", &[]);
+        let sub = repo.add_submodule("libs/sub");
+        fs::write(sub.workdir().unwrap().join("inner.txt"), "changed\n").unwrap();
+        let mut changes = open(&repo);
+        assert_eq!(listed(changes.unstaged()), [('M', "libs/sub", 0, 0)]);
+        let err = changes.discard(["libs/sub"]).unwrap_err();
+        assert!(err.message().contains("submodule"), "{}", err.message());
+        assert_eq!(
+            fs::read_to_string(sub.workdir().unwrap().join("inner.txt")).unwrap(),
+            "changed\n"
+        );
     }
 
     #[test]

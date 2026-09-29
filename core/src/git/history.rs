@@ -237,6 +237,12 @@ impl History {
         })
     }
 
+    /// The repository's working directory, which the paths of its
+    /// commits' files are relative to; none for a bare repository.
+    pub fn workdir(&self) -> Option<&Path> {
+        self.repo.workdir()
+    }
+
     /// The repository's git directory (`.git`, or the directory of a
     /// bare repository), to open it again elsewhere.
     pub fn git_dir(&self) -> &Path {

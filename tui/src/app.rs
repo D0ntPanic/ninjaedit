@@ -182,7 +182,7 @@ use crate::context_menu::{ContextMenu, MenuEntry, MenuOutcome};
 use crate::diff_pane::draw_pieces;
 use crate::editor_view::EditorView;
 use crate::git_layout;
-use crate::git_view::{self, GitLogTabs};
+use crate::git_view::{self, GitLogTabs, Version};
 use crate::goto_line::{GoToLineBox, GoToLineOutcome};
 use crate::heads::{Heads, Repository};
 use crate::new_branch::{NewBranchBox, NewBranchOutcome};
@@ -351,6 +351,29 @@ const EDITOR_MENU: &[MenuEntry] = &[
     MenuEntry::Command(Command::Paste),
     MenuEntry::Separator,
     MenuEntry::Command(Command::SelectAll),
+];
+/// What a right click on a file or directory of the changes page's
+/// lists offers: opening it and moving it between the lists first, and
+/// throwing its changes away, which asks first, set apart below. Only
+/// the ones that apply are listed: staging in the unstaged list,
+/// unstaging in the staged one, opening a file but not a directory.
+const CHANGES_MENU: &[MenuEntry] = &[
+    MenuEntry::Command(Command::OpenChange),
+    MenuEntry::Command(Command::StageSelected),
+    MenuEntry::Command(Command::UnstageSelected),
+    MenuEntry::Separator,
+    MenuEntry::Command(Command::DiscardSelected),
+];
+/// What a right click on a file or directory among the git log's
+/// selected commit's files offers: opening it, and, set apart below
+/// since they overwrite what the working directory has, restoring it as
+/// the commit left it or as it was before. Opening is for a file, not a
+/// directory.
+const GIT_LOG_MENU: &[MenuEntry] = &[
+    MenuEntry::Command(Command::OpenChange),
+    MenuEntry::Separator,
+    MenuEntry::Command(Command::RestoreCommitVersion),
+    MenuEntry::Command(Command::RestoreParentVersion),
 ];
 /// What the status bar shows on the settings page.
 const SETTINGS_HELP: &[(&str, &str)] = &[
@@ -1194,6 +1217,22 @@ impl App {
         self.context_menu = ContextMenu::new(EDITOR_MENU, &context, x, y);
     }
 
+    /// A right click on a row of the changes page's lists, which the
+    /// page selected: open its menu at the pointer (see
+    /// [`CHANGES_MENU`]).
+    fn open_changes_menu(&mut self, x: u16, y: u16) {
+        let context = self.command_context();
+        self.context_menu = ContextMenu::new(CHANGES_MENU, &context, x, y);
+    }
+
+    /// A right click on a file or directory among the git log's
+    /// selected commit's files, which the page selected: open its menu
+    /// at the pointer (see [`GIT_LOG_MENU`]).
+    fn open_git_log_menu(&mut self, x: u16, y: u16) {
+        let context = self.command_context();
+        self.context_menu = ContextMenu::new(GIT_LOG_MENU, &context, x, y);
+    }
+
     /// The command palette's entries; see
     /// [`open_command_palette`](Self::open_command_palette).
     fn command_items(&mut self) -> Vec<PaletteItem> {
@@ -1325,6 +1364,10 @@ impl App {
             Mode::Changes(tabs) => tabs.active_view(),
             _ => None,
         };
+        let log = match &self.mode {
+            Mode::GitLog(tabs) => tabs.active_view(),
+            _ => None,
+        };
         CommandContext {
             page,
             file,
@@ -1341,7 +1384,12 @@ impl App {
             },
             has_unstaged: changes.is_some_and(|view| view.has_unstaged()),
             has_staged: changes.is_some_and(|view| view.has_staged()),
-            change_selected: changes.is_some_and(|view| view.has_selected_change()),
+            change_selected: changes.is_some_and(|view| view.has_selected_change())
+                || log.is_some_and(|view| view.can_open_selected_change()),
+            can_stage_selected: changes.is_some_and(|view| view.can_stage_selected()),
+            can_unstage_selected: changes.is_some_and(|view| view.can_unstage_selected()),
+            can_discard_selected: changes.is_some_and(|view| view.can_discard_selected()),
+            can_restore_selected: log.is_some_and(|view| view.can_restore_selected()),
             has_repository: self.heads.head(self.status_repository()).is_some(),
         }
     }
@@ -1413,13 +1461,50 @@ impl App {
             Command::Commit => self.on_changes_page(ChangesTabs::commit),
             Command::StageAll => self.on_changes_page(ChangesTabs::stage_all),
             Command::UnstageAll => self.on_changes_page(ChangesTabs::unstage_all),
-            Command::OpenChange => self.on_changes_page(ChangesTabs::open_selected),
+            Command::StageSelected => self.on_changes_page(ChangesTabs::stage_selected),
+            Command::UnstageSelected => self.on_changes_page(ChangesTabs::unstage_selected),
+            Command::DiscardSelected => self.on_changes_page(ChangesTabs::discard_selected),
+            Command::OpenChange => match &mut self.mode {
+                Mode::GitLog(tabs) => {
+                    tabs.open_selected_change();
+                    self.follow_git_log();
+                }
+                _ => self.on_changes_page(ChangesTabs::open_selected),
+            },
+            Command::RestoreCommitVersion => self.restore_on_git_log(Version::Commit),
+            Command::RestoreParentVersion => self.restore_on_git_log(Version::Parent),
             Command::ToggleAmend => self.toggle_amend(),
             Command::SwitchView => self.open_modes_palette(),
             Command::NextView => self.focus_next(),
             Command::PreviousView => self.focus_previous(),
             Command::DismissOutput => self.dismiss_output(),
             Command::Quit => self.request_quit(),
+        }
+    }
+
+    /// Restore the git log's selected files, when the page is showing.
+    fn restore_on_git_log(&mut self, version: Version) {
+        if let Mode::GitLog(tabs) = &mut self.mode {
+            tabs.restore_selected(version);
+            self.follow_git_log();
+        }
+    }
+
+    /// Act on what the git log page asks for after a key, a click, or a
+    /// command: a file to open in the editor, and what to say in the
+    /// status bar.
+    fn follow_git_log(&mut self) {
+        let Mode::GitLog(tabs) = &mut self.mode else {
+            return;
+        };
+        let notice = tabs.take_notice();
+        let open = tabs.take_file_to_open();
+        if let Some(notice) = notice {
+            self.status = Some(notice);
+        }
+        if let Some(path) = open {
+            self.enter_editor();
+            self.open_file(&path);
         }
     }
 
@@ -3045,6 +3130,7 @@ impl App {
         }
         if let Mode::GitLog(tabs) = &mut self.mode {
             tabs.handle_key(key, &mut self.clipboard);
+            self.follow_git_log();
             return;
         }
         if let Mode::Changes(tabs) = &mut self.mode {
@@ -3299,7 +3385,8 @@ impl App {
                         self.focus = Focus::Editor;
                     }
                     // A resize is kept in the project's storage.
-                    if tabs.handle_mouse(mouse)
+                    let outcome = tabs.handle_mouse(mouse);
+                    if outcome.resized
                         && let Err(err) = git_layout::save(
                             &self.project_storage,
                             git_layout::LAYOUT_FILE,
@@ -3311,6 +3398,10 @@ impl App {
                             self.project_storage.path(git_layout::LAYOUT_FILE).display()
                         )));
                     }
+                    self.follow_git_log();
+                    if outcome.menu {
+                        self.open_git_log_menu(x, y);
+                    }
                 }
                 Mode::Changes(tabs)
                     if tabs
@@ -3320,7 +3411,11 @@ impl App {
                     if pressed {
                         self.focus = Focus::Editor;
                     }
-                    if tabs.handle_mouse(mouse)
+                    let outcome = tabs.handle_mouse(mouse);
+                    if let Some(notice) = outcome.notice {
+                        self.status = Some(notice);
+                    }
+                    if outcome.resized
                         && let Err(err) = git_layout::save(
                             &self.project_storage,
                             git_layout::CHANGES_LAYOUT_FILE,
@@ -3333,6 +3428,9 @@ impl App {
                                 .path(git_layout::CHANGES_LAYOUT_FILE)
                                 .display()
                         )));
+                    }
+                    if outcome.menu {
+                        self.open_changes_menu(x, y);
                     }
                 }
                 _ => {}
@@ -8356,5 +8454,271 @@ mod tests {
         draw(&mut app, 40, 12);
         right_click(&mut app, 10, 5);
         assert!(app.context_menu.is_none());
+    }
+
+    #[test]
+    fn right_click_on_a_change_offers_opening_staging_and_discarding_it() {
+        let (dir, mut app) = app_with_files(&[]);
+        // A repository with src/a.rs and top.txt committed; then a.rs
+        // edited and top.txt edited and staged.
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".storage/\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "a\n").unwrap();
+        std::fs::write(dir.path().join("top.txt"), "top\n").unwrap();
+        let mut index = repo.index().unwrap();
+        for path in [".gitignore", "src/a.rs", "top.txt"] {
+            index.add_path(Path::new(path)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Base", &tree, &[])
+            .unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "a edited\n").unwrap();
+        std::fs::write(dir.path().join("top.txt"), "top edited\n").unwrap();
+        index.add_path(Path::new("top.txt")).unwrap();
+        index.write().unwrap();
+
+        let settle = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Mode::Changes(tabs) = &app.mode
+                && tabs.is_loading()
+                && Instant::now() < deadline
+            {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(matches!(&app.mode, Mode::Changes(tabs) if !tabs.is_loading()));
+        };
+        let row_of = |screen: &[String], text: &str| -> u16 {
+            screen
+                .iter()
+                .position(|row| row.chars().take(30).collect::<String>().contains(text))
+                .unwrap_or_else(|| panic!("no {text:?} in {screen:#?}")) as u16
+        };
+        ctrl(&mut app, 'u');
+        settle(&mut app);
+        let screen = draw(&mut app, 100, 24);
+        let a_rs = row_of(&screen, "M a.rs");
+        let src = row_of(&screen, "▾ src");
+        let top = row_of(&screen, "M top.txt");
+
+        // A file of the unstaged list: open it, stage it, and apart
+        // from those, discard it.
+        right_click(&mut app, 4, a_rs);
+        assert_eq!(
+            menu_commands(&app),
+            [
+                Some(Command::OpenChange),
+                Some(Command::StageSelected),
+                None,
+                Some(Command::DiscardSelected)
+            ]
+        );
+        let screen = draw(&mut app, 100, 24);
+        let open = row_of(&screen, "Open changed file");
+        assert!(
+            screen[open as usize + 1].contains("│ Stage changes"),
+            "{screen:#?}"
+        );
+        assert!(screen[open as usize + 2].contains("├─"), "{screen:#?}");
+        assert!(
+            screen[open as usize + 3].contains("│ Discard changes"),
+            "{screen:#?}"
+        );
+        // A directory has no file to open.
+        press(&mut app, KeyCode::Esc);
+        right_click(&mut app, 4, src);
+        assert_eq!(
+            menu_commands(&app),
+            [
+                Some(Command::StageSelected),
+                None,
+                Some(Command::DiscardSelected)
+            ]
+        );
+        // A file of the staged list: open it and unstage it, nothing to
+        // discard.
+        press(&mut app, KeyCode::Esc);
+        right_click(&mut app, 4, top);
+        assert_eq!(
+            menu_commands(&app),
+            [Some(Command::OpenChange), Some(Command::UnstageSelected)]
+        );
+
+        // Back on a.rs, "Discard changes" asks first; `y` discards.
+        press(&mut app, KeyCode::Esc);
+        right_click(&mut app, 4, a_rs);
+        let screen = draw(&mut app, 100, 24);
+        click(&mut app, 12, row_of(&screen, "Discard changes"));
+        assert!(app.context_menu.is_none());
+        let screen = draw(&mut app, 100, 24);
+        assert!(
+            screen
+                .iter()
+                .any(|row| row.contains("Discard changes to src/a.rs?")),
+            "{screen:#?}"
+        );
+        assert!(screen[23].contains("y discard"), "{screen:#?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/a.rs")).unwrap(),
+            "a edited\n"
+        );
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/a.rs")).unwrap(),
+            "a\n"
+        );
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|status| status.text() == "Discarded changes to src/a.rs"),
+            "{:?}",
+            app.status
+        );
+        settle(&mut app);
+        let screen = draw(&mut app, 100, 24);
+        assert!(screen[1].contains("Unstaged changes "), "{screen:#?}");
+        assert!(screen[2].contains("none"), "{screen:#?}");
+
+        // The menu's "Unstage changes" does what Space in the staged
+        // list does.
+        right_click(&mut app, 4, row_of(&screen, "M top.txt"));
+        let screen = draw(&mut app, 100, 24);
+        click(&mut app, 12, row_of(&screen, "Unstage changes"));
+        let staged = match &app.mode {
+            Mode::Changes(tabs) => tabs.active_view().unwrap().has_staged(),
+            _ => unreachable!(),
+        };
+        assert!(!staged);
+        settle(&mut app);
+    }
+
+    #[test]
+    fn right_click_on_a_commits_file_offers_opening_and_restoring_it() {
+        let (dir, mut app) = app_with_files(&[]);
+        // Two commits of src/a.rs, the second also adding src/b.rs.
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".storage/\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        let commit = |files: &[(&str, &str)], message: &str| {
+            let mut index = repo.index().unwrap();
+            for (path, contents) in files {
+                std::fs::write(dir.path().join(path), contents).unwrap();
+                index.add_path(Path::new(path)).unwrap();
+            }
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit<'_>> = repo
+                .head()
+                .ok()
+                .and_then(|head| head.target())
+                .map(|id| repo.find_commit(id).unwrap())
+                .into_iter()
+                .collect();
+            let refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &refs)
+                .unwrap()
+        };
+        commit(
+            &[(".gitignore", ".storage/\n"), ("src/a.rs", "one\n")],
+            "Base",
+        );
+        commit(&[("src/a.rs", "two\n"), ("src/b.rs", "b\n")], "Change");
+
+        ctrl(&mut app, 'l');
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Mode::GitLog(tabs) = &app.mode
+            && tabs.is_loading()
+            && Instant::now() < deadline
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let screen = draw(&mut app, 100, 30);
+        // The file list is below the log, left of the diff.
+        let row_of = |screen: &[String], text: &str| -> u16 {
+            screen
+                .iter()
+                .skip(10)
+                .position(|row| row.contains(text))
+                .map(|row| row + 10)
+                .unwrap_or_else(|| panic!("no {text:?} in {screen:#?}")) as u16
+        };
+        let column_of = |screen: &[String], row: u16, text: &str| -> u16 {
+            let line = &screen[row as usize];
+            line[..line.find(text).unwrap()].chars().count() as u16
+        };
+        let a_row = row_of(&screen, "M a.rs");
+        let a_column = column_of(&screen, a_row, "M a.rs");
+        let src_row = row_of(&screen, "▾ src");
+
+        right_click(&mut app, a_column, a_row);
+        assert_eq!(
+            menu_commands(&app),
+            [
+                Some(Command::OpenChange),
+                None,
+                Some(Command::RestoreCommitVersion),
+                Some(Command::RestoreParentVersion)
+            ]
+        );
+        let screen = draw(&mut app, 100, 30);
+        assert!(
+            screen
+                .iter()
+                .any(|row| row.contains("│ Restore this version")),
+            "{screen:#?}"
+        );
+        assert!(
+            screen
+                .iter()
+                .any(|row| row.contains("│ Restore previous version")),
+            "{screen:#?}"
+        );
+        // A directory: only the restores.
+        press(&mut app, KeyCode::Esc);
+        right_click(&mut app, a_column, src_row);
+        assert_eq!(
+            menu_commands(&app),
+            [
+                Some(Command::RestoreCommitVersion),
+                Some(Command::RestoreParentVersion)
+            ]
+        );
+        // Restoring the directory as before the commit puts a.rs back and
+        // deletes b.rs, which the commit added; the status bar says so.
+        let screen = draw(&mut app, 100, 30);
+        let previous = screen
+            .iter()
+            .position(|row| row.contains("Restore previous version"))
+            .unwrap() as u16;
+        click(&mut app, a_column + 3, previous);
+        assert!(app.context_menu.is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/a.rs")).unwrap(),
+            "one\n"
+        );
+        assert!(!dir.path().join("src/b.rs").exists());
+        let status = app
+            .status
+            .as_ref()
+            .map(StatusLine::text)
+            .unwrap_or_default();
+        assert!(status.starts_with("Restored src/ as before "), "{status}");
+
+        // "Open changed file" on a.rs opens it in the editor, restored.
+        right_click(&mut app, a_column, a_row);
+        let screen = draw(&mut app, 100, 30);
+        let open = screen
+            .iter()
+            .position(|row| row.contains("Open changed file"))
+            .unwrap() as u16;
+        click(&mut app, a_column + 3, open);
+        assert!(matches!(app.mode, Mode::Editor));
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].view.editor().buffer().to_text(), "one\n");
     }
 }

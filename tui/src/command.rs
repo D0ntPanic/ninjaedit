@@ -85,8 +85,22 @@ pub enum Command {
     StageAll,
     /// The changes page's `a` in the staged list.
     UnstageAll,
-    /// The changes page's `o`.
+    /// The changes page's Space in the unstaged list.
+    StageSelected,
+    /// The changes page's Space in the staged list.
+    UnstageSelected,
+    /// The changes page's discarding of the selected unstaged changes,
+    /// once confirmed.
+    DiscardSelected,
+    /// The changes page's `o`, and the git log page's among a commit's
+    /// files.
     OpenChange,
+    /// The git log page's restoring of the selected files as the
+    /// selected commit left them.
+    RestoreCommitVersion,
+    /// The git log page's restoring of the selected files as they were
+    /// before the selected commit.
+    RestoreParentVersion,
     /// The changes page's `m`.
     ToggleAmend,
     SwitchView,
@@ -173,9 +187,24 @@ pub struct Context {
     pub has_unstaged: bool,
     /// On the changes page, whether there is anything to unstage.
     pub has_staged: bool,
-    /// On the changes page, whether a file (not a directory) is
-    /// selected to open.
+    /// On the changes page, or among the selected commit's files on the
+    /// git log page, whether a file (not a directory) is selected to
+    /// open.
     pub change_selected: bool,
+    /// On the changes page, whether a file or directory is selected in
+    /// the unstaged list, to stage.
+    pub can_stage_selected: bool,
+    /// On the changes page, whether a file or directory is selected in
+    /// the staged list, to unstage.
+    pub can_unstage_selected: bool,
+    /// On the changes page, whether what is selected in the unstaged
+    /// list has changes that can be discarded: not only conflicts and
+    /// submodules.
+    pub can_discard_selected: bool,
+    /// On the git log page, whether a file or directory is selected
+    /// among the selected commit's files, with files to restore: not
+    /// only submodules.
+    pub can_restore_selected: bool,
     /// Whether the status bar shows a repository to make a branch in:
     /// the one the file being edited is in, the shown git page's, or
     /// the project's own. A property of where the user is in the
@@ -187,7 +216,7 @@ impl Command {
     /// Every command, in the order the palette lists them before
     /// anything is typed: files, searching, editing, building, the
     /// pages, views, and quitting last.
-    pub const ALL: [Command; 41] = [
+    pub const ALL: [Command; 46] = [
         Command::OpenFile,
         Command::SwitchTab,
         Command::Save,
@@ -219,9 +248,14 @@ impl Command {
         Command::NewBranch,
         Command::Fetch,
         Command::CheckoutCommit,
+        Command::RestoreCommitVersion,
+        Command::RestoreParentVersion,
         Command::Commit,
+        Command::StageSelected,
+        Command::UnstageSelected,
         Command::StageAll,
         Command::UnstageAll,
+        Command::DiscardSelected,
         Command::OpenChange,
         Command::ToggleAmend,
         Command::SwitchView,
@@ -275,7 +309,15 @@ impl Command {
             Command::Commit | Command::ToggleAmend => on(Page::Changes),
             Command::StageAll => on(Page::Changes) && context.has_unstaged,
             Command::UnstageAll => on(Page::Changes) && context.has_staged,
-            Command::OpenChange => on(Page::Changes) && context.change_selected,
+            Command::OpenChange => {
+                (on(Page::Changes) || on(Page::GitLog)) && context.change_selected
+            }
+            Command::RestoreCommitVersion | Command::RestoreParentVersion => {
+                on(Page::GitLog) && context.can_restore_selected
+            }
+            Command::StageSelected => on(Page::Changes) && context.can_stage_selected,
+            Command::UnstageSelected => on(Page::Changes) && context.can_unstage_selected,
+            Command::DiscardSelected => on(Page::Changes) && context.can_discard_selected,
             Command::NextView | Command::PreviousView => context.tool_pane_visible,
             Command::DismissOutput => context.output_idle,
         }
@@ -319,6 +361,11 @@ impl Command {
             Command::StageAll => "Stage all changes",
             Command::UnstageAll => "Unstage all changes",
             Command::OpenChange => "Open changed file",
+            Command::RestoreCommitVersion => "Restore this version",
+            Command::RestoreParentVersion => "Restore previous version",
+            Command::StageSelected => "Stage changes",
+            Command::UnstageSelected => "Unstage changes",
+            Command::DiscardSelected => "Discard changes",
             Command::ToggleAmend => "Toggle amend",
             Command::SwitchView => "Switch view",
             Command::NextView => "Focus next view",
@@ -399,7 +446,22 @@ impl Command {
                 "On the changes page, unstage every staged file (a in the staged list)"
             }
             Command::OpenChange => {
-                "On the changes page, open the selected file in the editor (o in a list), at its first conflict if it has one; a submodule goes to its tab"
+                "Open the selected changed file in the editor (o): on the changes page at its first conflict if it has one, a submodule going to its tab; on the git log page as it is in the working directory now"
+            }
+            Command::RestoreCommitVersion => {
+                "On the git log page, put the selected file in the working directory as the selected commit left it, or every file the commit changed under the selected directory; the index is untouched, so it shows as an unstaged change"
+            }
+            Command::RestoreParentVersion => {
+                "On the git log page, put the selected file in the working directory as it was before the selected commit, undoing the commit's change to it, or every file the commit changed under the selected directory; the index is untouched, so it shows as an unstaged change"
+            }
+            Command::StageSelected => {
+                "On the changes page, stage the selected file, or every file under the selected directory (Space in the unstaged list)"
+            }
+            Command::UnstageSelected => {
+                "On the changes page, unstage the selected file, or every file under the selected directory (Space in the staged list)"
+            }
+            Command::DiscardSelected => {
+                "On the changes page, throw away the unstaged changes of the selected file or directory, after asking: files go back to what is staged, or else committed, and untracked ones are deleted"
             }
             Command::ToggleAmend => {
                 "On the changes page, make the commit replace the last one (git commit --amend), or follow it (m in a list)"
@@ -459,6 +521,11 @@ impl Command {
             | Command::StageAll
             | Command::UnstageAll
             | Command::OpenChange
+            | Command::RestoreCommitVersion
+            | Command::RestoreParentVersion
+            | Command::StageSelected
+            | Command::UnstageSelected
+            | Command::DiscardSelected
             | Command::ToggleAmend
             | Command::DismissOutput => return None,
         })
@@ -581,6 +648,87 @@ mod tests {
         assert!(listed.contains(&Command::Fetch));
         assert!(listed.contains(&Command::CheckoutCommit));
         assert!(!listed.contains(&Command::Commit));
+    }
+
+    #[test]
+    fn the_selected_changes_commands_follow_the_selection() {
+        let selection = [
+            Command::StageSelected,
+            Command::UnstageSelected,
+            Command::DiscardSelected,
+        ];
+        let nothing = Context {
+            page: Page::Changes,
+            ..Context::default()
+        };
+        let listed = available(&nothing);
+        assert!(selection.iter().all(|c| !listed.contains(c)), "{listed:?}");
+        // A row of the unstaged list: stage it, and discard it when it
+        // has something to discard.
+        let unstaged = Context {
+            can_stage_selected: true,
+            can_discard_selected: true,
+            ..nothing
+        };
+        let listed = available(&unstaged);
+        assert!(listed.contains(&Command::StageSelected));
+        assert!(listed.contains(&Command::DiscardSelected));
+        assert!(!listed.contains(&Command::UnstageSelected));
+        let conflict = Context {
+            can_discard_selected: false,
+            ..unstaged
+        };
+        assert!(!available(&conflict).contains(&Command::DiscardSelected));
+        let staged = Context {
+            can_unstage_selected: true,
+            ..nothing
+        };
+        let listed = available(&staged);
+        assert!(listed.contains(&Command::UnstageSelected));
+        assert!(!listed.contains(&Command::StageSelected));
+        // Off the page, none of them, whatever the context says.
+        let elsewhere = Context {
+            page: Page::GitLog,
+            ..unstaged
+        };
+        let listed = available(&elsewhere);
+        assert!(selection.iter().all(|c| !listed.contains(c)), "{listed:?}");
+    }
+
+    #[test]
+    fn the_git_log_offers_opening_and_restoring_its_files() {
+        let restore = [Command::RestoreCommitVersion, Command::RestoreParentVersion];
+        let log = Context {
+            page: Page::GitLog,
+            ..Context::default()
+        };
+        let listed = available(&log);
+        assert!(!listed.contains(&Command::OpenChange));
+        assert!(restore.iter().all(|c| !listed.contains(c)), "{listed:?}");
+        // A file: open it and restore it. A directory: restore it.
+        let file = Context {
+            change_selected: true,
+            can_restore_selected: true,
+            ..log
+        };
+        let listed = available(&file);
+        assert!(listed.contains(&Command::OpenChange));
+        assert!(restore.iter().all(|c| listed.contains(c)), "{listed:?}");
+        let dir = Context {
+            change_selected: false,
+            ..file
+        };
+        let listed = available(&dir);
+        assert!(!listed.contains(&Command::OpenChange));
+        assert!(restore.iter().all(|c| listed.contains(c)), "{listed:?}");
+        // Restoring is the git log's alone.
+        let changes = Context {
+            page: Page::Changes,
+            ..file
+        };
+        let listed = available(&changes);
+        assert!(listed.contains(&Command::OpenChange));
+        assert!(restore.iter().all(|c| !listed.contains(c)), "{listed:?}");
     }
 
     #[test]

@@ -51,6 +51,20 @@
 //! when nothing is scrolled sideways. The wheel scrolls whichever pane
 //! it is over.
 //!
+//! A right click on a file or directory in a list selects it and opens
+//! a menu of what can be done to it (the application draws the menu;
+//! see the `context_menu` module): open it, stage or unstage it, and,
+//! set apart below those in the unstaged list, discard its changes.
+//! Discarding (from the menu or the command palette) throws away the
+//! unstaged changes of a file, or of every file under a directory: each
+//! goes back to what is staged, or with nothing staged to what was last
+//! committed, and an untracked file is deleted. There is no undoing
+//! that, so a box asks first, saying what will happen, and `y` or its
+//! Discard button goes ahead (Enter alone presses Cancel, so an Enter
+//! pressed once too often loses nothing). A file in conflict has no one
+//! version to go back to, and a submodule's changes are its own to
+//! discard on its tab, so both are left alone, and the box says so.
+//!
 //! Amending (the toggle beside the commit heading, `m` in a list, or
 //! the command palette's "Toggle amend") makes the commit replace the
 //! last one, as `git commit --amend` does: the staged list becomes
@@ -67,7 +81,7 @@
 //! ends. The diff is the larger side to start with.
 //!
 //! The working tree is scanned when the page opens and again after
-//! every stage, unstage, and commit; the scan runs on a worker thread
+//! every stage, unstage, discard, and commit; the scan runs on a worker thread
 //! (see the core crate's `git::changes` module), and the status bar
 //! says so while it does. Ctrl+U on the page scans again, for changes
 //! made elsewhere: a file saved in the editor, a `git` command in a
@@ -86,6 +100,7 @@
 //! to, and the status bar says so.
 
 use crate::clipboard::Clipboard;
+use crate::confirm_box::{ConfirmBox, ConfirmOutcome};
 use crate::diff_pane::{
     Button, HScroll, Piece, WHEEL_COLUMNS, WHEEL_LINES, clamp_between, content_background,
     diff_extent, display_width, draw_cells, fit_end, layout_cells, render_diff, share_for,
@@ -102,7 +117,7 @@ use ninjaedit_core::{Editor, FileBuffer};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 /// The name of the page, shown in its tab.
@@ -130,6 +145,8 @@ const CLEAN: &str = "Nothing to commit: the working tree is clean";
 const NO_UNSTAGED: &str = "No unstaged changes";
 const NO_STAGED: &str = "No staged changes";
 const SCANNING: &str = "scanning…";
+/// The discard box's button.
+const DISCARD: &str = "Discard";
 /// The key bindings the status bar lists, pane by pane.
 const UNSTAGED_HELP: &[(&str, &str)] = &[
     ("↑↓", "move"),
@@ -158,6 +175,12 @@ const COMMIT_HELP: &[(&str, &str)] = &[
     ("Ctrl+S", "commit"),
     ("Tab", "pane"),
     ("Ctrl+E", "leave"),
+];
+const CONFIRM_HELP: &[(&str, &str)] = &[
+    ("y", "discard"),
+    ("n/Esc", "cancel"),
+    ("←→", "button"),
+    ("Enter", "press"),
 ];
 const CONTENT_HELP: &[(&str, &str)] = &[
     ("↑↓", "scroll"),
@@ -257,6 +280,31 @@ pub enum ChangesOutcome {
         path: PathBuf,
         conflicted: bool,
     },
+}
+
+/// What the application should do after the page handled a mouse
+/// event.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChangesMouseOutcome {
+    /// The pane sizes changed (a drag of a rule ended), so the layout
+    /// is worth keeping.
+    pub resized: bool,
+    /// A right press on a row of a list, which it selected: open the
+    /// page's menu at the pointer, for that row.
+    pub menu: bool,
+    /// Something to say in the status bar: a discard confirmed with a
+    /// click, an action that failed.
+    pub notice: Option<StatusLine>,
+}
+
+/// Unstaged changes the discard box is asking about: what the box
+/// asks, and the paths to discard once it is answered yes.
+struct PendingDiscard {
+    dialog: ConfirmBox,
+    paths: Vec<String>,
+    /// What is being discarded, for the status bar: a file's path, or a
+    /// directory's with a slash.
+    what: String,
 }
 
 /// One of the file lists: its files as a tree, which directories are
@@ -617,6 +665,28 @@ impl ChangesTabs {
         outcome
     }
 
+    /// Stage what is selected in the shown page's unstaged list, as its
+    /// Space does.
+    pub fn stage_selected(&mut self) -> ChangesOutcome {
+        let outcome = self.active().stage_selected();
+        self.refresh_others();
+        outcome
+    }
+
+    /// Unstage what is selected in the shown page's staged list, as its
+    /// Space does.
+    pub fn unstage_selected(&mut self) -> ChangesOutcome {
+        let outcome = self.active().unstage_selected();
+        self.refresh_others();
+        outcome
+    }
+
+    /// Ask whether to discard the unstaged changes selected on the
+    /// shown page; the page discards them once answered yes.
+    pub fn discard_selected(&mut self) -> ChangesOutcome {
+        self.active().discard_selected()
+    }
+
     /// Open the file selected on the shown page, as its `o` does, or
     /// show the selected submodule's tab.
     pub fn open_selected(&mut self) -> ChangesOutcome {
@@ -624,13 +694,13 @@ impl ChangesTabs {
         self.follow_submodule(outcome)
     }
 
-    /// Give the shown page a mouse event. Returns whether the page's
-    /// pane sizes changed (a drag of a rule ended), in which case the
-    /// layout is worth keeping.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+    /// Give the shown page a mouse event. A change to its pane sizes (a
+    /// drag of a rule ended) goes into the layout, which is then worth
+    /// keeping.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ChangesMouseOutcome {
         let active = self.active;
-        let resized = self.active().handle_mouse(mouse);
-        if resized {
+        let outcome = self.active().handle_mouse(mouse);
+        if outcome.resized {
             let sizes = self.tabs[active].view.as_ref().map(ChangesView::sizes);
             if let Some(sizes) = sizes {
                 let key = self.tabs[active].key().to_owned();
@@ -638,7 +708,7 @@ impl ChangesTabs {
             }
         }
         self.refresh_others();
-        resized
+        outcome
     }
 
     /// Add pasted text to the commit message, if that is where the
@@ -712,6 +782,8 @@ pub struct ChangesView {
     /// path from this repository, when `o` was on one (see
     /// [`ChangesTabs::follow_submodule`]) and not yet taken.
     submodule_to_show: Option<String>,
+    /// The discard box, while it asks whether to go ahead.
+    discard: Option<PendingDiscard>,
     /// The page, its panes, and the rules between them from the last
     /// render.
     area: Rect,
@@ -770,6 +842,7 @@ impl ChangesView {
             divider_drag: None,
             acted: false,
             submodule_to_show: None,
+            discard: None,
             area: Rect::default(),
             unstaged_area: Rect::default(),
             staged_area: Rect::default(),
@@ -874,6 +947,9 @@ impl ChangesView {
     pub fn hint(&self) -> StatusLine {
         if self.scanning() {
             return StatusLine::progress(SCANNING);
+        }
+        if self.discard.is_some() {
+            return StatusLine::help(CONFIRM_HELP);
         }
         StatusLine::help(match self.pane {
             Pane::Unstaged => UNSTAGED_HELP,
@@ -1082,13 +1158,135 @@ impl ChangesView {
         if files.is_empty() {
             return ChangesOutcome::Continue;
         }
-        let what = match row {
-            TreeRow::Dir { dir, .. } => {
-                format!("{}/", self.file_list(list).tree.dirs()[dir].path)
-            }
-            TreeRow::File { .. } => files[0].path.clone(),
-        };
+        let what = self.describe_row(list, row);
         self.apply(list, &files, &what)
+    }
+
+    /// How the status bar names what a row stands for: a file's path,
+    /// or a directory's with a slash.
+    fn describe_row(&self, list: List, row: TreeRow) -> String {
+        match self.file_list(list).key_of(row) {
+            RowKey::Dir(path) => format!("{path}/"),
+            RowKey::File(path) => path,
+        }
+    }
+
+    /// The command palette's and the menu's "Stage changes": Space in
+    /// the unstaged list.
+    pub fn stage_selected(&mut self) -> ChangesOutcome {
+        if self.list != List::Unstaged {
+            return ChangesOutcome::Continue;
+        }
+        self.toggle_selected(List::Unstaged)
+    }
+
+    /// The command palette's and the menu's "Unstage changes": Space in
+    /// the staged list.
+    pub fn unstage_selected(&mut self) -> ChangesOutcome {
+        if self.list != List::Staged {
+            return ChangesOutcome::Continue;
+        }
+        self.toggle_selected(List::Staged)
+    }
+
+    /// Whether a row of the unstaged list is selected, in the list the
+    /// diff follows, to stage.
+    pub fn can_stage_selected(&self) -> bool {
+        self.list == List::Unstaged && self.unstaged.selected_row().is_some()
+    }
+
+    /// Whether a row of the staged list is selected, in the list the
+    /// diff follows, to unstage.
+    pub fn can_unstage_selected(&self) -> bool {
+        self.list == List::Staged && self.staged.selected_row().is_some()
+    }
+
+    /// Whether what is selected in the unstaged list, in the list the
+    /// diff follows, has changes to discard.
+    pub fn can_discard_selected(&self) -> bool {
+        self.list == List::Unstaged && !self.discardable_selection().0.is_empty()
+    }
+
+    /// The files the unstaged list's selection stands for, split into
+    /// those whose changes can be discarded and those that can't: files
+    /// in conflict, which have no one version to go back to, and
+    /// submodules, whose changes are theirs to discard.
+    fn discardable_selection(&self) -> (Vec<FileChange>, Vec<FileChange>) {
+        let Some(row) = self.unstaged.selected_row() else {
+            return (Vec::new(), Vec::new());
+        };
+        let files = self.files(List::Unstaged);
+        self.unstaged
+            .files_of(row)
+            .into_iter()
+            .filter_map(|f| files.get(f).cloned())
+            .partition(|change| change.kind != ChangeKind::Conflicted && !change.submodule)
+    }
+
+    /// The command palette's and the menu's "Discard changes": ask, in
+    /// the discard box, whether to throw away the unstaged changes of
+    /// what is selected in the unstaged list, a file or every file
+    /// under a directory. The box's yes discards them (see
+    /// [`finish_discard`](Self::finish_discard)). Conflicts and
+    /// submodules under a directory are left alone, and the box says so.
+    pub fn discard_selected(&mut self) -> ChangesOutcome {
+        if self.list != List::Unstaged {
+            return ChangesOutcome::Continue;
+        }
+        let Some(row) = self.unstaged.selected_row() else {
+            return ChangesOutcome::Continue;
+        };
+        let what = self.describe_row(List::Unstaged, row);
+        let (files, kept) = self.discardable_selection();
+        if files.is_empty() {
+            return ChangesOutcome::Notice(StatusLine::info(format!(
+                "Nothing to discard in {what}: conflicts are resolved, and submodules discarded on their own tabs"
+            )));
+        }
+        let staged: HashSet<&str> = self
+            .files(List::Staged)
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        let body = discard_body(&files, &kept, &staged);
+        let dialog = ConfirmBox::new(format!("Discard changes to {what}?"), body, DISCARD);
+        self.discard = Some(PendingDiscard {
+            dialog,
+            paths: files.into_iter().map(|change| change.path).collect(),
+            what,
+        });
+        ChangesOutcome::Continue
+    }
+
+    /// The discard box was answered yes: discard what it asked about.
+    fn finish_discard(&mut self) -> ChangesOutcome {
+        let Some(pending) = self.discard.take() else {
+            return ChangesOutcome::Continue;
+        };
+        let Some(changes) = &mut self.changes else {
+            return ChangesOutcome::Continue;
+        };
+        let result = changes.discard(pending.paths.iter().map(String::as_str));
+        self.acted = true;
+        self.content = None;
+        self.follow_lists();
+        match result {
+            Ok(()) => ChangesOutcome::Notice(StatusLine::info(format!(
+                "Discarded changes to {}",
+                pending.what
+            ))),
+            Err(err) => ChangesOutcome::Notice(StatusLine::error(format!(
+                "Could not discard {}: {}",
+                pending.what,
+                err.message()
+            ))),
+        }
+    }
+
+    /// Whether the discard box is asking.
+    #[cfg(test)]
+    fn discard_box(&self) -> Option<&ConfirmBox> {
+        self.discard.as_ref().map(|pending| &pending.dialog)
     }
 
     /// The command palette's "Stage all changes": `a` in the unstaged
@@ -1240,6 +1438,17 @@ impl ChangesView {
     // ----- Input ----------------------------------------------------------
 
     pub fn handle_key(&mut self, key: KeyEvent, clipboard: &mut Clipboard) -> ChangesOutcome {
+        // The discard box, while it asks, has every key.
+        if let Some(pending) = &mut self.discard {
+            return match pending.dialog.handle_key(key) {
+                ConfirmOutcome::Continue => ChangesOutcome::Continue,
+                ConfirmOutcome::Cancel => {
+                    self.discard = None;
+                    ChangesOutcome::Continue
+                }
+                ConfirmOutcome::Confirm => self.finish_discard(),
+            };
+        }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -1376,7 +1585,7 @@ impl ChangesView {
     /// Add pasted text to the commit message, if that is where the
     /// keyboard is.
     pub fn paste(&mut self, text: &str) {
-        if self.pane == Pane::Commit {
+        if self.pane == Pane::Commit && self.discard.is_none() {
             self.message.editor_mut().paste(text);
         }
     }
@@ -1496,9 +1705,38 @@ impl ChangesView {
         }
     }
 
-    /// Handle a mouse event. Returns whether the pane sizes changed:
-    /// a drag of a rule ended.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+    /// The row of a list at screen row `y`, if there is one there: not
+    /// the heading, nor below the last row.
+    fn list_row_at(&self, list: List, y: u16) -> Option<usize> {
+        let area = match list {
+            List::Unstaged => self.unstaged_area,
+            List::Staged => self.staged_area,
+        };
+        if y <= area.y || y >= area.bottom() {
+            return None;
+        }
+        let file_list = self.file_list(list);
+        let row = file_list.scroll + (y - area.y - 1) as usize;
+        (row < file_list.rows.len()).then_some(row)
+    }
+
+    /// Handle a mouse event.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ChangesMouseOutcome {
+        let mut outcome = ChangesMouseOutcome::default();
+        // The discard box, while it asks, has the mouse; a press outside
+        // it is no.
+        if let Some(pending) = &mut self.discard {
+            match pending.dialog.handle_mouse(mouse) {
+                ConfirmOutcome::Continue => {}
+                ConfirmOutcome::Cancel => self.discard = None,
+                ConfirmOutcome::Confirm => {
+                    if let ChangesOutcome::Notice(notice) = self.finish_discard() {
+                        outcome.notice = Some(notice);
+                    }
+                }
+            }
+            return outcome;
+        }
         let at = ScreenPosition::new(mouse.column, mouse.row);
         // A rule being dragged owns the mouse until the button comes up.
         if let Some(divider) = self.divider_drag {
@@ -1506,11 +1744,11 @@ impl ChangesView {
                 MouseEventKind::Drag(_) => self.drag_divider(divider, mouse.column, mouse.row),
                 MouseEventKind::Up(_) => {
                     self.divider_drag = None;
-                    return true;
+                    outcome.resized = true;
                 }
                 _ => {}
             }
-            return false;
+            return outcome;
         }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             let divider = if self.files_rule.contains(at) {
@@ -1525,7 +1763,7 @@ impl ChangesView {
             if let Some(divider) = divider {
                 self.divider_drag = Some(divider);
                 self.drag_divider(divider, mouse.column, mouse.row);
-                return false;
+                return outcome;
             }
         }
         // A scrollbar drag, or a drag in the message, owns the mouse
@@ -1543,7 +1781,7 @@ impl ChangesView {
                 }
                 _ => self.message.handle_mouse(mouse),
             }
-            return false;
+            return outcome;
         }
         let pane = if self.unstaged_area.contains(at) {
             Some(Pane::Unstaged)
@@ -1557,7 +1795,7 @@ impl ChangesView {
             None
         };
         let Some(pane) = pane else {
-            return false;
+            return outcome;
         };
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if pane == Pane::Commit => {
@@ -1580,30 +1818,44 @@ impl ChangesView {
                 self.content_h.scroll_to(mouse.column, extent);
             }
             MouseEventKind::Down(MouseButton::Left) if self.amend_area.contains(at) => {
-                self.toggle_amend();
+                if let ChangesOutcome::Notice(notice) = self.toggle_amend() {
+                    outcome.notice = Some(notice);
+                }
+            }
+            // A right press on a row of a list selects it, without
+            // folding a directory, and asks for the menu of what can be
+            // done to it.
+            MouseEventKind::Down(MouseButton::Right)
+                if matches!(pane, Pane::Unstaged | Pane::Staged) =>
+            {
+                let list = if pane == Pane::Unstaged {
+                    List::Unstaged
+                } else {
+                    List::Staged
+                };
+                if let Some(row) = self.list_row_at(list, mouse.row) {
+                    self.enter_list(list, row);
+                    outcome.menu = true;
+                }
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.pane = pane;
                 match pane {
                     Pane::Unstaged | Pane::Staged => {
-                        let (list, area) = if pane == Pane::Unstaged {
-                            (List::Unstaged, self.unstaged_area)
+                        let list = if pane == Pane::Unstaged {
+                            List::Unstaged
                         } else {
-                            (List::Staged, self.staged_area)
+                            List::Staged
                         };
                         self.list = list;
                         // The heading row selects nothing; a directory
                         // folds or unfolds when clicked.
-                        if mouse.row > area.y {
-                            let row =
-                                self.file_list(list).scroll + (mouse.row - area.y - 1) as usize;
-                            if row < self.file_list(list).rows.len() {
-                                self.select(list, row);
-                                if let Some(TreeRow::Dir { dir, collapsed, .. }) =
-                                    self.file_list(list).selected_row()
-                                {
-                                    self.file_list_mut(list).set_dir_collapsed(dir, !collapsed);
-                                }
+                        if let Some(row) = self.list_row_at(list, mouse.row) {
+                            self.select(list, row);
+                            if let Some(TreeRow::Dir { dir, collapsed, .. }) =
+                                self.file_list(list).selected_row()
+                            {
+                                self.file_list_mut(list).set_dir_collapsed(dir, !collapsed);
                             }
                         }
                     }
@@ -1624,7 +1876,7 @@ impl ChangesView {
             }
             _ => {}
         }
-        false
+        outcome
     }
 
     fn scroll_pane(&mut self, pane: Pane, down: bool) {
@@ -1746,6 +1998,12 @@ impl ChangesView {
         self.render_list(List::Staged, buf, theme);
         let cursor = self.render_commit_box(buf, theme);
         self.render_content(buf, theme);
+        // The discard box over it all, while it asks; the message's
+        // cursor doesn't show through it.
+        if let Some(pending) = &mut self.discard {
+            pending.dialog.render(area, buf, theme);
+            return None;
+        }
         cursor
     }
 
@@ -2067,6 +2325,82 @@ fn message_editor(text: &str) -> EditorView {
     let mut view = EditorView::new(Editor::new(FileBuffer::from_text(text)));
     view.set_gutter(false);
     view
+}
+
+/// `count` and the noun for it, singular or plural.
+fn count_of(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// What the discard box says discarding `files` will do: which go back
+/// to what version, and which are deleted; that `kept` (conflicts and
+/// submodules under a directory) are left alone; and that there is no
+/// undoing it. `staged` are the paths with staged changes, which a file
+/// goes back to rather than to what was committed.
+fn discard_body(files: &[FileChange], kept: &[FileChange], staged: &HashSet<&str>) -> String {
+    let (untracked, restored): (Vec<&FileChange>, Vec<&FileChange>) = files
+        .iter()
+        .partition(|change| change.kind == ChangeKind::Untracked);
+    let mut body = match (files, restored.first()) {
+        ([_], Some(change)) => {
+            let version = if staged.contains(change.path.as_str()) {
+                "what is staged"
+            } else {
+                "what was last committed"
+            };
+            if change.kind == ChangeKind::Deleted {
+                format!("It is deleted: it comes back as {version}.")
+            } else {
+                format!("Its unstaged edits are lost: it goes back to {version}.")
+            }
+        }
+        ([_], None) => "It isn't tracked by git, so it is deleted.".to_owned(),
+        _ => {
+            let mut parts = Vec::new();
+            if !restored.is_empty() {
+                parts.push(format!(
+                    "{} back to what is staged, or else what was last committed",
+                    if restored.len() == 1 {
+                        "1 file goes".to_owned()
+                    } else {
+                        format!("{} files go", restored.len())
+                    }
+                ));
+            }
+            if !untracked.is_empty() {
+                parts.push(format!(
+                    "{} deleted",
+                    if untracked.len() == 1 {
+                        "1 untracked file is".to_owned()
+                    } else {
+                        format!("{} untracked files are", untracked.len())
+                    }
+                ));
+            }
+            format!("{}.", parts.join("; "))
+        }
+    };
+    let conflicts = kept
+        .iter()
+        .filter(|change| change.kind == ChangeKind::Conflicted)
+        .count();
+    let submodules = kept.len() - conflicts;
+    let mut left = Vec::new();
+    if conflicts > 0 {
+        left.push(count_of(conflicts, "file in conflict", "files in conflict"));
+    }
+    if submodules > 0 {
+        left.push(count_of(submodules, "submodule", "submodules"));
+    }
+    if !left.is_empty() {
+        body.push_str(&format!(
+            " {} {} left alone.",
+            left.join(" and "),
+            if kept.len() == 1 { "is" } else { "are" }
+        ));
+    }
+    body.push_str(" This can't be undone.");
+    body
 }
 
 /// What a file's row shows at its right edge: its counts, or what it
@@ -2935,7 +3269,7 @@ mod tests {
                 row: to.1,
                 modifiers: KeyModifiers::NONE,
             });
-            assert!(released);
+            assert!(released.resized);
             assert!(!view.is_dragging());
         };
         // The lists widen, keeping the diff its minimum.
@@ -3037,5 +3371,326 @@ mod tests {
         let screen = draw(&mut view, 60, 10);
         assert!(screen[1].contains(NOT_A_REPOSITORY), "{screen:#?}");
         assert!(!view.poll());
+    }
+
+    fn right_click(view: &mut ChangesView, column: u16, row: u16) -> ChangesMouseOutcome {
+        let outcome = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Right),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        outcome
+    }
+
+    fn read(dir: &tempfile::TempDir, path: &str) -> String {
+        fs::read_to_string(dir.path().join(path)).unwrap()
+    }
+
+    fn unstaged_paths(view: &ChangesView) -> Vec<&str> {
+        view.files(List::Unstaged)
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn discarding_asks_first_then_puts_files_back_or_deletes_them() {
+        let dir = repo_with_changes();
+        let mut view = view(&dir);
+        draw(&mut view, 100, 30);
+        // a.rs is selected in the unstaged list: it can be staged and
+        // discarded, and there is nothing staged to unstage.
+        assert!(view.can_stage_selected());
+        assert!(view.can_discard_selected());
+        assert!(!view.can_unstage_selected());
+
+        // Discarding asks first, saying what will happen; Enter alone
+        // presses Cancel, and nothing is lost.
+        let edited = read(&dir, "a.rs");
+        assert_eq!(view.discard_selected(), ChangesOutcome::Continue);
+        let dialog = view.discard_box().unwrap();
+        assert_eq!(dialog.title(), "Discard changes to a.rs?");
+        assert_eq!(
+            dialog.body(),
+            "Its unstaged edits are lost: it goes back to what was last committed. This can't be undone."
+        );
+        let screen = draw(&mut view, 100, 30);
+        row_with(&screen, "Discard changes to a.rs?");
+        let buttons = row_with(&screen, " Cancel ");
+        assert!(buttons.contains(" Discard "), "{screen:#?}");
+        assert!(view.hint().text().contains("y discard"), "{}", view.hint());
+        // The box has the keys while it asks: Space stages nothing.
+        press(&mut view, KeyCode::Char(' '));
+        assert!(view.files(List::Staged).is_empty());
+        assert_eq!(press(&mut view, KeyCode::Enter), ChangesOutcome::Continue);
+        assert!(view.discard_box().is_none());
+        assert_eq!(read(&dir, "a.rs"), edited);
+        assert!(!view.take_acted());
+
+        // `y` goes ahead: a.rs is as committed, and gone from the list
+        // before the scan confirms it.
+        view.discard_selected();
+        let outcome = press(&mut view, KeyCode::Char('y'));
+        assert_eq!(
+            outcome,
+            ChangesOutcome::Notice(StatusLine::info("Discarded changes to a.rs"))
+        );
+        assert!(view.take_acted());
+        assert_eq!(read(&dir, "a.rs"), "fn main() {\n    one();\n}\n");
+        assert_eq!(unstaged_paths(&view), ["b.txt", "c.txt"]);
+        settle(&mut view);
+        assert_eq!(unstaged_paths(&view), ["b.txt", "c.txt"]);
+
+        // A deleted file comes back, here by a click on the box's
+        // Discard button, whose notice goes to the status bar.
+        assert_eq!(
+            view.unstaged.selected_key(),
+            Some(RowKey::File("b.txt".into()))
+        );
+        view.discard_selected();
+        assert_eq!(
+            view.discard_box().unwrap().body(),
+            "It is deleted: it comes back as what was last committed. This can't be undone."
+        );
+        let screen = draw(&mut view, 100, 30);
+        let y = screen
+            .iter()
+            .position(|row| row.contains(" Cancel "))
+            .unwrap();
+        let x = screen[y].chars().collect::<Vec<_>>();
+        let x = (0..x.len())
+            .find(|&i| x[i..].iter().collect::<String>().starts_with(" Discard "))
+            .unwrap();
+        let outcome = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x as u16 + 1,
+            row: y as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            outcome.notice,
+            Some(StatusLine::info("Discarded changes to b.txt"))
+        );
+        assert_eq!(read(&dir, "b.txt"), "b\n");
+        settle(&mut view);
+
+        // An untracked file is deleted. A press outside the box is no.
+        assert_eq!(unstaged_paths(&view), ["c.txt"]);
+        view.discard_selected();
+        assert_eq!(
+            view.discard_box().unwrap().body(),
+            "It isn't tracked by git, so it is deleted. This can't be undone."
+        );
+        draw(&mut view, 100, 30);
+        let outcome = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 29,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(outcome, ChangesMouseOutcome::default());
+        assert!(view.discard_box().is_none());
+        assert!(dir.path().join("c.txt").exists());
+        view.discard_selected();
+        press(&mut view, KeyCode::Char('y'));
+        assert!(!dir.path().join("c.txt").exists());
+        settle(&mut view);
+        assert!(view.files(List::Unstaged).is_empty());
+        assert!(!view.can_discard_selected());
+        assert!(!view.can_stage_selected());
+        let screen = draw(&mut view, 100, 30);
+        row_with(&screen, CLEAN);
+    }
+
+    #[test]
+    fn discarding_a_directory_discards_every_file_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        configure_user(&repo);
+        commit_files(
+            &repo,
+            &[
+                ("src/a.rs", "a\n"),
+                ("src/b.rs", "b\n"),
+                ("top.txt", "top\n"),
+            ],
+            "Base",
+        );
+        // src/a.rs: staged, then edited again; src/b.rs: edited; and a
+        // new file in a directory of its own under src.
+        fs::write(dir.path().join("src/a.rs"), "a staged\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("src/a.rs")).unwrap();
+        index.write().unwrap();
+        fs::write(dir.path().join("src/a.rs"), "a staged and edited\n").unwrap();
+        fs::write(dir.path().join("src/b.rs"), "b edited\n").unwrap();
+        fs::create_dir_all(dir.path().join("src/new")).unwrap();
+        fs::write(dir.path().join("src/new/n.rs"), "n\n").unwrap();
+        fs::write(dir.path().join("top.txt"), "top edited\n").unwrap();
+        let mut view = view(&dir);
+        draw(&mut view, 100, 30);
+        assert_eq!(
+            unstaged_paths(&view),
+            ["src/a.rs", "src/b.rs", "src/new/n.rs", "top.txt"]
+        );
+        // The first row is the src directory.
+        assert_eq!(
+            view.unstaged.selected_key(),
+            Some(RowKey::Dir("src".into()))
+        );
+        assert!(view.can_discard_selected());
+        view.discard_selected();
+        let dialog = view.discard_box().unwrap();
+        assert_eq!(dialog.title(), "Discard changes to src/?");
+        assert_eq!(
+            dialog.body(),
+            "2 files go back to what is staged, or else what was last committed; 1 untracked file is deleted. This can't be undone."
+        );
+        let outcome = press(&mut view, KeyCode::Char('y'));
+        assert_eq!(
+            outcome,
+            ChangesOutcome::Notice(StatusLine::info("Discarded changes to src/"))
+        );
+        // Each file went back to its own version: a.rs to what is
+        // staged, which stays staged, and b.rs to what was committed.
+        assert_eq!(read(&dir, "src/a.rs"), "a staged\n");
+        assert_eq!(read(&dir, "src/b.rs"), "b\n");
+        assert!(!dir.path().join("src/new").exists());
+        assert_eq!(read(&dir, "top.txt"), "top edited\n");
+        assert_eq!(unstaged_paths(&view), ["top.txt"]);
+        let staged: Vec<&str> = view
+            .files(List::Staged)
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        assert_eq!(staged, ["src/a.rs"]);
+        settle(&mut view);
+        assert_eq!(unstaged_paths(&view), ["top.txt"]);
+
+        // Nothing to discard in the staged list: the command does
+        // nothing there.
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Down);
+        assert_eq!(view.list, List::Staged);
+        assert!(!view.can_discard_selected());
+        assert!(view.can_unstage_selected());
+        assert_eq!(view.discard_selected(), ChangesOutcome::Continue);
+        assert!(view.discard_box().is_none());
+    }
+
+    #[test]
+    fn a_right_click_on_a_row_selects_it_and_asks_for_the_menu() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        configure_user(&repo);
+        commit_files(&repo, &[("src/a.rs", "a\n"), ("top.txt", "top\n")], "Base");
+        fs::write(dir.path().join("src/a.rs"), "a edited\n").unwrap();
+        fs::write(dir.path().join("top.txt"), "top edited\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("top.txt")).unwrap();
+        index.write().unwrap();
+        let mut view = view(&dir);
+        let screen = draw(&mut view, 100, 30);
+        let width = view.files_rule.x as usize;
+        let left = left_column(&screen, width);
+        let src = left.iter().position(|r| r.contains("▾ src")).unwrap() as u16;
+        let a = left.iter().position(|r| r.contains("M a.rs")).unwrap() as u16;
+        let top = left.iter().position(|r| r.contains("M top.txt")).unwrap() as u16;
+
+        // A file of the unstaged list.
+        view.pane = Pane::Commit;
+        let outcome = right_click(&mut view, 3, a);
+        assert!(outcome.menu);
+        assert_eq!(view.pane, Pane::Unstaged);
+        assert_eq!(
+            view.unstaged.selected_key(),
+            Some(RowKey::File("src/a.rs".into()))
+        );
+        assert!(view.has_selected_change());
+        // A directory is selected, and not folded as a left click would.
+        let outcome = right_click(&mut view, 3, src);
+        assert!(outcome.menu);
+        assert_eq!(
+            view.unstaged.selected_key(),
+            Some(RowKey::Dir("src".into()))
+        );
+        assert!(!view.unstaged.dirs_collapsed[0]);
+        assert!(!view.has_selected_change());
+        assert!(view.can_stage_selected());
+        // A file of the staged list makes it the list the diff follows.
+        let outcome = right_click(&mut view, 3, top);
+        assert!(outcome.menu);
+        assert_eq!(view.list, List::Staged);
+        assert!(view.can_unstage_selected());
+        assert!(!view.can_stage_selected());
+        assert!(!view.can_discard_selected());
+        // The heading, the rows below the last, and the diff ask for no
+        // menu.
+        assert!(!right_click(&mut view, 3, 0).menu);
+        assert!(!right_click(&mut view, 3, top + 3).menu);
+        let content_x = view.content_area.x;
+        assert!(!right_click(&mut view, content_x + 3, 3).menu);
+        assert_eq!(view.list, List::Staged);
+        // The menu's Stage and Unstage do what Space does.
+        assert_eq!(view.unstage_selected(), ChangesOutcome::Continue);
+        assert!(view.files(List::Staged).is_empty());
+        settle(&mut view);
+        right_click(&mut view, 3, src);
+        assert_eq!(view.stage_selected(), ChangesOutcome::Continue);
+        assert!(
+            view.files(List::Unstaged)
+                .iter()
+                .all(|c| c.path == "top.txt")
+        );
+        settle(&mut view);
+    }
+
+    #[test]
+    fn the_discard_box_says_what_goes_back_what_is_deleted_and_what_is_left() {
+        let change = |kind: ChangeKind, path: &str, submodule: bool| FileChange {
+            kind,
+            path: path.to_owned(),
+            old_path: None,
+            additions: 0,
+            deletions: 0,
+            binary: false,
+            submodule,
+        };
+        let staged: HashSet<&str> = ["a.rs"].into_iter().collect();
+        let body = |files: &[FileChange], kept: &[FileChange]| discard_body(files, kept, &staged);
+        let modified = change(ChangeKind::Modified, "a.rs", false);
+        assert_eq!(
+            body(std::slice::from_ref(&modified), &[]),
+            "Its unstaged edits are lost: it goes back to what is staged. This can't be undone."
+        );
+        let deleted = change(ChangeKind::Deleted, "d.rs", false);
+        let untracked = change(ChangeKind::Untracked, "u.rs", false);
+        let conflict = change(ChangeKind::Conflicted, "c.rs", false);
+        let submodule = change(ChangeKind::Modified, "libs/sub", true);
+        assert_eq!(
+            body(
+                &[modified, deleted.clone()],
+                std::slice::from_ref(&conflict)
+            ),
+            "2 files go back to what is staged, or else what was last committed. 1 file in conflict is left alone. This can't be undone."
+        );
+        assert_eq!(
+            body(
+                &[untracked.clone(), untracked.clone()],
+                &[conflict.clone(), conflict.clone(), submodule.clone()]
+            ),
+            "2 untracked files are deleted. 2 files in conflict and 1 submodule are left alone. This can't be undone."
+        );
+        assert_eq!(
+            body(&[deleted, untracked], &[submodule]),
+            "1 file goes back to what is staged, or else what was last committed; 1 untracked file is deleted. 1 submodule is left alone. This can't be undone."
+        );
     }
 }

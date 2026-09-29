@@ -13,6 +13,7 @@ mod clicks;
 mod clipboard;
 mod command;
 mod commit_row;
+mod confirm_box;
 mod context_menu;
 mod diff_pane;
 mod editor_view;

@@ -54,6 +54,25 @@
 //! the log. In the diff the arrows scroll, Page Up and Page Down by a
 //! screenful, and ← goes back to the files when nothing is scrolled
 //! sideways. The wheel scrolls whichever pane it is over, sideways too.
+//! In the files and the diff, `o` opens the selected file in the editor
+//! as it is in the working directory now (one that isn't there any
+//! more has nothing to open, and the status bar says so).
+//!
+//! A right click on a file or directory of the selected commit selects
+//! it and opens a menu of what can be done to it (the application
+//! draws the menu; see the `context_menu` module): open it, and, set
+//! apart below, restore it. "Restore this version" puts the file in the
+//! working directory as the commit left it, and "Restore previous
+//! version" as it was before the commit (as the first parent has it,
+//! the side the diff is against), undoing what the commit did to it; a
+//! file that version hasn't is deleted. On a directory, each file the
+//! commit changed under it is restored, and nothing else in it. Only
+//! the working directory changes (see the core crate's `git::restore`
+//! module), so what was restored shows on the changes page as an
+//! unstaged change, to stage or discard. Restoring would lose changes
+//! to the files that aren't committed or staged, so with any a box asks
+//! first, naming them (see the `confirm_box` module); otherwise it is
+//! done at once. Submodules are left alone, and the status bar says so.
 //!
 //! The log and the content pane scroll sideways as the editor does
 //! (see `EditorView`): only as far as the longest line on screen now
@@ -133,6 +152,7 @@ use crate::branch_prompt::{BranchPrompt, BranchPromptOutcome};
 use crate::clicks::ClickTracker;
 use crate::clipboard::Clipboard;
 use crate::commit_row::{CommitLine, Highlight, commit_extent, draw_commit_line, lane_cap};
+use crate::confirm_box::{ConfirmBox, ConfirmOutcome};
 use crate::diff_pane::{
     Button, HScroll, Piece, WHEEL_COLUMNS, WHEEL_LINES, clamp_between, content_background,
     diff_extent, display_width, draw_cells, fit_end, layout_cells, render_diff, share_for,
@@ -145,7 +165,8 @@ use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
     ChangeKind, Checkout, CheckoutError, CheckoutJob, CheckoutOutcome, CommitDetail, Fetch,
-    FileDiff, FileTree, History, Oid, TreeRow, short_id, submodules,
+    FileChange, FileDiff, FileTree, History, Oid, Restored, TreeRow, restore, short_id, submodules,
+    unstaged_among,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
@@ -196,10 +217,19 @@ const LOG_HELP: &[(&str, &str)] = &[
     ("Ctrl+E", "leave"),
 ];
 const PROMPT_HELP: &[(&str, &str)] = &[("Enter", "create branch and check out"), ("Esc", "cancel")];
+const CONFIRM_HELP: &[(&str, &str)] = &[
+    ("y", "restore"),
+    ("n/Esc", "cancel"),
+    ("←→", "button"),
+    ("Enter", "press"),
+];
+/// The restore box's button.
+const RESTORE: &str = "Restore";
 const FILES_HELP: &[(&str, &str)] = &[
     ("↑↓", "file"),
     ("Enter", "view"),
     ("←→", "fold/unfold"),
+    ("o", "open"),
     ("F5", "fetch"),
     ("Tab", "pane"),
     ("Ctrl+E", "leave"),
@@ -208,6 +238,7 @@ const CONTENT_HELP: &[(&str, &str)] = &[
     ("↑↓", "scroll"),
     ("←→", "sideways"),
     ("▲▼", "expand context"),
+    ("o", "open"),
     ("F5", "fetch"),
     ("Tab", "pane"),
     ("Ctrl+E", "leave"),
@@ -291,6 +322,63 @@ enum Content {
     Directory(usize),
     Diff(Box<FileDiff>),
     Failed(String),
+}
+
+/// Which version of the selected files a restore puts in the working
+/// directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Version {
+    /// As the selected commit left them.
+    Commit,
+    /// As they were before it: as its first parent has them, the side
+    /// its diff is against.
+    Parent,
+}
+
+/// A restore of some of a commit's files: which, and from where.
+struct RestoreRequest {
+    /// The commit whose files are restored, and which version of them.
+    commit: Oid,
+    version: Version,
+    /// The commit that version is (none, for the version before a root
+    /// commit: the files didn't exist).
+    source: Option<Oid>,
+    /// The files' paths, and their paths before a rename.
+    paths: Vec<String>,
+    /// What is restored, for the status bar: a file's path, or a
+    /// directory's with a slash.
+    what: String,
+    /// How many submodules under a directory are left alone.
+    kept: usize,
+}
+
+impl RestoreRequest {
+    /// Which version, in words: `as of 1a2b3c4d`, `as before 1a2b3c4d`.
+    fn version_words(&self) -> String {
+        match self.version {
+            Version::Commit => format!("as of {}", short_id(self.commit)),
+            Version::Parent => format!("as before {}", short_id(self.commit)),
+        }
+    }
+}
+
+/// A restore waiting on the restore box, which asks because it would
+/// overwrite changes that aren't committed or staged.
+struct PendingRestore {
+    dialog: ConfirmBox,
+    request: RestoreRequest,
+}
+
+/// What the application should do after the page handled a mouse
+/// event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GitLogMouseOutcome {
+    /// The pane sizes changed (a drag of a rule ended), so the layout
+    /// is worth keeping.
+    pub resized: bool,
+    /// A right press on a file or directory of the selected commit,
+    /// which it selected: open the page's menu at the pointer, for it.
+    pub menu: bool,
 }
 
 /// What a page asks of its tabs when Enter or a double-click lands on
@@ -450,14 +538,37 @@ impl GitLogTabs {
         self.follow_checkout();
     }
 
+    /// Open the selected file of the shown page's commit in the editor,
+    /// as its `o` does; see [`take_file_to_open`](Self::take_file_to_open).
+    pub fn open_selected_change(&mut self) {
+        self.active().open_selected_change();
+    }
+
+    /// Restore the selected files of the shown page's commit in the
+    /// working directory, as the commit left them or as they were
+    /// before it, asking first if that would overwrite changes that
+    /// aren't committed or staged.
+    pub fn restore_selected(&mut self, version: Version) {
+        self.active().restore_selected(version);
+    }
+
+    /// The file of the working directory the shown page asks to have
+    /// opened in the editor, if it has asked since this was last asked.
+    pub fn take_file_to_open(&mut self) -> Option<PathBuf> {
+        self.tabs[self.active]
+            .view
+            .as_mut()
+            .and_then(|view| view.file_to_open.take())
+    }
+
     /// Give the shown page a mouse event, and go where it asks (see
-    /// [`follow_submodule`](Self::follow_submodule)). Returns whether
-    /// the page's pane sizes changed (a drag of a rule ended), in
-    /// which case the layout is worth keeping.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+    /// [`follow_submodule`](Self::follow_submodule)). A change to its
+    /// pane sizes (a drag of a rule ended) goes into the layout, which
+    /// is then worth keeping.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> GitLogMouseOutcome {
         let active = self.active;
-        let resized = self.active().handle_mouse(mouse);
-        if resized {
+        let outcome = self.active().handle_mouse(mouse);
+        if outcome.resized {
             let sizes = self.tabs[active].view.as_ref().map(GitLogView::sizes);
             if let Some(sizes) = sizes {
                 let key = self.tabs[active].key().to_owned();
@@ -466,7 +577,7 @@ impl GitLogTabs {
         }
         self.follow_checkout();
         self.follow_submodule();
-        resized
+        outcome
     }
 
     /// Show the commit of a submodule the shown page asks for, on the
@@ -674,6 +785,12 @@ pub struct GitLogView {
     /// Whether a checkout has been done and not yet noticed by the
     /// tabs (see [`take_checked_out`](Self::take_checked_out)).
     checked_out: bool,
+    /// A file of the working directory to open in the editor, asked
+    /// for with `o` or "Open changed file" and not yet taken (see
+    /// [`take_file_to_open`](Self::take_file_to_open)).
+    file_to_open: Option<PathBuf>,
+    /// The restore box, while it asks whether to go ahead.
+    restore: Option<PendingRestore>,
 }
 
 impl GitLogView {
@@ -751,6 +868,8 @@ impl GitLogView {
             submodule_jump: None,
             branch_prompt: None,
             checked_out: false,
+            file_to_open: None,
+            restore: None,
         };
         view.install(GitLogView::open_history(root, exact));
         view
@@ -1095,6 +1214,9 @@ impl GitLogView {
         if self.branch_prompt.is_some() {
             return StatusLine::help(PROMPT_HELP);
         }
+        if self.restore.is_some() {
+            return StatusLine::help(CONFIRM_HELP);
+        }
         StatusLine::help(match self.pane {
             Pane::Sidebar => SIDEBAR_HELP,
             Pane::Log => LOG_HELP,
@@ -1282,6 +1404,200 @@ impl GitLogView {
             Some(Content::Failed(why)) => self.notice = Some(StatusLine::error(why.clone())),
             _ => {}
         }
+    }
+
+    // ----- Opening and restoring files -----------------------------------
+
+    /// The file selected in the file list, if a file (not a directory,
+    /// nor the description) is.
+    fn selected_change(&self) -> Option<&FileChange> {
+        match self.selected_file_row()? {
+            TreeRow::File { file, .. } => self.detail.as_ref()?.files.get(file),
+            TreeRow::Dir { .. } => None,
+        }
+    }
+
+    /// Whether a file (not a submodule) is selected, for `o` to open.
+    pub fn can_open_selected_change(&self) -> bool {
+        self.selected_change()
+            .is_some_and(|change| !change.submodule)
+    }
+
+    /// `o`, or "Open changed file": ask for the selected file to be
+    /// opened in the editor as it is in the working directory now (see
+    /// [`GitLogTabs::take_file_to_open`]). A file that isn't there (the
+    /// commit deleted it, or a later one did) has nothing to open, and
+    /// the status bar says so.
+    pub fn open_selected_change(&mut self) {
+        self.ensure_detail();
+        let Some(change) = self.selected_change() else {
+            return;
+        };
+        if change.submodule {
+            self.notice = Some(StatusLine::info(format!(
+                "{} is a submodule: Enter goes to its commit",
+                change.path
+            )));
+            return;
+        }
+        let Some(workdir) = self.history.as_ref().and_then(History::workdir) else {
+            return;
+        };
+        let path = workdir.join(&change.path);
+        if path.is_file() {
+            self.file_to_open = Some(path);
+        } else {
+            self.notice = Some(StatusLine::info(format!(
+                "{} isn't in the working directory",
+                change.path
+            )));
+        }
+    }
+
+    /// How the status bar names what a row of the file list stands
+    /// for: a file's path, or a directory's with a slash.
+    fn describe_file_row(&self, row: TreeRow) -> String {
+        match row {
+            TreeRow::Dir { dir, .. } => format!("{}/", self.file_tree.dirs()[dir].path),
+            TreeRow::File { file, .. } => self
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.files.get(file))
+                .map(|change| change.path.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The paths a restore of the selected row writes or deletes: a
+    /// file's, or those of the commit's files under a directory (not
+    /// the rest of the directory: what the commit changed is what is
+    /// restored), each with its path before a rename, since the file
+    /// was there on one side. Submodules are left out, and counted.
+    fn restorable_selection(&self) -> (Vec<String>, usize) {
+        let (Some(detail), Some(row)) = (&self.detail, self.selected_file_row()) else {
+            return (Vec::new(), 0);
+        };
+        let files = match row {
+            TreeRow::Dir { dir, .. } => self.file_tree.files_under(dir),
+            TreeRow::File { file, .. } => vec![file],
+        };
+        let mut paths = Vec::new();
+        let mut kept = 0;
+        for change in files.iter().filter_map(|f| detail.files.get(*f)) {
+            if change.submodule {
+                kept += 1;
+                continue;
+            }
+            paths.push(change.path.clone());
+            paths.extend(change.old_path.clone());
+        }
+        (paths, kept)
+    }
+
+    /// Whether the selected file or directory has files to restore.
+    pub fn can_restore_selected(&self) -> bool {
+        !self.restorable_selection().0.is_empty()
+    }
+
+    /// "Restore this version" or "Restore previous version": put the
+    /// selected file in the working directory as the commit left it, or
+    /// as it was before the commit (as the first parent, which the diff
+    /// is against, has it), or likewise every file the commit changed
+    /// under the selected directory. A file the version hasn't is
+    /// deleted. Only the working directory changes, so the outcome is
+    /// an unstaged change to review on the changes page. Changes to the
+    /// files that aren't committed or staged would be lost, so with any
+    /// the restore box asks first (see [`handle_restore_outcome`](Self::handle_restore_outcome));
+    /// otherwise it is done now. The status bar says how it went.
+    pub fn restore_selected(&mut self, version: Version) {
+        self.ensure_detail();
+        if self.checkout.is_some() {
+            self.notice = Some(StatusLine::error("A checkout is under way"));
+            return;
+        }
+        let (Some(detail), Some(row), Some(history)) =
+            (&self.detail, self.selected_file_row(), &self.history)
+        else {
+            return;
+        };
+        let (paths, kept) = self.restorable_selection();
+        let what = self.describe_file_row(row);
+        if paths.is_empty() {
+            self.notice = Some(StatusLine::info(format!(
+                "Nothing to restore in {what}: a submodule's commit is checked out on its own tab"
+            )));
+            return;
+        }
+        let source = match version {
+            Version::Commit => Some(detail.id),
+            Version::Parent => detail.parents.first().copied(),
+        };
+        let request = RestoreRequest {
+            commit: detail.id,
+            version,
+            source,
+            paths,
+            what,
+            kept,
+        };
+        let refs: Vec<&str> = request.paths.iter().map(String::as_str).collect();
+        match unstaged_among(history.git_dir(), &refs) {
+            Ok(lost) if lost.is_empty() => self.finish_restore(request),
+            Ok(lost) => {
+                let dialog = ConfirmBox::new(
+                    format!("Restore {} {}?", request.what, request.version_words()),
+                    format!(
+                        "Changes that aren't committed or staged are overwritten in {}. This can't be undone.",
+                        name_some(&lost)
+                    ),
+                    RESTORE,
+                );
+                self.restore = Some(PendingRestore { dialog, request });
+            }
+            Err(err) => {
+                self.notice = Some(StatusLine::error(format!(
+                    "Could not restore {}: {}",
+                    request.what,
+                    err.message()
+                )));
+            }
+        }
+    }
+
+    /// Act on the restore box's answer: go ahead with the restore it
+    /// asked about, or drop it.
+    fn handle_restore_outcome(&mut self, outcome: ConfirmOutcome) {
+        match outcome {
+            ConfirmOutcome::Continue => {}
+            ConfirmOutcome::Cancel => self.restore = None,
+            ConfirmOutcome::Confirm => {
+                if let Some(pending) = self.restore.take() {
+                    self.finish_restore(pending.request);
+                }
+            }
+        }
+    }
+
+    /// Do a restore, and say how it went.
+    fn finish_restore(&mut self, request: RestoreRequest) {
+        let Some(history) = &self.history else {
+            return;
+        };
+        let refs: Vec<&str> = request.paths.iter().map(String::as_str).collect();
+        self.notice = Some(match restore(history.git_dir(), request.source, &refs) {
+            Ok(done) => StatusLine::info(restored_summary(&request, done)),
+            Err(err) => StatusLine::error(format!(
+                "Could not restore {}: {}",
+                request.what,
+                err.message()
+            )),
+        });
+    }
+
+    /// Whether the restore box is asking.
+    #[cfg(test)]
+    fn restore_box(&self) -> Option<&ConfirmBox> {
+        self.restore.as_ref().map(|pending| &pending.dialog)
     }
 
     /// Select a commit by id, now if it has been walked and otherwise
@@ -1736,6 +2052,12 @@ impl GitLogView {
             self.handle_prompt_outcome(outcome);
             return;
         }
+        // The restore box, while it asks, has every key.
+        if let Some(pending) = &mut self.restore {
+            let outcome = pending.dialog.handle_key(key);
+            self.handle_restore_outcome(outcome);
+            return;
+        }
         // The file list follows the selected commit's detail, which is
         // read on the first draw after the selection moves; a key that
         // comes first (from a test, or a burst of input) needs it too.
@@ -1756,6 +2078,10 @@ impl GitLogView {
             }
             KeyCode::F(5) => {
                 self.fetch();
+                return;
+            }
+            KeyCode::Char('o') if matches!(self.pane, Pane::Files | Pane::Content) => {
+                self.open_selected_change();
                 return;
             }
             _ => {}
@@ -2000,9 +2326,9 @@ impl GitLogView {
         }
     }
 
-    /// Handle a mouse event. Returns whether the pane sizes changed:
-    /// a drag of a rule ended.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+    /// Handle a mouse event.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> GitLogMouseOutcome {
+        let mut outcome = GitLogMouseOutcome::default();
         // The branch name box, while open, takes the mouse over it, and
         // a press anywhere else closes it, as the go to line box does.
         if let Some(prompt) = &mut self.branch_prompt {
@@ -2011,7 +2337,14 @@ impl GitLogView {
             } else if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.branch_prompt = None;
             }
-            return false;
+            return outcome;
+        }
+        // The restore box, while it asks, has the mouse; a press outside
+        // it is no.
+        if let Some(pending) = &mut self.restore {
+            let answer = pending.dialog.handle_mouse(mouse);
+            self.handle_restore_outcome(answer);
+            return outcome;
         }
         self.ensure_detail();
         let at = ScreenPosition::new(mouse.column, mouse.row);
@@ -2021,11 +2354,11 @@ impl GitLogView {
                 MouseEventKind::Drag(_) => self.drag_divider(divider, mouse.column, mouse.row),
                 MouseEventKind::Up(_) => {
                     self.divider_drag = None;
-                    return true;
+                    outcome.resized = true;
                 }
                 _ => {}
             }
-            return false;
+            return outcome;
         }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             let divider = if self.sidebar_rule.contains(at) {
@@ -2040,7 +2373,7 @@ impl GitLogView {
             if let Some(divider) = divider {
                 self.divider_drag = Some(divider);
                 self.drag_divider(divider, mouse.column, mouse.row);
-                return false;
+                return outcome;
             }
         }
         // A scrollbar drag owns the mouse likewise.
@@ -2061,7 +2394,7 @@ impl GitLogView {
                 }
                 _ => {}
             }
-            return false;
+            return outcome;
         }
         let pane = if self.sidebar_area.contains(at) {
             Some(Pane::Sidebar)
@@ -2075,9 +2408,20 @@ impl GitLogView {
             None
         };
         let Some(pane) = pane else {
-            return false;
+            return outcome;
         };
         match mouse.kind {
+            // A right press on a file or directory of the commit selects
+            // it, without folding a directory, and asks for the menu of
+            // what can be done to it.
+            MouseEventKind::Down(MouseButton::Right) if pane == Pane::Files => {
+                let row = self.files_scroll + (mouse.row - self.files_area.y) as usize;
+                if row > 0 && row < self.file_row_count() {
+                    self.pane = Pane::Files;
+                    self.select_file(row);
+                    outcome.menu = true;
+                }
+            }
             MouseEventKind::ScrollUp => self.scroll_pane(pane, false),
             MouseEventKind::ScrollDown => self.scroll_pane(pane, true),
             MouseEventKind::ScrollRight | MouseEventKind::ScrollLeft => {
@@ -2157,7 +2501,7 @@ impl GitLogView {
             }
             _ => {}
         }
-        false
+        outcome
     }
 
     fn scroll_pane(&mut self, pane: Pane, down: bool) {
@@ -2203,6 +2547,9 @@ impl GitLogView {
         theme: &Theme,
     ) -> Option<ScreenPosition> {
         self.render_panes(area, buf, theme);
+        if let Some(pending) = &mut self.restore {
+            pending.dialog.render(area, buf, theme);
+        }
         match &mut self.branch_prompt {
             Some(prompt) => prompt.render(area, buf, theme),
             None => None,
@@ -2708,6 +3055,48 @@ fn date_line(label: &str, time: ninjaedit_core::git::CommitTime) -> String {
     } else {
         format!("{label}{local}  ({own} where committed)")
     }
+}
+
+/// A few paths by name, and how many more there are: `a.rs`, `a.rs
+/// and b.rs`, `a.rs, b.rs, c.rs and 2 more`.
+fn name_some(paths: &[String]) -> String {
+    const NAMED: usize = 3;
+    let named = &paths[..paths.len().min(NAMED)];
+    let more = paths.len() - named.len();
+    match (named, more) {
+        ([only], 0) => only.clone(),
+        ([first @ .., last], 0) => format!("{} and {last}", first.join(", ")),
+        _ => format!("{} and {more} more", named.join(", ")),
+    }
+}
+
+/// What the status bar says once a restore is done: what was restored
+/// and as which version, and anything the version hasn't that was
+/// deleted or any submodules left alone.
+fn restored_summary(request: &RestoreRequest, done: Restored) -> String {
+    let mut text = format!("Restored {} {}", request.what, request.version_words());
+    let plural = |count: usize, one: &str, many: &str| {
+        format!("{count} {}", if count == 1 { one } else { many })
+    };
+    let mut details = Vec::new();
+    if done.deleted > 0 {
+        details.push(format!(
+            "{} as that version hasn't it",
+            plural(done.deleted, "file deleted,", "files deleted,")
+        ));
+    }
+    if request.kept > 0 {
+        details.push(plural(
+            request.kept,
+            "submodule left alone",
+            "submodules left alone",
+        ));
+    }
+    if !details.is_empty() {
+        text.push_str(": ");
+        text.push_str(&details.join("; "));
+    }
+    text
 }
 
 #[cfg(test)]
@@ -3860,7 +4249,7 @@ mod tests {
             row: at.1,
             modifiers: KeyModifiers::NONE,
         });
-        assert!(released);
+        assert!(released.resized);
     }
 
     #[test]
@@ -4718,6 +5107,289 @@ mod tests {
         assert_eq!(
             notice_of(&mut view).as_deref(),
             Some(format!("Checked out {main}").as_str())
+        );
+    }
+
+    /// A repository of three commits: Base (src/a.rs, src/b.rs,
+    /// top.txt), Change (src/a.rs and top.txt edited, src/new.rs added),
+    /// and Later (src/a.rs and src/b.rs edited). Returns their ids.
+    fn repo_to_restore() -> (tempfile::TempDir, [Oid; 3]) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut clock = 1_700_000_000;
+        let mut commit = |files: &[(&str, &str)], message: &str| {
+            let mut index = repo.index().unwrap();
+            for (name, content) in files {
+                let path = dir.path().join(name);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, content).unwrap();
+                index.add_path(Path::new(name)).unwrap();
+            }
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            clock += 60;
+            let sig = Signature::new("Ann Author", "ann@example.com", &git2::Time::new(clock, 0))
+                .unwrap();
+            let parents: Vec<git2::Commit<'_>> = repo
+                .head()
+                .ok()
+                .and_then(|head| head.target())
+                .map(|id| repo.find_commit(id).unwrap())
+                .into_iter()
+                .collect();
+            let refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &refs)
+                .unwrap()
+        };
+        let base = commit(
+            &[
+                ("src/a.rs", "a1\n"),
+                ("src/b.rs", "b1\n"),
+                ("top.txt", "t1\n"),
+            ],
+            "Base",
+        );
+        let change = commit(
+            &[
+                ("src/a.rs", "a2\n"),
+                ("src/new.rs", "n\n"),
+                ("top.txt", "t2\n"),
+            ],
+            "Change",
+        );
+        let later = commit(&[("src/a.rs", "a3\n"), ("src/b.rs", "b3\n")], "Later");
+        (dir, [base, change, later])
+    }
+
+    fn read(dir: &tempfile::TempDir, path: &str) -> String {
+        fs::read_to_string(dir.path().join(path)).unwrap()
+    }
+
+    /// Select a commit of the log by id, and a row of its file list.
+    fn select_file_of(view: &mut GitLogView, id: Oid, row: usize) {
+        let position = view.history.as_ref().unwrap().position(id).unwrap();
+        view.select_commit(position);
+        view.ensure_detail();
+        view.select_file(row);
+    }
+
+    /// The row of the file list for the directory at `path`.
+    fn dir_row_of(view: &GitLogView, path: &str) -> usize {
+        view.file_rows
+            .iter()
+            .position(|row| {
+                matches!(row, TreeRow::Dir { dir, .. } if view.file_tree.dirs()[*dir].path == path)
+            })
+            .unwrap_or_else(|| panic!("no row for {path}/"))
+            + 1
+    }
+
+    #[test]
+    fn restoring_a_directory_restores_the_commits_files_under_it() {
+        let (dir, [_base, change, _later]) = repo_to_restore();
+        let mut view = view(&dir);
+        draw(&mut view, 120, 40);
+        select_file_of(&mut view, change, 0);
+        let src = dir_row_of(&view, "src");
+        view.select_file(src);
+        assert!(view.can_restore_selected());
+        assert!(!view.can_open_selected_change());
+        let id = short_id(change);
+
+        // As before the commit: a.rs as Base had it, and new.rs, which
+        // Base hadn't, deleted. b.rs, which the commit didn't change, is
+        // left as it is, as is top.txt, outside the directory. Nothing
+        // unstaged was in the way, so nothing asked.
+        view.restore_selected(Version::Parent);
+        assert!(view.restore_box().is_none());
+        assert_eq!(
+            notice_of(&mut view).as_deref(),
+            Some(
+                format!("Restored src/ as before {id}: 1 file deleted, as that version hasn't it")
+                    .as_str()
+            )
+        );
+        assert_eq!(read(&dir, "src/a.rs"), "a1\n");
+        assert!(!dir.path().join("src/new.rs").exists());
+        assert_eq!(read(&dir, "src/b.rs"), "b3\n");
+        assert_eq!(read(&dir, "top.txt"), "t2\n");
+        // Only the working directory changed: the index has HEAD's.
+        let repo = Repository::open(dir.path()).unwrap();
+        let status = repo.status_file(Path::new("src/a.rs")).unwrap();
+        assert!(status.contains(git2::Status::WT_MODIFIED), "{status:?}");
+        assert!(!status.intersects(git2::Status::INDEX_MODIFIED));
+
+        // As of the commit, those restored changes are unstaged and
+        // would be overwritten, so the box asks; Enter alone cancels.
+        view.restore_selected(Version::Commit);
+        let dialog = view.restore_box().unwrap();
+        assert_eq!(dialog.title(), format!("Restore src/ as of {id}?"));
+        assert_eq!(
+            dialog.body(),
+            "Changes that aren't committed or staged are overwritten in src/a.rs. This can't be undone."
+        );
+        let screen = draw(&mut view, 120, 40);
+        row_with(&screen, &format!("Restore src/ as of {id}?"));
+        assert!(view.hint().text().contains("y restore"), "{}", view.hint());
+        let mut clipboard = Clipboard::local_only();
+        view.handle_key(key(KeyCode::Enter), &mut clipboard);
+        assert!(view.restore_box().is_none());
+        assert_eq!(read(&dir, "src/a.rs"), "a1\n");
+        assert_eq!(notice_of(&mut view), None);
+        view.restore_selected(Version::Commit);
+        view.handle_key(key(KeyCode::Char('y')), &mut clipboard);
+        assert_eq!(
+            notice_of(&mut view).as_deref(),
+            Some(format!("Restored src/ as of {id}").as_str())
+        );
+        assert_eq!(read(&dir, "src/a.rs"), "a2\n");
+        assert_eq!(read(&dir, "src/new.rs"), "n\n");
+        assert_eq!(read(&dir, "src/b.rs"), "b3\n");
+    }
+
+    #[test]
+    fn restoring_a_file_as_before_a_root_commit_deletes_it() {
+        let (dir, [base, _change, _later]) = repo_to_restore();
+        let mut view = view(&dir);
+        draw(&mut view, 120, 40);
+        select_file_of(&mut view, base, 0);
+        let top = file_row_of(&view, "top.txt");
+        view.select_file(top);
+        view.restore_selected(Version::Parent);
+        assert_eq!(
+            notice_of(&mut view).as_deref(),
+            Some(
+                format!(
+                    "Restored top.txt as before {}: 1 file deleted, as that version hasn't it",
+                    short_id(base)
+                )
+                .as_str()
+            )
+        );
+        assert!(!dir.path().join("top.txt").exists());
+        // As of it, it comes back. Its deletion is an unstaged change,
+        // but writing it back loses nothing, so nothing asks.
+        view.restore_selected(Version::Commit);
+        assert!(view.restore_box().is_none());
+        assert_eq!(read(&dir, "top.txt"), "t1\n");
+    }
+
+    #[test]
+    fn o_opens_the_selected_file_as_it_is_in_the_working_directory() {
+        let (dir, [_base, change, _later]) = repo_to_restore();
+        let mut tabs = GitLogTabs::new(dir.path(), GitLogLayout::default());
+        wait_tabs(&mut tabs);
+        draw(tabs.active(), 120, 40);
+        select_file_of(tabs.active(), change, 0);
+        let top = file_row_of(tabs.active(), "top.txt");
+        tabs.active().select_file(top);
+        assert!(tabs.active().can_open_selected_change());
+        // `o` from the file list, or from the diff.
+        let mut clipboard = Clipboard::local_only();
+        tabs.active().pane = Pane::Files;
+        tabs.handle_key(key(KeyCode::Char('o')), &mut clipboard);
+        let path = tabs.take_file_to_open().unwrap();
+        assert_eq!(
+            fs::canonicalize(path).unwrap(),
+            fs::canonicalize(dir.path().join("top.txt")).unwrap()
+        );
+        assert_eq!(tabs.take_file_to_open(), None);
+        tabs.active().pane = Pane::Content;
+        tabs.handle_key(key(KeyCode::Char('o')), &mut clipboard);
+        assert!(tabs.take_file_to_open().is_some());
+        // The palette's and the menu's "Open changed file" does the same.
+        tabs.open_selected_change();
+        assert!(tabs.take_file_to_open().is_some());
+        // A file that isn't in the working directory has nothing to
+        // open, and the status bar says so.
+        fs::remove_file(dir.path().join("src/new.rs")).unwrap();
+        let new = file_row_of(tabs.active(), "src/new.rs");
+        tabs.active().select_file(new);
+        tabs.open_selected_change();
+        assert_eq!(tabs.take_file_to_open(), None);
+        assert_eq!(
+            notice_of_tabs(&mut tabs).as_deref(),
+            Some("src/new.rs isn't in the working directory")
+        );
+        // Nor is there anything to open for the description.
+        tabs.active().select_file(0);
+        assert!(!tabs.active().can_open_selected_change());
+        assert!(!tabs.active().can_restore_selected());
+    }
+
+    #[test]
+    fn a_right_click_on_a_file_selects_it_and_asks_for_the_menu() {
+        let (dir, [_base, change, _later]) = repo_to_restore();
+        let mut view = view(&dir);
+        draw(&mut view, 120, 40);
+        select_file_of(&mut view, change, 0);
+        let screen = draw(&mut view, 120, 40);
+        let right_press = |view: &mut GitLogView, column: u16, row: u16| {
+            view.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let x = view.files_area.x + 2;
+        let y_of = |text: &str| {
+            screen
+                .iter()
+                .position(|row| {
+                    row.chars()
+                        .skip(view.files_area.x as usize)
+                        .take(view.files_area.width as usize)
+                        .collect::<String>()
+                        .contains(text)
+                })
+                .unwrap_or_else(|| panic!("no {text:?} in {screen:#?}")) as u16
+        };
+        let (src, top, description) = (y_of("src"), y_of("top.txt"), y_of(DESCRIPTION));
+        view.pane = Pane::Log;
+        let outcome = right_press(&mut view, x, top);
+        assert!(outcome.menu);
+        assert_eq!(view.pane, Pane::Files);
+        assert!(view.can_open_selected_change());
+        // A directory is selected, not folded as a left click would.
+        let outcome = right_press(&mut view, x, src);
+        assert!(outcome.menu);
+        assert!(!view.can_open_selected_change());
+        assert!(view.can_restore_selected());
+        assert!(view.dirs_collapsed.iter().all(|folded| !folded));
+        // The description, and the log, ask for no menu.
+        assert!(!right_press(&mut view, x, description).menu);
+        let log = view.log_area;
+        assert!(!right_press(&mut view, log.x + 4, log.y).menu);
+    }
+
+    #[test]
+    fn a_few_paths_are_named_and_the_rest_counted() {
+        let paths = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        assert_eq!(name_some(&paths(&["a"])), "a");
+        assert_eq!(name_some(&paths(&["a", "b"])), "a and b");
+        assert_eq!(name_some(&paths(&["a", "b", "c"])), "a, b and c");
+        assert_eq!(
+            name_some(&paths(&["a", "b", "c", "d", "e"])),
+            "a, b, c and 2 more"
+        );
+        let request = RestoreRequest {
+            commit: Oid::ZERO_SHA1,
+            version: Version::Commit,
+            source: None,
+            paths: Vec::new(),
+            what: "src/".to_owned(),
+            kept: 2,
+        };
+        let done = Restored {
+            written: 1,
+            deleted: 2,
+        };
+        assert_eq!(
+            restored_summary(&request, done),
+            "Restored src/ as of 00000000: 2 files deleted, as that version hasn't it; 2 submodules left alone"
         );
     }
 }
