@@ -14,8 +14,8 @@
 //! tree with it, to a commit picked from the log, on to whatever
 //! branch points there. The [`head`] module says where HEAD is, the
 //! branch or the commit, for the status bar, and the [`branch`] module
-//! makes a new branch there and moves HEAD on to it. The [`restore`]
-//! module writes files into the working directory as a commit (or the
+//! makes a new branch there and moves HEAD on to it, or deletes one.
+//! The [`restore`] module writes files into the working directory as a commit (or the
 //! one before it) has them, leaving the index alone.
 //! Everything goes through libgit2, by way of the `git2` crate; nothing
 //! shells out to git.
@@ -26,8 +26,9 @@
 //! change puts a file of the working directory back to the index's
 //! version (or deletes it, when untracked); a checkout also rewrites the
 //! working directory's files and may make a local branch, and refuses
-//! to while there are changes it could lose; a new branch is only a
-//! reference and HEAD, never the files; and restoring rewrites files
+//! to while there are changes it could lose; a new or deleted branch is
+//! only a reference (with its configuration) and HEAD, never the files;
+//! and restoring rewrites files
 //! of the working directory and nothing else.
 
 pub mod branch;
@@ -42,7 +43,7 @@ pub mod restore;
 pub mod submodules;
 pub mod tree;
 
-pub use branch::{BranchError, create_branch, create_branch_in};
+pub use branch::{BranchError, DeleteBranchError, create_branch, create_branch_in, delete_branch};
 pub use changes::Changes;
 pub use checkout::{Checkout, CheckoutError, CheckoutJob, CheckoutOutcome, CheckoutPlan};
 pub use diff::{

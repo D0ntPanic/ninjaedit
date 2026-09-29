@@ -74,6 +74,19 @@
 //! first, naming them (see the `confirm_box` module); otherwise it is
 //! done at once. Submodules are left alone, and the status bar says so.
 //!
+//! A right click on a branch in the sidebar selects it (without going
+//! to its commit) and opens a menu for it: check it out, and, set apart
+//! below, delete it; both are in the command palette too while the
+//! sidebar has the keyboard. Checking out a local branch puts HEAD on
+//! it; a remote's branch is checked out as its commit would be from
+//! the log were it the only branch there (see below): on the local
+//! branch tracking it, fast-forwarded if behind, or on a new one made
+//! to track it. Deleting is for a local branch HEAD isn't on, and asks
+//! first, in a box, only when the branch has commits that neither HEAD
+//! nor its upstream has, which would be left on no branch; otherwise
+//! it is done at once, the status bar saying which commit the branch
+//! was at. A remote's branch isn't deleted here.
+//!
 //! The log and the content pane scroll sideways as the editor does
 //! (see `EditorView`): only as far as the longest line on screen now
 //! needs, plus a little slack, never by the longest line in the whole
@@ -164,9 +177,9 @@ use crate::status::StatusLine;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
-    ChangeKind, Checkout, CheckoutError, CheckoutJob, CheckoutOutcome, CommitDetail, Fetch,
-    FileChange, FileDiff, FileTree, History, Oid, Restored, TreeRow, restore, short_id, submodules,
-    unstaged_among,
+    ChangeKind, Checkout, CheckoutError, CheckoutJob, CheckoutOutcome, CommitDetail,
+    DeleteBranchError, Fetch, FileChange, FileDiff, FileTree, History, Oid, Restored, TreeRow,
+    delete_branch, restore, short_id, submodules, unstaged_among,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
@@ -223,8 +236,16 @@ const CONFIRM_HELP: &[(&str, &str)] = &[
     ("←→", "button"),
     ("Enter", "press"),
 ];
+const DELETE_HELP: &[(&str, &str)] = &[
+    ("y", "delete"),
+    ("n/Esc", "cancel"),
+    ("←→", "button"),
+    ("Enter", "press"),
+];
 /// The restore box's button.
 const RESTORE: &str = "Restore";
+/// The delete branch box's button.
+const DELETE: &str = "Delete";
 const FILES_HELP: &[(&str, &str)] = &[
     ("↑↓", "file"),
     ("Enter", "view"),
@@ -369,6 +390,44 @@ struct PendingRestore {
     request: RestoreRequest,
 }
 
+/// A deletion of a branch waiting on the delete branch box, which asks
+/// because the branch has commits no other branch has.
+struct PendingDelete {
+    dialog: ConfirmBox,
+    /// The local branch to delete.
+    name: String,
+}
+
+/// A checkout under way, and what of.
+struct RunningCheckout {
+    /// What is being checked out, for the status bar: a commit's short
+    /// id, or a branch's name.
+    what: String,
+    /// The commit being checked out: the one picked, or the one a
+    /// branch was at when picked until the job has looked it up again.
+    id: Oid,
+    job: CheckoutJob,
+}
+
+/// A branch selected in the sidebar.
+struct SideBranch {
+    /// Its name as git has it: `main`, or `origin/main` for a remote's.
+    name: String,
+    remote: bool,
+    /// The commit it is at.
+    target: Oid,
+    is_head: bool,
+}
+
+/// Which of the page's right-click menus to open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitLogMenu {
+    /// For a file or directory of the selected commit.
+    Files,
+    /// For a branch in the sidebar.
+    Branch,
+}
+
 /// What the application should do after the page handled a mouse
 /// event.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -376,9 +435,10 @@ pub struct GitLogMouseOutcome {
     /// The pane sizes changed (a drag of a rule ended), so the layout
     /// is worth keeping.
     pub resized: bool,
-    /// A right press on a file or directory of the selected commit,
-    /// which it selected: open the page's menu at the pointer, for it.
-    pub menu: bool,
+    /// A right press on a file or directory of the selected commit, or
+    /// on a branch in the sidebar, which it selected: open that menu
+    /// of the page at the pointer, for it.
+    pub menu: Option<GitLogMenu>,
 }
 
 /// What a page asks of its tabs when Enter or a double-click lands on
@@ -536,6 +596,20 @@ impl GitLogTabs {
     pub fn checkout_selected(&mut self) {
         self.active().checkout_selected();
         self.follow_checkout();
+    }
+
+    /// The command palette's "Check out branch": the shown page's
+    /// branch selected in the sidebar.
+    pub fn checkout_selected_branch(&mut self) {
+        self.active().checkout_selected_branch();
+        self.follow_checkout();
+    }
+
+    /// The command palette's "Delete branch": the shown page's local
+    /// branch selected in the sidebar, asking first if it has commits
+    /// of its own.
+    pub fn delete_selected_branch(&mut self) {
+        self.active().delete_selected_branch();
     }
 
     /// Open the selected file of the shown page's commit in the editor,
@@ -705,9 +779,9 @@ pub struct GitLogView {
     pending: Option<History>,
     /// A fetch under way (F5); the page refreshes once it is done.
     fetch: Option<Fetch>,
-    /// A checkout under way (Space or a double-click in the log), of
-    /// which commit; the page refreshes once it is done.
-    checkout: Option<(Oid, CheckoutJob)>,
+    /// A checkout under way (Space or a double-click in the log, or a
+    /// branch from the sidebar); the page refreshes once it is done.
+    checkout: Option<RunningCheckout>,
     /// What the status bar is to say, once: how a fetch or a checkout
     /// went.
     notice: Option<StatusLine>,
@@ -791,6 +865,8 @@ pub struct GitLogView {
     file_to_open: Option<PathBuf>,
     /// The restore box, while it asks whether to go ahead.
     restore: Option<PendingRestore>,
+    /// The delete branch box, while it asks whether to go ahead.
+    branch_delete: Option<PendingDelete>,
 }
 
 impl GitLogView {
@@ -870,6 +946,7 @@ impl GitLogView {
             checked_out: false,
             file_to_open: None,
             restore: None,
+            branch_delete: None,
         };
         view.install(GitLogView::open_history(root, exact));
         view
@@ -1188,13 +1265,12 @@ impl GitLogView {
     pub fn hint(&self) -> StatusLine {
         // Something under way has the bar to itself: it is what the
         // user is waiting on, and the bindings have been seen.
-        if let Some((id, job)) = &self.checkout {
-            let id = short_id(*id);
+        if let Some(RunningCheckout { what, job, .. }) = &self.checkout {
             return StatusLine::progress(match job.progress() {
                 Some((written, total)) => {
-                    format!("checking out {id}… {written}/{total} files")
+                    format!("checking out {what}… {written}/{total} files")
                 }
-                None => format!("checking out {id}…"),
+                None => format!("checking out {what}…"),
             });
         }
         if let Some(history) = &self.history
@@ -1216,6 +1292,9 @@ impl GitLogView {
         }
         if self.restore.is_some() {
             return StatusLine::help(CONFIRM_HELP);
+        }
+        if self.branch_delete.is_some() {
+            return StatusLine::help(DELETE_HELP);
         }
         StatusLine::help(match self.pane {
             Pane::Sidebar => SIDEBAR_HELP,
@@ -1600,6 +1679,124 @@ impl GitLogView {
         self.restore.as_ref().map(|pending| &pending.dialog)
     }
 
+    // ----- Branches in the sidebar ---------------------------------------
+
+    /// The branch selected in the sidebar, if a branch (not a remote)
+    /// is.
+    fn selected_branch(&self) -> Option<SideBranch> {
+        let history = self.history.as_ref()?;
+        match self.side_rows.get(self.side_selected)? {
+            SideRow::Branch(b) => {
+                let branch = history.branches().get(*b)?;
+                Some(SideBranch {
+                    name: branch.name.clone(),
+                    remote: false,
+                    target: branch.target,
+                    is_head: branch.is_head,
+                })
+            }
+            SideRow::RemoteBranch(r, b) => {
+                let remote = history.remotes().get(*r)?;
+                let branch = remote.branches.get(*b)?;
+                Some(SideBranch {
+                    name: format!("{}/{}", remote.name, branch.name),
+                    remote: true,
+                    target: branch.target,
+                    is_head: false,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the keyboard is in the sidebar with a branch selected
+    /// there, for "Check out branch".
+    pub fn can_checkout_branch(&self) -> bool {
+        self.pane == Pane::Sidebar && self.selected_branch().is_some()
+    }
+
+    /// Whether the keyboard is in the sidebar with a local branch HEAD
+    /// isn't on selected there, for "Delete branch".
+    pub fn can_delete_branch(&self) -> bool {
+        self.pane == Pane::Sidebar
+            && self
+                .selected_branch()
+                .is_some_and(|branch| !branch.remote && !branch.is_head)
+    }
+
+    /// "Delete branch": delete the local branch selected in the
+    /// sidebar (see the core crate's `git::branch` module). One whose
+    /// commits HEAD or its upstream has is deleted at once; one with
+    /// commits of its own, which would be left on no branch, has the
+    /// delete branch box ask first. The status bar says how it went,
+    /// and the page refreshes.
+    pub fn delete_selected_branch(&mut self) {
+        if self.checkout.is_some() {
+            self.notice = Some(StatusLine::error("A checkout is under way"));
+            return;
+        }
+        let Some(branch) = self.selected_branch() else {
+            return;
+        };
+        if branch.remote {
+            return;
+        }
+        if branch.is_head {
+            self.notice = Some(StatusLine::error(format!(
+                "Could not delete {}: it is checked out",
+                branch.name
+            )));
+            return;
+        }
+        self.delete_branch_named(branch.name, false);
+    }
+
+    /// Delete a local branch, forced or not, and say how it went; or,
+    /// when unforced and it has commits of its own, open the box asking
+    /// whether to force it.
+    fn delete_branch_named(&mut self, name: String, force: bool) {
+        let Some(history) = &self.history else {
+            return;
+        };
+        match delete_branch(history.git_dir(), &name, force) {
+            Ok(id) => {
+                self.notice = Some(StatusLine::info(format!(
+                    "Deleted branch {name} (was {})",
+                    short_id(id)
+                )));
+                self.refresh();
+            }
+            Err(DeleteBranchError::Unmerged { commits, .. }) => {
+                let noun = if commits == 1 { "commit" } else { "commits" };
+                let dialog = ConfirmBox::new(
+                    format!("Delete branch {name}?"),
+                    format!(
+                        "{name} has {commits} {noun} that neither HEAD nor its upstream has, which would be left on no branch. This can't be undone."
+                    ),
+                    DELETE,
+                );
+                self.branch_delete = Some(PendingDelete { dialog, name });
+            }
+            Err(err) => {
+                self.notice = Some(StatusLine::error(format!("Could not delete {name}: {err}")));
+            }
+        }
+    }
+
+    /// Act on the delete branch box's answer: delete the branch it
+    /// asked about, forced, or drop it.
+    fn handle_delete_outcome(&mut self, outcome: ConfirmOutcome) {
+        match outcome {
+            ConfirmOutcome::Continue => {}
+            ConfirmOutcome::Cancel => self.branch_delete = None,
+            ConfirmOutcome::Confirm => {
+                if let Some(pending) = self.branch_delete.take() {
+                    self.delete_branch_named(pending.name, true);
+                }
+            }
+        }
+    }
+
     /// Select a commit by id, now if it has been walked and otherwise
     /// when it is.
     fn jump_to(&mut self, id: Oid) {
@@ -1937,13 +2134,33 @@ impl GitLogView {
         let Some(history) = &self.history else {
             return;
         };
-        self.start_checkout(id, CheckoutJob::start(history.git_dir(), id));
+        let job = CheckoutJob::start(history.git_dir(), id);
+        self.start_checkout(short_id(id), id, job);
     }
 
-    /// Keep a checkout job just started, or say why it couldn't be.
-    fn start_checkout(&mut self, id: Oid, job: Result<CheckoutJob, CheckoutError>) {
+    /// "Check out branch": check out the branch selected in the
+    /// sidebar (see the core crate's `git::checkout` module): a local
+    /// branch as it is, a remote's on the local branch tracking it,
+    /// fast-forwarded to it, or on a new one made to track it, with
+    /// the box asking for a name if its own is taken. The status bar
+    /// says what was done, or why it couldn't be.
+    pub fn checkout_selected_branch(&mut self) {
+        if self.checkout.is_some() {
+            self.notice = Some(StatusLine::error("A checkout is under way"));
+            return;
+        }
+        let (Some(branch), Some(history)) = (self.selected_branch(), &self.history) else {
+            return;
+        };
+        let job = CheckoutJob::start_branch(history.git_dir(), &branch.name, branch.remote);
+        self.start_checkout(branch.name, branch.target, job);
+    }
+
+    /// Keep a checkout job just started, of `what` (for the status
+    /// bar) at `id`, or say why it couldn't be.
+    fn start_checkout(&mut self, what: String, id: Oid, job: Result<CheckoutJob, CheckoutError>) {
         match job {
-            Ok(job) => self.checkout = Some((id, job)),
+            Ok(job) => self.checkout = Some(RunningCheckout { what, id, job }),
             Err(err) => {
                 self.notice = Some(StatusLine::error(format!("Could not check out: {err}")))
             }
@@ -1956,16 +2173,19 @@ impl GitLogView {
     /// say why it couldn't be done (in the box, when it is the name
     /// that won't do). Returns whether anything changed.
     fn poll_checkout(&mut self) -> bool {
-        let Some((_, job)) = &mut self.checkout else {
+        let Some(RunningCheckout { job, .. }) = &mut self.checkout else {
             return false;
         };
         let changed = job.poll();
         if !job.is_done() {
             return changed;
         }
-        let Some((id, job)) = self.checkout.take() else {
+        let Some(RunningCheckout { id, job, .. }) = self.checkout.take() else {
             return changed;
         };
+        // A branch's commit as the job found it, which may have moved
+        // since the page was read.
+        let id = job.commit().unwrap_or(id);
         match job.outcome() {
             Some(CheckoutOutcome::Done { how, submodules }) => {
                 let already = self.history.as_ref().is_some_and(|history| {
@@ -2028,12 +2248,13 @@ impl GitLogView {
                     return;
                 };
                 let (id, upstream) = (prompt.id, prompt.upstream.clone());
+                let what = name.clone();
                 let how = Checkout::NewBranch { name, upstream };
                 let job = CheckoutJob::start_with(history.git_dir(), id, how);
                 if job.is_err() {
                     self.branch_prompt = None;
                 }
-                self.start_checkout(id, job);
+                self.start_checkout(what, id, job);
             }
         }
     }
@@ -2056,6 +2277,12 @@ impl GitLogView {
         if let Some(pending) = &mut self.restore {
             let outcome = pending.dialog.handle_key(key);
             self.handle_restore_outcome(outcome);
+            return;
+        }
+        // So has the delete branch box.
+        if let Some(pending) = &mut self.branch_delete {
+            let outcome = pending.dialog.handle_key(key);
+            self.handle_delete_outcome(outcome);
             return;
         }
         // The file list follows the selected commit's detail, which is
@@ -2346,6 +2573,11 @@ impl GitLogView {
             self.handle_restore_outcome(answer);
             return outcome;
         }
+        if let Some(pending) = &mut self.branch_delete {
+            let answer = pending.dialog.handle_mouse(mouse);
+            self.handle_delete_outcome(answer);
+            return outcome;
+        }
         self.ensure_detail();
         let at = ScreenPosition::new(mouse.column, mouse.row);
         // A rule being dragged owns the mouse until the button comes up.
@@ -2419,7 +2651,21 @@ impl GitLogView {
                 if row > 0 && row < self.file_row_count() {
                     self.pane = Pane::Files;
                     self.select_file(row);
-                    outcome.menu = true;
+                    outcome.menu = Some(GitLogMenu::Files);
+                }
+            }
+            // A right press on a branch in the sidebar selects it,
+            // without going to its commit, and asks for the menu of
+            // what can be done to it.
+            MouseEventKind::Down(MouseButton::Right) if pane == Pane::Sidebar => {
+                let row = self.side_scroll + (mouse.row - self.sidebar_area.y) as usize;
+                if matches!(
+                    self.side_rows.get(row),
+                    Some(SideRow::Branch(_) | SideRow::RemoteBranch(..))
+                ) {
+                    self.pane = Pane::Sidebar;
+                    self.side_selected = row;
+                    outcome.menu = Some(GitLogMenu::Branch);
                 }
             }
             MouseEventKind::ScrollUp => self.scroll_pane(pane, false),
@@ -2548,6 +2794,9 @@ impl GitLogView {
     ) -> Option<ScreenPosition> {
         self.render_panes(area, buf, theme);
         if let Some(pending) = &mut self.restore {
+            pending.dialog.render(area, buf, theme);
+        }
+        if let Some(pending) = &mut self.branch_delete {
             pending.dialog.render(area, buf, theme);
         }
         match &mut self.branch_prompt {
@@ -5348,19 +5597,132 @@ mod tests {
         let (src, top, description) = (y_of("src"), y_of("top.txt"), y_of(DESCRIPTION));
         view.pane = Pane::Log;
         let outcome = right_press(&mut view, x, top);
-        assert!(outcome.menu);
+        assert_eq!(outcome.menu, Some(GitLogMenu::Files));
         assert_eq!(view.pane, Pane::Files);
         assert!(view.can_open_selected_change());
         // A directory is selected, not folded as a left click would.
         let outcome = right_press(&mut view, x, src);
-        assert!(outcome.menu);
+        assert_eq!(outcome.menu, Some(GitLogMenu::Files));
         assert!(!view.can_open_selected_change());
         assert!(view.can_restore_selected());
         assert!(view.dirs_collapsed.iter().all(|folded| !folded));
         // The description, and the log, ask for no menu.
-        assert!(!right_press(&mut view, x, description).menu);
+        assert_eq!(right_press(&mut view, x, description).menu, None);
         let log = view.log_area;
-        assert!(!right_press(&mut view, log.x + 4, log.y).menu);
+        assert_eq!(right_press(&mut view, log.x + 4, log.y).menu, None);
+    }
+
+    #[test]
+    fn a_branch_in_the_sidebar_is_checked_out_or_deleted() {
+        let (dir, ids) = repo_with_history();
+        let [_a, b, s, m] = ids[..] else { panic!() };
+        let main = head_of(&dir).0.unwrap();
+        let mut view = view(&dir);
+        let screen = draw(&mut view, 110, 24);
+        let right_press = |view: &mut GitLogView, row: u16| {
+            view.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: 4,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let side_row = |screen: &[String], name: &str| {
+            screen
+                .iter()
+                .position(|row| row.starts_with(&format!("   {name} ")))
+                .unwrap_or_else(|| panic!("no {name} in {screen:#?}")) as u16
+        };
+        // With the keyboard in the log, the sidebar's branch is nothing
+        // to act on.
+        assert_eq!(view.pane, Pane::Log);
+        assert!(!view.can_checkout_branch());
+        // A right press on a heading asks for nothing; on a branch it
+        // selects it, without going to its commit.
+        assert_eq!(right_press(&mut view, 0).menu, None);
+        let outcome = right_press(&mut view, side_row(&screen, "side"));
+        assert_eq!(outcome.menu, Some(GitLogMenu::Branch));
+        assert_eq!(view.pane, Pane::Sidebar);
+        assert_eq!(view.selected_commit(), Some(m));
+        assert!(view.can_checkout_branch());
+        assert!(view.can_delete_branch());
+
+        // Checking it out puts HEAD on it.
+        view.checkout_selected_branch();
+        assert!(
+            view.hint().text().starts_with("checking out side…"),
+            "{}",
+            view.hint()
+        );
+        wait(&mut view);
+        assert_eq!(notice_of(&mut view).as_deref(), Some("Checked out side"));
+        assert_eq!(head_of(&dir), (Some("side".to_owned()), s));
+        wait(&mut view);
+        // HEAD's branch can't be deleted.
+        assert!(view.can_checkout_branch());
+        assert!(!view.can_delete_branch());
+
+        // main has commits side hasn't: the box asks first, and No
+        // keeps it.
+        view.handle_key(key(KeyCode::Up), &mut Clipboard::new());
+        assert!(view.can_delete_branch());
+        view.delete_selected_branch();
+        assert_eq!(view.hint(), StatusLine::help(DELETE_HELP));
+        let screen = draw(&mut view, 110, 24);
+        let asked = format!("Delete branch {main}?");
+        assert!(screen.iter().any(|r| r.contains(&asked)), "{screen:#?}");
+        view.handle_key(key(KeyCode::Char('n')), &mut Clipboard::new());
+        assert!(view.branch_delete.is_none());
+        let repo = Repository::open(dir.path()).unwrap();
+        assert!(repo.find_branch(&main, BranchType::Local).is_ok());
+        // Yes deletes it.
+        view.delete_selected_branch();
+        view.handle_key(key(KeyCode::Char('y')), &mut Clipboard::new());
+        assert_eq!(
+            notice_of(&mut view),
+            Some(format!("Deleted branch {main} (was {})", short_id(m)))
+        );
+        assert!(repo.find_branch(&main, BranchType::Local).is_err());
+        wait(&mut view);
+
+        // A remote's branch can be checked out, not deleted: with no
+        // local branch of its name, one is made tracking it.
+        let screen = draw(&mut view, 110, 24);
+        let origin = screen
+            .iter()
+            .position(|row| row.contains("▸ origin"))
+            .unwrap() as u16;
+        click(&mut view, 4, origin);
+        let screen = draw(&mut view, 110, 24);
+        let outcome = right_press(&mut view, side_row(&screen, &format!("  {main}")));
+        assert_eq!(outcome.menu, Some(GitLogMenu::Branch));
+        assert!(view.can_checkout_branch());
+        assert!(!view.can_delete_branch());
+        view.delete_selected_branch();
+        assert!(view.branch_delete.is_none());
+        assert!(notice_of(&mut view).is_none());
+        view.checkout_selected_branch();
+        wait(&mut view);
+        assert_eq!(
+            notice_of(&mut view),
+            Some(format!(
+                "Checked out new branch {main} tracking origin/{main}"
+            ))
+        );
+        assert_eq!(head_of(&dir), (Some(main.clone()), m));
+        wait(&mut view);
+
+        // side is merged into main now: deleted at once.
+        let screen = draw(&mut view, 110, 24);
+        right_press(&mut view, side_row(&screen, "side"));
+        view.delete_selected_branch();
+        assert!(view.branch_delete.is_none());
+        assert_eq!(
+            notice_of(&mut view),
+            Some(format!("Deleted branch side (was {})", short_id(s)))
+        );
+        assert!(repo.find_branch("side", BranchType::Local).is_err());
+        let _ = b;
     }
 
     #[test]

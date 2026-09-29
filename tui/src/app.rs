@@ -182,7 +182,7 @@ use crate::context_menu::{ContextMenu, MenuEntry, MenuOutcome};
 use crate::diff_pane::draw_pieces;
 use crate::editor_view::EditorView;
 use crate::git_layout;
-use crate::git_view::{self, GitLogTabs, Version};
+use crate::git_view::{self, GitLogMenu, GitLogTabs, Version};
 use crate::goto_line::{GoToLineBox, GoToLineOutcome};
 use crate::heads::{Heads, Repository};
 use crate::new_branch::{NewBranchBox, NewBranchOutcome};
@@ -374,6 +374,14 @@ const GIT_LOG_MENU: &[MenuEntry] = &[
     MenuEntry::Separator,
     MenuEntry::Command(Command::RestoreCommitVersion),
     MenuEntry::Command(Command::RestoreParentVersion),
+];
+/// What a right click on a branch in the git log's sidebar offers:
+/// checking it out first, and, set apart below, deleting it, which is
+/// only for a local branch HEAD isn't on.
+const GIT_LOG_BRANCH_MENU: &[MenuEntry] = &[
+    MenuEntry::Command(Command::CheckoutBranch),
+    MenuEntry::Separator,
+    MenuEntry::Command(Command::DeleteBranch),
 ];
 /// What the status bar shows on the settings page.
 const SETTINGS_HELP: &[(&str, &str)] = &[
@@ -1226,11 +1234,16 @@ impl App {
     }
 
     /// A right click on a file or directory among the git log's
-    /// selected commit's files, which the page selected: open its menu
-    /// at the pointer (see [`GIT_LOG_MENU`]).
-    fn open_git_log_menu(&mut self, x: u16, y: u16) {
+    /// selected commit's files, or on a branch in its sidebar, which
+    /// the page selected: open the menu for it at the pointer (see
+    /// [`GIT_LOG_MENU`] and [`GIT_LOG_BRANCH_MENU`]).
+    fn open_git_log_menu(&mut self, menu: GitLogMenu, x: u16, y: u16) {
         let context = self.command_context();
-        self.context_menu = ContextMenu::new(GIT_LOG_MENU, &context, x, y);
+        let entries = match menu {
+            GitLogMenu::Files => GIT_LOG_MENU,
+            GitLogMenu::Branch => GIT_LOG_BRANCH_MENU,
+        };
+        self.context_menu = ContextMenu::new(entries, &context, x, y);
     }
 
     /// The command palette's entries; see
@@ -1390,6 +1403,8 @@ impl App {
             can_unstage_selected: changes.is_some_and(|view| view.can_unstage_selected()),
             can_discard_selected: changes.is_some_and(|view| view.can_discard_selected()),
             can_restore_selected: log.is_some_and(|view| view.can_restore_selected()),
+            can_checkout_branch: log.is_some_and(|view| view.can_checkout_branch()),
+            can_delete_branch: log.is_some_and(|view| view.can_delete_branch()),
             has_repository: self.heads.head(self.status_repository()).is_some(),
         }
     }
@@ -1456,6 +1471,17 @@ impl App {
             Command::CheckoutCommit => {
                 if let Mode::GitLog(tabs) = &mut self.mode {
                     tabs.checkout_selected();
+                }
+            }
+            Command::CheckoutBranch => {
+                if let Mode::GitLog(tabs) = &mut self.mode {
+                    tabs.checkout_selected_branch();
+                }
+            }
+            Command::DeleteBranch => {
+                if let Mode::GitLog(tabs) = &mut self.mode {
+                    tabs.delete_selected_branch();
+                    self.follow_git_log();
                 }
             }
             Command::Commit => self.on_changes_page(ChangesTabs::commit),
@@ -3399,8 +3425,8 @@ impl App {
                         )));
                     }
                     self.follow_git_log();
-                    if outcome.menu {
-                        self.open_git_log_menu(x, y);
+                    if let Some(menu) = outcome.menu {
+                        self.open_git_log_menu(menu, x, y);
                     }
                 }
                 Mode::Changes(tabs)
@@ -8720,5 +8746,73 @@ mod tests {
         assert!(matches!(app.mode, Mode::Editor));
         assert_eq!(app.tabs.len(), 1);
         assert_eq!(app.tabs[0].view.editor().buffer().to_text(), "one\n");
+    }
+
+    #[test]
+    fn right_click_on_a_branch_offers_checking_out_and_deleting_it() {
+        let (dir, mut app) = app_with_files(&[]);
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".storage/\n").unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(".gitignore")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let first = repo
+            .commit(Some("HEAD"), &sig, &sig, "First", &tree, &[])
+            .unwrap();
+        repo.branch("topic", &repo.find_commit(first).unwrap(), false)
+            .unwrap();
+        let head = repo.head().unwrap().shorthand().unwrap().to_owned();
+
+        ctrl(&mut app, 'l');
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Mode::GitLog(tabs) = &app.mode
+            && tabs.is_loading()
+            && Instant::now() < deadline
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let screen = draw(&mut app, 100, 30);
+        let row_of = |name: &str| -> u16 {
+            screen
+                .iter()
+                .position(|row| row.contains(&format!("   {name} ")))
+                .unwrap_or_else(|| panic!("no {name:?} in {screen:#?}")) as u16
+        };
+        let (topic, head_row) = (row_of("topic"), row_of(&head));
+
+        // Checking out first, deleting set apart below.
+        right_click(&mut app, 4, topic);
+        assert_eq!(
+            menu_commands(&app),
+            [
+                Some(Command::CheckoutBranch),
+                None,
+                Some(Command::DeleteBranch)
+            ]
+        );
+        // HEAD's branch can only be checked out.
+        press(&mut app, KeyCode::Esc);
+        right_click(&mut app, 4, head_row);
+        assert_eq!(menu_commands(&app), [Some(Command::CheckoutBranch)]);
+        press(&mut app, KeyCode::Esc);
+
+        // Deleting topic, merged, happens at once.
+        right_click(&mut app, 4, topic);
+        let screen = draw(&mut app, 100, 30);
+        let delete = screen
+            .iter()
+            .position(|row| row.contains("│ Delete branch"))
+            .unwrap() as u16;
+        click(&mut app, 6, delete);
+        assert!(app.context_menu.is_none());
+        assert!(repo.find_branch("topic", git2::BranchType::Local).is_err());
+        let status = app.status.as_ref().map(StatusLine::text);
+        assert_eq!(
+            status.as_deref(),
+            Some(format!("Deleted branch topic (was {})", &first.to_string()[..8]).as_str())
+        );
     }
 }

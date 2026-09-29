@@ -79,6 +79,12 @@ pub enum Command {
     Fetch,
     /// The git log page's Space.
     CheckoutCommit,
+    /// The git log page's checking out of the branch selected in the
+    /// sidebar.
+    CheckoutBranch,
+    /// The git log page's deleting of the local branch selected in the
+    /// sidebar.
+    DeleteBranch,
     /// The changes page's Ctrl+S.
     Commit,
     /// The changes page's `a` in the unstaged list.
@@ -205,6 +211,12 @@ pub struct Context {
     /// among the selected commit's files, with files to restore: not
     /// only submodules.
     pub can_restore_selected: bool,
+    /// On the git log page, with the keyboard in the sidebar, whether a
+    /// branch (local or a remote's) is selected there, to check out.
+    pub can_checkout_branch: bool,
+    /// On the git log page, with the keyboard in the sidebar, whether a
+    /// local branch HEAD isn't on is selected there, to delete.
+    pub can_delete_branch: bool,
     /// Whether the status bar shows a repository to make a branch in:
     /// the one the file being edited is in, the shown git page's, or
     /// the project's own. A property of where the user is in the
@@ -216,7 +228,7 @@ impl Command {
     /// Every command, in the order the palette lists them before
     /// anything is typed: files, searching, editing, building, the
     /// pages, views, and quitting last.
-    pub const ALL: [Command; 46] = [
+    pub const ALL: [Command; 48] = [
         Command::OpenFile,
         Command::SwitchTab,
         Command::Save,
@@ -248,6 +260,8 @@ impl Command {
         Command::NewBranch,
         Command::Fetch,
         Command::CheckoutCommit,
+        Command::CheckoutBranch,
+        Command::DeleteBranch,
         Command::RestoreCommitVersion,
         Command::RestoreParentVersion,
         Command::Commit,
@@ -306,6 +320,8 @@ impl Command {
             Command::NewBranch => context.has_repository,
             Command::Fetch => on(Page::GitLog),
             Command::CheckoutCommit => on(Page::GitLog) && context.commit_selected,
+            Command::CheckoutBranch => on(Page::GitLog) && context.can_checkout_branch,
+            Command::DeleteBranch => on(Page::GitLog) && context.can_delete_branch,
             Command::Commit | Command::ToggleAmend => on(Page::Changes),
             Command::StageAll => on(Page::Changes) && context.has_unstaged,
             Command::UnstageAll => on(Page::Changes) && context.has_staged,
@@ -357,6 +373,8 @@ impl Command {
             Command::NewBranch => "Create branch",
             Command::Fetch => "Fetch from remotes",
             Command::CheckoutCommit => "Check out commit",
+            Command::CheckoutBranch => "Check out branch",
+            Command::DeleteBranch => "Delete branch",
             Command::Commit => "Commit",
             Command::StageAll => "Stage all changes",
             Command::UnstageAll => "Unstage all changes",
@@ -435,6 +453,12 @@ impl Command {
             }
             Command::CheckoutCommit => {
                 "On the git log page, check out the selected commit (Space in the log): its branch, a new one tracking a remote's, or HEAD detached"
+            }
+            Command::CheckoutBranch => {
+                "On the git log page, check out the branch selected in the sidebar: a local branch as it is, a remote's on the local branch tracking it (fast-forwarded) or a new one made to track it"
+            }
+            Command::DeleteBranch => {
+                "On the git log page, delete the local branch selected in the sidebar, asking first if it has commits that neither HEAD nor its upstream has"
             }
             Command::Commit => {
                 "On the changes page, commit what is staged with the message in the box"
@@ -518,6 +542,8 @@ impl Command {
             | Command::RemoveBuildEntry
             | Command::NewBranch
             | Command::CheckoutCommit
+            | Command::CheckoutBranch
+            | Command::DeleteBranch
             | Command::StageAll
             | Command::UnstageAll
             | Command::OpenChange

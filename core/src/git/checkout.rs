@@ -23,7 +23,10 @@
 //! * With nothing pointing at the commit, HEAD is detached there.
 //!
 //! [`Checkout::plan`] says which of these a commit calls for, and
-//! [`Checkout::run`] does it. Both refuse when the working tree has
+//! [`Checkout::run`] does it. A branch can be checked out by name too
+//! ([`Checkout::plan_branch`]): a local branch as it is, and a remote's
+//! as its commit would be were it the only branch there, through the
+//! local branch tracking it or a new one. Both refuse when the working tree has
 //! changes to tracked files, staged or not, since the checkout could
 //! lose them: the user is to commit or stash first. Untracked files
 //! are left alone and don't get in the way.
@@ -194,44 +197,38 @@ impl Checkout {
                 (full, name)
             })
             .collect();
-        // A local branch tracking one of the remote's branches is
-        // brought up to it, if that is a fast-forward; if not, nothing
-        // else is tried, since that branch is the one the user means.
-        for (upstream, name) in &named {
-            if let Some(local) = tracking_branch(repo, upstream, name)? {
-                let target = local.get().target().ok_or_else(|| {
-                    git2::Error::from_str("the tracking branch points at nothing")
-                })?;
-                let (ahead, behind) = repo.graph_ahead_behind(target, id)?;
-                let name = local.name()?.unwrap_or(name).to_owned();
-                if ahead > 0 {
-                    return Err(CheckoutError::NotFastForward {
-                        name,
-                        upstream: upstream.clone(),
-                        ahead,
-                        behind,
-                    });
-                }
-                return Ok(CheckoutPlan::Ready(Checkout::FastForward {
-                    name,
-                    upstream: upstream.clone(),
-                }));
-            }
+        Ok(plan_upstreams(repo, id, named)?.unwrap_or(CheckoutPlan::Ready(Checkout::Detached)))
+    }
+
+    /// What checking out a branch from the sidebar calls for, and the
+    /// commit the branch is at. A local branch (`remote` false, `name`
+    /// as `main`) is checked out as it is. A remote's branch (`name` as
+    /// `origin/main`) is checked out as its commit would be from the
+    /// log were it the only branch there: on the local branch tracking
+    /// it, fast-forwarded to it if behind, or on a new local branch
+    /// made tracking it, with a name asked for if its own is taken.
+    /// Refused, as [`plan`](Self::plan) is, while there are changes the
+    /// checkout could lose.
+    pub fn plan_branch(
+        repo: &Repository,
+        name: &str,
+        remote: bool,
+    ) -> Result<(Oid, CheckoutPlan), CheckoutError> {
+        let kind = if remote {
+            BranchType::Remote
+        } else {
+            BranchType::Local
+        };
+        let id = repo.find_branch(name, kind)?.get().peel_to_commit()?.id();
+        ensure_clean(repo)?;
+        check_submodules(repo, &repo.find_commit(id)?)?;
+        if !remote {
+            return Ok((id, CheckoutPlan::Ready(Checkout::Branch(name.to_owned()))));
         }
-        // A remote's branch whose name is free makes a local branch of
-        // that name; only when every one is taken is a name asked for.
-        for (upstream, name) in &named {
-            if !branch_exists(repo, name)? {
-                return Ok(CheckoutPlan::Ready(Checkout::NewBranch {
-                    name: name.clone(),
-                    upstream: upstream.clone(),
-                }));
-            }
-        }
-        if let Some((upstream, taken)) = named.into_iter().next() {
-            return Ok(CheckoutPlan::NeedsName { upstream, taken });
-        }
-        Ok(CheckoutPlan::Ready(Checkout::Detached))
+        let local = branch_part(repo, name);
+        let plan = plan_upstreams(repo, id, vec![(name.to_owned(), local)])?
+            .expect("a remote's branch was given");
+        Ok((id, plan))
     }
 
     /// Check out `id` this way: the working tree and index are brought
@@ -323,6 +320,58 @@ impl Checkout {
             n => format!("{what}; {n} submodules updated"),
         }
     }
+}
+
+/// How to check out `id` by way of the remotes' branches pointing at
+/// it (`upstreams`, each as `origin/feature` with its own part,
+/// `feature`), or `None` with none given. A local branch tracking one
+/// is checked out, brought up to it if that is a fast-forward; if not,
+/// nothing else is tried, since that branch is the one the user means.
+/// Otherwise a remote's branch whose name is free makes a local branch
+/// of that name; only when every one is taken is a name asked for.
+fn plan_upstreams(
+    repo: &Repository,
+    id: Oid,
+    upstreams: Vec<(String, String)>,
+) -> Result<Option<CheckoutPlan>, CheckoutError> {
+    for (upstream, name) in &upstreams {
+        if let Some(local) = tracking_branch(repo, upstream, name)? {
+            let target = local
+                .get()
+                .target()
+                .ok_or_else(|| git2::Error::from_str("the tracking branch points at nothing"))?;
+            let name = local.name()?.unwrap_or(name).to_owned();
+            // Already there: nothing to fast-forward.
+            if target == id {
+                return Ok(Some(CheckoutPlan::Ready(Checkout::Branch(name))));
+            }
+            let (ahead, behind) = repo.graph_ahead_behind(target, id)?;
+            if ahead > 0 {
+                return Err(CheckoutError::NotFastForward {
+                    name,
+                    upstream: upstream.clone(),
+                    ahead,
+                    behind,
+                });
+            }
+            return Ok(Some(CheckoutPlan::Ready(Checkout::FastForward {
+                name,
+                upstream: upstream.clone(),
+            })));
+        }
+    }
+    for (upstream, name) in &upstreams {
+        if !branch_exists(repo, name)? {
+            return Ok(Some(CheckoutPlan::Ready(Checkout::NewBranch {
+                name: name.clone(),
+                upstream: upstream.clone(),
+            })));
+        }
+    }
+    Ok(upstreams
+        .into_iter()
+        .next()
+        .map(|(upstream, taken)| CheckoutPlan::NeedsName { upstream, taken }))
 }
 
 /// Bring the working tree and index to a commit, refusing to overwrite
@@ -465,15 +514,27 @@ pub enum CheckoutOutcome {
 }
 
 enum Message {
+    /// The commit being checked out, once known: a branch's is looked
+    /// up when the job starts.
+    Commit(Oid),
     /// Files written so far, and files to write.
     Progress(usize, usize),
     Outcome(CheckoutOutcome),
+}
+
+/// What a job is to check out, and how.
+enum Start {
+    /// A commit, however [`Checkout::plan`] says to, or a given way.
+    Commit(Oid, Option<Checkout>),
+    /// A branch, as [`Checkout::plan_branch`] says to.
+    Branch { name: String, remote: bool },
 }
 
 /// A checkout under way in the background. [`poll`](Self::poll) takes
 /// in its progress; once it is done the outcome says how it went.
 pub struct CheckoutJob {
     receiver: Receiver<Message>,
+    commit: Option<Oid>,
     progress: Option<(usize, usize)>,
     done: Option<CheckoutOutcome>,
 }
@@ -484,7 +545,7 @@ impl CheckoutJob {
     /// says to; a plan wanting a name ends the job with
     /// [`CheckoutOutcome::NeedsName`].
     pub fn start(git_dir: &Path, id: Oid) -> Result<CheckoutJob, CheckoutError> {
-        CheckoutJob::spawn(git_dir.to_path_buf(), id, None)
+        CheckoutJob::spawn(git_dir.to_path_buf(), Start::Commit(id, None))
     }
 
     /// Start checking out `id` a given way: the plan, or a
@@ -494,14 +555,30 @@ impl CheckoutJob {
         id: Oid,
         how: Checkout,
     ) -> Result<CheckoutJob, CheckoutError> {
-        CheckoutJob::spawn(git_dir.to_path_buf(), id, Some(how))
+        CheckoutJob::spawn(git_dir.to_path_buf(), Start::Commit(id, Some(how)))
     }
 
-    fn spawn(
-        git_dir: PathBuf,
-        id: Oid,
-        how: Option<Checkout>,
+    /// Start checking out a branch, as [`Checkout::plan_branch`] says
+    /// to: a local branch (`main`), or a remote's (`origin/main`) with
+    /// `remote`. The commit it is at is looked up in the job, and
+    /// reported (see [`commit`](Self::commit)); a plan wanting a name
+    /// ends the job with [`CheckoutOutcome::NeedsName`], for
+    /// [`start_with`](Self::start_with) to go on with at that commit.
+    pub fn start_branch(
+        git_dir: &Path,
+        name: &str,
+        remote: bool,
     ) -> Result<CheckoutJob, CheckoutError> {
+        CheckoutJob::spawn(
+            git_dir.to_path_buf(),
+            Start::Branch {
+                name: name.to_owned(),
+                remote,
+            },
+        )
+    }
+
+    fn spawn(git_dir: PathBuf, start: Start) -> Result<CheckoutJob, CheckoutError> {
         let (sender, receiver) = mpsc::channel();
         thread::Builder::new()
             .name("git-checkout".to_owned())
@@ -511,15 +588,23 @@ impl CheckoutJob {
                         Ok(repo) => repo,
                         Err(err) => return CheckoutOutcome::Failed(err.into()),
                     };
-                    let how = match how {
-                        Some(how) => how,
-                        None => match Checkout::plan(&repo, id) {
-                            Ok(CheckoutPlan::Ready(how)) => how,
-                            Ok(CheckoutPlan::NeedsName { upstream, taken }) => {
-                                return CheckoutOutcome::NeedsName { upstream, taken };
-                            }
-                            Err(err) => return CheckoutOutcome::Failed(err),
-                        },
+                    let plan = match start {
+                        Start::Commit(id, Some(how)) => Ok((id, CheckoutPlan::Ready(how))),
+                        Start::Commit(id, None) => Checkout::plan(&repo, id).map(|plan| (id, plan)),
+                        Start::Branch { name, remote } => {
+                            Checkout::plan_branch(&repo, &name, remote)
+                        }
+                    };
+                    let (id, how) = match plan {
+                        Ok((id, CheckoutPlan::Ready(how))) => {
+                            let _ = sender.send(Message::Commit(id));
+                            (id, how)
+                        }
+                        Ok((id, CheckoutPlan::NeedsName { upstream, taken })) => {
+                            let _ = sender.send(Message::Commit(id));
+                            return CheckoutOutcome::NeedsName { upstream, taken };
+                        }
+                        Err(err) => return CheckoutOutcome::Failed(err),
                     };
                     let mut progress = |completed, total| {
                         let _ = sender.send(Message::Progress(completed, total));
@@ -534,6 +619,7 @@ impl CheckoutJob {
             .map_err(|err| CheckoutError::Git(git2::Error::from_str(&err.to_string())))?;
         Ok(CheckoutJob {
             receiver,
+            commit: None,
             progress: None,
             done: None,
         })
@@ -545,6 +631,7 @@ impl CheckoutJob {
         let mut changed = false;
         loop {
             match self.receiver.try_recv() {
+                Ok(Message::Commit(id)) => self.commit = Some(id),
                 Ok(Message::Progress(completed, total)) => {
                     self.progress = Some((completed, total));
                     changed = true;
@@ -566,6 +653,13 @@ impl CheckoutJob {
             }
         }
         changed
+    }
+
+    /// The commit being checked out, once the job has looked it up
+    /// (as of the last poll): the one it was started with, or the one a
+    /// branch it was started with is at.
+    pub fn commit(&self) -> Option<Oid> {
+        self.commit
     }
 
     /// How many files have been written, and how many there are to
@@ -914,6 +1008,104 @@ mod tests {
             Some("origin/feature")
         );
         assert_eq!(fs::read_to_string(t.path().join("f.txt")).unwrap(), "one\n");
+    }
+
+    #[test]
+    fn a_branch_is_checked_out_by_name() {
+        let mut t = TestRepo::new();
+        let a = t.commit(&[("f.txt", "one\n")], "One", &[]);
+        let b = t.commit(&[("f.txt", "two\n")], "Two", &[a]);
+        let c = t.commit(&[("f.txt", "three\n")], "Three", &[b]);
+        let main = head_of(&t.repo).0.unwrap();
+        // A local branch at a commit HEAD's branch is also at is still
+        // the one checked out, not HEAD's.
+        t.branch("side", c);
+        assert_eq!(
+            Checkout::plan_branch(&t.repo, "side", false).unwrap(),
+            (c, CheckoutPlan::Ready(Checkout::Branch("side".to_owned())))
+        );
+
+        // A remote's branch with no local one tracking it makes one.
+        t.remote_branch("origin", "feature", a);
+        assert_eq!(
+            Checkout::plan_branch(&t.repo, "origin/feature", true).unwrap(),
+            (
+                a,
+                CheckoutPlan::Ready(Checkout::NewBranch {
+                    name: "feature".to_owned(),
+                    upstream: "origin/feature".to_owned(),
+                })
+            )
+        );
+        // A local branch tracking it, at it already, is checked out as
+        // it is; behind it, fast-forwarded.
+        t.branch("feature", a);
+        t.repo
+            .find_branch("feature", BranchType::Local)
+            .unwrap()
+            .set_upstream(Some("origin/feature"))
+            .unwrap();
+        assert_eq!(
+            Checkout::plan_branch(&t.repo, "origin/feature", true)
+                .unwrap()
+                .1,
+            CheckoutPlan::Ready(Checkout::Branch("feature".to_owned()))
+        );
+        t.repo
+            .reference("refs/remotes/origin/feature", b, true, "t")
+            .unwrap();
+        assert_eq!(
+            Checkout::plan_branch(&t.repo, "origin/feature", true).unwrap(),
+            (
+                b,
+                CheckoutPlan::Ready(Checkout::FastForward {
+                    name: "feature".to_owned(),
+                    upstream: "origin/feature".to_owned(),
+                })
+            )
+        );
+        // Taken by a branch tracking nothing: a name is asked for.
+        t.remote_branch("origin", "side", b);
+        assert_eq!(
+            Checkout::plan_branch(&t.repo, "origin/side", true).unwrap(),
+            (
+                b,
+                CheckoutPlan::NeedsName {
+                    upstream: "origin/side".to_owned(),
+                    taken: "side".to_owned(),
+                }
+            )
+        );
+
+        // No such branch, or changes to lose, refuse.
+        assert!(matches!(
+            Checkout::plan_branch(&t.repo, "nothing", false),
+            Err(CheckoutError::Git(_))
+        ));
+        fs::write(t.path().join("f.txt"), "edited\n").unwrap();
+        assert!(matches!(
+            Checkout::plan_branch(&t.repo, "side", false),
+            Err(CheckoutError::Dirty { .. })
+        ));
+        fs::write(t.path().join("f.txt"), "three\n").unwrap();
+
+        // In the background, the commit comes back with the outcome.
+        let mut job = CheckoutJob::start_branch(t.repo.path(), "origin/feature", true).unwrap();
+        finish(&mut job);
+        assert_eq!(job.commit(), Some(b));
+        assert!(matches!(
+            job.outcome(),
+            Some(CheckoutOutcome::Done {
+                how: Checkout::FastForward { .. },
+                ..
+            })
+        ));
+        assert_eq!(head_of(&t.repo), (Some("feature".to_owned()), b, false));
+        assert_eq!(fs::read_to_string(t.path().join("f.txt")).unwrap(), "two\n");
+        let mut job = CheckoutJob::start_branch(t.repo.path(), &main, false).unwrap();
+        finish(&mut job);
+        assert_eq!(job.commit(), Some(c));
+        assert_eq!(head_of(&t.repo), (Some(main), c, false));
     }
 
     #[test]
