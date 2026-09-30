@@ -1,13 +1,13 @@
 //! NEON kernels for arm64, where Advanced SIMD is always present.
 //!
-//! Decode is a plain dot product per row, converting the f16 weights as they load. Prefill is
-//! compute-bound, so it works on tiles: a block of weight rows is converted to f32 once into a
-//! per-thread scratch buffer, packed eight rows wide so one column of the block is two
-//! vectors, and a register-blocked kernel accumulates eight rows against eight tokens as
-//! outer products, broadcasting each input value from a lane. Each accumulator then holds
+//! Decode is a plain dot product per row, converting the f16 or 8-bit weights as they load.
+//! Prefill is compute-bound, so it works on tiles: a block of weight rows is converted to f32
+//! once into a per-thread scratch buffer, packed eight rows wide so one column of the block
+//! is two vectors, and a register-blocked kernel accumulates eight rows against eight tokens
+//! as outer products, broadcasting each input value from a lane. Each accumulator then holds
 //! four adjacent outputs of one token, which store directly with no horizontal sums.
 
-use super::Matrix;
+use super::{Matrix, Weights};
 use half::f16;
 use rayon::prelude::*;
 use std::arch::aarch64::*;
@@ -47,6 +47,102 @@ pub fn dot_f16(x: &[f32], w: &[f16]) -> f32 {
         sum += x[j] * w[j].to_f32();
     }
     sum
+}
+
+/// Dot product of an f32 vector with a row of 8-bit weights, as [`super::dot_q8`]. Each
+/// group is summed unscaled and then scaled once, so the conversion is only a widening.
+pub fn dot_q8(x: &[f32], w: &[i8], scales: &[f16], group: usize) -> f32 {
+    debug_assert!(group.is_multiple_of(16) && w.len() == scales.len() * group);
+    let (xp, wp) = (x.as_ptr(), w.as_ptr());
+    unsafe {
+        let mut total = vdupq_n_f32(0.0);
+        for (g, &s) in scales.iter().enumerate() {
+            let mut acc = [vdupq_n_f32(0.0); 4];
+            let mut i = g * group;
+            let end = i + group;
+            while i < end {
+                let q = vld1q_s8(wp.add(i));
+                let (lo, hi) = (vmovl_s8(vget_low_s8(q)), vmovl_high_s8(q));
+                let f = [
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))),
+                    vcvtq_f32_s32(vmovl_high_s16(lo)),
+                    vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))),
+                    vcvtq_f32_s32(vmovl_high_s16(hi)),
+                ];
+                for (k, (a, f)) in acc.iter_mut().zip(f).enumerate() {
+                    *a = vfmaq_f32(*a, vld1q_f32(xp.add(i + 4 * k)), f);
+                }
+                i += 16;
+            }
+            let sum = vaddq_f32(vaddq_f32(acc[0], acc[1]), vaddq_f32(acc[2], acc[3]));
+            total = vfmaq_n_f32(total, sum, s.to_f32());
+        }
+        vaddvq_f32(total)
+    }
+}
+
+/// `acc + a · b`, four lanes each summing four byte products, as SDOT computes it but with
+/// widening multiplies, for cores without the dot product extension. Integer sums are exact,
+/// so both give the same result.
+#[inline(always)]
+fn sdot_widening(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    unsafe {
+        let lo = vmull_s8(vget_low_s8(a), vget_low_s8(b));
+        let hi = vmull_high_s8(a, b);
+        vaddq_s32(acc, vpadalq_s16(vpaddlq_s16(lo), hi))
+    }
+}
+
+/// Dot product of a quantized input with a row of 8-bit weights, as [`super::dot_q8q8`].
+pub fn dot_q8q8(xq: &[i8], xs: &[f32], w: &[i8], ws: &[f16], group: usize) -> f32 {
+    debug_assert!(group.is_multiple_of(16) && w.len() == ws.len() * group);
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
+        // Safety: the extension was detected.
+        unsafe { dot_q8q8_sdot(xq, xs, w, ws, group) }
+    } else {
+        dot_q8q8_with(xq, xs, w, ws, group, sdot_widening)
+    }
+}
+
+/// [`dot_q8q8`] with SDOT. The loop is instantiated inside this function so the intrinsic
+/// inlines with the extension enabled.
+///
+/// # Safety
+/// The CPU must have the dot product extension.
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_q8q8_sdot(xq: &[i8], xs: &[f32], w: &[i8], ws: &[f16], group: usize) -> f32 {
+    dot_q8q8_with(xq, xs, w, ws, group, |acc, a, b| vdotq_s32(acc, a, b))
+}
+
+#[inline(always)]
+fn dot_q8q8_with(
+    xq: &[i8],
+    xs: &[f32],
+    w: &[i8],
+    ws: &[f16],
+    group: usize,
+    dot: impl Fn(int32x4_t, int8x16_t, int8x16_t) -> int32x4_t,
+) -> f32 {
+    let (xp, wp) = (xq.as_ptr(), w.as_ptr());
+    unsafe {
+        // Groups rotate through four sums so the scaling FMAs don't form one long chain.
+        let mut total = [vdupq_n_f32(0.0); 4];
+        for (g, (&s, &x_scale)) in ws.iter().zip(xs).enumerate() {
+            let mut acc = vdupq_n_s32(0);
+            let mut i = g * group;
+            let end = i + group;
+            while i < end {
+                acc = dot(acc, vld1q_s8(wp.add(i)), vld1q_s8(xp.add(i)));
+                i += 16;
+            }
+            let t = &mut total[g % 4];
+            *t = vfmaq_n_f32(*t, vcvtq_f32_s32(acc), s.to_f32() * x_scale);
+        }
+        vaddvq_f32(vaddq_f32(
+            vaddq_f32(total[0], total[1]),
+            vaddq_f32(total[2], total[3]),
+        ))
+    }
 }
 
 /// `y += a * x`, converting `x` from f16.
@@ -227,27 +323,33 @@ const TILE_ROWS: usize = 8;
 /// the rest of the 32 NEON registers for the eight input vectors and the weights.
 const TILE_TOKENS: usize = 8;
 
-/// Converts `rows <= TILE_ROWS` f16 rows of `cols` values starting at `src` to f32, packed
-/// column by column into `dst` (`cols * TILE_ROWS` values). Missing rows are zero.
+/// Converts `rows <= TILE_ROWS` rows of `cols` values to f32, packed column by column into
+/// `dst` (`cols * TILE_ROWS` values). Missing rows are zero. `load(r, k)` gives row `r`'s
+/// values at columns `k..k + 4`, and `scalar(r, k)` its value at column `k`.
 ///
 /// # Safety
-/// `src` must hold `rows * cols` values.
-unsafe fn pack(src: *const f16, rows: usize, cols: usize, dst: &mut [f32]) {
+/// `load` must be safe to call for every `r < rows` and `k + 4 <= cols`.
+unsafe fn pack(
+    rows: usize,
+    cols: usize,
+    dst: &mut [f32],
+    load: impl Fn(usize, usize) -> float32x4_t,
+    scalar: impl Fn(usize, usize) -> f32,
+) {
     debug_assert_eq!(dst.len(), cols * TILE_ROWS);
-    let src = src as *const u16;
     let dp = dst.as_mut_ptr();
     let mut k = 0;
     if rows == TILE_ROWS {
-        // Four columns at a time: convert a 4x4 f16 block per half of the rows and transpose
-        // it so each column's four rows are one vector.
+        // Four columns at a time: convert a 4x4 block per half of the rows and transpose it
+        // so each column's four rows are one vector.
         while k + 4 <= cols {
             for half in 0..2 {
-                let load = |r: usize| unsafe {
-                    vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(
-                        src.add((4 * half + r) * cols + k),
-                    )))
-                };
-                let (r0, r1, r2, r3) = (load(0), load(1), load(2), load(3));
+                let (r0, r1, r2, r3) = (
+                    load(4 * half, k),
+                    load(4 * half + 1, k),
+                    load(4 * half + 2, k),
+                    load(4 * half + 3, k),
+                );
                 unsafe {
                     let t0 = vreinterpretq_f64_f32(vtrn1q_f32(r0, r1));
                     let t1 = vreinterpretq_f64_f32(vtrn2q_f32(r0, r1));
@@ -272,12 +374,42 @@ unsafe fn pack(src: *const f16, rows: usize, cols: usize, dst: &mut [f32]) {
     }
     for k in k..cols {
         for r in 0..TILE_ROWS {
-            dst[k * TILE_ROWS + r] = if r < rows {
-                // Safety: r < rows and k < cols.
-                f16::from_bits(unsafe { *src.add(r * cols + k) }).to_f32()
-            } else {
-                0.0
+            dst[k * TILE_ROWS + r] = if r < rows { scalar(r, k) } else { 0.0 };
+        }
+    }
+}
+
+/// Packs rows `r..r + rows` of `w` into `dst`, as [`pack`].
+///
+/// # Safety
+/// The rows must be in the matrix.
+unsafe fn pack_rows(w: &Matrix, r: usize, rows: usize, dst: &mut [f32]) {
+    let cols = w.cols;
+    match &w.data {
+        Weights::F16(data) => {
+            let src = unsafe { data.as_ptr().add(r * cols) } as *const u16;
+            let load = |r: usize, k: usize| unsafe {
+                vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(src.add(r * cols + k))))
             };
+            // Safety: r < rows and k < cols.
+            let scalar = |r: usize, k: usize| f16::from_bits(unsafe { *src.add(r * cols + k) });
+            unsafe { pack(rows, cols, dst, load, |r, k| scalar(r, k).to_f32()) }
+        }
+        Weights::Q8(q) => {
+            let groups = cols / q.group;
+            let src = unsafe { q.values.as_ptr().add(r * cols) };
+            let scales = &q.scales[r * groups..(r + rows) * groups];
+            let scale = |r: usize, k: usize| scales[r * groups + k / q.group].to_f32();
+            // Four values never straddle a group, whose size is a multiple of 16.
+            let load = |r: usize, k: usize| unsafe {
+                let bytes = vld1_lane_s32::<0>(src.add(r * cols + k) as *const i32, vdup_n_s32(0));
+                let wide = vmovl_s16(vget_low_s16(vmovl_s8(vreinterpret_s8_s32(bytes))));
+                vmulq_n_f32(vcvtq_f32_s32(wide), scale(r, k))
+            };
+            // Safety: r < rows and k < cols.
+            let scalar =
+                |r: usize, k: usize| unsafe { *src.add(r * cols + k) } as f32 * scale(r, k);
+            unsafe { pack(rows, cols, dst, load, scalar) }
         }
     }
 }
@@ -429,14 +561,7 @@ pub fn matmul(w: &Matrix, xs: &[f32], ys: &mut [f32], n: usize) {
                 {
                     let r = r0 + g * TILE_ROWS;
                     // Safety: the rows packed, at most r1 - r, are in the matrix.
-                    unsafe {
-                        pack(
-                            w.data.as_ptr().add(r * cols),
-                            TILE_ROWS.min(r1 - r),
-                            cols,
-                            packed,
-                        )
-                    };
+                    unsafe { pack_rows(w, r, TILE_ROWS.min(r1 - r), packed) };
                 }
                 for t in (t0..t1).step_by(TILE_TOKENS) {
                     let tn = TILE_TOKENS.min(t1 - t);

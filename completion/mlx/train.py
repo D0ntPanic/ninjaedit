@@ -49,7 +49,7 @@ def parse_args():
     p.add_argument("--save-every", type=int)
     p.add_argument("--resume", action="store_true", help="continue from the checkpoint in --out")
     p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32", help="compute dtype; parameters stay float32")
+    p.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16", help="compute dtype; parameters stay float32")
     p.add_argument("--no-compile", action="store_true", help="run the training step eagerly")
     args = p.parse_args()
     resolve_plan(args)

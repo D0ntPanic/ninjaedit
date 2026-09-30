@@ -1,7 +1,7 @@
 //! The model: weight loading, the forward pass over a key/value cache, and the session that
 //! keeps the cache aligned with an editor's token sequence.
 
-use crate::kernels::{Matrix, attend, matmul, matvec, rms_norm, rope, silu};
+use crate::kernels::{Matrix, Q8, Weights, attend, matmul, matvec, rms_norm, rope, silu};
 use anyhow::{Context, Result, bail};
 use half::f16;
 use half::slice::HalfFloatSliceExt;
@@ -132,11 +132,36 @@ fn read_f32(tensors: &SafeTensors, name: &str) -> Result<Vec<f32>> {
     Ok(values.into_iter().map(f16::to_f32).collect())
 }
 
-/// Loads a linear weight `[out, in]`.
+/// Loads a linear weight `[out, in]`: f16 (or converted to it), or 8-bit if the tensor is i8,
+/// with its groups' scales beside it as `.scales`.
 fn read_linear(tensors: &SafeTensors, name: &str) -> Result<Matrix> {
-    let (shape, data) = read_f16(tensors, name)?;
-    let [d_out, d_in] = shape[..] else {
+    let view = tensors
+        .tensor(name)
+        .with_context(|| format!("missing tensor {name}"))?;
+    let [d_out, d_in] = view.shape()[..] else {
         bail!("{name} is not 2-D")
+    };
+    let data = if view.dtype() == Dtype::I8 {
+        let scales_name = format!("{}.scales", name.strip_suffix(".weight").unwrap_or(name));
+        let (shape, scales) = read_f16(tensors, &scales_name)?;
+        let groups = match shape[..] {
+            [rows, groups] if rows == d_out && groups > 0 && d_in.is_multiple_of(groups) => groups,
+            _ => bail!("{scales_name} has shape {shape:?}, which does not group {name}"),
+        };
+        let group = d_in / groups;
+        if !group.is_multiple_of(Q8::GROUP_MULTIPLE) {
+            bail!(
+                "{name} is quantized in groups of {group}, not a multiple of {}",
+                Q8::GROUP_MULTIPLE
+            );
+        }
+        Weights::Q8(Q8 {
+            values: view.data().iter().map(|&b| b as i8).collect(),
+            scales,
+            group,
+        })
+    } else {
+        Weights::F16(read_f16(tensors, name)?.1)
     };
     Ok(Matrix {
         rows: d_out,
@@ -145,15 +170,30 @@ fn read_linear(tensors: &SafeTensors, name: &str) -> Result<Matrix> {
     })
 }
 
-fn stack(parts: Vec<Matrix>) -> Matrix {
+/// Stacks matrices of the same width and format.
+fn stack(parts: Vec<Matrix>) -> Result<Matrix> {
     let cols = parts[0].cols;
     let rows = parts.iter().map(|m| m.rows).sum();
-    let mut data = Vec::with_capacity(rows * cols);
+    let mut data = match &parts[0].data {
+        Weights::F16(_) => Weights::F16(Vec::with_capacity(rows * cols)),
+        Weights::Q8(q) => Weights::Q8(Q8 {
+            values: Vec::with_capacity(rows * cols),
+            scales: Vec::new(),
+            group: q.group,
+        }),
+    };
     for m in parts {
         assert_eq!(m.cols, cols);
-        data.extend_from_slice(&m.data);
+        match (&mut data, m.data) {
+            (Weights::F16(all), Weights::F16(part)) => all.extend_from_slice(&part),
+            (Weights::Q8(all), Weights::Q8(part)) if all.group == part.group => {
+                all.values.extend_from_slice(&part.values);
+                all.scales.extend_from_slice(&part.scales);
+            }
+            _ => bail!("the projections stacked together are not in the same format"),
+        }
     }
-    Matrix { rows, cols, data }
+    Ok(Matrix { rows, cols, data })
 }
 
 impl Model {
@@ -169,7 +209,7 @@ impl Model {
         let mut matrix = |rows: usize, cols: usize| Matrix {
             rows,
             cols,
-            data: (0..rows * cols).map(|_| f16::from_f32(next())).collect(),
+            data: Weights::F16((0..rows * cols).map(|_| f16::from_f32(next())).collect()),
         };
         let d = config.d_model;
         let layers = (0..config.n_layers)
@@ -203,15 +243,14 @@ impl Model {
         let bytes = fs::read(dir.join("model.safetensors"))
             .with_context(|| format!("reading weights in {}", dir.display()))?;
         let tensors = SafeTensors::deserialize(&bytes)?;
-        let (shape, values) = read_f16(&tensors, "embedding.weight")?;
-        if shape != [config.vocab_size, config.d_model] {
-            bail!("embedding shape {shape:?} does not match config");
+        let embedding = read_linear(&tensors, "embedding.weight")?;
+        if (embedding.rows, embedding.cols) != (config.vocab_size, config.d_model) {
+            bail!(
+                "embedding shape [{}, {}] does not match config",
+                embedding.rows,
+                embedding.cols
+            );
         }
-        let embedding = Matrix {
-            rows: config.vocab_size,
-            cols: config.d_model,
-            data: values,
-        };
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
             let p = |s: &str| format!("layers.{i}.{s}");
@@ -221,13 +260,13 @@ impl Model {
                     read_linear(&tensors, &p("attn.wq.weight"))?,
                     read_linear(&tensors, &p("attn.wk.weight"))?,
                     read_linear(&tensors, &p("attn.wv.weight"))?,
-                ]),
+                ])?,
                 wo: read_linear(&tensors, &p("attn.wo.weight"))?,
                 ffn_norm: read_f32(&tensors, &p("ffn_norm.weight"))?,
                 wgu: stack(vec![
                     read_linear(&tensors, &p("ffn.gate.weight"))?,
                     read_linear(&tensors, &p("ffn.up.weight"))?,
-                ]),
+                ])?,
                 wdown: read_linear(&tensors, &p("ffn.down.weight"))?,
             });
         }
@@ -288,12 +327,8 @@ impl Model {
         // Residual stream, one row per token.
         let mut x = vec![0f32; n * d];
         for (t, &tok) in tokens.iter().enumerate() {
-            for (o, &w) in x[t * d..(t + 1) * d]
-                .iter_mut()
-                .zip(self.embedding.row(tok as usize))
-            {
-                *o = w.to_f32();
-            }
+            self.embedding
+                .row_into(tok as usize, &mut x[t * d..(t + 1) * d]);
         }
         let mut h = vec![0f32; n * d];
         let mut qkv = vec![0f32; n * 3 * d];

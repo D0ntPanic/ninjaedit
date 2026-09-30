@@ -1,5 +1,6 @@
 //! AVX2 kernels for x86_64, selected at run time so one binary still runs on CPUs without
-//! them. F16C converts eight weights per instruction and FMA does the arithmetic.
+//! them. F16C converts eight f16 weights per instruction, a sign extension eight 8-bit ones,
+//! and FMA does the arithmetic.
 //!
 //! Decode is a plain dot product per row, like the NEON kernel. Prefill is compute-bound, so
 //! it works on tiles: a block of weight rows is converted to f32 once into a per-thread
@@ -7,7 +8,7 @@
 //! a time, loading each weight vector once for three tokens and each input vector once for
 //! four rows.
 
-use super::Matrix;
+use super::{Matrix, Weights};
 use half::f16;
 use rayon::prelude::*;
 use std::arch::x86_64::*;
@@ -63,6 +64,81 @@ pub unsafe fn dot_f16(x: &[f32], w: &[f16]) -> f32 {
         sum += x[j] * w[j].to_f32();
     }
     sum
+}
+
+/// Eight 8-bit values at `p`, converted.
+///
+/// # Safety
+/// The CPU must support AVX2, and the values must be readable.
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn load8_i8(p: *const i8) -> __m256 {
+    unsafe { _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(p as *const __m128i))) }
+}
+
+/// Dot product of an f32 vector with a row of 8-bit weights, as [`super::dot_q8`]. Each
+/// group is summed unscaled and then scaled once.
+///
+/// # Safety
+/// The CPU must support AVX2, FMA and F16C ([`available`]).
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn dot_q8(x: &[f32], w: &[i8], scales: &[f16], group: usize) -> f32 {
+    debug_assert!(group.is_multiple_of(16) && w.len() == scales.len() * group);
+    let (xp, wp) = (x.as_ptr(), w.as_ptr());
+    let mut total = _mm256_setzero_ps();
+    for (g, &s) in scales.iter().enumerate() {
+        let mut acc = [_mm256_setzero_ps(); 2];
+        let mut i = g * group;
+        let end = i + group;
+        unsafe {
+            while i < end {
+                for (k, a) in acc.iter_mut().enumerate() {
+                    let w = load8_i8(wp.add(i + 8 * k));
+                    *a = _mm256_fmadd_ps(_mm256_loadu_ps(xp.add(i + 8 * k)), w, *a);
+                }
+                i += 16;
+            }
+        }
+        total = _mm256_fmadd_ps(
+            _mm256_add_ps(acc[0], acc[1]),
+            _mm256_set1_ps(s.to_f32()),
+            total,
+        );
+    }
+    hsum(total)
+}
+
+/// Dot product of a quantized input with a row of 8-bit weights, as [`super::dot_q8q8`]:
+/// sixteen values at a time are sign-extended to 16 bits and multiplied and pairwise summed
+/// into 32-bit lanes, exactly.
+///
+/// # Safety
+/// The CPU must support AVX2, FMA and F16C ([`available`]).
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn dot_q8q8(xq: &[i8], xs: &[f32], w: &[i8], ws: &[f16], group: usize) -> f32 {
+    debug_assert!(group.is_multiple_of(16) && w.len() == ws.len() * group);
+    let (xp, wp) = (xq.as_ptr(), w.as_ptr());
+    let mut total = [_mm256_setzero_ps(); 2];
+    for (g, (&s, &x_scale)) in ws.iter().zip(xs).enumerate() {
+        let mut acc = _mm256_setzero_si256();
+        let mut i = g * group;
+        let end = i + group;
+        unsafe {
+            while i < end {
+                let a = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(i) as *const __m128i));
+                let b = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(i) as *const __m128i));
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(a, b));
+                i += 16;
+            }
+        }
+        let t = &mut total[g % 2];
+        *t = _mm256_fmadd_ps(
+            _mm256_cvtepi32_ps(acc),
+            _mm256_set1_ps(s.to_f32() * x_scale),
+            *t,
+        );
+    }
+    hsum(_mm256_add_ps(total[0], total[1]))
 }
 
 /// `y += a * x`, converting `x` from f16.
@@ -281,6 +357,42 @@ fn convert(src: &[f16], dst: &mut [f32]) {
     }
 }
 
+/// Converts 8-bit rows of `cols` values to f32 into `dst`, with their groups' `scales`.
+#[target_feature(enable = "avx2,fma,f16c")]
+fn convert_q8(src: &[i8], scales: &[f16], group: usize, dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), dst.len());
+    for ((src, dst), &s) in src.chunks(group).zip(dst.chunks_mut(group)).zip(scales) {
+        let sv = _mm256_set1_ps(s.to_f32());
+        // Groups are a multiple of 16 values, so of eight.
+        for (i, d) in dst.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            unsafe {
+                _mm256_storeu_ps(
+                    d.as_mut_ptr(),
+                    _mm256_mul_ps(load8_i8(src.as_ptr().add(8 * i)), sv),
+                )
+            };
+        }
+    }
+}
+
+/// Converts rows `r0..r1` of `w` to f32 into `dst`.
+#[target_feature(enable = "avx2,fma,f16c")]
+fn convert_rows(w: &Matrix, r0: usize, r1: usize, dst: &mut [f32]) {
+    let cols = w.cols;
+    match &w.data {
+        Weights::F16(data) => convert(&data[r0 * cols..r1 * cols], dst),
+        Weights::Q8(q) => {
+            let groups = cols / q.group;
+            convert_q8(
+                &q.values[r0 * cols..r1 * cols],
+                &q.scales[r0 * groups..r1 * groups],
+                q.group,
+                dst,
+            )
+        }
+    }
+}
+
 /// Weight rows per microkernel tile.
 const TILE_ROWS: usize = 4;
 /// Tokens per microkernel tile. Four rows by three tokens is twelve accumulators, which
@@ -430,7 +542,7 @@ pub unsafe fn matmul(w: &Matrix, xs: &[f32], ys: &mut [f32], n: usize) {
                 scratch.resize(row_block * cols, 0.0);
                 let block = &mut scratch[..(r1 - r0) * cols];
                 // Safety: the caller guarantees the features.
-                unsafe { convert(&w.data[r0 * cols..r1 * cols], block) };
+                unsafe { convert_rows(w, r0, r1, block) };
                 for t in (t0..t1).step_by(TILE_TOKENS) {
                     let tn = TILE_TOKENS.min(t1 - t);
                     for r in (r0..r1).step_by(TILE_ROWS) {

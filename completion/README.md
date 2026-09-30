@@ -34,12 +34,18 @@ Crates:
   and every task depends on `setup`, which runs `uv sync`. On a fresh machine,
   `mise install` once and then `mise run train -- --shape 70m`, or
   `mise run export||shapes -- <args>`; the venv and packages appear on first
-  use.
+  use. `export.py` writes float16 weights by default, or with `--dtype q8`
+  8-bit matrices with per-group scales for `infer`.
 
 * `infer` — the dedicated CPU engine, with minimal dependencies. It loads the
   f16 safetensors directly, keeps weights in f16 and converts inside the
   dot-product kernel (NEON on arm64; AVX2, FMA and F16C on x86_64, detected
-  at run time with a portable fallback). The key/value cache is f16 too: at
+  at run time with a portable fallback). It also loads 8-bit exports
+  (`export --dtype q8`): each matrix row in groups of 32 signed bytes with an
+  f16 scale, half the bytes of f16. Decode quantizes its input vector in the
+  same groups and multiplies bytes (SDOT on arm64), since converting every
+  weight to f32 costs more than the memory traffic it saves; prefill
+  converts blocks of rows to f32 as for f16. The key/value cache is f16 too: at
   full context it is read as much as the weights, and rounding it changes
   next-token distributions by a KL of about 1e-7. Inference returns a
   completion as lines, each with a confidence (geometric mean token
