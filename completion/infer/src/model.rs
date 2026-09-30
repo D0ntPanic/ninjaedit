@@ -4,6 +4,7 @@
 use crate::kernels::{Matrix, attend, matmul, matvec, rms_norm, rope, silu};
 use anyhow::{Context, Result, bail};
 use half::f16;
+use half::slice::HalfFloatSliceExt;
 use rayon::prelude::*;
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
@@ -327,14 +328,15 @@ impl Model {
                 let pos = start + t;
                 for head in 0..heads {
                     let at = slot(head, pos);
-                    k_cache[at..at + hd].copy_from_slice(&row[d + head * hd..d + (head + 1) * hd]);
+                    k_cache[at..at + hd]
+                        .convert_from_f32_slice(&row[d + head * hd..d + (head + 1) * hd]);
                     v_cache[at..at + hd]
-                        .copy_from_slice(&row[2 * d + head * hd..2 * d + (head + 1) * hd]);
+                        .convert_from_f32_slice(&row[2 * d + head * hd..2 * d + (head + 1) * hd]);
                 }
             }
             // Attention: every (token, head) pair is independent.
-            let k_cache: &[f32] = k_cache;
-            let v_cache: &[f32] = v_cache;
+            let k_cache: &[f16] = k_cache;
+            let v_cache: &[f16] = v_cache;
             let qkv_ref = &qkv;
             attn.par_chunks_mut(hd).enumerate().for_each(|(idx, out)| {
                 let (t, head) = (idx / heads, idx % heads);
@@ -475,10 +477,10 @@ fn project(w: &Matrix, xs: &[f32], ys: &mut [f32], n: usize) {
     }
 }
 
-/// Keys and values for every layer, `[n_heads, max_seq_len, head_dim]` per layer, f32.
+/// Keys and values for every layer, `[n_heads, max_seq_len, head_dim]` per layer, f16.
 pub struct KvCache {
-    k: Vec<Vec<f32>>,
-    v: Vec<Vec<f32>>,
+    k: Vec<Vec<f16>>,
+    v: Vec<Vec<f16>>,
     len: usize,
 }
 
@@ -486,13 +488,17 @@ impl KvCache {
     fn new(config: &Config) -> KvCache {
         let size = config.max_seq_len * config.d_model;
         KvCache {
-            k: (0..config.n_layers).map(|_| vec![0.0; size]).collect(),
-            v: (0..config.n_layers).map(|_| vec![0.0; size]).collect(),
+            k: (0..config.n_layers)
+                .map(|_| vec![f16::ZERO; size])
+                .collect(),
+            v: (0..config.n_layers)
+                .map(|_| vec![f16::ZERO; size])
+                .collect(),
             len: 0,
         }
     }
 
-    fn layer_mut(&mut self, layer: usize) -> (&mut [f32], &mut [f32]) {
+    fn layer_mut(&mut self, layer: usize) -> (&mut [f16], &mut [f16]) {
         (&mut self.k[layer], &mut self.v[layer])
     }
 

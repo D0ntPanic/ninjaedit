@@ -65,59 +65,26 @@ pub unsafe fn dot_f16(x: &[f32], w: &[f16]) -> f32 {
     sum
 }
 
-/// Dot product of two f32 vectors.
+/// `y += a * x`, converting `x` from f16.
 ///
 /// # Safety
-/// The CPU must support AVX2 and FMA ([`available`]).
-#[target_feature(enable = "avx2,fma")]
-pub unsafe fn dot(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let n = a.len();
-    let mut i = 0;
-    let mut acc = [_mm256_setzero_ps(); 2];
-    unsafe {
-        while i + 16 <= n {
-            for (k, acc) in acc.iter_mut().enumerate() {
-                let (x, y) = (a.as_ptr().add(i + 8 * k), b.as_ptr().add(i + 8 * k));
-                *acc = _mm256_fmadd_ps(_mm256_loadu_ps(x), _mm256_loadu_ps(y), *acc);
-            }
-            i += 16;
-        }
-        while i + 8 <= n {
-            let (x, y) = (a.as_ptr().add(i), b.as_ptr().add(i));
-            acc[0] = _mm256_fmadd_ps(_mm256_loadu_ps(x), _mm256_loadu_ps(y), acc[0]);
-            i += 8;
-        }
-    }
-    let mut sum = hsum(_mm256_add_ps(acc[0], acc[1]));
-    for j in i..n {
-        sum += a[j] * b[j];
-    }
-    sum
-}
-
-/// `y += a * x`.
-///
-/// # Safety
-/// The CPU must support AVX2 and FMA ([`available`]).
-#[target_feature(enable = "avx2,fma")]
-pub unsafe fn axpy(a: f32, x: &[f32], y: &mut [f32]) {
+/// The CPU must support AVX2, FMA and F16C ([`available`]).
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn axpy_f16(a: f32, x: &[f16], y: &mut [f32]) {
     debug_assert_eq!(x.len(), y.len());
     let n = x.len();
     let av = _mm256_set1_ps(a);
     let mut i = 0;
     unsafe {
         while i + 8 <= n {
-            let (xp, yp) = (x.as_ptr().add(i), y.as_mut_ptr().add(i));
-            _mm256_storeu_ps(
-                yp,
-                _mm256_fmadd_ps(av, _mm256_loadu_ps(xp), _mm256_loadu_ps(yp)),
-            );
+            let xv = _mm256_cvtph_ps(_mm_loadu_si128(x.as_ptr().add(i) as *const __m128i));
+            let yp = y.as_mut_ptr().add(i);
+            _mm256_storeu_ps(yp, _mm256_fmadd_ps(av, xv, _mm256_loadu_ps(yp)));
             i += 8;
         }
     }
     for j in i..n {
-        y[j] += a * x[j];
+        y[j] += a * x[j].to_f32();
     }
 }
 
@@ -214,12 +181,12 @@ pub unsafe fn softmax(x: &mut [f32]) {
 /// Attention for one query over one head's cache, as [`super::attend`].
 ///
 /// # Safety
-/// The CPU must support AVX2 and FMA ([`available`]).
-#[target_feature(enable = "avx2,fma")]
+/// The CPU must support AVX2, FMA and F16C ([`available`]).
+#[target_feature(enable = "avx2,fma,f16c")]
 pub unsafe fn attend(
     q: &[f32],
-    keys: &[f32],
-    values: &[f32],
+    keys: &[f16],
+    values: &[f16],
     scale: f32,
     scores: &mut [f32],
     out: &mut [f32],
@@ -227,7 +194,11 @@ pub unsafe fn attend(
     let hd = q.len();
     let len = scores.len();
     debug_assert!(keys.len() == len * hd && values.len() == len * hd && out.len() == hd);
-    let (qp, kp, vp) = (q.as_ptr(), keys.as_ptr(), values.as_ptr());
+    let (qp, kp, vp) = (
+        q.as_ptr(),
+        keys.as_ptr() as *const __m128i,
+        values.as_ptr() as *const __m128i,
+    );
     // Scores four keys at a time, sharing each load of the query.
     const KEYS: usize = 4;
     let mut p = 0;
@@ -238,7 +209,7 @@ pub unsafe fn attend(
             while i + 8 <= hd {
                 let qv = _mm256_loadu_ps(qp.add(i));
                 for (j, a) in acc.iter_mut().enumerate() {
-                    *a = _mm256_fmadd_ps(_mm256_loadu_ps(kp.add((p + j) * hd + i)), qv, *a);
+                    *a = _mm256_fmadd_ps(load8(kp, (p + j) * hd + i), qv, *a);
                 }
                 i += 8;
             }
@@ -246,14 +217,14 @@ pub unsafe fn attend(
         for (j, &a) in acc.iter().enumerate() {
             let mut sum = hsum(a);
             for k in i..hd {
-                sum += q[k] * keys[(p + j) * hd + k];
+                sum += q[k] * keys[(p + j) * hd + k].to_f32();
             }
             scores[p + j] = sum * scale;
         }
         p += KEYS;
     }
     for p in p..len {
-        scores[p] = unsafe { dot(q, &keys[p * hd..(p + 1) * hd]) } * scale;
+        scores[p] = unsafe { dot_f16(q, &keys[p * hd..(p + 1) * hd]) } * scale;
     }
     unsafe { softmax(scores) };
     // The weighted sum of values, a register-sized slice of the output at a time so it stays
@@ -266,9 +237,7 @@ pub unsafe fn attend(
         for (p, &w) in scores.iter().enumerate() {
             let wv = _mm256_set1_ps(w);
             for (r, a) in acc.iter_mut().enumerate() {
-                unsafe {
-                    *a = _mm256_fmadd_ps(wv, _mm256_loadu_ps(vp.add(p * hd + c + 8 * r)), *a);
-                }
+                *a = _mm256_fmadd_ps(wv, unsafe { load8(vp, p * hd + c + 8 * r) }, *a);
             }
         }
         for (r, &a) in acc.iter().enumerate() {
@@ -279,9 +248,19 @@ pub unsafe fn attend(
     if c < hd {
         out[c..].fill(0.0);
         for (p, &w) in scores.iter().enumerate() {
-            unsafe { axpy(w, &values[p * hd + c..(p + 1) * hd], &mut out[c..]) };
+            unsafe { axpy_f16(w, &values[p * hd + c..(p + 1) * hd], &mut out[c..]) };
         }
     }
+}
+
+/// The eight f16 values at element offset `i` from `p`, converted.
+///
+/// # Safety
+/// The CPU must support F16C, and the values must be readable.
+#[target_feature(enable = "avx2,f16c")]
+#[inline]
+unsafe fn load8(p: *const __m128i, i: usize) -> __m256 {
+    unsafe { _mm256_cvtph_ps(_mm_loadu_si128(p.byte_add(2 * i))) }
 }
 
 /// Converts `src` to f32 into `dst`.

@@ -49,52 +49,22 @@ pub fn dot_f16(x: &[f32], w: &[f16]) -> f32 {
     sum
 }
 
-/// Dot product of two f32 vectors.
-pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let n = a.len();
-    let mut i = 0;
-    let mut acc = [unsafe { vdupq_n_f32(0.0) }; 4];
-    unsafe {
-        while i + 16 <= n {
-            for (k, acc) in acc.iter_mut().enumerate() {
-                let (x, y) = (a.as_ptr().add(i + 4 * k), b.as_ptr().add(i + 4 * k));
-                *acc = vfmaq_f32(*acc, vld1q_f32(x), vld1q_f32(y));
-            }
-            i += 16;
-        }
-        while i + 4 <= n {
-            let (x, y) = (a.as_ptr().add(i), b.as_ptr().add(i));
-            acc[0] = vfmaq_f32(acc[0], vld1q_f32(x), vld1q_f32(y));
-            i += 4;
-        }
-    }
-    let mut sum = unsafe {
-        vaddvq_f32(vaddq_f32(
-            vaddq_f32(acc[0], acc[1]),
-            vaddq_f32(acc[2], acc[3]),
-        ))
-    };
-    for j in i..n {
-        sum += a[j] * b[j];
-    }
-    sum
-}
-
-/// `y += a * x`.
-pub fn axpy(a: f32, x: &[f32], y: &mut [f32]) {
+/// `y += a * x`, converting `x` from f16.
+pub fn axpy_f16(a: f32, x: &[f16], y: &mut [f32]) {
     debug_assert_eq!(x.len(), y.len());
     let n = x.len();
+    let xp = x.as_ptr() as *const u16;
     let mut i = 0;
     unsafe {
         while i + 4 <= n {
-            let (xp, yp) = (x.as_ptr().add(i), y.as_mut_ptr().add(i));
-            vst1q_f32(yp, vfmaq_n_f32(vld1q_f32(yp), vld1q_f32(xp), a));
+            let yp = y.as_mut_ptr().add(i);
+            let xv = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(xp.add(i))));
+            vst1q_f32(yp, vfmaq_n_f32(vld1q_f32(yp), xv, a));
             i += 4;
         }
     }
     for j in i..n {
-        y[j] += a * x[j];
+        y[j] += a * x[j].to_f32();
     }
 }
 
@@ -171,8 +141,8 @@ pub fn softmax(x: &mut [f32]) {
 /// Attention for one query over one head's cache, as [`super::attend`].
 pub fn attend(
     q: &[f32],
-    keys: &[f32],
-    values: &[f32],
+    keys: &[f16],
+    values: &[f16],
     scale: f32,
     scores: &mut [f32],
     out: &mut [f32],
@@ -180,33 +150,46 @@ pub fn attend(
     let hd = q.len();
     let len = scores.len();
     assert!(keys.len() == len * hd && values.len() == len * hd && out.len() == hd);
-    let (qp, kp, vp) = (q.as_ptr(), keys.as_ptr(), values.as_ptr());
-    // Scores four keys at a time, sharing each load of the query.
+    let (qp, kp, vp) = (
+        q.as_ptr(),
+        keys.as_ptr() as *const u16,
+        values.as_ptr() as *const u16,
+    );
+    let half = |v: uint16x8_t| unsafe {
+        (
+            vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(v))),
+            vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(v))),
+        )
+    };
+    // Scores four keys at a time, sharing each load of the query, with two accumulators per
+    // key so the eight FMA chains hide the latency.
     const KEYS: usize = 4;
     let mut p = 0;
     while p + KEYS <= len {
-        let mut acc = [unsafe { vdupq_n_f32(0.0) }; KEYS];
+        let mut acc = [[unsafe { vdupq_n_f32(0.0) }; 2]; KEYS];
         let mut i = 0;
         unsafe {
-            while i + 4 <= hd {
-                let qv = vld1q_f32(qp.add(i));
+            while i + 8 <= hd {
+                let (q0, q1) = (vld1q_f32(qp.add(i)), vld1q_f32(qp.add(i + 4)));
                 for (j, a) in acc.iter_mut().enumerate() {
-                    *a = vfmaq_f32(*a, vld1q_f32(kp.add((p + j) * hd + i)), qv);
+                    let (k0, k1) = half(vld1q_u16(kp.add((p + j) * hd + i)));
+                    a[0] = vfmaq_f32(a[0], k0, q0);
+                    a[1] = vfmaq_f32(a[1], k1, q1);
                 }
-                i += 4;
+                i += 8;
             }
         }
-        for (j, &a) in acc.iter().enumerate() {
-            let mut sum = unsafe { vaddvq_f32(a) };
+        for (j, a) in acc.iter().enumerate() {
+            let mut sum = unsafe { vaddvq_f32(vaddq_f32(a[0], a[1])) };
             for k in i..hd {
-                sum += q[k] * keys[(p + j) * hd + k];
+                sum += q[k] * keys[(p + j) * hd + k].to_f32();
             }
             scores[p + j] = sum * scale;
         }
         p += KEYS;
     }
     for p in p..len {
-        scores[p] = dot(q, &keys[p * hd..(p + 1) * hd]) * scale;
+        scores[p] = dot_f16(q, &keys[p * hd..(p + 1) * hd]) * scale;
     }
     softmax(scores);
     // The weighted sum of values, a register-sized slice of the output at a time so it stays
@@ -217,8 +200,12 @@ pub fn attend(
     while c + WIDTH <= hd {
         let mut acc = [unsafe { vdupq_n_f32(0.0) }; REGS];
         for (p, &w) in scores.iter().enumerate() {
-            for (r, a) in acc.iter_mut().enumerate() {
-                unsafe { *a = vfmaq_n_f32(*a, vld1q_f32(vp.add(p * hd + c + 4 * r)), w) };
+            for (r, a) in acc.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                let (v0, v1) = half(unsafe { vld1q_u16(vp.add(p * hd + c + 8 * r)) });
+                unsafe {
+                    a[0] = vfmaq_n_f32(a[0], v0, w);
+                    a[1] = vfmaq_n_f32(a[1], v1, w);
+                }
             }
         }
         for (r, &a) in acc.iter().enumerate() {
@@ -229,7 +216,7 @@ pub fn attend(
     if c < hd {
         out[c..].fill(0.0);
         for (p, &w) in scores.iter().enumerate() {
-            axpy(w, &values[p * hd + c..(p + 1) * hd], &mut out[c..]);
+            axpy_f16(w, &values[p * hd + c..(p + 1) * hd], &mut out[c..]);
         }
     }
 }

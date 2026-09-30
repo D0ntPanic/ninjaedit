@@ -39,9 +39,12 @@ Crates:
 * `infer` — the dedicated CPU engine, with minimal dependencies. It loads the
   f16 safetensors directly, keeps weights in f16 and converts inside the
   dot-product kernel (NEON on arm64; AVX2, FMA and F16C on x86_64, detected
-  at run time with a portable fallback). Inference returns a completion as
-  lines, each with a confidence (geometric mean token probability), the least
-  likely token's probability, and the end-of-middle probability at its end.
+  at run time with a portable fallback). The key/value cache is f16 too: at
+  full context it is read as much as the weights, and rounding it changes
+  next-token distributions by a KL of about 1e-7. Inference returns a
+  completion as lines, each with a confidence (geometric mean token
+  probability), the least likely token's probability, and the end-of-middle
+  probability at its end.
   Inference also leaves the context at the end of the kept text so accepting
   it costs nothing. The context ends at the last pre-token boundary of the
   prefix (`pretok::last_piece_start`), and whatever the user has typed past

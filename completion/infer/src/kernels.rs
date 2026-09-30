@@ -56,59 +56,29 @@ fn dot_f16_portable(x: &[f32], w: &[f16]) -> f32 {
     sum
 }
 
-/// Dot product of two f32 vectors.
-pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+/// `y += a * x`, converting `x` from f16.
+pub fn axpy_f16(a: f32, x: &[f16], y: &mut [f32]) {
     #[cfg(target_arch = "aarch64")]
-    return arm::dot(a, b);
+    return arm::axpy_f16(a, x, y);
     #[cfg(target_arch = "x86_64")]
     if x86::available() {
         // Safety: the features were detected.
-        return unsafe { x86::dot(a, b) };
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    dot_portable(a, b)
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-fn dot_portable(a: &[f32], b: &[f32]) -> f32 {
-    // Eight independent sums, which the compiler turns into vector lanes.
-    let mut acc = [0f32; 8];
-    let (ca, ra) = a.as_chunks::<8>();
-    let (cb, rb) = b.as_chunks::<8>();
-    for (x, y) in ca.iter().zip(cb) {
-        for k in 0..8 {
-            acc[k] += x[k] * y[k];
-        }
-    }
-    let mut sum: f32 = acc.iter().sum();
-    for (x, y) in ra.iter().zip(rb) {
-        sum += x * y;
-    }
-    sum
-}
-
-/// `y += a * x`.
-pub fn axpy(a: f32, x: &[f32], y: &mut [f32]) {
-    #[cfg(target_arch = "aarch64")]
-    return arm::axpy(a, x, y);
-    #[cfg(target_arch = "x86_64")]
-    if x86::available() {
-        // Safety: the features were detected.
-        return unsafe { x86::axpy(a, x, y) };
+        return unsafe { x86::axpy_f16(a, x, y) };
     }
     #[cfg(not(target_arch = "aarch64"))]
     for (y, &x) in y.iter_mut().zip(x) {
-        *y += a * x;
+        *y += a * x.to_f32();
     }
 }
 
 /// Attention for one query over one head's cache: `keys` and `values` hold `scores.len()`
-/// positions of `q.len()` values each. `scores` is scratch for the attention weights, and
-/// `out` receives the weighted sum of the values.
+/// positions of `q.len()` values each, in f16 like the weights, since at long context
+/// reading the cache costs as much as reading the weights. `scores` is scratch for the
+/// attention weights, and `out` receives the weighted sum of the values.
 pub fn attend(
     q: &[f32],
-    keys: &[f32],
-    values: &[f32],
+    keys: &[f16],
+    values: &[f16],
     scale: f32,
     scores: &mut [f32],
     out: &mut [f32],
@@ -124,12 +94,12 @@ pub fn attend(
     {
         let hd = q.len();
         for (s, k) in scores.iter_mut().zip(keys.chunks(hd)) {
-            *s = dot(q, k) * scale;
+            *s = dot_f16(q, k) * scale;
         }
         softmax(scores);
         out.fill(0.0);
         for (&w, v) in scores.iter().zip(values.chunks(hd)) {
-            axpy(w, v, out);
+            axpy_f16(w, v, out);
         }
     }
 }
@@ -285,18 +255,22 @@ mod tests {
     fn attend_matches_scalar() {
         for (hd, len) in [(64, 37), (72, 5), (20, 9), (64, 1)] {
             let q: Vec<f32> = (0..hd).map(|i| (i as f32 * 0.3).sin()).collect();
-            let keys: Vec<f32> = (0..hd * len).map(|i| (i as f32 * 0.17).cos()).collect();
-            let values: Vec<f32> = (0..hd * len).map(|i| (i as f32 * 0.05).sin()).collect();
+            let keys: Vec<f16> = (0..hd * len)
+                .map(|i| f16::from_f32((i as f32 * 0.17).cos()))
+                .collect();
+            let values: Vec<f16> = (0..hd * len)
+                .map(|i| f16::from_f32((i as f32 * 0.05).sin()))
+                .collect();
             let scale = 1.0 / (hd as f32).sqrt();
             let mut expected_scores: Vec<f32> = keys
                 .chunks(hd)
-                .map(|k| q.iter().zip(k).map(|(a, b)| a * b).sum::<f32>() * scale)
+                .map(|k| q.iter().zip(k).map(|(a, b)| a * b.to_f32()).sum::<f32>() * scale)
                 .collect();
             softmax(&mut expected_scores);
             let mut expected = vec![0f32; hd];
             for (&w, v) in expected_scores.iter().zip(values.chunks(hd)) {
                 for (o, &v) in expected.iter_mut().zip(v) {
-                    *o += w * v;
+                    *o += w * v.to_f32();
                 }
             }
             let mut scores = vec![0f32; len];
