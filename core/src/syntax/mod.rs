@@ -275,11 +275,15 @@ pub enum Language {
     Python,
     Markdown,
     CMake,
+    CSharp,
+    Java,
+    Kotlin,
+    Go,
 }
 
 impl Language {
     /// Every language, in a stable order; see [`index`](Self::index).
-    pub const ALL: [Language; 12] = [
+    pub const ALL: [Language; 16] = [
         Language::Plain,
         Language::Rust,
         Language::C,
@@ -292,6 +296,10 @@ impl Language {
         Language::Python,
         Language::Markdown,
         Language::CMake,
+        Language::CSharp,
+        Language::Java,
+        Language::Kotlin,
+        Language::Go,
     ];
 
     /// A stable small integer for the language, the inverse of
@@ -323,6 +331,10 @@ impl Language {
             "py" | "python" | "python3" => Language::Python,
             "md" | "markdown" => Language::Markdown,
             "cmake" => Language::CMake,
+            "cs" | "csharp" | "c#" => Language::CSharp,
+            "java" => Language::Java,
+            "kotlin" | "kt" | "kts" => Language::Kotlin,
+            "go" | "golang" => Language::Go,
             _ => return None,
         })
     }
@@ -358,6 +370,10 @@ impl Language {
             "py" | "pyi" | "pyw" => Language::Python,
             "md" | "markdown" | "mdown" | "mkd" | "mkdn" => Language::Markdown,
             "cmake" => Language::CMake,
+            "cs" | "csx" => Language::CSharp,
+            "java" => Language::Java,
+            "kt" | "kts" => Language::Kotlin,
+            "go" => Language::Go,
             _ => return None,
         })
     }
@@ -376,6 +392,10 @@ impl Language {
             Language::Python => "Python",
             Language::Markdown => "Markdown",
             Language::CMake => "CMake",
+            Language::CSharp => "C#",
+            Language::Java => "Java",
+            Language::Kotlin => "Kotlin",
+            Language::Go => "Go",
         }
     }
 
@@ -392,6 +412,10 @@ impl Language {
             Language::TypeScript => &clike::TYPESCRIPT,
             Language::Wgsl => &clike::WGSL,
             Language::Python => &clike::PYTHON,
+            Language::CSharp => &clike::CSHARP,
+            Language::Java => &clike::JAVA,
+            Language::Kotlin => &clike::KOTLIN,
+            Language::Go => &clike::GO,
             Language::Toml => &toml::Toml,
             Language::Json => &json::Json,
             Language::Markdown => &markdown::Markdown,
@@ -474,9 +498,29 @@ pub enum Context {
     },
     /// Inside a JavaScript template literal, outside any `${ }`.
     Template,
-    /// Inside a `${ }` in a template literal, `braces` levels of plain
-    /// braces deep.
+    /// Inside an embedded expression: a `${ }` in a template literal or
+    /// a Kotlin string, or a `{ }` in a C# interpolated string, `braces`
+    /// levels of plain braces deep. The string it is embedded in is
+    /// below it on the stack.
     TemplateExpression { braces: u8 },
+    /// Inside a C# or Kotlin string literal of a kind that has no
+    /// [`String`](Self::String) equivalent: raw, verbatim, or with
+    /// embedded expressions.
+    RichString {
+        /// The number of quotes that close the string: 1, or 3 or more
+        /// for a raw string. A run of more closes it too, the extra
+        /// quotes being part of the string.
+        quotes: u8,
+        /// Whether backslash escapes are recognized. A one-quote string
+        /// without them is a C# verbatim string, where `""` stands for a
+        /// quote and line breaks are allowed.
+        escapes: bool,
+        /// For a string with embedded expressions, the number of `$` in
+        /// its prefix, which is the number of braces that open and close
+        /// an expression in C# (Kotlin strings always have 1). 0 for a
+        /// string without them.
+        dollars: u8,
+    },
     /// Inside a bracketed value in a data file (a TOML array or inline
     /// table), where keys are not expected.
     Value { close: u8 },
@@ -668,6 +712,11 @@ mod tests {
         assert_eq!(of("README"), Some(Language::Markdown));
         assert_eq!(of("src/CMakeLists.txt"), Some(Language::CMake));
         assert_eq!(of("Find.cmake"), Some(Language::CMake));
+        assert_eq!(of("Program.cs"), Some(Language::CSharp));
+        assert_eq!(of("Main.java"), Some(Language::Java));
+        assert_eq!(of("Main.kt"), Some(Language::Kotlin));
+        assert_eq!(of("build.gradle.kts"), Some(Language::Kotlin));
+        assert_eq!(of("main.go"), Some(Language::Go));
         assert_eq!(of("Makefile"), None);
         for language in Language::ALL {
             assert_eq!(Language::from_index(language.index()), Some(language));
@@ -680,6 +729,8 @@ mod tests {
             Language::from_fence_info("Python {.x}"),
             Some(Language::Python)
         );
+        assert_eq!(Language::from_fence_info("c#"), Some(Language::CSharp));
+        assert_eq!(Language::from_fence_info("golang"), Some(Language::Go));
         assert_eq!(Language::from_fence_info(""), None);
         assert_eq!(Language::from_fence_info("text"), None);
     }

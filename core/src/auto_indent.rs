@@ -140,10 +140,13 @@ pub(crate) struct Rules {
 impl Rules {
     pub fn for_language(language: Language) -> Rules {
         use Language::*;
-        let c_like = matches!(language, Rust | C | Cpp | JavaScript | TypeScript | Wgsl);
+        let c_like = matches!(
+            language,
+            Rust | C | Cpp | JavaScript | TypeScript | Wgsl | CSharp | Java | Kotlin | Go
+        );
         let python = language == Python;
         Rules {
-            colon_scopes: python || (c_like && language != Rust),
+            colon_scopes: python || (c_like && !matches!(language, Rust | Kotlin)),
             c_like,
             python,
         }

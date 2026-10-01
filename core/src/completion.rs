@@ -899,6 +899,10 @@ fn model_language(language: Language, path: Option<&Path>) -> &'static str {
         Language::Python => "python",
         Language::Markdown => "markdown",
         Language::CMake => "cmake",
+        Language::CSharp => "csharp",
+        Language::Java => "java",
+        Language::Kotlin => "kotlin",
+        Language::Go => "go",
     }
 }
 
