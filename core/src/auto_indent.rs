@@ -38,6 +38,12 @@
 //!   `do`, one level deeper, unless the new line starts with `{`.
 //! * In Python, after `return`, `pass`, `break`, `continue`, or `raise`,
 //!   one level shallower.
+//! * In Ruby, after a line that leaves a block open (`def`, `class`,
+//!   `if`, `do`, ... without their `end`) or starts one's next part
+//!   (`else`, `when`, `rescue`, ...), one level deeper than the line. A
+//!   line ending in a binary operator continues the statement, as does
+//!   one starting with `.`; after a statement, a new line goes back to
+//!   its level, or stays level with a `.` line, as a chain may go on.
 //! * After a line ending in `\`, one level deeper than the statement on
 //!   its first continuation line, and level with the line after that.
 //! * Otherwise, level with the line (a statement may be continuing), or
@@ -49,13 +55,17 @@
 //! is typed between a pair of brackets, which puts the closing one on a
 //! line of its own. The editor also uses these rules to
 //! move a line when `{` is typed at its start (so a brace on its own line
-//! lines up with its `if`), and when `:` completes a `case` label or a
+//! lines up with its `if`), when `:` completes a `case` label or a
 //! Python `else:`, `elif`, `except`, or `finally` (which go level with the
-//! label or block they continue).
+//! label or block they continue), and when a Ruby `end`, `else`, `when`,
+//! ... is finished by the character after it (they go level with the line
+//! that opened their block). Moving a Ruby line only once its keyword is
+//! followed by something leaves `ending` and `index` alone.
 
 use crate::indent::{self, Indentation};
 use crate::syntax::{Language, Token, TokenKind};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::rc::Rc;
 
 /// How far scans go back through the buffer, in lines, before giving up
@@ -77,6 +87,23 @@ const PYTHON_CONTINUATIONS: [&[u8]; 4] = [b"else", b"elif", b"except", b"finally
 
 /// Python keywords that start a compound statement that can be continued.
 const PYTHON_COMPOUNDS: [&[u8]; 7] = [b"if", b"elif", b"else", b"for", b"while", b"try", b"except"];
+
+/// Ruby keywords that open a block closed by `end`. `if`, `unless`,
+/// `while`, and `until` only do so at the start of an expression; after
+/// one, as in `return if done`, they are modifiers.
+const RUBY_OPENERS: [&[u8]; 10] = [
+    b"def", b"class", b"module", b"if", b"unless", b"while", b"until", b"case", b"begin", b"for",
+];
+
+/// Ruby keywords that start the next part of the block above them: they
+/// go level with its opener, and their body one level deeper.
+const RUBY_CONTINUATIONS: [&[u8]; 6] = [b"else", b"elsif", b"when", b"in", b"rescue", b"ensure"];
+
+/// Whether `word` is a Ruby keyword whose line goes level with the line
+/// that opened its block: `end`, or one of [`RUBY_CONTINUATIONS`].
+pub fn is_ruby_dedenter(word: &[u8]) -> bool {
+    word == b"end" || RUBY_CONTINUATIONS.contains(&word)
+}
 
 /// Labels within a C-like `switch`.
 const CASE_LABELS: [&[u8]; 2] = [b"case", b"default"];
@@ -135,6 +162,7 @@ pub(crate) struct Rules {
     /// Statements end in `;` and control statements may omit braces.
     pub c_like: bool,
     pub python: bool,
+    pub ruby: bool,
 }
 
 impl Rules {
@@ -145,10 +173,12 @@ impl Rules {
             Rust | C | Cpp | JavaScript | TypeScript | Wgsl | CSharp | Java | Kotlin | Go
         );
         let python = language == Python;
+        let ruby = language == Ruby;
         Rules {
             colon_scopes: python || (c_like && !matches!(language, Rust | Kotlin)),
             c_like,
             python,
+            ruby,
         }
     }
 }
@@ -216,6 +246,170 @@ impl CodeLine {
             .count();
         &self.text[start..start + len]
     }
+}
+
+impl CodeLine {
+    /// The words of Ruby code before `end` that may be keywords: not a
+    /// method (`x.class`), a symbol, a variable, a hash key (`if:`), or a
+    /// name ending in `?` or `!`.
+    fn ruby_keywords(&self, end: usize) -> Vec<Range<usize>> {
+        let end = end.min(self.text.len());
+        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut words = Vec::new();
+        let mut i = 0;
+        while i < end {
+            if !self.code[i] || !is_word(self.text[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < end && is_word(self.text[i]) {
+                i += 1;
+            }
+            let before = start.checked_sub(1).map(|j| self.text[j]);
+            let after = self.text.get(i).copied();
+            let member = matches!(before, Some(b'.' | b':' | b'@' | b'$'));
+            let suffixed = matches!(after, Some(b'?' | b'!'))
+                || (after == Some(b':') && self.text.get(i + 1) != Some(&b':'));
+            if !member && !suffixed && !self.text[start].is_ascii_digit() {
+                words.push(start..i);
+            }
+        }
+        words
+    }
+
+    /// How the Ruby code before `end` nests blocks: how many blocks opened
+    /// above it its `end`s close, and how many it leaves open.
+    fn ruby_blocks(&self, end: usize) -> (usize, usize) {
+        let mut closes = 0;
+        let mut opens = 0usize;
+        // `while x do` takes a `do` of its own, which opens nothing more.
+        let mut loop_do = false;
+        for word in self.ruby_keywords(end) {
+            let w = &self.text[word.clone()];
+            if w == b"end" {
+                if opens > 0 {
+                    opens -= 1;
+                } else {
+                    closes += 1;
+                }
+            } else if w == b"do" {
+                if loop_do {
+                    loop_do = false;
+                } else {
+                    opens += 1;
+                }
+            } else if w == b"def" {
+                if !self.endless_def(word.end) {
+                    opens += 1;
+                }
+            } else if RUBY_OPENERS.contains(&w) {
+                let modifier = matches!(w, b"if" | b"unless" | b"while" | b"until")
+                    && !self.starts_expression(word.start);
+                if !modifier {
+                    opens += 1;
+                    loop_do = matches!(w, b"while" | b"until" | b"for");
+                }
+            }
+        }
+        (closes, opens)
+    }
+
+    /// Whether a Ruby word at byte `i` starts an expression, rather than
+    /// following a value as a modifier does (`x = if a` versus `x if a`).
+    fn starts_expression(&self, i: usize) -> bool {
+        let Some(p) = (0..i).rev().find(|&j| !is_blank(self.text[j])) else {
+            return true;
+        };
+        let b = self.text[p];
+        self.code[p]
+            && !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b')' | b']' | b'}' | b'?' | b'!'))
+    }
+
+    /// Whether the Ruby `def` ending at byte `after` defines an endless
+    /// method, `def name(args) = expr`, which needs no `end`.
+    fn endless_def(&self, after: usize) -> bool {
+        let text = &self.text;
+        let skip_blanks = |mut i: usize| {
+            while i < text.len() && is_blank(text[i]) {
+                i += 1;
+            }
+            i
+        };
+        // The name, which may be an operator (`==`) or a setter (`name=`).
+        let mut i = skip_blanks(after);
+        while i < text.len() && !is_blank(text[i]) && text[i] != b'(' {
+            i += 1;
+        }
+        i = skip_blanks(i);
+        if text.get(i) == Some(&b'(') {
+            let mut depth = 0;
+            loop {
+                match text.get(i) {
+                    None => return false,
+                    Some(b'(') => depth += 1,
+                    Some(b')') => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            i = skip_blanks(i + 1);
+        }
+        text.get(i) == Some(&b'=') && !matches!(text.get(i + 1), Some(b'=' | b'~' | b'>'))
+    }
+
+    /// Whether the Ruby code before `end` has a `then` with more code
+    /// after it, as in `when 1 then :one`, which finishes its part of the
+    /// block on the line.
+    fn ruby_inline_then(&self, end: usize) -> bool {
+        self.ruby_keywords(end).iter().any(|w| {
+            &self.text[w.clone()] == b"then" && self.last_code(end).is_some_and(|l| l >= w.end)
+        })
+    }
+
+    /// Whether the Ruby code before `end` ends in a binary operator or a
+    /// `.`, so the statement goes on to the next line.
+    fn ruby_continues(&self, end: usize) -> bool {
+        let Some(last) = self.last_code(end) else {
+            return false;
+        };
+        match self.text[last] {
+            b'|' => last > 0 && self.text[last - 1] == b'|',
+            b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'&' | b'<' | b'>' | b'^' | b'~' | b'.' => {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the line's code starts with `.` or `&.`, continuing a
+    /// chain of Ruby method calls.
+    fn ruby_chained(&self) -> bool {
+        self.first_code()
+            .is_some_and(|i| self.text[i..].starts_with(b".") || self.text[i..].starts_with(b"&."))
+    }
+}
+
+/// Whether `text` is just a Ruby block's parameters, `|a, b|`.
+fn is_block_params(text: &[u8]) -> bool {
+    let text = text.trim_ascii();
+    text.len() >= 2 && text.starts_with(b"|") && text.ends_with(b"|")
+}
+
+/// Whether Ruby `line` before byte `col` ends with a brace block's
+/// opening brace and parameters, as in `items.each { |x|`, so a line
+/// break before its closing brace opens the block as one right after the
+/// brace would.
+pub(crate) fn ends_with_block_params(line: &CodeLine, col: usize) -> bool {
+    (0..col)
+        .rev()
+        .find(|&i| line.code[i] && line.text[i] == b'{')
+        .is_some_and(|i| is_block_params(&line.text[i + 1..col]))
 }
 
 /// Whether a token is code, as opposed to a comment or a literal.
@@ -297,6 +491,18 @@ impl<F: FnMut(usize) -> CodeLine> Indenter<F> {
         self.line(line).leading().to_vec()
     }
 
+    /// Treat `line` as indented by `indent` from now on, for working out
+    /// the lines after it when the editor is about to reindent it.
+    pub fn set_indent(&mut self, line: usize, indent: &[u8]) {
+        let l = self.line(line);
+        let lead = l.leading().len();
+        let mut text = indent.to_vec();
+        text.extend_from_slice(&l.text[lead..]);
+        let mut code = vec![true; indent.len()];
+        code.extend_from_slice(&l.code[lead..]);
+        self.cache.insert(line, Rc::new(CodeLine { text, code }));
+    }
+
     /// One level deeper than `indent`.
     fn deeper(&self, mut indent: Vec<u8>) -> Vec<u8> {
         indent.extend_from_slice(self.indentation.unit().as_bytes());
@@ -367,6 +573,12 @@ impl<F: FnMut(usize) -> CodeLine> Indenter<F> {
     fn continued_from(&mut self, line: usize) -> Option<usize> {
         if line > 0 && self.line(line - 1).text.trim_ascii_end().ends_with(b"\\") {
             return Some(line - 1);
+        }
+        if self.rules.ruby {
+            let previous = self.previous_code_line(line)?;
+            let p = self.line(previous);
+            let continues = p.ruby_continues(p.text.len()) || self.line(line).ruby_chained();
+            return continues.then_some(previous);
         }
         if !self.rules.c_like {
             return None;
@@ -464,7 +676,12 @@ impl<F: FnMut(usize) -> CodeLine> Indenter<F> {
                     l.text.len()
                 };
                 let after = opener_col + 1..limit;
-                let block = !after.clone().any(|i| l.is_code_at(i));
+                // A Ruby brace block's parameters, as in `{ |x|`, still
+                // leave the brace opening a block.
+                let block = !after.clone().any(|i| l.is_code_at(i))
+                    || (self.rules.ruby
+                        && l.text[opener_col] == b'{'
+                        && is_block_params(&l.text[after.clone()]));
                 if block || self.style.continuation == ContinuationIndent::Indent {
                     let base = self.opener_base(opener_line, opener_col);
                     return self.deeper(base);
@@ -481,6 +698,14 @@ impl<F: FnMut(usize) -> CodeLine> Indenter<F> {
             }
             Scan::Balanced(start) => {
                 let Some(last) = current.last_code(col) else {
+                    // After a Ruby heredoc, back to the statement it is in.
+                    if self.rules.ruby
+                        && let Some(opener) = self.ruby_heredoc_opener(line)
+                    {
+                        let len = self.line(opener).text.len();
+                        let start = self.statement_start(opener, len);
+                        return self.leading(start);
+                    }
                     // Nothing but comments: keep their indentation.
                     let len = current.leading().len().min(col);
                     return current.text[..len].to_vec();
@@ -506,6 +731,9 @@ impl<F: FnMut(usize) -> CodeLine> Indenter<F> {
                 if is_scope_colon {
                     let base = self.leading(statement);
                     return self.deeper(base);
+                }
+                if self.rules.ruby {
+                    return self.ruby_newline_indent(start, statement, line, col);
                 }
                 if self.rules.python
                     && PYTHON_BLOCK_ENDERS.contains(&self.line(statement).first_word())
@@ -598,6 +826,126 @@ impl<F: FnMut(usize) -> CodeLine> Indenter<F> {
             }
         }
         None
+    }
+
+    /// The indentation for a new line after byte `col` of Ruby `line`,
+    /// balanced from `start` and continuing the statement from
+    /// `statement`, outside any bracket.
+    fn ruby_newline_indent(
+        &mut self,
+        start: usize,
+        statement: usize,
+        line: usize,
+        col: usize,
+    ) -> Vec<u8> {
+        let base = self.leading(start);
+        if self.ruby_opens_block(start, line, col) {
+            return self.deeper(base);
+        }
+        if self.line(line).ruby_continues(col) {
+            // Indent the first continuation line, keep the level of
+            // later ones.
+            return if self.continued_from(start).is_some() {
+                base
+            } else {
+                self.deeper(base)
+            };
+        }
+        // After an `end`, back to the statement its block began in, which
+        // may have started lines before the block did.
+        if self.line(start).first_word() == b"end"
+            && let Some(opener) = self.ruby_block_start(start)
+        {
+            let len = self.line(opener).text.len();
+            let opened = self.statement_start(opener, len);
+            return self.leading(opened);
+        }
+        if self.line(start).ruby_chained() {
+            base
+        } else {
+            self.leading(statement)
+        }
+    }
+
+    /// Whether the Ruby code from `start` to byte `col` of `line` leaves a
+    /// block open, or starts the next part of one (`else`, `when`, ...)
+    /// without finishing it on the line.
+    fn ruby_opens_block(&mut self, start: usize, line: usize, col: usize) -> bool {
+        let mut depth = 0usize;
+        for n in start..=line {
+            let l = self.line(n);
+            let end = if n == line { col } else { l.text.len() };
+            let (closes, opens) = l.ruby_blocks(end);
+            depth = depth.saturating_sub(closes) + opens;
+        }
+        let l = self.line(start);
+        let end = if start == line { col } else { l.text.len() };
+        depth > 0 || (RUBY_CONTINUATIONS.contains(&l.first_word()) && !l.ruby_inline_then(end))
+    }
+
+    /// When Ruby `line` is a heredoc's terminator, the line that opened
+    /// the heredoc: the nearest line above with an opener (`<<~SQL`,
+    /// `<<-'EOS'`, ...) for that terminator.
+    fn ruby_heredoc_opener(&mut self, line: usize) -> Option<usize> {
+        let l = self.line(line);
+        let tag = l.text.trim_ascii();
+        if tag.is_empty() || !tag.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
+        (line.saturating_sub(MAX_SCAN_LINES)..line)
+            .rev()
+            .find(|&n| {
+                let text = &self.line(n).text;
+                (0..text.len()).any(|i| {
+                    let Some(rest) = text[i..].strip_prefix(b"<<") else {
+                        return false;
+                    };
+                    let rest = rest
+                        .strip_prefix(b"~")
+                        .or(rest.strip_prefix(b"-"))
+                        .unwrap_or(rest);
+                    let rest = match rest.first() {
+                        Some(b'\'' | b'"' | b'`') => &rest[1..],
+                        _ => rest,
+                    };
+                    rest.strip_prefix(tag).is_some_and(|after| {
+                        after
+                            .first()
+                            .is_none_or(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
+                    })
+                })
+            })
+    }
+
+    /// The line that opened the innermost Ruby block `line` is in, as
+    /// far as `end`s go.
+    fn ruby_block_start(&mut self, line: usize) -> Option<usize> {
+        let mut depth = 0;
+        let mut current = line;
+        for _ in 0..MAX_SCAN_LINES {
+            current = self.previous_code_line(current)?;
+            let l = self.line(current);
+            let (closes, opens) = l.ruby_blocks(l.text.len());
+            if opens > depth {
+                return Some(current);
+            }
+            depth = depth - opens + closes;
+        }
+        None
+    }
+
+    /// The indentation for Ruby `line` when it starts with `end` or a
+    /// keyword that continues a block (see [`is_ruby_dedenter`]): level
+    /// with the line that opened the block. `None` when it doesn't, or
+    /// there is no such line.
+    pub fn ruby_keyword_indent(&mut self, line: usize) -> Option<Vec<u8>> {
+        if !is_ruby_dedenter(self.line(line).first_word()) {
+            return None;
+        }
+        let opener = self.ruby_block_start(line)?;
+        let len = self.line(opener).text.len();
+        let start = self.balanced_start(opener, len);
+        Some(self.leading(start))
     }
 
     /// The indentation of the previous `case` or `default` label in the

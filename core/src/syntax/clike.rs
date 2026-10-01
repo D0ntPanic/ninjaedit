@@ -1,8 +1,8 @@
 //! A table-driven lexer for languages with C-like lexical structure:
 //! identifiers, keywords, brackets, C or shell comments, quoted strings,
 //! and numbers. Rust, C, C++, JavaScript, TypeScript, WGSL, Python, C#,
-//! Java, Kotlin, and Go are all instances of it, differing in their tables
-//! and in a handful of feature flags (nested comments, raw strings,
+//! Java, Kotlin, Go, and Ruby are all instances of it, differing in their
+//! tables and in a handful of feature flags (nested comments, raw strings,
 //! template literals, ...).
 //!
 //! Identifiers are classified by their surroundings, using only the
@@ -28,7 +28,8 @@
 //!   a capitalized name in languages where that is the class imported.
 //! * A Kotlin extension's receiver (`fun Foo.bar`) is a type, and so is a
 //!   Go method's (`func (f *Foo) Bar`), the name after either being the
-//!   definition. Go's `a, b :=` defines its names.
+//!   definition; so is the name after Ruby's `def self.`. Go's `a, b :=`
+//!   defines its names, and so does a Ruby block's `|a, b|`.
 
 use super::{Context, LexState, Lexer, Token, TokenKind};
 use std::collections::HashMap;
@@ -70,6 +71,10 @@ enum RichStrings {
     /// Kotlin: every string has `$name` and `${expr}` templates, and
     /// `"""raw"""` strings have no escapes.
     Kotlin,
+    /// Ruby: strings that span lines, with `#{expr}` in `"..."` but not
+    /// `'...'`, `%w[...]` and other `%` literals, and heredocs. See
+    /// [`Context::Delimited`] and [`Context::Heredoc`].
+    Ruby,
 }
 
 /// How a language writes the receiver of a method definition.
@@ -169,6 +174,18 @@ pub(super) struct Spec {
     short_declarations: bool,
     /// `name@` is a label and `return@name` refers to one, as in Kotlin.
     at_labels: bool,
+    /// `:name` is a symbol, as in Ruby.
+    symbols: bool,
+    /// `@name`, `@@name`, and `$name` are variables, as in Ruby.
+    sigils: bool,
+    /// A method name may end in `?` or `!`, and a setter's definition in
+    /// `=`, as in Ruby.
+    method_suffixes: bool,
+    /// `=begin` and `=end` lines enclose a block comment, as in Ruby.
+    begin_end_comments: bool,
+    /// `|a, b|` after `do` or `{` defines a block's parameters, as in
+    /// Ruby.
+    block_parameters: bool,
     /// The keyword tables merged into one map, built on first use, with
     /// whether each word is a soft keyword.
     words: OnceLock<HashMap<&'static [u8], (TokenKind, bool)>>,
@@ -284,6 +301,11 @@ pub(super) static RUST: Spec = Spec {
     receivers: Receivers::None,
     short_declarations: false,
     at_labels: false,
+    symbols: false,
+    sigils: false,
+    method_suffixes: false,
+    begin_end_comments: false,
+    block_parameters: false,
     words: OnceLock::new(),
 };
 
@@ -394,6 +416,11 @@ pub(super) static C: Spec = Spec {
     receivers: Receivers::None,
     short_declarations: false,
     at_labels: false,
+    symbols: false,
+    sigils: false,
+    method_suffixes: false,
+    begin_end_comments: false,
+    block_parameters: false,
     words: OnceLock::new(),
 };
 
@@ -511,6 +538,11 @@ pub(super) static CPP: Spec = Spec {
     receivers: Receivers::None,
     short_declarations: false,
     at_labels: false,
+    symbols: false,
+    sigils: false,
+    method_suffixes: false,
+    begin_end_comments: false,
+    block_parameters: false,
     words: OnceLock::new(),
 };
 
@@ -593,6 +625,11 @@ pub(super) static JAVASCRIPT: Spec = Spec {
     receivers: Receivers::None,
     short_declarations: false,
     at_labels: false,
+    symbols: false,
+    sigils: false,
+    method_suffixes: false,
+    begin_end_comments: false,
+    block_parameters: false,
     words: OnceLock::new(),
 };
 
@@ -692,6 +729,11 @@ pub(super) static TYPESCRIPT: Spec = Spec {
     receivers: Receivers::None,
     short_declarations: false,
     at_labels: false,
+    symbols: false,
+    sigils: false,
+    method_suffixes: false,
+    begin_end_comments: false,
+    block_parameters: false,
     words: OnceLock::new(),
 };
 
@@ -820,6 +862,11 @@ pub(super) static WGSL: Spec = Spec {
     receivers: Receivers::None,
     short_declarations: false,
     at_labels: false,
+    symbols: false,
+    sigils: false,
+    method_suffixes: false,
+    begin_end_comments: false,
+    block_parameters: false,
     words: OnceLock::new(),
 };
 
@@ -888,6 +935,11 @@ pub(super) static PYTHON: Spec = Spec {
     receivers: Receivers::None,
     short_declarations: false,
     at_labels: false,
+    symbols: false,
+    sigils: false,
+    method_suffixes: false,
+    begin_end_comments: false,
+    block_parameters: false,
     words: OnceLock::new(),
 };
 
@@ -1013,6 +1065,11 @@ pub(super) static CSHARP: Spec = Spec {
     receivers: Receivers::None,
     short_declarations: false,
     at_labels: false,
+    symbols: false,
+    sigils: false,
+    method_suffixes: false,
+    begin_end_comments: false,
+    block_parameters: false,
     words: OnceLock::new(),
 };
 
@@ -1105,6 +1162,11 @@ pub(super) static JAVA: Spec = Spec {
     receivers: Receivers::None,
     short_declarations: false,
     at_labels: false,
+    symbols: false,
+    sigils: false,
+    method_suffixes: false,
+    begin_end_comments: false,
+    block_parameters: false,
     words: OnceLock::new(),
 };
 
@@ -1210,6 +1272,11 @@ pub(super) static KOTLIN: Spec = Spec {
     receivers: Receivers::Dotted,
     short_declarations: false,
     at_labels: true,
+    symbols: false,
+    sigils: false,
+    method_suffixes: false,
+    begin_end_comments: false,
+    block_parameters: false,
     words: OnceLock::new(),
 };
 
@@ -1305,6 +1372,105 @@ pub(super) static GO: Spec = Spec {
     receivers: Receivers::Parenthesized,
     short_declarations: true,
     at_labels: false,
+    symbols: false,
+    sigils: false,
+    method_suffixes: false,
+    begin_end_comments: false,
+    block_parameters: false,
+    words: OnceLock::new(),
+};
+
+pub(super) static RUBY: Spec = Spec {
+    keywords: &[
+        "alias",
+        "and",
+        "attr_accessor",
+        "attr_reader",
+        "attr_writer",
+        "begin",
+        "BEGIN",
+        "class",
+        "def",
+        "defined?",
+        "do",
+        "end",
+        "END",
+        "extend",
+        "include",
+        "module",
+        "module_function",
+        "not",
+        "or",
+        "prepend",
+        "private",
+        "private_constant",
+        "protected",
+        "public",
+        "refine",
+        "require",
+        "require_relative",
+        "self",
+        "super",
+        "undef",
+        "using",
+    ],
+    control: &[
+        "break", "case", "else", "elsif", "ensure", "for", "if", "in", "next", "raise", "redo",
+        "rescue", "retry", "return", "then", "unless", "until", "when", "while", "yield",
+    ],
+    primitives: &[],
+    constants: &[
+        "true",
+        "false",
+        "nil",
+        "__FILE__",
+        "__LINE__",
+        "__dir__",
+        "__method__",
+        "__ENCODING__",
+    ],
+    soft_keywords: &[],
+    definitions: &[
+        ("def", TokenKind::FunctionDefinition),
+        ("alias", TokenKind::FunctionDefinition),
+        ("class", TokenKind::TypeDefinition),
+        ("module", TokenKind::TypeDefinition),
+        ("for", TokenKind::VariableDefinition),
+    ],
+    line_comment: "#",
+    doc_line_comment: &[],
+    doc_block_comment: &[],
+    block_comments: false,
+    nested_comments: false,
+    single_quote: Quote::String,
+    triple_quotes: false,
+    multiline_strings: true,
+    string_prefixes: &[],
+    raw_strings: false,
+    raw_hashes: false,
+    backticks: Backticks::None,
+    rich_strings: RichStrings::Ruby,
+    regex_literals: true,
+    preprocessor: false,
+    attributes: Attributes::None,
+    macros: false,
+    scope_operator: true,
+    scope_member: TokenKind::Function,
+    scope_namespaces: false,
+    dollar_identifiers: false,
+    colon_fields: true,
+    underscore_t_types: false,
+    arrow_member: false,
+    capitalized_values: false,
+    path_types: false,
+    receivers: Receivers::Dotted,
+    short_declarations: false,
+    at_labels: false,
+    symbols: true,
+    sigils: true,
+    method_suffixes: true,
+    begin_end_comments: true,
+    block_parameters: true,
     words: OnceLock::new(),
 };
 
@@ -1356,6 +1522,11 @@ struct Line<'a> {
     /// Whether the current token is directly inside a C# interpolation
     /// hole, where a `:` starts a format string.
     format_hole: bool,
+    /// The first Ruby heredoc opened on this line, whose body starts on
+    /// the next.
+    heredoc: Option<Context>,
+    /// Whether this is inside a Ruby block's `|parameters|`.
+    block_params: bool,
 }
 
 impl Lexer for Spec {
@@ -1375,6 +1546,8 @@ impl Lexer for Spec {
             keep_pending: false,
             receiver_depth: 0,
             format_hole: false,
+            heredoc: None,
+            block_params: false,
         };
         if state.top() == Some(Context::Preprocessor) {
             state.pop();
@@ -1397,6 +1570,15 @@ impl Lexer for Spec {
                     escapes,
                     dollars,
                 }) => lx.continue_rich_string(&mut state, quotes, escapes, dollars),
+                Some(Context::Delimited {
+                    close,
+                    depth,
+                    interpolates,
+                    regex,
+                }) => lx.continue_delimited(&mut state, close, depth, interpolates, regex),
+                Some(Context::Heredoc { tag, interpolates }) => {
+                    lx.continue_heredoc(&mut state, tag, interpolates)
+                }
                 Some(Context::TemplateExpression { .. })
                 | Some(Context::Value { .. })
                 | Some(Context::Fence { .. })
@@ -1412,6 +1594,9 @@ impl Lexer for Spec {
         }
         if self.preprocessor && lx.directive && line.ends_with(b"\\") {
             state.push(Context::Preprocessor);
+        }
+        if let Some(heredoc) = lx.heredoc {
+            state.push(heredoc);
         }
         state
     }
@@ -1435,6 +1620,45 @@ fn is_screaming(word: &[u8]) -> bool {
 
 fn is_capitalized(word: &[u8]) -> bool {
     word.first().is_some_and(|b| b.is_ascii_uppercase())
+}
+
+/// Whether `line` starts with `word` followed by a space or nothing, as
+/// Ruby's `=begin` and `=end` lines do.
+fn is_line_keyword(line: &[u8], word: &[u8]) -> bool {
+    line.starts_with(word) && line.get(word.len()).is_none_or(|b| b.is_ascii_whitespace())
+}
+
+/// A hash of a Ruby heredoc's terminator, which is all of it a
+/// [`Context::Heredoc`] has room for: FNV-1a, folded to 24 bits.
+fn tag_hash(tag: &[u8]) -> [u8; 3] {
+    let mut hash: u32 = 0x811c_9dc5;
+    for &b in tag {
+        hash = (hash ^ b as u32).wrapping_mul(0x0100_0193);
+    }
+    let folded = (hash >> 24) ^ (hash & 0x00ff_ffff);
+    [folded as u8, (folded >> 8) as u8, (folded >> 16) as u8]
+}
+
+/// The bracket that closes `open`, or `open` itself if it isn't one.
+fn closing_bracket(open: u8) -> u8 {
+    match open {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        b'<' => b'>',
+        _ => open,
+    }
+}
+
+/// The bracket that `close` closes, or `close` itself if it isn't one.
+fn opening_bracket(close: u8) -> u8 {
+    match close {
+        b')' => b'(',
+        b']' => b'[',
+        b'}' => b'{',
+        b'>' => b'<',
+        _ => close,
+    }
 }
 
 /// Whether a token of `kind` is a definition of a new name.
@@ -1480,6 +1704,15 @@ impl<'a> Line<'a> {
     /// Lex the rest of a block comment. Returns whether the line goes on
     /// after it.
     fn continue_block_comment(&mut self, state: &mut LexState, doc: bool, mut depth: u8) -> bool {
+        if self.spec.begin_end_comments {
+            // The whole line is comment, through the `=end` line.
+            if is_line_keyword(self.line, b"=end") {
+                state.pop();
+            }
+            self.emit(self.pos, self.line.len(), TokenKind::Comment);
+            self.pos = self.line.len();
+            return false;
+        }
         let start = self.pos;
         let kind = if doc {
             TokenKind::DocComment
@@ -1701,6 +1934,15 @@ impl<'a> Line<'a> {
                 escapes,
                 dollars,
             }) => self.continue_rich_string(state, quotes, escapes, dollars),
+            Some(Context::Delimited {
+                close,
+                depth,
+                interpolates,
+                regex,
+            }) => self.continue_delimited(state, close, depth, interpolates, regex),
+            Some(Context::Heredoc { tag, interpolates }) => {
+                self.continue_heredoc(state, tag, interpolates)
+            }
             _ => self.continue_template(state),
         }
     }
@@ -1710,13 +1952,219 @@ impl<'a> Line<'a> {
         self.line[i..].iter().take_while(|&&c| c == b).count()
     }
 
+    /// Lex the rest of a Ruby literal; see [`Context::Delimited`]. Returns
+    /// whether the line goes on after it.
+    fn continue_delimited(
+        &mut self,
+        state: &mut LexState,
+        close: u8,
+        mut depth: u8,
+        interpolates: bool,
+        regex: bool,
+    ) -> bool {
+        let line = self.line;
+        let open = opening_bracket(close);
+        let kind = if regex {
+            TokenKind::Regex
+        } else {
+            TokenKind::String
+        };
+        let mut segment = self.pos;
+        let mut i = self.pos;
+        while i < line.len() {
+            let b = line[i];
+            if b == b'\\' {
+                // Without interpolation, only the delimiters and the
+                // backslash itself can be escaped.
+                let next = self.at(i + 1);
+                let end = if interpolates {
+                    self.escape_end(i)
+                } else if next == b'\\' || next == close || next == open {
+                    i + 2
+                } else {
+                    i += 1;
+                    continue;
+                };
+                self.emit(segment, i, kind);
+                self.emit(i, end, TokenKind::StringEscape);
+                i = end;
+                segment = end;
+                continue;
+            }
+            if b == close && (depth == 0 || open == close) {
+                let mut end = i + 1;
+                if regex {
+                    while end < line.len() && line[end].is_ascii_alphabetic() {
+                        end += 1;
+                    }
+                }
+                self.emit(segment, end, kind);
+                self.pos = end;
+                state.pop();
+                self.prev = Prev::Value;
+                self.pending = None;
+                return true;
+            }
+            if b == close {
+                depth -= 1;
+            } else if b == open && open != close {
+                depth = depth.saturating_add(1);
+            } else if interpolates && b == b'#' && self.at(i + 1) == b'{' {
+                self.emit(segment, i, kind);
+                state.replace(Context::Delimited {
+                    close,
+                    depth,
+                    interpolates,
+                    regex,
+                });
+                return self.open_embedded(state, i, i + 2);
+            }
+            i += 1;
+        }
+        self.emit(segment, line.len(), kind);
+        self.pos = line.len();
+        state.replace(Context::Delimited {
+            close,
+            depth,
+            interpolates,
+            regex,
+        });
+        false
+    }
+
+    /// Lex a line of a Ruby heredoc's body, or its terminator; see
+    /// [`Context::Heredoc`]. Returns whether the line goes on after it.
+    fn continue_heredoc(&mut self, state: &mut LexState, tag: [u8; 3], interpolates: bool) -> bool {
+        let line = self.line;
+        let trimmed = line.trim_ascii();
+        if self.pos == 0 && !trimmed.is_empty() && tag_hash(trimmed) == tag {
+            self.emit(0, line.len(), TokenKind::String);
+            self.pos = line.len();
+            state.pop();
+            return false;
+        }
+        let mut segment = self.pos;
+        let mut i = self.pos;
+        while interpolates && i < line.len() {
+            if line[i] == b'\\' {
+                let end = self.escape_end(i);
+                self.emit(segment, i, TokenKind::String);
+                self.emit(i, end, TokenKind::StringEscape);
+                i = end;
+                segment = end;
+            } else if line[i..].starts_with(b"#{") {
+                self.emit(segment, i, TokenKind::String);
+                return self.open_embedded(state, i, i + 2);
+            } else {
+                i += 1;
+            }
+        }
+        self.emit(segment, line.len(), TokenKind::String);
+        self.pos = line.len();
+        false
+    }
+
+    /// Where a Ruby method name ending at `end` really ends, with a `?` or
+    /// `!` (`empty?`, `save!`, but not `a != b` or `x ?y : z`), or the
+    /// `=` of a setter's definition (`def name=(value)`).
+    fn method_suffix_end(&self, end: usize) -> usize {
+        let next = self.at(end + 1);
+        match self.at(end) {
+            b'?' if !is_identifier_char(next, false) && next != b':' => end + 1,
+            b'!' if next != b'=' => end + 1,
+            b'=' if next == b'(' && self.pending == Some(TokenKind::FunctionDefinition) => end + 1,
+            _ => end,
+        }
+    }
+
+    /// If a Ruby string or `%` literal starts at `start`, where its body
+    /// starts and the context it is lexed in.
+    fn ruby_literal_start(&self, start: usize) -> Option<(usize, Context)> {
+        let delimited = |close, interpolates, regex| Context::Delimited {
+            close,
+            depth: 0,
+            interpolates,
+            regex,
+        };
+        match self.at(start) {
+            b @ (b'"' | b'`') => Some((start + 1, delimited(b, true, false))),
+            b'\'' => Some((start + 1, delimited(b'\'', false, false))),
+            b'%' => {
+                let letter = self.at(start + 1);
+                let (letter, at) = if letter.is_ascii_alphabetic() {
+                    (letter, start + 2)
+                } else {
+                    (0, start + 1)
+                };
+                if !matches!(
+                    letter,
+                    0 | b'q' | b'Q' | b'w' | b'W' | b'i' | b'I' | b'r' | b's' | b'x'
+                ) {
+                    return None;
+                }
+                let open = self.at(at);
+                if !open.is_ascii_punctuation() {
+                    return None;
+                }
+                // After a value, `%` is the modulo operator: `x % 2`,
+                // `count %(n)`. A method name can take a literal argument
+                // only with a letter, as in `puts %w[a b]`.
+                if self.prev == Prev::Value || (letter == 0 && self.prev == Prev::Identifier) {
+                    return None;
+                }
+                let interpolates = matches!(letter, 0 | b'Q' | b'W' | b'I' | b'r' | b'x');
+                Some((
+                    at + 1,
+                    delimited(closing_bracket(open), interpolates, letter == b'r'),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// If a Ruby heredoc opener such as `<<~SQL` or `<<-'EOS'` starts at
+    /// `start`, where it ends and the context its body is lexed in.
+    fn heredoc_start(&self, start: usize) -> Option<(usize, Context)> {
+        let line = self.line;
+        if !self.starts_with("<<")
+            || (start > 0 && !matches!(line[start - 1], b' ' | b'\t' | b'(' | b',' | b'[' | b'='))
+        {
+            return None;
+        }
+        let mut i = start + 2;
+        let indented = matches!(self.at(i), b'~' | b'-');
+        if indented {
+            i += 1;
+        }
+        let quote = self.at(i);
+        let quoted = matches!(quote, b'\'' | b'"' | b'`');
+        let tag_start = if quoted { i + 1 } else { i };
+        // A bare `<<NAME` needs a constant's name, to tell it from a shift.
+        let first = self.at(tag_start);
+        if !(quoted || indented || first.is_ascii_uppercase() || first == b'_') {
+            return None;
+        }
+        let mut end = tag_start;
+        while end < line.len() && is_identifier_char(line[end], false) {
+            end += 1;
+        }
+        if end == tag_start || (quoted && self.at(end) != quote) {
+            return None;
+        }
+        let context = Context::Heredoc {
+            tag: tag_hash(&line[tag_start..end]),
+            interpolates: quote != b'\'',
+        };
+        Some((if quoted { end + 1 } else { end }, context))
+    }
+
     /// If a string that needs a [`Context::RichString`] starts at
     /// `start`, where its body starts and the context's `quotes`,
     /// `escapes`, and `dollars`.
     fn rich_string_start(&self, start: usize) -> Option<(usize, u8, bool, u8)> {
         let count = |n: usize| n.min(u8::MAX as usize) as u8;
         match self.spec.rich_strings {
-            RichStrings::None => None,
+            RichStrings::None | RichStrings::Ruby => None,
             RichStrings::Kotlin => {
                 if self.at(start) != b'"' {
                     return None;
@@ -1949,6 +2397,15 @@ impl<'a> Line<'a> {
             && !self.saw_question;
 
         // Comments.
+        if spec.begin_end_comments && start == 0 && is_line_keyword(line, b"=begin") {
+            state.push(Context::BlockComment {
+                doc: false,
+                depth: 1,
+            });
+            self.emit(start, line.len(), TokenKind::Comment);
+            self.pos = line.len();
+            return false;
+        }
         if self.starts_with(spec.line_comment) {
             let doc = spec
                 .doc_line_comment
@@ -2057,6 +2514,71 @@ impl<'a> Line<'a> {
             _ => {}
         }
 
+        // Ruby's literals, variables, and symbols.
+        if spec.rich_strings == RichStrings::Ruby {
+            if let Some((body, context)) = self.ruby_literal_start(start) {
+                let kind = if matches!(context, Context::Delimited { regex: true, .. }) {
+                    TokenKind::Regex
+                } else {
+                    TokenKind::String
+                };
+                self.emit(start, body, kind);
+                self.pos = body;
+                state.push(context);
+                let more = self.continue_embedding(state);
+                self.merge_string_start(start);
+                return more;
+            }
+            if let Some((end, context)) = self.heredoc_start(start) {
+                self.emit(start, end, TokenKind::String);
+                self.pos = end;
+                self.heredoc.get_or_insert(context);
+                self.prev = Prev::Value;
+                self.pending = None;
+                return true;
+            }
+        }
+        if spec.sigils && matches!(b, b'@' | b'$') {
+            let mut i = start + 1;
+            if b == b'@' && self.at(i) == b'@' {
+                i += 1;
+            }
+            let name = i;
+            while i < line.len() && is_identifier_char(line[i], false) {
+                i += 1;
+            }
+            // Special globals: `$!`, `$0`, `$~`, ...
+            if i == name && b == b'$' && self.at(i).is_ascii_punctuation() {
+                i += 1;
+            }
+            if i > name && (b == b'$' || !self.at(name).is_ascii_digit()) {
+                self.emit(start, i, TokenKind::Variable);
+                self.pos = i;
+                self.prev = Prev::Value;
+                self.pending = None;
+                return true;
+            }
+        }
+        if spec.symbols
+            && b == b':'
+            && is_identifier_start(self.at(start + 1), false)
+            && (start == 0
+                || !is_identifier_char(line[start - 1], false) && line[start - 1] != b':')
+        {
+            let mut end = start + 2;
+            while end < line.len() && is_identifier_char(line[end], false) {
+                end += 1;
+            }
+            if spec.method_suffixes && matches!(self.at(end), b'?' | b'!' | b'=') {
+                end += 1;
+            }
+            self.emit(start, end, TokenKind::Constant);
+            self.pos = end;
+            self.prev = Prev::Value;
+            self.pending = None;
+            return true;
+        }
+
         // C# and Kotlin strings beyond the ordinary ones, and C# verbatim
         // identifiers such as `@class`.
         if spec.rich_strings != RichStrings::None {
@@ -2089,6 +2611,9 @@ impl<'a> Line<'a> {
             let mut end = start + 1;
             while end < line.len() && is_identifier_char(line[end], spec.dollar_identifiers) {
                 end += 1;
+            }
+            if spec.method_suffixes {
+                end = self.method_suffix_end(end);
             }
             let word = &line[start..end];
             if !spec.string_prefixes.is_empty()
@@ -2280,8 +2805,8 @@ impl<'a> Line<'a> {
         let n = self.out.len();
         if n >= 2
             && self.out[n - 2].range.start == start
-            && self.out[n - 2].kind == TokenKind::String
-            && self.out[n - 1].kind == TokenKind::String
+            && matches!(self.out[n - 2].kind, TokenKind::String | TokenKind::Regex)
+            && self.out[n - 1].kind == self.out[n - 2].kind
             && self.out[n - 1].range.start == self.out[n - 2].range.end
         {
             let end = self.out[n - 1].range.end;
@@ -2457,6 +2982,10 @@ impl<'a> Line<'a> {
                 TokenKind::Field
             }
         } else if let Some(kind) = reserved {
+            // Ruby's `def self.name`.
+            keep = spec.receivers == Receivers::Dotted
+                && self.pending == Some(TokenKind::FunctionDefinition)
+                && self.receiver_follows(end);
             prev = match kind {
                 TokenKind::Constant => Prev::Value,
                 TokenKind::Keyword | TokenKind::ControlKeyword => {
@@ -2555,6 +3084,8 @@ impl<'a> Line<'a> {
             if let Some((_, def)) = spec.definitions.iter().find(|(k, _)| k.as_bytes() == word) {
                 self.pending = Some(*def);
                 self.keep_pending = false;
+            } else if keep {
+                self.keep_pending = true;
             }
         } else if keep {
             self.keep_pending = true;
@@ -2611,6 +3142,22 @@ impl<'a> Line<'a> {
                 Some(TokenKind::Type | TokenKind::PrimitiveType)
             ) && self.out.last().is_some_and(|t| t.range.end == start);
         }
+        // A Ruby block's parameters: `do |a, b|`, `{ |x| ... }`.
+        let mut in_params = false;
+        if self.spec.block_parameters && op == b"|" {
+            if self.block_params {
+                self.block_params = false;
+            } else {
+                in_params = self.out.last().is_some_and(|t| {
+                    let text = &self.line[t.range.clone()];
+                    (t.kind == TokenKind::Keyword && text == b"do")
+                        || (t.kind == TokenKind::Punctuation && text == b"{")
+                });
+            }
+        } else {
+            in_params = self.block_params;
+        }
+        self.block_params = in_params;
         self.emit(start, start + len, kind);
         self.pos = start + len;
         self.prev = prev;
@@ -2649,6 +3196,9 @@ impl<'a> Line<'a> {
         }
         if receiver_closed {
             self.pending = Some(TokenKind::FunctionDefinition);
+        }
+        if in_params {
+            self.pending = Some(TokenKind::VariableDefinition);
         }
         true
     }
@@ -2930,6 +3480,56 @@ kkkk DDDDpt TTTp kkkkkk p iiii ottttptp p
         );
     }
 
+    #[test]
+    fn ruby() {
+        check(
+            Language::Ruby,
+            "\
+require_relative \"lib/#{name}\" # comment
+kkkkkkkkkkkkkkkk sssssppiiiips ccccccccc
+def self.build(items = [], discount: 0) = new(**opts)
+kkk kkkkpFFFFFpiiiii o ppp ddddddddo np o fffpooiiiip
+def empty? = @items.empty? && $stdout && @@count != 1
+kkk FFFFFF o $$$$$$pdddddd oo $$$$$$$ oo $$$$$$$ oo n
+attr_accessor :items; ok = x =~ /ab+c/ ? :yes : :no
+kkkkkkkkkkkkk NNNNNNp ii o i oo rrrrrr o NNNN o NNN
+words = %w[a b] + %r{^/x/(\\d+)$}i + %(a (b) c); y % 3
+iiiii o sssssss o rrrrrrrreerrrrr o ssssssssssp i o n
+@items.each { |item, i| save! unless item.valid? }
+$$$$$$pdddd p ovvvvp vo iiiii KKKKKK iiiipdddddd p
+Shop::Order.find(id)&.update(total: 0, 'k' => 'it\\'s \\n')
+ttttpptttttpffffpiipopffffffpdddddo np sss oo ssseesssssp
+
+",
+        );
+    }
+
+    #[test]
+    fn ruby_literals_carry_across_lines() {
+        // A heredoc's body starts on the next line, and ends at its
+        // terminator however it is indented.
+        let lines = lex_text(
+            Language::Ruby,
+            "x = <<~SQL.strip + 'a\n  SELECT #{id}\n  SQL\nb' + y\n=begin\nc\n=end\nd\n",
+        );
+        assert_eq!(lines[0][4].kind, TokenKind::Field);
+        assert_eq!(lines[0][6].kind, TokenKind::String);
+        assert_eq!(lines[1][1].kind, TokenKind::Punctuation);
+        assert_eq!(lines[1][2].kind, TokenKind::Identifier);
+        assert_eq!(lines[2][0].kind, TokenKind::String);
+        // The string opened on the heredoc's line resumes after it.
+        assert_eq!(lines[3][0].kind, TokenKind::String);
+        assert_eq!(lines[3].last().unwrap().kind, TokenKind::Identifier);
+        assert_eq!(lines[5][0].kind, TokenKind::Comment);
+        assert_eq!(lines[6][0].kind, TokenKind::Comment);
+        assert_eq!(lines[7][0].kind, TokenKind::Identifier);
+
+        // A  literal nests its brackets across lines.
+        let lines = lex_text(Language::Ruby, "%w[a [\nb] c] d\n");
+        assert_eq!(lines[1][0].kind, TokenKind::String);
+        assert_eq!(lines[1][1].kind, TokenKind::Identifier);
+    }
+
     /// Print the annotated lexing of a file, for eyeballing the rules on
     /// real code: `SYNTAX_FILE=src/foo.rs cargo test -p ninjaedit-core
     /// annotate_file -- --ignored --nocapture`.
@@ -3115,6 +3715,7 @@ kkkk DDDDpt TTTp kkkkkk p iiii ottttptp p
             Language::Java,
             Language::Kotlin,
             Language::Go,
+            Language::Ruby,
         ] {
             let text = "a \"b\\\"c\" 'd' /* e */ f(g) # h @i #[j] `k ${l}` /m/ 0.5e3 x::y z.w ->\n";
             for tokens in lex_text(language, text) {
@@ -3161,6 +3762,13 @@ kkkk DDDDpt TTTp kkkkkk p iiii ottttptp p
             b"func (",
             b"fun a.",
             b"x@",
+            b"%w[",
+            b"<<~",
+            b"<<~'A",
+            b":",
+            b"$",
+            b"@@",
+            b"=begin",
         ];
         for language in [
             Language::Rust,
@@ -3174,6 +3782,7 @@ kkkk DDDDpt TTTp kkkkkk p iiii ottttptp p
             Language::Java,
             Language::Kotlin,
             Language::Go,
+            Language::Ruby,
         ] {
             let lexer = language.lexer();
             for input in inputs {

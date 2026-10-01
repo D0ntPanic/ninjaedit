@@ -279,11 +279,12 @@ pub enum Language {
     Java,
     Kotlin,
     Go,
+    Ruby,
 }
 
 impl Language {
     /// Every language, in a stable order; see [`index`](Self::index).
-    pub const ALL: [Language; 16] = [
+    pub const ALL: [Language; 17] = [
         Language::Plain,
         Language::Rust,
         Language::C,
@@ -300,6 +301,7 @@ impl Language {
         Language::Java,
         Language::Kotlin,
         Language::Go,
+        Language::Ruby,
     ];
 
     /// A stable small integer for the language, the inverse of
@@ -335,6 +337,7 @@ impl Language {
             "java" => Language::Java,
             "kotlin" | "kt" | "kts" => Language::Kotlin,
             "go" | "golang" => Language::Go,
+            "ruby" | "rb" => Language::Ruby,
             _ => return None,
         })
     }
@@ -346,6 +349,7 @@ impl Language {
         let name = path.file_name()?.to_str()?;
         match name {
             "Cargo.lock" => return Some(Language::Toml),
+            "Rakefile" | "Gemfile" => return Some(Language::Ruby),
             "CMakeLists.txt" => return Some(Language::CMake),
             "README" | "CHANGELOG" | "CONTRIBUTING" | "LICENSE.md" => {
                 return Some(Language::Markdown);
@@ -374,6 +378,7 @@ impl Language {
             "java" => Language::Java,
             "kt" | "kts" => Language::Kotlin,
             "go" => Language::Go,
+            "rb" | "rake" | "gemspec" => Language::Ruby,
             _ => return None,
         })
     }
@@ -396,6 +401,7 @@ impl Language {
             Language::Java => "Java",
             Language::Kotlin => "Kotlin",
             Language::Go => "Go",
+            Language::Ruby => "Ruby",
         }
     }
 
@@ -416,6 +422,7 @@ impl Language {
             Language::Java => &clike::JAVA,
             Language::Kotlin => &clike::KOTLIN,
             Language::Go => &clike::GO,
+            Language::Ruby => &clike::RUBY,
             Language::Toml => &toml::Toml,
             Language::Json => &json::Json,
             Language::Markdown => &markdown::Markdown,
@@ -521,6 +528,22 @@ pub enum Context {
         /// string without them.
         dollars: u8,
     },
+    /// Inside a Ruby string, `%` literal, or other literal that ends at
+    /// `close`. When `close` closes a bracket, brackets of its kind nest
+    /// inside, and this is `depth` of them deep.
+    Delimited {
+        close: u8,
+        depth: u8,
+        /// Whether `#{ }` embeds an expression and all backslash escapes
+        /// are recognized, as in `"..."` but not `'...'`.
+        interpolates: bool,
+        /// Whether it is a regular expression, `%r{...}`.
+        regex: bool,
+    },
+    /// Inside the body of a Ruby heredoc, which ends at a line holding
+    /// only its terminator. The terminator itself doesn't fit in a state,
+    /// so it is known by a hash; see `clike::tag_hash`.
+    Heredoc { tag: [u8; 3], interpolates: bool },
     /// Inside a bracketed value in a data file (a TOML array or inline
     /// table), where keys are not expected.
     Value { close: u8 },
@@ -717,6 +740,8 @@ mod tests {
         assert_eq!(of("Main.kt"), Some(Language::Kotlin));
         assert_eq!(of("build.gradle.kts"), Some(Language::Kotlin));
         assert_eq!(of("main.go"), Some(Language::Go));
+        assert_eq!(of("app.rb"), Some(Language::Ruby));
+        assert_eq!(of("Gemfile"), Some(Language::Ruby));
         assert_eq!(of("Makefile"), None);
         for language in Language::ALL {
             assert_eq!(Language::from_index(language.index()), Some(language));

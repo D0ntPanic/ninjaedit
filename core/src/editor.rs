@@ -1092,9 +1092,14 @@ impl Editor {
     ///   [`auto_indent`](crate::auto_indent) module.
     /// * A `:` completing a `case` label or a Python `else:` (and the like)
     ///   moves the line level with the label or block it continues.
+    /// * Any other character finishing a Ruby `end`, `else`, `when`, ... at
+    ///   the start of a line moves the line level with the line that
+    ///   opened its block.
     fn type_code_char(&mut self, c: u8) -> bool {
         let closer = auto_indent::closer_of(c);
-        if closer.is_none() && !auto_indent::is_closer(c) && c != b':' {
+        let rules = Rules::for_language(self.language());
+        let ends_word = rules.ruby && !(c.is_ascii_alphanumeric() || c == b'_');
+        if closer.is_none() && !auto_indent::is_closer(c) && c != b':' && !ends_word {
             return false;
         }
         let line = self.buffer.line_of_offset(self.cursor);
@@ -1119,7 +1124,6 @@ impl Editor {
             Some(pending) => pending.as_bytes(),
             None => &text[..lead_len],
         };
-        let rules = Rules::for_language(self.language());
         let reindent = {
             let mut indenter = self.indenter();
             if at_line_start && auto_indent::is_closer(c) {
@@ -1128,6 +1132,8 @@ impl Editor {
                 indenter.brace_line_indent(line)
             } else if c == b':' && !at_line_start && rest_blank {
                 indenter.label_indent(line)
+            } else if ends_word && finishes_ruby_dedenter(&code_line, lead_len, col) {
+                indenter.ruby_keyword_indent(line)
             } else {
                 None
             }
@@ -1209,7 +1215,8 @@ impl Editor {
         }
         let range = self.selection().unwrap_or(self.cursor..self.cursor);
         let line = self.buffer.line_of_offset(range.start);
-        let col = range.start - self.buffer.offset_of_line(line);
+        let line_start = self.buffer.offset_of_line(line);
+        let col = range.start - line_start;
         let code_line = self.code_line(line);
         let before = &code_line.text[..col];
         let end_line = self.buffer.line_of_offset(range.end);
@@ -1217,25 +1224,50 @@ impl Editor {
             .buffer
             .bytes_in_range(range.end..self.buffer.line_content_range(end_line).end);
         let next = rest.first().copied();
+        // A Ruby `end`, `else`, ... just typed moves level with the line
+        // that opened its block, along with the line break.
+        let mut reindent = None;
         let (indent, closer_indent) = if before.iter().all(|&b| b == b' ' || b == b'\t') {
             (before.to_vec(), None)
         } else {
+            let ruby = Rules::for_language(self.language()).ruby;
             let paired = code_line.code[col - 1]
                 && next.is_some()
-                && auto_indent::closer_of(before[col - 1]) == next;
+                && (auto_indent::closer_of(before[col - 1]) == next
+                    || (ruby
+                        && next == Some(b'}')
+                        && auto_indent::ends_with_block_params(&code_line, col)));
+            let lead_len = code_line.leading().len().min(col);
             let mut indenter = self.indenter();
+            // Where the line break goes once the line is reindented.
+            let mut at = col;
+            if ruby
+                && finishes_ruby_dedenter(&code_line, lead_len, col)
+                && let Some(indent) = indenter.ruby_keyword_indent(line)
+                && indent[..] != before[..lead_len]
+            {
+                indenter.set_indent(line, &indent);
+                at = col - lead_len + indent.len();
+                let mut prefix = indent;
+                prefix.extend_from_slice(&before[lead_len..]);
+                reindent = Some(prefix);
+            }
             if paired {
-                let inner = indenter.newline_indent(line, col, None);
-                (inner, indenter.closer_indent(line, col))
+                let inner = indenter.newline_indent(line, at, None);
+                (inner, indenter.closer_indent(line, at))
             } else {
-                (indenter.newline_indent(line, col, next), None)
+                (indenter.newline_indent(line, at, next), None)
             }
         };
-        let mut inserted = eol.clone();
+        let (range, mut inserted) = match reindent {
+            Some(prefix) => (line_start..range.end, prefix),
+            None => (range, Vec::new()),
+        };
+        inserted.extend_from_slice(&eol);
         if let Some(closer_indent) = closer_indent {
+            let cursor = range.start + inserted.len();
             inserted.extend_from_slice(&eol);
             inserted.extend_from_slice(&closer_indent);
-            let cursor = range.start + eol.len();
             self.commit_with_cursor(range, inserted, EditKind::Other, cursor, None);
             self.set_pending(indent);
         } else if rest.is_empty() {
@@ -2396,6 +2428,15 @@ fn block_end(brackets: &[(usize, u8)], opener: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Whether the code of `line` before byte `col`, after its `lead_len`
+/// bytes of indentation, is just a Ruby keyword that goes level with the
+/// line that opened its block (see [`auto_indent::is_ruby_dedenter`]).
+fn finishes_ruby_dedenter(line: &CodeLine, lead_len: usize, col: usize) -> bool {
+    col > lead_len
+        && line.code[lead_len]
+        && auto_indent::is_ruby_dedenter(&line.text[lead_len..col])
 }
 
 /// Whether an opening bracket is paired when `next` follows it: at the
@@ -4334,6 +4375,132 @@ mod tests {
         let mut ed = code(Language::Markdown, "Notes:‸");
         ed.insert_char('\n');
         assert_eq!(shown(&ed), "Notes:\n‸", "not in prose");
+    }
+
+    #[test]
+    fn ruby_blocks() {
+        let mut ed = code(Language::Ruby, "‸");
+        type_str(&mut ed, "class Foo\ndef bar(x)\nif x\n");
+        assert_eq!(
+            shown(&ed),
+            "class Foo\n    def bar(x)\n        if x\n            ‸"
+        );
+        type_str(&mut ed, "a\nelse\n");
+        assert_eq!(
+            shown(&ed),
+            "class Foo\n    def bar(x)\n        if x\n            a\n        else\n            ‸",
+            "`else` goes level with its `if` when the line is broken"
+        );
+        type_str(&mut ed, "b\nend\nend\n");
+        assert_eq!(
+            shown(&ed),
+            "class Foo\n    def bar(x)\n        if x\n            a\n        else\n            b\n        end\n    end\n    ‸"
+        );
+        ed.undo();
+        assert_eq!(
+            shown(&ed),
+            "class Foo\n    def bar(x)\n        if x\n            a\n        else\n            b\n        end\n        end‸",
+            "moving `end` is part of the line break's undo step"
+        );
+
+        // A keyword finished by a space, or by a `.`, moves too.
+        let mut ed = code(Language::Ruby, "‸");
+        type_str(&mut ed, "case x\nwhen 1\n:one\nwhen 2 then :two\n");
+        assert_eq!(
+            shown(&ed),
+            "case x\nwhen 1\n    :one\nwhen 2 then :two\n‸",
+            "`when` goes level with `case`, and `then` finishes it"
+        );
+        let mut ed = code(Language::Ruby, "x = items.map do |i|\n    i * 2\n    ‸");
+        type_str(&mut ed, "end.sum");
+        assert_eq!(shown(&ed), "x = items.map do |i|\n    i * 2\nend.sum‸");
+
+        let mut ed = code(Language::Ruby, "‸");
+        type_str(
+            &mut ed,
+            "def f\nbegin\nrun\nrescue => e\nlog e\nensure\nclose\nend\nend\n",
+        );
+        assert_eq!(
+            shown(&ed),
+            "def f\n    begin\n        run\n    rescue => e\n        log e\n    ensure\n        close\n    end\nend\n‸"
+        );
+        let mut ed = code(Language::Ruby, "‸");
+        type_str(
+            &mut ed,
+            "if a\nx\nelsif b\ny\nend\ncase v\nin [a, b]\nz\nend\n",
+        );
+        assert_eq!(
+            shown(&ed),
+            "if a\n    x\nelsif b\n    y\nend\ncase v\nin [a, b]\n    z\nend\n‸"
+        );
+        let mut ed = code(Language::Ruby, "‸");
+        type_str(
+            &mut ed,
+            "class << self\nprivate def g(a, b)\nsql = <<~SQL\nend\nSQL\nend\n",
+        );
+        assert_eq!(
+            shown(&ed),
+            "class << self\n    private def g(a, b)\n        sql = <<~SQL\n            end\n            SQL\n    end\n    ‸",
+            "an `end` in a heredoc is text"
+        );
+        let mut ed = code(Language::Ruby, "def f\n    ‸");
+        type_str(&mut ed, "items.each { |x|\np x");
+        assert_eq!(
+            shown(&ed),
+            "def f\n    items.each { |x|\n        p x‸\n    }",
+            "a brace block's parameters still open it"
+        );
+
+        // Longer words that start like keywords stay put.
+        let mut ed = code(Language::Ruby, "def f\n    ‸");
+        type_str(&mut ed, "ending = 1\nindex = 2");
+        assert_eq!(shown(&ed), "def f\n    ending = 1\n    index = 2‸");
+    }
+
+    #[test]
+    fn ruby_lines_that_open_nothing() {
+        let mut ed = code(Language::Ruby, "def f\n    ‸");
+        type_str(&mut ed, "return if done\nputs x unless y\nz = a while b\n");
+        assert_eq!(
+            shown(&ed),
+            "def f\n    return if done\n    puts x unless y\n    z = a while b\n    ‸",
+            "modifiers open no block"
+        );
+        type_str(&mut ed, "def g = 1\nif a then b end\ny = foo.class\n");
+        assert_eq!(
+            shown(&ed),
+            "def f\n    return if done\n    puts x unless y\n    z = a while b\n    def g = 1\n    if a then b end\n    y = foo.class\n    ‸",
+            "nor endless methods, one-line blocks, or method calls named like keywords"
+        );
+
+        // But an `if` that starts an expression does, and `while ... do`
+        // opens one block, not two.
+        let mut ed = code(Language::Ruby, "‸");
+        type_str(&mut ed, "x = if a\n1\nend\nwhile b do\n");
+        assert_eq!(shown(&ed), "x = if a\n    1\nend\nwhile b do\n    ‸");
+    }
+
+    #[test]
+    fn ruby_continuations() {
+        let mut ed = code(Language::Ruby, "‸");
+        type_str(&mut ed, "total = a +\nb +\nc\n");
+        assert_eq!(
+            shown(&ed),
+            "total = a +\n    b +\n    c\n‸",
+            "a trailing operator continues the statement"
+        );
+        type_str(&mut ed, "items\n.map { |x| x }\n");
+        assert_eq!(
+            shown(&ed),
+            "total = a +\n    b +\n    c\nitems\n.map { |x| x }\n‸",
+            "a chain may go on"
+        );
+        let mut ed = code(Language::Ruby, "items\n    .each do |x|‸");
+        type_str(&mut ed, "\np x\nend\n");
+        assert_eq!(
+            shown(&ed),
+            "items\n    .each do |x|\n        p x\n    end\n‸"
+        );
     }
 
     #[test]

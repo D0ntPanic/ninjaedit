@@ -903,6 +903,7 @@ fn model_language(language: Language, path: Option<&Path>) -> &'static str {
         Language::Java => "java",
         Language::Kotlin => "kotlin",
         Language::Go => "go",
+        Language::Ruby => "ruby",
     }
 }
 
