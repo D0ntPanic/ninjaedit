@@ -121,7 +121,9 @@
 //! full, or typed through to its end, the next completion is asked for.
 //! A suggestion never goes past the end of the scope the cursor is in,
 //! so it can't propose a closing bracket that pairing has already typed
-//! (see [`Editor::offer_completion`]).
+//! (see [`Editor::offer_completion`]). Nor, when editing in the middle
+//! of a line, does it go on to propose again what the line already has
+//! after the cursor.
 //!
 //! A completion comes with how much of it the model is sure enough of
 //! to offer (see [`ConfidenceThresholds`](crate::ConfidenceThresholds)),
@@ -282,6 +284,25 @@ enum ScopeEnd<'a> {
     /// It ends before the closing bracket of the scope, which the buffer
     /// has next; the whitespace is what it put before its own.
     BeforeCloser(&'a str),
+    /// It ends where it would go on to repeat the rest of the cursor's
+    /// line, or close a bracket the rest of the line closes; any
+    /// whitespace it ends with goes before the rest of the line.
+    BeforeLineRest,
+}
+
+/// The rest of the cursor's line after the cursor, when there is more to
+/// it than whitespace, for telling where a suggestion starts to repeat
+/// it; see [`Editor::offer_completion`].
+struct LineRest {
+    /// Its tokens, as [`tokens_of`] splits it.
+    tokens: Vec<Vec<u8>>,
+    /// Whether its first token is code, rather than part of a comment or
+    /// a string.
+    first_is_code: bool,
+    /// Whether it starts with whitespace.
+    spaced: bool,
+    /// Whether it closes the bracket the cursor is in.
+    closes_scope: bool,
 }
 
 /// The layout of one line's content: its characters with their byte ranges
@@ -1937,6 +1958,18 @@ impl Editor {
     /// would double it; otherwise it ends with it. Brackets in strings
     /// and comments don't count.
     ///
+    /// When the cursor's line goes on after it, as when fixing up a name
+    /// in the middle of a line, the model tends to propose the rest of
+    /// the line again along with its fix. So a suggestion ends where it
+    /// would start to repeat the rest of the line: where, outside
+    /// brackets of its own, its tokens go on with all of the line's
+    /// (whatever the spacing), or failing that, with the first of them,
+    /// as with `std` proposed as `td::string& name)` before
+    /// `::string& name)`, or `line` as `ine in lines:` before
+    /// ` in lines:`. If the rest of the line closes the bracket the
+    /// cursor is in, the suggestion ends before closing it too, even
+    /// when it doesn't close it next.
+    ///
     /// A suggestion whose first line ends by opening a block that Tab
     /// would pair (see [`accept_suggestion`](Self::accept_suggestion))
     /// ends with that block: once the first line is taken, the rest is
@@ -1992,12 +2025,16 @@ impl Editor {
         before_closer: Option<String>,
         accepted_line: bool,
     ) -> Option<Suggestion> {
-        let brackets = self.brackets_of_insertion(text);
-        let (kept, end) = self.scope_end(text, &brackets);
-        let mut kept = kept.trim_end();
+        let code = self.code_of_insertion(text);
+        let brackets = brackets_in(text, &code);
+        let (kept, end) = self.scope_end(text, &code, &brackets);
+        // Whitespace before the rest of the line is kept: it goes between
+        // the suggestion and the text after it.
+        let before_rest = matches!(end, ScopeEnd::BeforeLineRest);
+        let mut kept = if before_rest { kept } else { kept.trim_end() };
         let mut before_closer = match end {
             ScopeEnd::Open => before_closer,
-            ScopeEnd::Closed => None,
+            ScopeEnd::Closed | ScopeEnd::BeforeLineRest => None,
             ScopeEnd::BeforeCloser(whitespace) => Some(whitespace.to_owned()),
         };
         let first_end = first_line_end(kept);
@@ -2009,8 +2046,12 @@ impl Editor {
             kept = &kept[..=end];
             before_closer = None;
         }
-        let offered = kept[..offered.min(kept.len())].trim_end().len();
-        (!kept.is_empty()).then(|| Suggestion {
+        let offered = if before_rest && offered >= kept.len() {
+            kept.len()
+        } else {
+            kept[..offered.min(kept.len())].trim_end().len()
+        };
+        (!kept.trim_end().is_empty()).then(|| Suggestion {
             text: kept.to_owned(),
             offered,
             accepted_line,
@@ -2019,9 +2060,16 @@ impl Editor {
     }
 
     /// The part of `text`, proposed at the cursor, within the cursor's
-    /// scope, and how it ends. `brackets` are its brackets, as
-    /// [`brackets_of_insertion`](Self::brackets_of_insertion) finds them.
-    fn scope_end<'a>(&self, text: &'a str, brackets: &[(usize, u8)]) -> (&'a str, ScopeEnd<'a>) {
+    /// scope and short of the rest of the cursor's line, and how it ends.
+    /// `code` and `brackets` are which of its bytes are code and its
+    /// brackets, as [`code_of_insertion`](Self::code_of_insertion) and
+    /// [`brackets_in`] find them.
+    fn scope_end<'a>(
+        &self,
+        text: &'a str,
+        code: &[bool],
+        brackets: &[(usize, u8)],
+    ) -> (&'a str, ScopeEnd<'a>) {
         let mut depth = 0usize;
         let mut closer = None;
         for &(at, b) in brackets {
@@ -2034,6 +2082,19 @@ impl Editor {
                 depth -= 1;
             }
         }
+        let rest = self.line_rest();
+        if let Some(rest) = &rest
+            && let Some(at) = repeat_of_line_rest(text, code, brackets, closer, rest)
+        {
+            let kept = &text[..at];
+            let trimmed = kept.trim_end();
+            let spacing = &kept[trimmed.len()..];
+            return if rest.spaced || spacing.contains('\n') {
+                (trimmed, ScopeEnd::BeforeLineRest)
+            } else {
+                (kept, ScopeEnd::BeforeLineRest)
+            };
+        }
         let Some(closer) = closer else {
             return (text, ScopeEnd::Open);
         };
@@ -2041,15 +2102,60 @@ impl Editor {
         if next == Some(text.as_bytes()[closer]) {
             let kept = text[..closer].trim_end();
             (kept, ScopeEnd::BeforeCloser(&text[kept.len()..closer]))
+        } else if rest.is_some_and(|rest| rest.closes_scope) {
+            (text[..closer].trim_end(), ScopeEnd::BeforeLineRest)
         } else {
             (&text[..=closer], ScopeEnd::Closed)
         }
+    }
+
+    /// The rest of the cursor's line after the cursor, if there is more
+    /// to it than whitespace.
+    fn line_rest(&self) -> Option<LineRest> {
+        let line = self.buffer.line_of_offset(self.cursor);
+        let content = self.buffer.line_content_range(line);
+        let start = self.cursor.clamp(content.start, content.end) - content.start;
+        let tokens = self.highlighter.tokens(&self.buffer, line);
+        let code_line = CodeLine::new(self.buffer.bytes_in_range(content), &tokens);
+        let rest = &code_line.text[start..];
+        let code = &code_line.code[start..];
+        let ranges = tokens_of(rest);
+        let first = ranges.first()?;
+        let mut depth = 0usize;
+        let closes_scope = rest.iter().zip(code).any(|(&b, &code)| {
+            if !code {
+                false
+            } else if auto_indent::closer_of(b).is_some() {
+                depth += 1;
+                false
+            } else if auto_indent::is_closer(b) {
+                let closes = depth == 0;
+                depth = depth.saturating_sub(1);
+                closes
+            } else {
+                false
+            }
+        });
+        Some(LineRest {
+            tokens: ranges.iter().map(|r| rest[r.clone()].to_vec()).collect(),
+            first_is_code: code[first.start],
+            spaced: rest[0].is_ascii_whitespace(),
+            closes_scope,
+        })
     }
 
     /// The brackets in code in `text`, about to be inserted at the
     /// cursor, with their offsets in it, as the text before the cursor
     /// on its line (and pending indentation) would have them lexed.
     fn brackets_of_insertion(&self, text: &str) -> Vec<(usize, u8)> {
+        brackets_in(text, &self.code_of_insertion(text))
+    }
+
+    /// Which bytes of `text`, about to be inserted at the cursor, are
+    /// code rather than part of a comment or a string, as the text
+    /// before the cursor on its line (and pending indentation) would
+    /// have them lexed. Line breaks count as not code.
+    fn code_of_insertion(&self, text: &str) -> Vec<bool> {
         let line = self.buffer.line_of_offset(self.cursor);
         let start = self.buffer.offset_of_line(line);
         let mut first = self.buffer.bytes_in_range(start..self.cursor);
@@ -2064,21 +2170,15 @@ impl Editor {
         let tokens = self
             .highlighter
             .tokens_of_lines(&self.buffer, line, &contents);
-        let mut brackets = Vec::new();
-        let mut at = 0; // offset in `text` of the current line
+        let mut code = Vec::with_capacity(text.len());
         for (n, (content, tokens)) in lines.into_iter().zip(&tokens).enumerate() {
-            let skip = if n == 0 { first_offset } else { 0 };
-            let code_line = CodeLine::new(content, tokens);
-            for i in skip..code_line.text.len() {
-                let b = code_line.text[i];
-                let bracket = auto_indent::closer_of(b).is_some() || auto_indent::is_closer(b);
-                if bracket && code_line.code[i] {
-                    brackets.push((at + i - skip, b));
-                }
+            if n > 0 {
+                code.push(false);
             }
-            at += code_line.text.len() - skip + 1;
+            let skip = if n == 0 { first_offset } else { 0 };
+            code.extend_from_slice(&CodeLine::new(content, tokens).code[skip..]);
         }
-        brackets
+        code
     }
 
     /// The offset and byte of the first text after the cursor other than
@@ -2411,8 +2511,6 @@ fn text_of(bytes: &[u8]) -> String {
     }
 }
 
-/// Where the first line of a suggestion ends: at its first line break
-/// after any it begins with, or at its end.
 /// The offset of the closing bracket that matches the opening one at
 /// `opener`, among `brackets` (offsets and bytes, in order).
 fn block_end(brackets: &[(usize, u8)], opener: usize) -> Option<usize> {
@@ -2439,6 +2537,148 @@ fn finishes_ruby_dedenter(line: &CodeLine, lead_len: usize, col: usize) -> bool 
         && auto_indent::is_ruby_dedenter(&line.text[lead_len..col])
 }
 
+fn is_bracket(b: u8) -> bool {
+    auto_indent::closer_of(b).is_some() || auto_indent::is_closer(b)
+}
+
+/// The brackets in `text` with their offsets in it, among the bytes
+/// `code` says are code.
+fn brackets_in(text: &str, code: &[bool]) -> Vec<(usize, u8)> {
+    text.bytes()
+        .zip(code)
+        .enumerate()
+        .filter(|&(_, (b, &code))| code && is_bracket(b))
+        .map(|(at, (b, _))| (at, b))
+        .collect()
+}
+
+/// The kinds of [`tokens_of`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenClass {
+    Space,
+    /// Identifier characters, which run together.
+    Word,
+    /// Operator characters, which run together.
+    Operator,
+    /// Brackets, separators and quotes, each a token of its own.
+    Single,
+}
+
+fn token_class(b: u8) -> TokenClass {
+    match b {
+        b if b.is_ascii_whitespace() => TokenClass::Space,
+        b if b == b'_' || b.is_ascii_alphanumeric() || !b.is_ascii() => TokenClass::Word,
+        b'(' | b')' | b'[' | b']' | b'{' | b'}' | b',' | b';' | b'"' | b'\'' | b'`' => {
+            TokenClass::Single
+        }
+        _ => TokenClass::Operator,
+    }
+}
+
+/// The byte ranges of the tokens in `text`, roughly as code is split
+/// into them, for comparing a suggestion with text the buffer has
+/// regardless of spacing: runs of identifier characters, runs of
+/// operator characters, and single brackets, separators and quotes.
+/// Whitespace separates tokens but isn't one.
+fn tokens_of(text: &[u8]) -> Vec<Range<usize>> {
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        let class = token_class(text[i]);
+        let start = i;
+        i += 1;
+        if matches!(class, TokenClass::Word | TokenClass::Operator) {
+            while i < text.len() && token_class(text[i]) == class {
+                i += 1;
+            }
+        }
+        if class != TokenClass::Space {
+            tokens.push(start..i);
+        }
+    }
+    tokens
+}
+
+/// Where `text`, proposed at the cursor, starts to repeat `rest`, the
+/// rest of the cursor's line, if it does: the first place, outside
+/// brackets of its own and before `closer` (where it closes the
+/// cursor's scope), where its tokens go on with all of the tokens of
+/// `rest`, or failing that, with the first of them, if that is code.
+/// Either way, the repeat must be code just where `rest` is, so that,
+/// say, a comma in a string doesn't count. `code` and `brackets` are as
+/// for [`Editor::scope_end`].
+///
+/// The whole of `rest` may start partway through an identifier, as when
+/// the cursor is in the middle of one being fixed up; just its first
+/// token must be a token of `text`.
+fn repeat_of_line_rest(
+    text: &str,
+    code: &[bool],
+    brackets: &[(usize, u8)],
+    closer: Option<usize>,
+    rest: &LineRest,
+) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let ranges = tokens_of(bytes);
+    let limit = closer.unwrap_or(text.len());
+    let mut starts = Vec::new(); // indices in `ranges` where a repeat can start
+    let mut depth = 0usize;
+    let mut next_bracket = brackets.iter().peekable();
+    for (i, range) in ranges.iter().enumerate() {
+        if range.start >= limit {
+            break;
+        }
+        while let Some(&(_, b)) = next_bracket.next_if(|&&(at, _)| at < range.start) {
+            if auto_indent::closer_of(b).is_some() {
+                depth += 1;
+            } else {
+                depth = depth.saturating_sub(1);
+            }
+        }
+        if depth == 0 && code[range.start] == rest.first_is_code {
+            starts.push(i);
+        }
+    }
+    let token = |range: &Range<usize>| &bytes[range.clone()];
+    let (first, others) = rest.tokens.split_first()?;
+    // In a string or comment, a lone token is too little to go on: the
+    // line may only be lexed as being in one because a quote the
+    // suggestion has is missing from it. A word or quote alone is still
+    // taken (as in fixing up the last word of a comment), but not a
+    // bracket, which more likely belongs to the code after the quote.
+    let in_literal = !rest.first_is_code;
+    if in_literal && others.is_empty() && is_bracket(first[0]) {
+        return None;
+    }
+    let whole = starts.iter().find_map(|&i| {
+        let t = token(&ranges[i]);
+        let start = if t == first.as_slice() {
+            ranges[i].start
+        } else if token_class(t[0]) == TokenClass::Word
+            && token_class(first[0]) == TokenClass::Word
+            && t.ends_with(first)
+        {
+            ranges[i].end - first.len()
+        } else {
+            return None;
+        };
+        let follow = ranges.get(i + 1..i + 1 + others.len())?;
+        let repeats = follow
+            .iter()
+            .zip(others)
+            .all(|(r, o)| token(r) == o.as_slice());
+        (repeats && text.is_char_boundary(start)).then_some(start)
+    });
+    whole.or_else(|| {
+        starts
+            .iter()
+            .map(|&i| &ranges[i])
+            .filter(|_| !in_literal)
+            .find(|r| token(r) == first.as_slice())
+            .map(|r| r.start)
+    })
+}
+
 /// Whether an opening bracket is paired when `next` follows it: at the
 /// end of a line, or before whitespace or the end of an expression, but
 /// not right before other text.
@@ -2446,6 +2686,8 @@ fn pairs_before(next: Option<u8>) -> bool {
     next.is_none_or(|b| b.is_ascii_whitespace() || matches!(b, b')' | b']' | b'}' | b',' | b';'))
 }
 
+/// Where the first line of a suggestion ends: at its first line break
+/// after any it begins with, or at its end.
 fn first_line_end(text: &str) -> usize {
     let skipped = text.len() - text.trim_start_matches('\n').len();
     text[skipped..]
@@ -4785,6 +5027,13 @@ mod tests {
         ed.suggestion().map(str::to_owned)
     }
 
+    /// Answer the latest request again, with a different `completion`;
+    /// returns the suggestion.
+    fn offer_now(ed: &mut Editor, completion: &str) -> Option<String> {
+        ed.offer_completion(ed.completion_serial(), completion);
+        ed.suggestion().map(str::to_owned)
+    }
+
     #[test]
     fn brackets_pair_the_same_whether_or_not_a_suggestion_came_first() {
         // Typed before the suggestion arrives: paired, and the answer
@@ -4944,6 +5193,146 @@ mod tests {
     }
 
     #[test]
+    fn suggestions_stop_before_repeating_the_rest_of_the_line() {
+        // Fixing up a namespace: the model proposes the rest of the line
+        // again along with it.
+        let mut ed = code(Language::Cpp, "void foo(const s‸::string& name)");
+        ed.insert_char('t');
+        ed.backspace();
+        assert_eq!(offer(&mut ed, "td::string& name)").as_deref(), Some("td"));
+        // Whatever the spacing, and in the middle of an identifier.
+        assert_eq!(
+            offer_now(&mut ed, "td::string &name)").as_deref(),
+            Some("td")
+        );
+        let mut ed = code(Language::Cpp, "void foo(const s‸d::string& name)");
+        ed.request_completion();
+        assert_eq!(offer(&mut ed, "td::string& name)").as_deref(), Some("t"));
+
+        // Fixing up a loop variable.
+        let mut ed = code(Language::Python, "for l‸ in lines:\n    pass\n");
+        ed.insert_char('i');
+        assert_eq!(
+            offer(&mut ed, "ne in lines:\n    print(line)").as_deref(),
+            Some("ne")
+        );
+        // Going on differently, it still stops at the first token.
+        assert_eq!(
+            offer_now(&mut ed, "ne_no, line in enumerate(lines):").as_deref(),
+            Some("ne_no, line")
+        );
+
+        // Before a semicolon, an index, or a comma.
+        let mut ed = code(Language::Rust, "let x = fo‸;");
+        ed.insert_char('o');
+        assert_eq!(offer(&mut ed, "(1);\nlet y = 2;").as_deref(), Some("(1)"));
+        let mut ed = code(Language::Rust, "let x = valu‸[i] + 1;");
+        ed.insert_char('e');
+        assert_eq!(offer(&mut ed, "s[j]").as_deref(), Some("s"));
+        // Brackets of the suggestion's own don't count.
+        assert_eq!(
+            offer_now(&mut ed, "s(a[0], b)[i] + 1;").as_deref(),
+            Some("s(a[0], b)")
+        );
+        let mut ed = code(Language::Rust, "f(ab‸ , c);");
+        ed.insert_char('c');
+        assert_eq!(offer(&mut ed, "d(x, y) , c);").as_deref(), Some("d(x, y)"));
+        // Nor do commas and brackets in strings.
+        let mut ed = code(Language::Rust, "f(‸, b)");
+        ed.request_completion();
+        assert_eq!(
+            offer(&mut ed, "\"a, (b\", c, b)").as_deref(),
+            Some("\"a, (b\", c")
+        );
+        assert_eq!(
+            offer_now(&mut ed, "\"a, (b\", d)").as_deref(),
+            Some("\"a, (b\"")
+        );
+        // A different bracket isn't the rest of the line.
+        let mut ed = code(Language::Rust, "let x = vals.‸[i] + 1;");
+        ed.request_completion();
+        assert_eq!(offer(&mut ed, "get(i)").as_deref(), Some("get(i)"));
+
+        // Text inserted in front of what is there keeps its spacing, and
+        // the rest of the line can turn up in it before it repeats.
+        let mut ed = code(Language::Rust, "let y = ‸x + 1;");
+        ed.request_completion();
+        assert_eq!(offer(&mut ed, "x * x + 1;").as_deref(), Some("x * "));
+        ed.accept_suggestion();
+        assert_eq!(shown(&ed), "let y = x * ‸x + 1;");
+        // A suggestion that only repeats the line offers nothing.
+        let mut ed = code(Language::Rust, "x‸[i]");
+        ed.insert_char('s');
+        assert_eq!(offer(&mut ed, "[i]"), None);
+
+        // In strings and comments too.
+        let mut ed = code(Language::Rust, "let s = \"hel‸ world\";");
+        ed.request_completion();
+        assert_eq!(offer(&mut ed, "lo world\";").as_deref(), Some("lo"));
+        let mut ed = code(Language::Rust, "let s = \"hel‸\";");
+        ed.request_completion();
+        assert_eq!(offer(&mut ed, "lo\";").as_deref(), Some("lo"));
+        let mut ed = code(Language::Rust, "x(); // fix th‸ bug");
+        ed.request_completion();
+        assert_eq!(offer(&mut ed, "e bug").as_deref(), Some("e"));
+        // But where the line is only in a string for want of the quote
+        // the suggestion has, what follows the quote is code.
+        let mut ed = code(Language::Rust, "println!(\"none‸);");
+        ed.request_completion();
+        assert_eq!(offer(&mut ed, ")\");\n").as_deref(), Some(")\""));
+        let mut ed = code(Language::Rust, "foo(\"‸)");
+        ed.request_completion();
+        assert_eq!(offer(&mut ed, "x\")").as_deref(), Some("x\""));
+
+        // A block's brace, on a later line of the suggestion.
+        let mut ed = code(Language::Rust, "fn f() {\n    if a‸ {\n    }\n}");
+        ed.insert_char(' ');
+        assert_eq!(
+            offer(&mut ed, "&&\n        b {\n        c();\n    }").as_deref(),
+            Some("&&\n        b")
+        );
+    }
+
+    #[test]
+    fn suggestions_dont_close_a_bracket_the_rest_of_the_line_closes() {
+        // Its own brackets are balanced, but it would close the call.
+        let mut ed = code(
+            Language::Python,
+            "sorted(‸, key=lambda x: x[1], reverse=True)",
+        );
+        ed.insert_char('o');
+        assert_eq!(
+            offer(&mut ed, "bjects.items())").as_deref(),
+            Some("bjects.items()")
+        );
+        ed.accept_suggestion();
+        assert_eq!(
+            shown(&ed),
+            "sorted(objects.items()‸, key=lambda x: x[1], reverse=True)"
+        );
+        // Taking it leaves the comma the buffer has.
+        let mut ed = code(Language::Rust, "foo(a‸, b)");
+        ed.insert_char('r');
+        assert_eq!(offer(&mut ed, "g, b)").as_deref(), Some("g"));
+        ed.accept_suggestion();
+        assert_eq!(shown(&ed), "foo(arg‸, b)");
+        // Brackets closed in a string on the line don't count.
+        let mut ed = code(Language::Rust, "foo(‸x, \")\"");
+        ed.request_completion();
+        assert_eq!(offer(&mut ed, "a)").as_deref(), Some("a)"));
+
+        // A fresh argument list is still completed in full, up to the
+        // closing bracket the pair supplied, and only text on the
+        // cursor's line counts.
+        let mut ed = code(Language::Rust, "foo(‸)");
+        ed.insert_char('a');
+        assert_eq!(offer(&mut ed, ", b[0])").as_deref(), Some(", b[0]"));
+        let mut ed = code(Language::Rust, "let x = ‸\n[1];");
+        ed.insert_char('a');
+        assert_eq!(offer(&mut ed, "[0];").as_deref(), Some("[0];"));
+    }
+
+    #[test]
     fn enter_along_with_a_suggestion_takes_its_indentation() {
         // The next line of the suggestion is indented more than the
         // current one: Enter goes on to it with that indentation pending.
@@ -4987,7 +5376,7 @@ mod tests {
         ed.set_cursor(7);
         ed.insert_char('x');
         ed.backspace();
-        suggest(&mut ed, "\nd();");
+        suggest(&mut ed, "\nd()");
         ed.insert_char('\n');
         assert_eq!(text(&ed), "    a()\n    ;\n    b();\n");
         assert!(ed.suggestion().is_none());
