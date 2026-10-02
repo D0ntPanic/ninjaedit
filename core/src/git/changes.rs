@@ -36,16 +36,24 @@
 //! [`abort`](Changes::abort), which puts things back as they were
 //! before it started.
 //!
+//! A conflict can also be settled wholesale by
+//! [`resolve`](Changes::resolve), which takes one side's version of the
+//! file, ours or theirs (see [`ConflictSide`]), as `git checkout
+//! --ours` and then `git add` do.
+//!
 //! [`discard`](Changes::discard) throws away unstaged changes, putting
-//! files back to the index's version (or deleting them, when untracked),
-//! the one action here that loses work: it touches the working
-//! directory and nothing else, and can't be undone.
+//! files back to the index's version (or deleting them, when untracked):
+//! it touches the working directory and nothing else, and can't be
+//! undone. It and [`resolve`](Changes::resolve), which writes over what
+//! the working directory has for a conflicted file, are the actions
+//! here that lose work.
 //!
 //! Every action ([`stage`](Changes::stage), [`unstage`](Changes::unstage),
-//! [`discard`](Changes::discard), and [`commit`](Changes::commit))
+//! [`discard`](Changes::discard), [`resolve`](Changes::resolve), and
+//! [`commit`](Changes::commit))
 //! changes the repository on the caller's thread and updates the lists
-//! right away with what it did: staging, unstaging, and discarding
-//! compare just the files they touched again, which is quick however
+//! right away with what it did: staging, unstaging, discarding, and
+//! resolving compare just the files they touched again, which is quick however
 //! big the tree, and a commit empties the
 //! staged list. A scan then starts to confirm the lists and catch
 //! anything else; while it runs, [`is_confirming`](Changes::is_confirming)
@@ -61,6 +69,7 @@
 //! A conflicted file is shown against our side of the merge, so the
 //! diff is what the conflict markers and their side's lines add to it.
 
+use super::checkout::follow_gitlink;
 use super::diff::{
     self, CONTEXT_LINES, ChangeKind, Contents, FileChange, FileDiff, STATS_LIMIT, Unshown,
 };
@@ -69,7 +78,8 @@ use super::rebase::{RebaseStatus, rebase_status};
 use super::submodule_conflicts::resolve_submodule_conflicts;
 use super::submodules::{Submodule, changed_submodules, submodule_range, uncommitted_changes};
 use git2::{
-    Delta, DiffFindOptions, DiffOptions, ErrorCode, Oid, Patch, Repository, RepositoryState, Tree,
+    Delta, DiffFindOptions, DiffOptions, ErrorCode, FileMode, Index, IndexEntry, Oid, Patch,
+    Repository, RepositoryState, Tree,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -77,6 +87,26 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// The bits of an index entry's flags that hold its stage: 0 for a
+/// path not in conflict, and 1 to 3 for the ancestor, ours, and theirs
+/// of one that is.
+const STAGE_MASK: u16 = 0x3000;
+
+/// A side of a merge or rebase stopped at conflicts, whose version of a
+/// conflicted file [`Changes::resolve`] takes. These are git's own
+/// names, which mean what HEAD is on at the time: in a rebase, that is
+/// the commit being replayed onto, not the branch being rebased.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictSide {
+    /// HEAD's side: in a merge, the branch being merged into; in a
+    /// rebase, what it is rebasing onto, with the commits replayed so
+    /// far.
+    Ours,
+    /// The incoming side: in a merge, the commit being merged in; in a
+    /// rebase, the commit being replayed.
+    Theirs,
+}
 
 /// What a scan of the working tree found.
 struct Snapshot {
@@ -731,6 +761,87 @@ impl Changes {
         Ok(())
     }
 
+    /// Resolve the conflicts of `paths` by taking `side`'s version of
+    /// each, as `git checkout --ours -- path` (or `--theirs`) and then
+    /// `git add` do: the file is written as that side has it (its
+    /// contents, and whether it is executable or a symbolic link) and
+    /// staged, which marks it resolved. A file that side deleted is
+    /// deleted, and the deletion staged. A submodule is checked out at
+    /// that side's commit and then staged there, so a checkout that
+    /// fails (one that would lose changes in the submodule) stages
+    /// nothing; one that side deleted is unstaged and its directory
+    /// left alone. A path not in conflict is left alone.
+    ///
+    /// What the working directory had for a resolved file, conflict
+    /// markers and any resolving done by hand, is lost: a frontend
+    /// should confirm it.
+    pub fn resolve<'a>(
+        &mut self,
+        paths: impl IntoIterator<Item = &'a str>,
+        side: ConflictSide,
+    ) -> Result<(), git2::Error> {
+        let paths: Vec<&str> = paths.into_iter().collect();
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let result = self.take_side(&paths, side);
+        // Whatever was resolved before a failure shows in the lists too.
+        self.rescan(&paths);
+        self.confirm();
+        result
+    }
+
+    /// The work of a resolve: stage `side`'s entry of each conflict
+    /// among `paths`, then bring the working directory to match. A
+    /// failure partway still writes what was resolved before it, so
+    /// that the index and the working directory agree.
+    fn take_side(&self, paths: &[&str], side: ConflictSide) -> Result<(), git2::Error> {
+        let gitlink = u32::from(FileMode::Commit);
+        let mut index = self.repo.index()?;
+        index.read(false)?;
+        let mut write = Vec::new();
+        let mut remove = Vec::new();
+        let mut failure = None;
+        for &path in paths {
+            let conflict = match index.conflict_get(Path::new(path)) {
+                Ok(conflict) => conflict,
+                Err(err) if err.code() == ErrorCode::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            let submodule = [&conflict.ancestor, &conflict.our, &conflict.their]
+                .into_iter()
+                .flatten()
+                .any(|entry| entry.mode == gitlink);
+            let taken = match side {
+                ConflictSide::Ours => conflict.our,
+                ConflictSide::Theirs => conflict.their,
+            };
+            match taken {
+                Some(entry) if entry.mode == gitlink => {
+                    if let Err(why) = follow_gitlink(&self.repo, path, entry.id, &mut |_, _| {}) {
+                        failure = Some(git2::Error::from_str(&why.to_string()));
+                        break;
+                    }
+                    stage_side(&mut index, path, entry)?;
+                }
+                Some(entry) => {
+                    stage_side(&mut index, path, entry)?;
+                    write.push(path.to_owned());
+                }
+                None => {
+                    index.remove_path(Path::new(path))?;
+                    let file = fs::symlink_metadata(self.workdir.join(path));
+                    if !submodule && file.is_ok_and(|file| !file.is_dir()) {
+                        remove.push(path.to_owned());
+                    }
+                }
+            }
+        }
+        index.write()?;
+        self.restore_and_remove(&write, &remove)?;
+        failure.map_or(Ok(()), Err)
+    }
+
     /// Commit what is staged with `message`, on the current branch (or
     /// as a detached commit), as the person the repository's
     /// configuration names. A merge in progress is finished: the merged
@@ -911,6 +1022,14 @@ fn workdir_diff<'r>(repo: &'r Repository, paths: &[&str]) -> Result<git2::Diff<'
 /// conflict is shown unstaged, to be resolved.
 fn staged_delta(delta: Delta) -> bool {
     delta != Delta::Conflicted
+}
+
+/// Put `entry`, one side of the conflict at `path`, in the index as the
+/// path's only entry, clearing the conflict.
+fn stage_side(index: &mut Index, path: &str, mut entry: IndexEntry) -> Result<(), git2::Error> {
+    index.remove_path(Path::new(path))?;
+    entry.flags &= !STAGE_MASK;
+    index.add(&entry)
 }
 
 fn count_conflicts(unstaged: &[FileChange]) -> usize {
@@ -1316,6 +1435,88 @@ mod tests {
         assert_eq!(parents, vec![ours, theirs]);
         assert_eq!(repo.repo.state(), RepositoryState::Clean);
         assert!(!changes.is_merging());
+        assert!(changes.is_clean());
+    }
+
+    #[test]
+    fn conflicts_are_resolved_by_taking_one_side() {
+        let mut repo = TestRepo::new();
+        configure_user(&repo);
+        // The test repository's checkout only moves HEAD: bring the
+        // working directory and the index along.
+        let follow_head = |repo: &TestRepo| {
+            let mut checkout = git2::build::CheckoutBuilder::new();
+            repo.repo.checkout_head(Some(checkout.force())).unwrap();
+        };
+        let base = repo.commit(
+            &[
+                ("a/f.txt", "one\ntwo\nthree\n"),
+                ("a/g.txt", "g\n"),
+                ("d/gone.txt", "d\n"),
+            ],
+            "Base",
+            &[],
+        );
+        let main = repo.repo.head().unwrap().shorthand().unwrap().to_owned();
+        let ours = repo.commit(
+            &[
+                ("a/f.txt", "one\nours\nthree\n"),
+                ("a/g.txt", "g ours\n"),
+                ("d/gone.txt", "d ours\n"),
+            ],
+            "Ours",
+            &[base],
+        );
+        repo.branch("side", base);
+        repo.checkout("side");
+        follow_head(&repo);
+        let edited = repo.commit(
+            &[
+                ("a/f.txt", "one\ntheirs\nthree\n"),
+                ("a/g.txt", "g theirs\n"),
+            ],
+            "Theirs",
+            &[base],
+        );
+        let theirs = repo.remove("d/gone.txt", "Remove", edited);
+        repo.checkout(&main);
+        follow_head(&repo);
+        let annotated = repo.repo.find_annotated_commit(theirs).unwrap();
+        repo.repo.merge(&[&annotated], None, None).unwrap();
+
+        let mut changes = open(&repo);
+        assert_eq!(changes.conflict_count(), 3);
+        // Ours: the file is as HEAD has it, so it is in neither list. A
+        // path not in conflict is left alone.
+        changes
+            .resolve(["a/f.txt", "nothing.txt"], ConflictSide::Ours)
+            .unwrap();
+        confirmed(&mut changes);
+        assert_eq!(read(&repo, "a/f.txt"), "one\nours\nthree\n");
+        assert_eq!(changes.conflict_count(), 2);
+        assert_eq!(
+            listed(changes.unstaged()),
+            [('U', "a/g.txt", 0, 0), ('U', "d/gone.txt", 0, 0)]
+        );
+        assert!(changes.staged().is_empty());
+        // Theirs: an edit is staged as theirs, and a deletion deletes,
+        // taking the directory it leaves empty.
+        changes
+            .resolve(["a/g.txt", "d/gone.txt"], ConflictSide::Theirs)
+            .unwrap();
+        confirmed(&mut changes);
+        assert_eq!(read(&repo, "a/g.txt"), "g theirs\n");
+        assert!(!repo.path().join("d").exists());
+        assert_eq!(changes.conflict_count(), 0);
+        assert!(changes.unstaged().is_empty());
+        assert_eq!(
+            listed(changes.staged()),
+            [('M', "a/g.txt", 1, 1), ('D', "d/gone.txt", 0, 1)]
+        );
+        let id = changes.commit("Merge branch 'side'").unwrap();
+        confirmed(&mut changes);
+        let commit = repo.repo.find_commit(id).unwrap();
+        assert_eq!(commit.parent_ids().collect::<Vec<_>>(), [ours, theirs]);
         assert!(changes.is_clean());
     }
 

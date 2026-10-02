@@ -222,7 +222,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ninjaedit_core::build::root_candidates;
-use ninjaedit_core::git::{BranchError, Head, create_branch};
+use ninjaedit_core::git::{BranchError, ConflictSide, Head, create_branch};
 use ninjaedit_core::search::literal_query;
 use ninjaedit_core::terminal::{ExitStatus, Output, Session, SessionId};
 use ninjaedit_core::{
@@ -402,14 +402,20 @@ const EDITOR_MENU: &[MenuEntry] = &[
     MenuEntry::Command(Command::SelectAll),
 ];
 /// What a right click on a file or directory of the changes page's
-/// lists offers: opening it and moving it between the lists first, and
-/// throwing its changes away, which asks first, set apart below. Only
-/// the ones that apply are listed: staging in the unstaged list,
-/// unstaging in the staged one, opening a file but not a directory.
+/// lists offers: opening it and moving it between the lists first;
+/// resolving its conflicts by taking one side, set apart below; and
+/// throwing its changes away, set apart again. The last two ask first.
+/// Only the ones that apply are listed: staging in the unstaged list,
+/// unstaging in the staged one, opening a file but not a directory,
+/// resolving where there are conflicts, and discarding where there are
+/// changes other than conflicts.
 const CHANGES_MENU: &[MenuEntry] = &[
     MenuEntry::Command(Command::OpenChange),
     MenuEntry::Command(Command::StageSelected),
     MenuEntry::Command(Command::UnstageSelected),
+    MenuEntry::Separator,
+    MenuEntry::Command(Command::ResolveOurs),
+    MenuEntry::Command(Command::ResolveTheirs),
     MenuEntry::Separator,
     MenuEntry::Command(Command::DiscardSelected),
 ];
@@ -1525,6 +1531,7 @@ impl App {
             can_stage_selected: changes.is_some_and(|view| view.can_stage_selected()),
             can_unstage_selected: changes.is_some_and(|view| view.can_unstage_selected()),
             can_discard_selected: changes.is_some_and(|view| view.can_discard_selected()),
+            can_resolve_selected: changes.is_some_and(|view| view.can_resolve_selected()),
             can_restore_selected: log.is_some_and(|view| view.can_restore_selected()),
             can_checkout_branch: log.is_some_and(|view| view.can_checkout_branch()),
             can_delete_branch: log.is_some_and(|view| view.can_delete_branch()),
@@ -1628,6 +1635,12 @@ impl App {
             Command::StageSelected => self.on_changes_page(ChangesTabs::stage_selected),
             Command::UnstageSelected => self.on_changes_page(ChangesTabs::unstage_selected),
             Command::DiscardSelected => self.on_changes_page(ChangesTabs::discard_selected),
+            Command::ResolveOurs => {
+                self.on_changes_page(|tabs| tabs.resolve_selected(ConflictSide::Ours))
+            }
+            Command::ResolveTheirs => {
+                self.on_changes_page(|tabs| tabs.resolve_selected(ConflictSide::Theirs))
+            }
             Command::OpenChange => match &mut self.mode {
                 Mode::GitLog(tabs) => {
                     tabs.open_selected_change();
@@ -9480,6 +9493,142 @@ mod tests {
         };
         assert!(!staged);
         settle(&mut app);
+    }
+
+    #[test]
+    fn right_click_on_a_conflict_offers_resolving_it_by_taking_a_side() {
+        let (dir, mut app) = app_with_files(&[]);
+        // A merge of `side` into the main branch stopped with src/a.rs
+        // in conflict, and src/b.rs edited besides.
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        let commit = |files: &[(&str, &str)], message: &str| {
+            let mut index = repo.index().unwrap();
+            for (path, content) in files {
+                let file = dir.path().join(path);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, content).unwrap();
+                index.add_path(Path::new(path)).unwrap();
+            }
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit<'_>> = repo
+                .head()
+                .ok()
+                .and_then(|head| head.peel_to_commit().ok())
+                .into_iter()
+                .collect();
+            let parents: Vec<&git2::Commit<'_>> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
+                .unwrap()
+        };
+        let base = commit(
+            &[
+                (".gitignore", ".storage/\n"),
+                ("src/a.rs", "a\n"),
+                ("src/b.rs", "b\n"),
+            ],
+            "Base",
+        );
+        let main = repo.head().unwrap().shorthand().unwrap().to_owned();
+        commit(&[("src/a.rs", "a ours\n")], "Ours");
+        repo.branch("side", &repo.find_commit(base).unwrap(), false)
+            .unwrap();
+        let force = || {
+            let mut checkout = git2::build::CheckoutBuilder::new();
+            checkout.force();
+            checkout
+        };
+        repo.set_head("refs/heads/side").unwrap();
+        repo.checkout_head(Some(&mut force())).unwrap();
+        let theirs = commit(&[("src/a.rs", "a theirs\n")], "Theirs");
+        repo.set_head(&format!("refs/heads/{main}")).unwrap();
+        repo.checkout_head(Some(&mut force())).unwrap();
+        let annotated = repo.find_annotated_commit(theirs).unwrap();
+        repo.merge(&[&annotated], None, None).unwrap();
+        std::fs::write(dir.path().join("src/b.rs"), "b edited\n").unwrap();
+
+        let settle = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Mode::Changes(tabs) = &app.mode
+                && tabs.is_loading()
+                && Instant::now() < deadline
+            {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(matches!(&app.mode, Mode::Changes(tabs) if !tabs.is_loading()));
+        };
+        let row_of = |screen: &[String], text: &str| -> u16 {
+            screen
+                .iter()
+                .position(|row| row.contains(text))
+                .unwrap_or_else(|| panic!("no {text:?} in {screen:#?}")) as u16
+        };
+        ctrl(&mut app, 'u');
+        settle(&mut app);
+        let screen = draw(&mut app, 100, 24);
+        let a_rs = row_of(&screen, "U a.rs");
+        let src = row_of(&screen, "▾ src");
+
+        // A conflicted file: resolve it by taking either side, set
+        // apart, but nothing to discard.
+        right_click(&mut app, 4, a_rs);
+        assert_eq!(
+            menu_commands(&app),
+            [
+                Some(Command::OpenChange),
+                Some(Command::StageSelected),
+                None,
+                Some(Command::ResolveOurs),
+                Some(Command::ResolveTheirs),
+            ]
+        );
+        // A directory with a conflict and an edit: both resolving and
+        // discarding, each group apart.
+        press(&mut app, KeyCode::Esc);
+        right_click(&mut app, 4, src);
+        assert_eq!(
+            menu_commands(&app),
+            [
+                Some(Command::StageSelected),
+                None,
+                Some(Command::ResolveOurs),
+                Some(Command::ResolveTheirs),
+                None,
+                Some(Command::DiscardSelected),
+            ]
+        );
+
+        // Back on a.rs, "Resolve using theirs" asks first; `y` resolves.
+        press(&mut app, KeyCode::Esc);
+        right_click(&mut app, 4, a_rs);
+        let screen = draw(&mut app, 100, 24);
+        click(&mut app, 12, row_of(&screen, "Resolve using theirs"));
+        assert!(app.context_menu.is_none());
+        let screen = draw(&mut app, 100, 24);
+        row_of(&screen, "Resolve src/a.rs using theirs?");
+        assert!(screen[23].contains("y resolve"), "{screen:#?}");
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/a.rs")).unwrap(),
+            "a theirs\n"
+        );
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|status| status.text() == "Resolved src/a.rs using theirs"),
+            "{:?}",
+            app.status
+        );
+        settle(&mut app);
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        assert!(!index.has_conflicts());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/b.rs")).unwrap(),
+            "b edited\n"
+        );
     }
 
     #[test]

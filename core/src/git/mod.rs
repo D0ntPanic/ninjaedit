@@ -59,7 +59,7 @@ pub mod submodules;
 pub mod tree;
 
 pub use branch::{BranchError, DeleteBranchError, create_branch, create_branch_in, delete_branch};
-pub use changes::Changes;
+pub use changes::{Changes, ConflictSide};
 pub use checkout::{Checkout, CheckoutError, CheckoutJob, CheckoutOutcome, CheckoutPlan};
 pub use diff::{
     ChangeKind, CommitDetail, DiffLine, DiffRow, FileChange, FileDiff, LineKind, Person, Side,

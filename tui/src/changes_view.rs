@@ -56,7 +56,21 @@
 //! A right click on a file or directory in a list selects it and opens
 //! a menu of what can be done to it (the application draws the menu;
 //! see the `context_menu` module): open it, stage or unstage it, and,
-//! set apart below those in the unstaged list, discard its changes.
+//! set apart below those in the unstaged list, resolve its conflicts
+//! and discard its changes.
+//!
+//! "Resolve using ours" and "Resolve using theirs" (from the menu or
+//! the command palette) settle a file in conflict, or every one under a
+//! directory, by taking one side's version whole, as `git checkout
+//! --ours` (or `--theirs`) and `git add` do: the file is written as
+//! that side has it, or deleted if that side deleted it, and staged.
+//! Files under the directory that aren't in conflict are left alone.
+//! Ours and theirs are git's names, which in a rebase are easy to have
+//! backwards (ours is what is being rebased onto), so the box that asks
+//! first names whose version each is. It asks because what the file
+//! has now, conflict markers and any resolving done in it by hand, is
+//! lost; `y` or its Resolve button goes ahead.
+//!
 //! Discarding (from the menu or the command palette) throws away the
 //! unstaged changes of a file, or of every file under a directory: each
 //! goes back to what is staged, or with nothing staged to what was last
@@ -96,7 +110,7 @@
 //! ends. The diff is the larger side to start with.
 //!
 //! The working tree is scanned when the page opens and again after
-//! every stage, unstage, discard, and commit; the scan runs on a worker thread
+//! every stage, unstage, resolve, discard, and commit; the scan runs on a worker thread
 //! (see the core crate's `git::changes` module), and the status bar
 //! says so while it does. Ctrl+U on the page scans again, for changes
 //! made elsewhere: a file saved in the editor, a `git` command in a
@@ -128,7 +142,8 @@ use crate::status::StatusLine;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
-    ChangeKind, Changes, FileChange, FileDiff, FileTree, InProgress, TreeRow, short_id,
+    ChangeKind, Changes, ConflictSide, FileChange, FileDiff, FileTree, InProgress, TreeRow,
+    short_id,
 };
 use ninjaedit_core::{Editor, FileBuffer};
 use ratatui::buffer::Buffer;
@@ -164,6 +179,8 @@ const NO_STAGED: &str = "No staged changes";
 const SCANNING: &str = "scanning…";
 /// The discard box's button.
 const DISCARD: &str = "Discard";
+/// The resolve box's button.
+const RESOLVE: &str = "Resolve";
 /// The abort box's button.
 const ABORT: &str = "Abort";
 /// The key bindings the status bar lists, pane by pane.
@@ -195,8 +212,14 @@ const COMMIT_HELP: &[(&str, &str)] = &[
     ("Tab", "pane"),
     ("Ctrl+E", "leave"),
 ];
-const CONFIRM_HELP: &[(&str, &str)] = &[
+const DISCARD_HELP: &[(&str, &str)] = &[
     ("y", "discard"),
+    ("n/Esc", "cancel"),
+    ("←→", "button"),
+    ("Enter", "press"),
+];
+const RESOLVE_HELP: &[(&str, &str)] = &[
+    ("y", "resolve"),
     ("n/Esc", "cancel"),
     ("←→", "button"),
     ("Enter", "press"),
@@ -322,12 +345,22 @@ pub struct ChangesMouseOutcome {
     pub notice: Option<StatusLine>,
 }
 
-/// Unstaged changes the discard box is asking about: what the box
-/// asks, and the paths to discard once it is answered yes.
-struct PendingDiscard {
+/// What a box asking about files of the unstaged list will do to them
+/// once answered yes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilesAction {
+    Discard,
+    /// Resolve their conflicts by taking a side.
+    Resolve(ConflictSide),
+}
+
+/// Unstaged files the discard or resolve box is asking about: what the
+/// box asks, and what to do to which paths once it is answered yes.
+struct PendingFiles {
     dialog: ConfirmBox,
+    action: FilesAction,
     paths: Vec<String>,
-    /// What is being discarded, for the status bar: a file's path, or a
+    /// What is being acted on, for the status bar: a file's path, or a
     /// directory's with a slash.
     what: String,
 }
@@ -722,6 +755,12 @@ impl ChangesTabs {
         self.active().discard_selected()
     }
 
+    /// Ask whether to resolve the conflicts selected on the shown page
+    /// by taking `side`; the page resolves them once answered yes.
+    pub fn resolve_selected(&mut self, side: ConflictSide) -> ChangesOutcome {
+        self.active().resolve_selected(side)
+    }
+
     /// Ask whether to give up the shown page's merge or rebase in
     /// progress; the page does once answered yes.
     pub fn abort(&mut self) -> ChangesOutcome {
@@ -834,8 +873,8 @@ pub struct ChangesView {
     /// path from this repository, when `o` was on one (see
     /// [`ChangesTabs::follow_submodule`]) and not yet taken.
     submodule_to_show: Option<String>,
-    /// The discard box, while it asks whether to go ahead.
-    discard: Option<PendingDiscard>,
+    /// The discard or resolve box, while it asks whether to go ahead.
+    pending: Option<PendingFiles>,
     /// The abort box, while it asks whether to give up the merge or
     /// rebase in progress.
     abort: Option<ConfirmBox>,
@@ -897,7 +936,7 @@ impl ChangesView {
             divider_drag: None,
             acted: false,
             submodule_to_show: None,
-            discard: None,
+            pending: None,
             abort: None,
             area: Rect::default(),
             unstaged_area: Rect::default(),
@@ -1008,8 +1047,11 @@ impl ChangesView {
         if self.scanning() {
             return StatusLine::progress(SCANNING);
         }
-        if self.discard.is_some() {
-            return StatusLine::help(CONFIRM_HELP);
+        if let Some(pending) = &self.pending {
+            return StatusLine::help(match pending.action {
+                FilesAction::Discard => DISCARD_HELP,
+                FilesAction::Resolve(_) => RESOLVE_HELP,
+            });
         }
         if self.abort.is_some() {
             return StatusLine::help(ABORT_HELP);
@@ -1290,7 +1332,7 @@ impl ChangesView {
     /// the discard box, whether to throw away the unstaged changes of
     /// what is selected in the unstaged list, a file or every file
     /// under a directory. The box's yes discards them (see
-    /// [`finish_discard`](Self::finish_discard)). Conflicts and
+    /// [`finish_pending`](Self::finish_pending)). Conflicts and
     /// submodules under a directory are left alone, and the box says so.
     pub fn discard_selected(&mut self) -> ChangesOutcome {
         if self.list != List::Unstaged {
@@ -1313,43 +1355,122 @@ impl ChangesView {
             .collect();
         let body = discard_body(&files, &kept, &staged);
         let dialog = ConfirmBox::new(format!("Discard changes to {what}?"), body, DISCARD);
-        self.discard = Some(PendingDiscard {
+        self.pending = Some(PendingFiles {
             dialog,
+            action: FilesAction::Discard,
             paths: files.into_iter().map(|change| change.path).collect(),
             what,
         });
         ChangesOutcome::Continue
     }
 
-    /// The discard box was answered yes: discard what it asked about.
-    fn finish_discard(&mut self) -> ChangesOutcome {
-        let Some(pending) = self.discard.take() else {
+    /// Whether what is selected in the unstaged list, in the list the
+    /// diff follows, has files in conflict to resolve.
+    pub fn can_resolve_selected(&self) -> bool {
+        self.list == List::Unstaged && !self.conflicted_selection().is_empty()
+    }
+
+    /// The files in conflict among those the unstaged list's selection
+    /// stands for, submodules included.
+    fn conflicted_selection(&self) -> Vec<FileChange> {
+        let Some(row) = self.unstaged.selected_row() else {
+            return Vec::new();
+        };
+        let files = self.files(List::Unstaged);
+        self.unstaged
+            .files_of(row)
+            .into_iter()
+            .filter_map(|f| files.get(f))
+            .filter(|change| change.kind == ChangeKind::Conflicted)
+            .cloned()
+            .collect()
+    }
+
+    /// The command palette's and the menu's "Resolve using ours" and
+    /// "Resolve using theirs": ask, in the resolve box, whether to
+    /// resolve the conflicts of what is selected in the unstaged list,
+    /// a file or every conflicted file under a directory, by taking
+    /// `side`'s version. The box's yes resolves them (see
+    /// [`finish_pending`](Self::finish_pending)). Files under a
+    /// directory that aren't in conflict are left alone.
+    pub fn resolve_selected(&mut self, side: ConflictSide) -> ChangesOutcome {
+        if self.list != List::Unstaged {
+            return ChangesOutcome::Continue;
+        }
+        let Some(row) = self.unstaged.selected_row() else {
+            return ChangesOutcome::Continue;
+        };
+        let Some(changes) = &self.changes else {
+            return ChangesOutcome::Continue;
+        };
+        let what = self.describe_row(List::Unstaged, row);
+        let files = self.conflicted_selection();
+        if files.is_empty() {
+            return ChangesOutcome::Notice(StatusLine::info(format!(
+                "Nothing to resolve in {what}: it has no conflicts"
+            )));
+        }
+        let title = match &files[..] {
+            [file] => format!("Resolve {} using {}?", file.path, side_name(side)),
+            _ => format!("Resolve conflicts in {what} using {}?", side_name(side)),
+        };
+        let body = resolve_body(changes, side, &files);
+        let dialog = ConfirmBox::new(title, body, RESOLVE);
+        self.pending = Some(PendingFiles {
+            dialog,
+            action: FilesAction::Resolve(side),
+            paths: files.into_iter().map(|change| change.path).collect(),
+            what,
+        });
+        ChangesOutcome::Continue
+    }
+
+    /// The discard or resolve box was answered yes: do what it asked
+    /// about.
+    fn finish_pending(&mut self) -> ChangesOutcome {
+        let Some(pending) = self.pending.take() else {
             return ChangesOutcome::Continue;
         };
         let Some(changes) = &mut self.changes else {
             return ChangesOutcome::Continue;
         };
-        let result = changes.discard(pending.paths.iter().map(String::as_str));
+        let paths = pending.paths.iter().map(String::as_str);
+        let result = match pending.action {
+            FilesAction::Discard => changes.discard(paths),
+            FilesAction::Resolve(side) => changes.resolve(paths, side),
+        };
         self.acted = true;
         self.content = None;
         self.follow_lists();
-        match result {
-            Ok(()) => ChangesOutcome::Notice(StatusLine::info(format!(
-                "Discarded changes to {}",
-                pending.what
-            ))),
-            Err(err) => ChangesOutcome::Notice(StatusLine::error(format!(
-                "Could not discard {}: {}",
-                pending.what,
+        let what = &pending.what;
+        match (pending.action, result) {
+            (FilesAction::Discard, Ok(())) => {
+                ChangesOutcome::Notice(StatusLine::info(format!("Discarded changes to {what}")))
+            }
+            (FilesAction::Discard, Err(err)) => ChangesOutcome::Notice(StatusLine::error(format!(
+                "Could not discard {what}: {}",
                 err.message()
             ))),
+            (FilesAction::Resolve(side), Ok(())) => {
+                let what = match pending.paths.len() {
+                    1 => what.clone(),
+                    n => format!("{n} conflicts in {what}"),
+                };
+                ChangesOutcome::Notice(StatusLine::info(format!(
+                    "Resolved {what} using {}",
+                    side_name(side)
+                )))
+            }
+            (FilesAction::Resolve(_), Err(err)) => ChangesOutcome::Notice(StatusLine::error(
+                format!("Could not resolve {what}: {}", err.message()),
+            )),
         }
     }
 
-    /// Whether the discard box is asking.
+    /// Whether the discard or resolve box is asking.
     #[cfg(test)]
-    fn discard_box(&self) -> Option<&ConfirmBox> {
-        self.discard.as_ref().map(|pending| &pending.dialog)
+    fn files_box(&self) -> Option<&ConfirmBox> {
+        self.pending.as_ref().map(|pending| &pending.dialog)
     }
 
     /// The command palette's "Stage all changes": `a` in the unstaged
@@ -1600,15 +1721,15 @@ impl ChangesView {
     // ----- Input ----------------------------------------------------------
 
     pub fn handle_key(&mut self, key: KeyEvent, clipboard: &mut Clipboard) -> ChangesOutcome {
-        // The discard box, while it asks, has every key.
-        if let Some(pending) = &mut self.discard {
+        // The discard or resolve box, while it asks, has every key.
+        if let Some(pending) = &mut self.pending {
             return match pending.dialog.handle_key(key) {
                 ConfirmOutcome::Continue => ChangesOutcome::Continue,
                 ConfirmOutcome::Cancel => {
-                    self.discard = None;
+                    self.pending = None;
                     ChangesOutcome::Continue
                 }
-                ConfirmOutcome::Confirm => self.finish_discard(),
+                ConfirmOutcome::Confirm => self.finish_pending(),
             };
         }
         // So has the abort box.
@@ -1758,7 +1879,7 @@ impl ChangesView {
     /// Add pasted text to the commit message, if that is where the
     /// keyboard is.
     pub fn paste(&mut self, text: &str) {
-        if self.pane == Pane::Commit && self.discard.is_none() && self.abort.is_none() {
+        if self.pane == Pane::Commit && self.pending.is_none() && self.abort.is_none() {
             self.message.editor_mut().paste(text);
         }
     }
@@ -1896,14 +2017,14 @@ impl ChangesView {
     /// Handle a mouse event.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ChangesMouseOutcome {
         let mut outcome = ChangesMouseOutcome::default();
-        // The discard box, while it asks, has the mouse; a press outside
-        // it is no.
-        if let Some(pending) = &mut self.discard {
+        // The discard or resolve box, while it asks, has the mouse; a
+        // press outside it is no.
+        if let Some(pending) = &mut self.pending {
             match pending.dialog.handle_mouse(mouse) {
                 ConfirmOutcome::Continue => {}
-                ConfirmOutcome::Cancel => self.discard = None,
+                ConfirmOutcome::Cancel => self.pending = None,
                 ConfirmOutcome::Confirm => {
-                    if let ChangesOutcome::Notice(notice) = self.finish_discard() {
+                    if let ChangesOutcome::Notice(notice) = self.finish_pending() {
                         outcome.notice = Some(notice);
                     }
                 }
@@ -2183,9 +2304,9 @@ impl ChangesView {
         self.render_list(List::Staged, buf, theme);
         let cursor = self.render_commit_box(buf, theme);
         self.render_content(buf, theme);
-        // The discard box over it all, while it asks; the message's
-        // cursor doesn't show through it.
-        if let Some(pending) = &mut self.discard {
+        // The discard or resolve box over it all, while it asks; the
+        // message's cursor doesn't show through it.
+        if let Some(pending) = &mut self.pending {
             pending.dialog.render(area, buf, theme);
             return None;
         }
@@ -2535,6 +2656,53 @@ fn message_editor(text: &str) -> EditorView {
 /// `count` and the noun for it, singular or plural.
 fn count_of(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// How the resolve box and the status bar name a side, as git does.
+fn side_name(side: ConflictSide) -> &'static str {
+    match side {
+        ConflictSide::Ours => "ours",
+        ConflictSide::Theirs => "theirs",
+    }
+}
+
+/// What the resolve box says resolving `files` by taking `side` will
+/// do: whose version that is in the merge or rebase in progress (in a
+/// rebase, ours is what it is rebasing onto, which is easy to have
+/// backwards), that the files are staged, and that what they have now
+/// is lost for good.
+fn resolve_body(changes: &Changes, side: ConflictSide, files: &[FileChange]) -> String {
+    let whose = match (side, changes.rebase()) {
+        (ConflictSide::Ours, Some(rebase)) => {
+            format!("{} with the commits replayed so far", rebase.onto)
+        }
+        (ConflictSide::Theirs, Some(rebase)) => match rebase
+            .message
+            .as_deref()
+            .and_then(|message| message.lines().next())
+        {
+            Some(summary) => format!("the commit being replayed (\"{summary}\")"),
+            None => "the commit being replayed".to_owned(),
+        },
+        (ConflictSide::Ours, None) => changes.head_branch().unwrap_or("HEAD").to_owned(),
+        (ConflictSide::Theirs, None) => "the branch being merged in".to_owned(),
+    };
+    let side = side_name(side);
+    let mut body = if files.len() == 1 {
+        format!(
+            "The file is written as {whose} has it ({side}), or deleted if {side} deleted it, and staged, marking it resolved. What it has now, conflict markers and any resolving done by hand, is lost."
+        )
+    } else {
+        format!(
+            "The {} files in conflict are written as {whose} has them ({side}), or deleted where {side} deleted them, and staged, marking them resolved. What they have now, conflict markers and any resolving done by hand, is lost.",
+            files.len()
+        )
+    };
+    if files.iter().any(|file| file.submodule) {
+        body.push_str(" A submodule is checked out at that side's commit.");
+    }
+    body.push_str(" This can't be undone.");
+    body
 }
 
 /// What the discard box says discarding `files` will do: which go back
@@ -3449,6 +3617,140 @@ mod tests {
         );
     }
 
+    #[test]
+    fn conflicts_are_resolved_by_taking_a_side_after_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        configure_user(&repo);
+        let base = commit_files(
+            &repo,
+            &[
+                ("f.txt", "f\n"),
+                ("src/a.txt", "a\n"),
+                ("src/b.txt", "b\n"),
+                ("src/c.txt", "c\n"),
+            ],
+            "Base",
+        );
+        let main = repo.head().unwrap().shorthand().unwrap().to_owned();
+        let ours = [
+            ("f.txt", "f ours\n"),
+            ("src/a.txt", "a ours\n"),
+            ("src/b.txt", "b ours\n"),
+        ];
+        commit_files(&repo, &ours, "Ours");
+        repo.branch("side", &repo.find_commit(base).unwrap(), false)
+            .unwrap();
+        repo.set_head("refs/heads/side").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let theirs = [
+            ("f.txt", "f theirs\n"),
+            ("src/a.txt", "a theirs\n"),
+            ("src/b.txt", "b theirs\n"),
+        ];
+        let theirs = commit_files(&repo, &theirs, "Theirs");
+        repo.set_head(&format!("refs/heads/{main}")).unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let annotated = repo.find_annotated_commit(theirs).unwrap();
+        repo.merge(&[&annotated], None, None).unwrap();
+        fs::write(dir.path().join("src/c.txt"), "c edited\n").unwrap();
+
+        let mut view = view(&dir);
+        let row_of = |view: &ChangesView, key: RowKey| {
+            let list = &view.unstaged;
+            list.rows
+                .iter()
+                .position(|row| list.key_of(*row) == key)
+                .unwrap()
+        };
+
+        // A conflicted file can be resolved, but not discarded. The box
+        // asks first, naming whose version ours is; Escape cancels.
+        let f = row_of(&view, RowKey::File("f.txt".into()));
+        view.select(List::Unstaged, f);
+        assert!(view.can_resolve_selected());
+        assert!(!view.can_discard_selected());
+        let conflicted = read(&dir, "f.txt");
+        view.resolve_selected(ConflictSide::Ours);
+        let dialog = view.files_box().unwrap();
+        assert_eq!(dialog.title(), "Resolve f.txt using ours?");
+        assert_eq!(
+            dialog.body(),
+            format!(
+                "The file is written as {main} has it (ours), or deleted if ours deleted it, and staged, marking it resolved. What it has now, conflict markers and any resolving done by hand, is lost. This can't be undone."
+            )
+        );
+        assert!(view.hint().text().contains("y resolve"), "{}", view.hint());
+        press(&mut view, KeyCode::Esc);
+        assert!(view.files_box().is_none());
+        assert_eq!(read(&dir, "f.txt"), conflicted);
+
+        // `y` goes ahead: f.txt is as main has it, so it leaves the
+        // lists altogether.
+        view.resolve_selected(ConflictSide::Ours);
+        let outcome = press(&mut view, KeyCode::Char('y'));
+        assert_eq!(
+            outcome,
+            ChangesOutcome::Notice(StatusLine::info("Resolved f.txt using ours"))
+        );
+        assert!(view.take_acted());
+        assert_eq!(read(&dir, "f.txt"), "f ours\n");
+        settle(&mut view);
+        assert_eq!(
+            unstaged_paths(&view),
+            ["src/a.txt", "src/b.txt", "src/c.txt"]
+        );
+
+        // A directory resolves every conflict under it, and leaves its
+        // other changes alone.
+        let src = row_of(&view, RowKey::Dir("src".into()));
+        view.select(List::Unstaged, src);
+        assert!(view.can_resolve_selected());
+        view.resolve_selected(ConflictSide::Theirs);
+        let dialog = view.files_box().unwrap();
+        assert_eq!(dialog.title(), "Resolve conflicts in src/ using theirs?");
+        assert!(
+            dialog
+                .body()
+                .starts_with("The 2 files in conflict are written as the branch being merged in has them (theirs)"),
+            "{}",
+            dialog.body()
+        );
+        let outcome = press(&mut view, KeyCode::Char('y'));
+        assert_eq!(
+            outcome,
+            ChangesOutcome::Notice(StatusLine::info(
+                "Resolved 2 conflicts in src/ using theirs"
+            ))
+        );
+        settle(&mut view);
+        assert_eq!(read(&dir, "src/a.txt"), "a theirs\n");
+        assert_eq!(read(&dir, "src/b.txt"), "b theirs\n");
+        assert_eq!(read(&dir, "src/c.txt"), "c edited\n");
+        assert_eq!(unstaged_paths(&view), ["src/c.txt"]);
+        let staged: Vec<&str> = view
+            .files(List::Staged)
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        assert_eq!(staged, ["src/a.txt", "src/b.txt"]);
+        // Nothing is left in conflict to resolve.
+        assert!(!view.can_resolve_selected());
+        let outcome = view.resolve_selected(ConflictSide::Ours);
+        assert!(
+            matches!(&outcome, ChangesOutcome::Notice(m) if m.text().contains("no conflicts")),
+            "{outcome:?}"
+        );
+        let screen = draw(&mut view, 100, 30);
+        let right = right_column(&screen, view.files_rule.x as usize);
+        assert!(
+            right.iter().any(|r| r.starts_with(" Merge into ")),
+            "{right:#?}"
+        );
+    }
+
     /// A repository whose main branch has two commits on a base, the
     /// first changing `f.txt` as a `side` branch from the base does too,
     /// rebased onto side as far as that conflict. Returns the
@@ -3753,7 +4055,7 @@ mod tests {
         // presses Cancel, and nothing is lost.
         let edited = read(&dir, "a.rs");
         assert_eq!(view.discard_selected(), ChangesOutcome::Continue);
-        let dialog = view.discard_box().unwrap();
+        let dialog = view.files_box().unwrap();
         assert_eq!(dialog.title(), "Discard changes to a.rs?");
         assert_eq!(
             dialog.body(),
@@ -3768,7 +4070,7 @@ mod tests {
         press(&mut view, KeyCode::Char(' '));
         assert!(view.files(List::Staged).is_empty());
         assert_eq!(press(&mut view, KeyCode::Enter), ChangesOutcome::Continue);
-        assert!(view.discard_box().is_none());
+        assert!(view.files_box().is_none());
         assert_eq!(read(&dir, "a.rs"), edited);
         assert!(!view.take_acted());
 
@@ -3794,7 +4096,7 @@ mod tests {
         );
         view.discard_selected();
         assert_eq!(
-            view.discard_box().unwrap().body(),
+            view.files_box().unwrap().body(),
             "It is deleted: it comes back as what was last committed. This can't be undone."
         );
         let screen = draw(&mut view, 100, 30);
@@ -3823,7 +4125,7 @@ mod tests {
         assert_eq!(unstaged_paths(&view), ["c.txt"]);
         view.discard_selected();
         assert_eq!(
-            view.discard_box().unwrap().body(),
+            view.files_box().unwrap().body(),
             "It isn't tracked by git, so it is deleted. This can't be undone."
         );
         draw(&mut view, 100, 30);
@@ -3834,7 +4136,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(outcome, ChangesMouseOutcome::default());
-        assert!(view.discard_box().is_none());
+        assert!(view.files_box().is_none());
         assert!(dir.path().join("c.txt").exists());
         view.discard_selected();
         press(&mut view, KeyCode::Char('y'));
@@ -3885,7 +4187,7 @@ mod tests {
         );
         assert!(view.can_discard_selected());
         view.discard_selected();
-        let dialog = view.discard_box().unwrap();
+        let dialog = view.files_box().unwrap();
         assert_eq!(dialog.title(), "Discard changes to src/?");
         assert_eq!(
             dialog.body(),
@@ -3920,7 +4222,7 @@ mod tests {
         assert!(!view.can_discard_selected());
         assert!(view.can_unstage_selected());
         assert_eq!(view.discard_selected(), ChangesOutcome::Continue);
-        assert!(view.discard_box().is_none());
+        assert!(view.files_box().is_none());
     }
 
     #[test]

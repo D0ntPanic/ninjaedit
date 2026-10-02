@@ -116,6 +116,12 @@ pub enum Command {
     /// The changes page's discarding of the selected unstaged changes,
     /// once confirmed.
     DiscardSelected,
+    /// The changes page's resolving of the selected conflicts by taking
+    /// our side, once confirmed.
+    ResolveOurs,
+    /// The changes page's resolving of the selected conflicts by taking
+    /// their side, once confirmed.
+    ResolveTheirs,
     /// The changes page's `o`, and the git log page's among a commit's
     /// files.
     OpenChange,
@@ -235,6 +241,9 @@ pub struct Context {
     /// list has changes that can be discarded: not only conflicts and
     /// submodules.
     pub can_discard_selected: bool,
+    /// On the changes page, whether what is selected in the unstaged
+    /// list has files in conflict, to resolve by taking a side.
+    pub can_resolve_selected: bool,
     /// On the git log page, whether a file or directory is selected
     /// among the selected commit's files, with files to restore: not
     /// only submodules.
@@ -272,7 +281,7 @@ impl Command {
     /// Every command, in the order the palette lists them before
     /// anything is typed: files, searching, editing, building, the
     /// pages, views, and quitting last.
-    pub const ALL: [Command; 57] = [
+    pub const ALL: [Command; 59] = [
         Command::OpenFile,
         Command::SwitchTab,
         Command::Save,
@@ -320,6 +329,8 @@ impl Command {
         Command::StageAll,
         Command::UnstageAll,
         Command::DiscardSelected,
+        Command::ResolveOurs,
+        Command::ResolveTheirs,
         Command::OpenChange,
         Command::ToggleAmend,
         Command::ContinueRebase,
@@ -397,6 +408,9 @@ impl Command {
             Command::StageSelected => on(Page::Changes) && context.can_stage_selected,
             Command::UnstageSelected => on(Page::Changes) && context.can_unstage_selected,
             Command::DiscardSelected => on(Page::Changes) && context.can_discard_selected,
+            Command::ResolveOurs | Command::ResolveTheirs => {
+                on(Page::Changes) && context.can_resolve_selected
+            }
             Command::NextView | Command::PreviousView => context.tool_pane_visible,
             Command::DismissOutput => context.output_idle,
         }
@@ -453,6 +467,8 @@ impl Command {
             Command::StageSelected => "Stage changes",
             Command::UnstageSelected => "Unstage changes",
             Command::DiscardSelected => "Discard changes",
+            Command::ResolveOurs => "Resolve using ours",
+            Command::ResolveTheirs => "Resolve using theirs",
             Command::ToggleAmend => "Toggle amend",
             Command::ContinueRebase => "Continue rebase",
             Command::AbortMerge => "Abort merge",
@@ -577,6 +593,12 @@ impl Command {
             Command::DiscardSelected => {
                 "On the changes page, throw away the unstaged changes of the selected file or directory, after asking: files go back to what is staged, or else committed, and untracked ones are deleted"
             }
+            Command::ResolveOurs => {
+                "On the changes page, resolve the selected conflicted file, or every one under the selected directory, by taking our side's version and staging it, after asking (git checkout --ours): in a merge the branch merged into, in a rebase what it is rebasing onto"
+            }
+            Command::ResolveTheirs => {
+                "On the changes page, resolve the selected conflicted file, or every one under the selected directory, by taking their side's version and staging it, after asking (git checkout --theirs): in a merge the branch merged in, in a rebase the commit being replayed"
+            }
             Command::ToggleAmend => {
                 "On the changes page, make the commit replace the last one (git commit --amend), or follow it (m in a list)"
             }
@@ -659,6 +681,8 @@ impl Command {
             | Command::StageSelected
             | Command::UnstageSelected
             | Command::DiscardSelected
+            | Command::ResolveOurs
+            | Command::ResolveTheirs
             | Command::ToggleAmend
             | Command::DismissOutput => return None,
         })
@@ -789,6 +813,8 @@ mod tests {
             Command::StageSelected,
             Command::UnstageSelected,
             Command::DiscardSelected,
+            Command::ResolveOurs,
+            Command::ResolveTheirs,
         ];
         let nothing = Context {
             page: Page::Changes,
@@ -807,11 +833,18 @@ mod tests {
         assert!(listed.contains(&Command::StageSelected));
         assert!(listed.contains(&Command::DiscardSelected));
         assert!(!listed.contains(&Command::UnstageSelected));
+        assert!(!listed.contains(&Command::ResolveOurs));
+        assert!(!listed.contains(&Command::ResolveTheirs));
+        // A conflict: resolve it by taking a side, but not discard it.
         let conflict = Context {
             can_discard_selected: false,
+            can_resolve_selected: true,
             ..unstaged
         };
-        assert!(!available(&conflict).contains(&Command::DiscardSelected));
+        let listed = available(&conflict);
+        assert!(!listed.contains(&Command::DiscardSelected));
+        assert!(listed.contains(&Command::ResolveOurs));
+        assert!(listed.contains(&Command::ResolveTheirs));
         let staged = Context {
             can_unstage_selected: true,
             ..nothing
@@ -822,6 +855,7 @@ mod tests {
         // Off the page, none of them, whatever the context says.
         let elsewhere = Context {
             page: Page::GitLog,
+            can_resolve_selected: true,
             ..unstaged
         };
         let listed = available(&elsewhere);

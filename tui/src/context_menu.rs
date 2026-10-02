@@ -2,10 +2,10 @@
 //! pointer, for what can be done to the thing under it. The command
 //! palette (Ctrl+P) is the keyboard's way to the same commands; this is
 //! the mouse's, for the few that are wanted right where one is looking
-//! (cut, copy, and paste over the text; staging and discarding over a
-//! changed file; opening and restoring over a file a commit changed;
-//! checking out, merging, rebasing, and resetting over a commit or a
-//! branch).
+//! (cut, copy, and paste over the text; staging, resolving, and
+//! discarding over a changed file; opening and restoring over a file a
+//! commit changed; checking out, merging, rebasing, and resetting over
+//! a commit or a branch).
 //!
 //! A menu is opened with a list of [`MenuEntry`]s: the commands it
 //! offers, with separators between groups of them. It lists only the

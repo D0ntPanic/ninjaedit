@@ -768,6 +768,44 @@ mod tests {
     }
 
     #[test]
+    fn a_submodule_left_in_conflict_is_resolved_by_taking_a_side() {
+        use crate::git::{Changes, ConflictSide};
+        let w = workflow(&["Feature work"], false);
+        let Outcome::Conflicts { unresolved, .. } = w.rebase() else {
+            panic!("a conflict");
+        };
+        assert_eq!(unresolved.len(), 1);
+        let mut changes = Changes::open(w.t.path()).unwrap();
+        assert!(changes.wait(std::time::Duration::from_secs(10)));
+        assert_eq!(changes.conflict_count(), 1);
+        // Ours, in a rebase, is upstream's B: the submodule is checked
+        // out there and staged.
+        changes.resolve(["sub"], ConflictSide::Ours).unwrap();
+        assert_eq!(changes.conflict_count(), 0);
+        // Written by the page's own handle on the repository.
+        let mut index = w.t.repo.index().unwrap();
+        index.read(true).unwrap();
+        assert!(!index.has_conflicts());
+        assert_eq!(index.get_path(Path::new("sub"), 0).unwrap().id, w.b);
+        assert_eq!(w.sub_head().1, w.b);
+        // The commit being replayed changed nothing else, so taking
+        // ours leaves it empty, and it is dropped as git drops one.
+        let outcome = crate::git::continue_rebase(&w.t.repo, None).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Rebased {
+                    commits: 0,
+                    skipped: 1,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(w.recorded(), w.b);
+    }
+
+    #[test]
     fn two_rebased_copies_are_ambiguous() {
         let w = workflow(&["Feature work"], false);
         let one = w.rebase_submodule(20, "feature");
