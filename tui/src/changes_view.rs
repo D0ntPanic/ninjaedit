@@ -1,9 +1,11 @@
 //! The changes page (Ctrl+U): a mode, like the git log, that stands in
 //! for the editor in the upper part of the screen and shows what is
 //! changed in the working tree and not yet committed, for reviewing
-//! the changes, staging them, and committing them; and, after a merge,
-//! for seeing which files are in conflict and committing the merge once
-//! they are resolved.
+//! the changes, staging them, and committing them; and, after a merge
+//! or rebase that stopped at conflicts, for seeing which files are in
+//! conflict and committing the merge, or continuing the rebase, once
+//! they are resolved. The git log page brings it up when one of its
+//! merges or rebases stops so.
 //!
 //! The left of the page is the file lists: `Unstaged changes` above
 //! (the working directory against the index: modified, deleted, and
@@ -65,6 +67,19 @@
 //! version to go back to, and a submodule's changes are its own to
 //! discard on its tab, so both are left alone, and the box says so.
 //!
+//! While a rebase is in progress the commit box is where it goes on
+//! from: its heading says which of the rebase's commits it stopped at
+//! (`Rebase main onto origin/main: 2 of 5`), the box starts with that
+//! commit's message, and Ctrl+S (or "Continue rebase") commits it,
+//! keeping its author, and replays the rest, as `git rebase --continue`
+//! does; that may stop at conflicts again. Continuing (or committing a
+//! merge) first tries again to resolve submodule conflicts by
+//! themselves, so that one whose own branch has been rebased since the
+//! stop, as the status bar advised, needs nothing more. "Abort merge" and "Abort
+//! rebase" in the command palette give up the one in progress, putting
+//! the branch and its files back as they were before it began; that
+//! loses whatever was resolved, so a box asks first.
+//!
 //! Amending (the toggle beside the commit heading, `m` in a list, or
 //! the command palette's "Toggle amend") makes the commit replace the
 //! last one, as `git commit --amend` does: the staged list becomes
@@ -112,7 +127,9 @@ use crate::palette::palette_background;
 use crate::status::StatusLine;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ninjaedit_core::git::{ChangeKind, Changes, FileChange, FileDiff, FileTree, TreeRow, short_id};
+use ninjaedit_core::git::{
+    ChangeKind, Changes, FileChange, FileDiff, FileTree, InProgress, TreeRow, short_id,
+};
 use ninjaedit_core::{Editor, FileBuffer};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
@@ -147,6 +164,8 @@ const NO_STAGED: &str = "No staged changes";
 const SCANNING: &str = "scanning…";
 /// The discard box's button.
 const DISCARD: &str = "Discard";
+/// The abort box's button.
+const ABORT: &str = "Abort";
 /// The key bindings the status bar lists, pane by pane.
 const UNSTAGED_HELP: &[(&str, &str)] = &[
     ("↑↓", "move"),
@@ -178,6 +197,12 @@ const COMMIT_HELP: &[(&str, &str)] = &[
 ];
 const CONFIRM_HELP: &[(&str, &str)] = &[
     ("y", "discard"),
+    ("n/Esc", "cancel"),
+    ("←→", "button"),
+    ("Enter", "press"),
+];
+const ABORT_HELP: &[(&str, &str)] = &[
+    ("y", "abort"),
     ("n/Esc", "cancel"),
     ("←→", "button"),
     ("Enter", "press"),
@@ -448,6 +473,10 @@ pub struct ChangesTabs {
     active: usize,
     /// The pane sizes of every repository, as loaded and as dragged.
     layout: GitChangesLayout,
+    /// The working directory of a submodule whose tab is to be shown
+    /// once the main repository's scan lists it (see
+    /// [`show_repository`](Self::show_repository)).
+    wanted: Option<PathBuf>,
 }
 
 impl ChangesTabs {
@@ -466,6 +495,7 @@ impl ChangesTabs {
             }],
             active: 0,
             layout,
+            wanted: None,
         }
     }
 
@@ -581,6 +611,11 @@ impl ChangesTabs {
             .iter()
             .position(|tab| tab.title == shown)
             .unwrap_or(0);
+        if let Some(wanted) = self.wanted.take()
+            && let Some(index) = self.tabs.iter().position(|tab| tab.workdir == wanted)
+        {
+            self.set_active(index);
+        }
     }
 
     /// Scan the other opened pages again after an action on the shown
@@ -687,6 +722,23 @@ impl ChangesTabs {
         self.active().discard_selected()
     }
 
+    /// Ask whether to give up the shown page's merge or rebase in
+    /// progress; the page does once answered yes.
+    pub fn abort(&mut self) -> ChangesOutcome {
+        self.active().abort()
+    }
+
+    /// Show the tab of the repository whose working directory is
+    /// `workdir`: now if it has one, otherwise once the main
+    /// repository's next scan lists it among the submodules with
+    /// changes (a merge stopped at conflicts in one has them).
+    pub fn show_repository(&mut self, workdir: &Path) {
+        match self.tabs.iter().position(|tab| tab.workdir == workdir) {
+            Some(index) => self.set_active(index),
+            None => self.wanted = Some(workdir.to_path_buf()),
+        }
+    }
+
     /// Open the file selected on the shown page, as its `o` does, or
     /// show the selected submodule's tab.
     pub fn open_selected(&mut self) -> ChangesOutcome {
@@ -784,6 +836,9 @@ pub struct ChangesView {
     submodule_to_show: Option<String>,
     /// The discard box, while it asks whether to go ahead.
     discard: Option<PendingDiscard>,
+    /// The abort box, while it asks whether to give up the merge or
+    /// rebase in progress.
+    abort: Option<ConfirmBox>,
     /// The page, its panes, and the rules between them from the last
     /// render.
     area: Rect,
@@ -843,6 +898,7 @@ impl ChangesView {
             acted: false,
             submodule_to_show: None,
             discard: None,
+            abort: None,
             area: Rect::default(),
             unstaged_area: Rect::default(),
             staged_area: Rect::default(),
@@ -886,7 +942,11 @@ impl ChangesView {
         self.unstaged.rebuild(changes.unstaged());
         self.staged.rebuild(changes.staged());
         self.content = None;
-        let merge_message = match changes.merge_message() {
+        // A rebase's commit keeps its message unless another is written.
+        let rebase_message = changes
+            .rebase()
+            .and_then(|rebase| rebase.message.as_deref());
+        let merge_message = match changes.merge_message().or(rebase_message) {
             Some(message) if !changes.is_amending() => Some(message.to_owned()),
             _ => None,
         };
@@ -950,6 +1010,9 @@ impl ChangesView {
         }
         if self.discard.is_some() {
             return StatusLine::help(CONFIRM_HELP);
+        }
+        if self.abort.is_some() {
+            return StatusLine::help(ABORT_HELP);
         }
         StatusLine::help(match self.pane {
             Pane::Unstaged => UNSTAGED_HELP,
@@ -1385,8 +1448,12 @@ impl ChangesView {
         ChangesOutcome::Continue
     }
 
-    /// Commit what is staged with the message in the box.
+    /// Commit what is staged with the message in the box; while a
+    /// rebase is in progress, continue it instead.
     pub fn commit(&mut self) -> ChangesOutcome {
+        if self.is_rebasing() {
+            return self.continue_rebase();
+        }
         let message = self.message_text();
         let Some(changes) = &mut self.changes else {
             return ChangesOutcome::Continue;
@@ -1410,6 +1477,101 @@ impl ChangesView {
                 err.message()
             ))),
         }
+    }
+
+    /// Whether a merge is in progress, to commit or abort.
+    pub fn is_merging(&self) -> bool {
+        self.changes.as_ref().is_some_and(Changes::is_merging)
+    }
+
+    /// Whether a rebase is in progress, to continue or abort.
+    pub fn is_rebasing(&self) -> bool {
+        self.changes
+            .as_ref()
+            .is_some_and(|changes| changes.rebase().is_some())
+    }
+
+    /// "Continue rebase", and Ctrl+S while a rebase is in progress:
+    /// commit the commit it stopped at, its conflicts resolved and
+    /// staged, with the message in the box, and replay the rest (see
+    /// the core crate's `git::rebase` module). The status bar says how
+    /// that went: finished, or stopped at conflicts again.
+    pub fn continue_rebase(&mut self) -> ChangesOutcome {
+        let message = self.message_text();
+        let Some(changes) = &mut self.changes else {
+            return ChangesOutcome::Continue;
+        };
+        let Some(status) = changes.rebase().cloned() else {
+            return ChangesOutcome::Notice(StatusLine::info("No rebase is in progress"));
+        };
+        let result = changes.continue_rebase(&message);
+        self.acted = true;
+        self.content = None;
+        match result {
+            Ok(outcome) => {
+                self.message = message_editor("");
+                self.auto_message = None;
+                ChangesOutcome::Notice(StatusLine::info(status.summary(&outcome)))
+            }
+            Err(err) => ChangesOutcome::Notice(StatusLine::error(format!(
+                "Could not continue the rebase: {err}"
+            ))),
+        }
+    }
+
+    /// "Abort merge" and "Abort rebase": ask whether to give up the one
+    /// in progress, which goes ahead once answered yes (see
+    /// [`finish_abort`](Self::finish_abort)).
+    pub fn abort(&mut self) -> ChangesOutcome {
+        let Some(changes) = &self.changes else {
+            return ChangesOutcome::Continue;
+        };
+        let (title, body) = if let Some(rebase) = changes.rebase() {
+            let branch = rebase.branch.as_deref().unwrap_or("HEAD");
+            (
+                format!("Abort rebasing {branch} onto {}?", rebase.onto),
+                format!(
+                    "The commits replayed so far and any conflicts resolved are thrown away: {branch} and its files go back to how they were before the rebase. This can't be undone."
+                ),
+            )
+        } else if changes.is_merging() {
+            let branch = changes.head_branch().unwrap_or("HEAD");
+            (
+                "Abort the merge?".to_owned(),
+                format!(
+                    "The merge's changes and any conflicts resolved are thrown away: {branch} and its files go back to how they were before the merge. Untracked files are left alone. This can't be undone."
+                ),
+            )
+        } else {
+            return ChangesOutcome::Notice(StatusLine::info("No merge or rebase is in progress"));
+        };
+        self.abort = Some(ConfirmBox::new(title, body, ABORT));
+        ChangesOutcome::Continue
+    }
+
+    /// The abort box was answered yes: give up the merge or rebase.
+    fn finish_abort(&mut self) -> ChangesOutcome {
+        self.abort = None;
+        let Some(changes) = &mut self.changes else {
+            return ChangesOutcome::Continue;
+        };
+        let result = changes.abort();
+        self.acted = true;
+        self.content = None;
+        self.withdraw_message();
+        match result {
+            Ok(InProgress::Rebase) => ChangesOutcome::Notice(StatusLine::info("Rebase aborted")),
+            Ok(_) => ChangesOutcome::Notice(StatusLine::info("Merge aborted")),
+            Err(err) => {
+                ChangesOutcome::Notice(StatusLine::error(format!("Could not abort: {err}")))
+            }
+        }
+    }
+
+    /// Whether the abort box is asking.
+    #[cfg(test)]
+    fn abort_box(&self) -> Option<&ConfirmBox> {
+        self.abort.as_ref()
     }
 
     /// Open the selected file in the editor. A submodule isn't a file
@@ -1447,6 +1609,17 @@ impl ChangesView {
                     ChangesOutcome::Continue
                 }
                 ConfirmOutcome::Confirm => self.finish_discard(),
+            };
+        }
+        // So has the abort box.
+        if let Some(dialog) = &mut self.abort {
+            return match dialog.handle_key(key) {
+                ConfirmOutcome::Continue => ChangesOutcome::Continue,
+                ConfirmOutcome::Cancel => {
+                    self.abort = None;
+                    ChangesOutcome::Continue
+                }
+                ConfirmOutcome::Confirm => self.finish_abort(),
             };
         }
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -1585,7 +1758,7 @@ impl ChangesView {
     /// Add pasted text to the commit message, if that is where the
     /// keyboard is.
     pub fn paste(&mut self, text: &str) {
-        if self.pane == Pane::Commit && self.discard.is_none() {
+        if self.pane == Pane::Commit && self.discard.is_none() && self.abort.is_none() {
             self.message.editor_mut().paste(text);
         }
     }
@@ -1731,6 +1904,18 @@ impl ChangesView {
                 ConfirmOutcome::Cancel => self.discard = None,
                 ConfirmOutcome::Confirm => {
                     if let ChangesOutcome::Notice(notice) = self.finish_discard() {
+                        outcome.notice = Some(notice);
+                    }
+                }
+            }
+            return outcome;
+        }
+        if let Some(dialog) = &mut self.abort {
+            match dialog.handle_mouse(mouse) {
+                ConfirmOutcome::Continue => {}
+                ConfirmOutcome::Cancel => self.abort = None,
+                ConfirmOutcome::Confirm => {
+                    if let ChangesOutcome::Notice(notice) = self.finish_abort() {
                         outcome.notice = Some(notice);
                     }
                 }
@@ -2004,6 +2189,10 @@ impl ChangesView {
             pending.dialog.render(area, buf, theme);
             return None;
         }
+        if let Some(dialog) = &mut self.abort {
+            dialog.render(area, buf, theme);
+            return None;
+        }
         cursor
     }
 
@@ -2169,6 +2358,15 @@ impl ChangesView {
         let Some(changes) = &self.changes else {
             return (String::new(), heading);
         };
+        let rebasing = changes.rebase().map(|rebase| {
+            format!(
+                "Rebase {} onto {}: {} of {}",
+                rebase.branch.as_deref().unwrap_or("HEAD"),
+                rebase.onto,
+                rebase.step,
+                rebase.total
+            )
+        });
         let conflicts = changes.conflict_count();
         if conflicts > 0 {
             let noun = if conflicts == 1 {
@@ -2176,12 +2374,19 @@ impl ChangesView {
             } else {
                 "conflicts"
             };
+            let doing = match &rebasing {
+                Some(rebasing) => format!(" · {rebasing}"),
+                None => String::new(),
+            };
             return (
-                format!("Resolve {conflicts} {noun}"),
+                format!("Resolve {conflicts} {noun}{doing}"),
                 background
                     .fg(theme.diff_removed_text)
                     .add_modifier(Modifier::BOLD),
             );
+        }
+        if let Some(rebasing) = rebasing {
+            return (rebasing, heading);
         }
         let branch = changes.head_branch();
         let text = if changes.is_amending() {
@@ -3241,6 +3446,139 @@ mod tests {
         assert!(
             right.iter().any(|r| r.starts_with(" Commit to ")),
             "{right:#?}"
+        );
+    }
+
+    /// A repository whose main branch has two commits on a base, the
+    /// first changing `f.txt` as a `side` branch from the base does too,
+    /// rebased onto side as far as that conflict. Returns the
+    /// repository's directory, main's branch, and side's commit.
+    fn rebase_stopped_at_a_conflict() -> (tempfile::TempDir, String, git2::Oid) {
+        use ninjaedit_core::git::{Integration, Target};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        configure_user(&repo);
+        let base = commit_files(&repo, &[("f.txt", "one\ntwo\nthree\n")], "Base");
+        let main = repo.head().unwrap().shorthand().unwrap().to_owned();
+        commit_files(&repo, &[("f.txt", "one\nours\nthree\n")], "Ours");
+        commit_files(&repo, &[("g.txt", "more\n")], "More");
+        repo.branch("side", &repo.find_commit(base).unwrap(), false)
+            .unwrap();
+        repo.set_head("refs/heads/side").unwrap();
+        repo.checkout_head(Some(
+            git2::build::CheckoutBuilder::new()
+                .force()
+                .remove_untracked(true),
+        ))
+        .unwrap();
+        let side = commit_files(&repo, &[("f.txt", "one\ntheirs\nthree\n")], "Theirs");
+        repo.set_head(&format!("refs/heads/{main}")).unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let rebase = Integration::Rebase(Target::Branch {
+            name: "side".to_owned(),
+            remote: false,
+        });
+        rebase.run_with(&repo, &mut |_, _| {}).unwrap();
+        assert_eq!(repo.state(), git2::RepositoryState::RebaseMerge);
+        (dir, main, side)
+    }
+
+    #[test]
+    fn a_rebase_stopped_at_a_conflict_is_resolved_and_continued() {
+        let (dir, main, side) = rebase_stopped_at_a_conflict();
+        let repo = Repository::open(dir.path()).unwrap();
+        let mut view = view(&dir);
+        assert!(view.is_rebasing());
+        assert!(!view.is_merging());
+        let screen = draw(&mut view, 100, 30);
+        let width = view.files_rule.x as usize;
+        let right = right_column(&screen, width);
+        let heading = format!(" Resolve 1 conflict · Rebase {main} onto side: 1 of 2");
+        assert!(right.iter().any(|r| r.starts_with(&heading)), "{right:#?}");
+        // The box starts with the message of the commit being replayed.
+        assert_eq!(view.message_text(), "Ours");
+        // Amending is refused, and so is going on with the conflict.
+        let outcome = press(&mut view, KeyCode::Char('m'));
+        assert!(
+            matches!(&outcome, ChangesOutcome::Notice(m) if m.text().contains("rebase")),
+            "{outcome:?}"
+        );
+        let outcome = ctrl(&mut view, 's');
+        assert!(
+            matches!(&outcome, ChangesOutcome::Notice(m)
+                if m.text() == "Could not continue the rebase: 1 file is still in conflict; resolve and stage them first"),
+            "{outcome:?}"
+        );
+        settle(&mut view);
+
+        // Resolved and staged, the heading says what Ctrl+S goes on with.
+        fs::write(dir.path().join("f.txt"), "one\nboth\nthree\n").unwrap();
+        press(&mut view, KeyCode::Char(' '));
+        settle(&mut view);
+        let right = right_column(&draw(&mut view, 100, 30), width);
+        let heading = format!(" Rebase {main} onto side: 1 of 2");
+        assert!(right.iter().any(|r| r.starts_with(&heading)), "{right:#?}");
+        let outcome = ctrl(&mut view, 's');
+        assert!(
+            matches!(&outcome, ChangesOutcome::Notice(m)
+                if m.text() == format!("Rebased {main} onto side: 2 commits")),
+            "{outcome:?}"
+        );
+        settle(&mut view);
+        assert!(!view.is_rebasing());
+        assert_eq!(view.message_text(), "");
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        let head = repo.head().unwrap();
+        assert_eq!(head.shorthand().unwrap(), main);
+        let head = head.peel_to_commit().unwrap();
+        assert_eq!(head.message().unwrap(), "More");
+        let resolved = head.parent(0).unwrap();
+        assert_eq!(resolved.message().unwrap(), "Ours");
+        assert_eq!(resolved.parent_ids().collect::<Vec<_>>(), [side]);
+        let right = right_column(&draw(&mut view, 100, 30), width);
+        assert!(
+            right.iter().any(|r| r.starts_with(" Commit to ")),
+            "{right:#?}"
+        );
+    }
+
+    #[test]
+    fn a_rebase_is_aborted_once_the_box_says_yes() {
+        let (dir, main, _) = rebase_stopped_at_a_conflict();
+        let repo = Repository::open(dir.path()).unwrap();
+        let before = repo.find_branch(&main, git2::BranchType::Local).unwrap();
+        let before = before.get().target().unwrap();
+        let mut view = view(&dir);
+        assert_eq!(view.abort(), ChangesOutcome::Continue);
+        let title = format!("Abort rebasing {main} onto side?");
+        assert_eq!(view.abort_box().unwrap().title(), title);
+        assert_eq!(view.hint(), StatusLine::help(ABORT_HELP));
+        // No keeps it going.
+        press(&mut view, KeyCode::Char('n'));
+        assert!(view.abort_box().is_none());
+        assert!(view.is_rebasing());
+        view.abort();
+        let screen = draw(&mut view, 100, 30);
+        assert!(screen.iter().any(|r| r.contains(&title)), "{screen:#?}");
+        let outcome = press(&mut view, KeyCode::Char('y'));
+        assert_eq!(
+            outcome,
+            ChangesOutcome::Notice(StatusLine::info("Rebase aborted"))
+        );
+        settle(&mut view);
+        assert!(!view.is_rebasing());
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        assert_eq!(repo.head().unwrap().shorthand().unwrap(), main);
+        assert_eq!(repo.head().unwrap().target(), Some(before));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "one\nours\nthree\n"
+        );
+        // Nothing is left to abort.
+        assert_eq!(
+            view.abort(),
+            ChangesOutcome::Notice(StatusLine::info("No merge or rebase is in progress"))
         );
     }
 

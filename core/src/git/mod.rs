@@ -16,12 +16,19 @@
 //! branch or the commit, for the status bar, and the [`branch`] module
 //! makes a new branch there and moves HEAD on to it, or deletes one.
 //! The [`restore`] module writes files into the working directory as a commit (or the
-//! one before it) has them, leaving the index alone.
+//! one before it) has them, leaving the index alone. The [`merge`] and
+//! [`rebase`] modules bring another branch's commits into HEAD's, as
+//! `git merge` and `git rebase` do, stopping at conflicts for the
+//! changes page to resolve, with what the two share (and the job that
+//! runs either in the background) in the [`operation`] module; the
+//! [`reset`] module moves HEAD's branch to a commit as `git reset`
+//! does, keeping the working directory.
 //! Everything goes through libgit2, by way of the `git2` crate; nothing
 //! shells out to git.
 //!
-//! Only the [`changes`], [`fetch`], [`checkout`], [`branch`], and
-//! [`restore`] modules change the repository. The first two touch only its index,
+//! Only the [`changes`], [`fetch`], [`checkout`], [`branch`],
+//! [`restore`], [`merge`], [`rebase`], and [`reset`] modules change the
+//! repository. The first two touch only its index,
 //! HEAD, and remote-tracking references, except that discarding a
 //! change puts a file of the working directory back to the index's
 //! version (or deletes it, when untracked); a checkout also rewrites the
@@ -29,7 +36,10 @@
 //! to while there are changes it could lose; a new or deleted branch is
 //! only a reference (with its configuration) and HEAD, never the files;
 //! and restoring rewrites files
-//! of the working directory and nothing else.
+//! of the working directory and nothing else. A merge or rebase
+//! rewrites the working directory and index as a checkout does, and
+//! refuses to start while there are changes it could lose; a reset
+//! moves HEAD and the index, never the working directory.
 
 pub mod branch;
 pub mod changes;
@@ -39,7 +49,12 @@ pub mod fetch;
 pub mod graph;
 pub mod head;
 pub mod history;
+pub mod merge;
+pub mod operation;
+pub mod rebase;
+pub mod reset;
 pub mod restore;
+pub mod submodule_conflicts;
 pub mod submodules;
 pub mod tree;
 
@@ -54,7 +69,14 @@ pub use fetch::{Fetch, FetchReport};
 pub use graph::{GraphCell, GraphRow, NODE, cells_for};
 pub use head::{Head, head, head_of};
 pub use history::{Branch, Commit, CommitTime, History, Oid, RefKind, RefLabel, Remote, short_id};
+pub use merge::abort_merge;
+pub use operation::{
+    InProgress, Integration, IntegrationJob, OperationError, Outcome, Target, in_progress,
+};
+pub use rebase::{RebaseStatus, abort_rebase, continue_rebase, rebase_status};
+pub use reset::{left_behind, reset};
 pub use restore::{Restored, restore, unstaged_among};
+pub use submodule_conflicts::SubmoduleConflict;
 pub use submodules::{
     RANGE_LIMIT, Submodule, SubmoduleRange, UncommittedChange, changed_submodules,
     has_uncommitted_changes, submodule_range, submodules, uncommitted_changes,

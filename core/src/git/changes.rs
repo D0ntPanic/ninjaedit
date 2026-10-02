@@ -26,6 +26,16 @@
 //! [`head_message`](Changes::head_message) is HEAD's message, to start
 //! the amended one from.
 //!
+//! A merge or rebase that stopped at conflicts (see the
+//! [`merge`](super::merge) and [`rebase`](super::rebase) modules) is
+//! finished here once they are resolved and staged: a merge by
+//! [`commit`](Changes::commit), a rebase by
+//! [`continue_rebase`](Changes::continue_rebase), which commits the
+//! commit it stopped at and replays the rest. [`rebase`](Changes::rebase)
+//! says what a rebase in progress is doing. Either is given up with
+//! [`abort`](Changes::abort), which puts things back as they were
+//! before it started.
+//!
 //! [`discard`](Changes::discard) throws away unstaged changes, putting
 //! files back to the index's version (or deleting them, when untracked),
 //! the one action here that loses work: it touches the working
@@ -54,7 +64,10 @@
 use super::diff::{
     self, CONTEXT_LINES, ChangeKind, Contents, FileChange, FileDiff, STATS_LIMIT, Unshown,
 };
-use super::submodules::{Submodule, changed_submodules, uncommitted_changes};
+use super::operation::{InProgress, OperationError, Outcome};
+use super::rebase::{RebaseStatus, rebase_status};
+use super::submodule_conflicts::resolve_submodule_conflicts;
+use super::submodules::{Submodule, changed_submodules, submodule_range, uncommitted_changes};
 use git2::{
     Delta, DiffFindOptions, DiffOptions, ErrorCode, Oid, Patch, Repository, RepositoryState, Tree,
 };
@@ -75,6 +88,7 @@ struct Snapshot {
     unborn: bool,
     merging: bool,
     merge_message: Option<String>,
+    rebase: Option<RebaseStatus>,
     head_message: Option<String>,
     conflicts: usize,
 }
@@ -97,6 +111,7 @@ pub struct Changes {
     unborn: bool,
     merging: bool,
     merge_message: Option<String>,
+    rebase: Option<RebaseStatus>,
     head_message: Option<String>,
     conflicts: usize,
     /// Whether the commit will replace HEAD.
@@ -140,6 +155,7 @@ impl Changes {
             unborn: false,
             merging: false,
             merge_message: None,
+            rebase: None,
             head_message: None,
             conflicts: 0,
             amend: false,
@@ -246,6 +262,7 @@ impl Changes {
                 self.unborn = snapshot.unborn;
                 self.merging = snapshot.merging;
                 self.merge_message = snapshot.merge_message;
+                self.rebase = snapshot.rebase;
                 self.head_message = snapshot.head_message;
                 self.conflicts = snapshot.conflicts;
                 self.error = None;
@@ -326,6 +343,11 @@ impl Changes {
                     "a merge in progress can't amend: commit it first",
                 ));
             }
+            if self.repo.state() == RepositoryState::RebaseMerge {
+                return Err(git2::Error::from_str(
+                    "a rebase in progress can't amend: continue it first",
+                ));
+            }
         }
         self.amend = amend;
         self.refresh();
@@ -368,6 +390,13 @@ impl Changes {
     /// The message git prepared for the merge in progress, if any.
     pub fn merge_message(&self) -> Option<&str> {
         self.merge_message.as_deref()
+    }
+
+    /// What the rebase in progress is doing, if one is: its commit
+    /// that stopped at conflicts is committed and the rest replayed by
+    /// [`continue_rebase`](Self::continue_rebase), not by a commit.
+    pub fn rebase(&self) -> Option<&RebaseStatus> {
+        self.rebase.as_ref()
     }
 
     /// How many files are in conflict, which must be resolved and
@@ -468,19 +497,34 @@ impl Changes {
     }
 
     /// A conflicted file in the working directory against our side of
-    /// the merge (or nothing, when our side deleted it).
+    /// the merge (or nothing, when our side deleted it). A submodule in
+    /// conflict has no file to compare: its diff is the commits of the
+    /// two sides, from ours to theirs, which the submodule's own
+    /// repository has.
     fn conflict_diff(&self, change: &FileChange) -> Result<FileDiff, git2::Error> {
         let index = self.repo.index()?;
-        let ours = index
-            .conflicts()?
-            .filter_map(Result::ok)
-            .find(|conflict| {
-                [&conflict.our, &conflict.their, &conflict.ancestor]
-                    .into_iter()
-                    .flatten()
-                    .any(|entry| entry.path == change.path.as_bytes())
-            })
-            .and_then(|conflict| conflict.our);
+        let conflict = index.conflicts()?.filter_map(Result::ok).find(|conflict| {
+            [&conflict.our, &conflict.their, &conflict.ancestor]
+                .into_iter()
+                .flatten()
+                .any(|entry| entry.path == change.path.as_bytes())
+        });
+        let gitlink = |entry: &Option<git2::IndexEntry>| {
+            entry
+                .as_ref()
+                .filter(|entry| entry.mode == 0o160000)
+                .map(|entry| entry.id)
+        };
+        if let Some(conflict) = &conflict {
+            let (ours, theirs) = (gitlink(&conflict.our), gitlink(&conflict.their));
+            if ours.is_some() || theirs.is_some() {
+                let mut diff =
+                    FileDiff::unshown(change.kind, &change.path, None, Unshown::Submodule);
+                diff.submodule = Some(submodule_range(&self.repo, &change.path, ours, theirs));
+                return Ok(diff);
+            }
+        }
+        let ours = conflict.and_then(|conflict| conflict.our);
         let old = match ours {
             Some(entry) => {
                 let blob = self.repo.find_blob(entry.id)?;
@@ -598,7 +642,7 @@ impl Changes {
         let diff = index_diff(&self.repo, base_tree.as_ref(), paths)?;
         let staged = list_changes(&diff, staged_delta, self.staged.len() <= STATS_LIMIT)?;
         let diff = workdir_diff(&self.repo, paths)?;
-        let unstaged = list_changes(&diff, |_| true, self.unstaged.len() <= STATS_LIMIT)?;
+        let unstaged = unstaged_changes(&diff, self.unstaged.len() <= STATS_LIMIT)?;
         Ok((staged, unstaged, diff.is_sorted_icase()))
     }
 
@@ -639,8 +683,7 @@ impl Changes {
         let mut restore = Vec::new();
         let mut remove = Vec::new();
         let diff = workdir_diff(&self.repo, &paths)?;
-        for index in 0..diff.deltas().len() {
-            let change = diff::file_change(&diff, index, false)?;
+        for change in unstaged_changes(&diff, false)? {
             if change.kind == ChangeKind::Conflicted {
                 return Err(git2::Error::from_str(&format!(
                     "{} is in conflict: resolve it instead",
@@ -701,6 +744,11 @@ impl Changes {
         if message.is_empty() {
             return Err(git2::Error::from_str("a commit needs a message"));
         }
+        if self.repo.state() == RepositoryState::RebaseMerge {
+            return Err(git2::Error::from_str(
+                "a rebase is in progress: continue it rather than commit",
+            ));
+        }
         let merging = self.repo.state() == RepositoryState::Merge;
         let mut merged = Vec::new();
         if merging {
@@ -711,6 +759,12 @@ impl Changes {
         }
         let id = {
             let mut index = self.repo.index()?;
+            if index.has_conflicts() && merging {
+                // A submodule conflict that has become resolvable since
+                // the merge stopped (its own branch rebased since, as the
+                // stop said to) is resolved now.
+                resolve_submodule_conflicts(&self.repo, &mut |_, _| {})?;
+            }
             if index.has_conflicts() {
                 return Err(git2::Error::from_str(
                     "resolve the conflicts and stage the files first",
@@ -772,6 +826,35 @@ impl Changes {
         self.head_message = Some(message.to_owned());
         self.confirm();
         Ok(id)
+    }
+
+    /// Go on with the rebase in progress, now that the conflicts of the
+    /// commit it stopped at are resolved and staged: commit that commit
+    /// with `message` (its own when empty), keeping its author, and
+    /// replay the rest, which may stop at conflicts again (see the
+    /// [`rebase`](super::rebase) module). The lists scan again after.
+    pub fn continue_rebase(&mut self, message: &str) -> Result<Outcome, OperationError> {
+        let outcome = super::rebase::continue_rebase(&self.repo, Some(message));
+        self.refresh();
+        outcome
+    }
+
+    /// Give up the merge or rebase in progress, putting the branch, the
+    /// index, and the working tree back as they were before it began.
+    /// Returns which it was. The lists scan again after.
+    pub fn abort(&mut self) -> Result<InProgress, OperationError> {
+        let aborted = match self.repo.state() {
+            RepositoryState::Merge => {
+                super::merge::abort_merge(&self.repo).map(|()| InProgress::Merge)
+            }
+            RepositoryState::RebaseMerge => {
+                super::rebase::abort_rebase(&self.repo).map(|()| InProgress::Rebase)
+            }
+            _ => Err(OperationError::NothingInProgress),
+        };
+        self.amend = false;
+        self.refresh();
+        aborted
     }
 }
 
@@ -899,18 +982,22 @@ fn snapshot(workdir: &Path, amend: bool) -> Result<Snapshot, git2::Error> {
     let diff = index_diff(&repo, base_tree.as_ref(), &[])?;
     let staged = list_changes(&diff, staged_delta, diff.deltas().len() <= STATS_LIMIT)?;
     let diff = workdir_diff(&repo, &[])?;
-    let unstaged = list_changes(&diff, |_| true, diff.deltas().len() <= STATS_LIMIT)?;
+    let unstaged = unstaged_changes(&diff, diff.deltas().len() <= STATS_LIMIT)?;
     let conflicts = count_conflicts(&unstaged);
 
     let merging = repo.state() == RepositoryState::Merge;
     let merge_message = if merging {
+        // Without the comments libgit2 adds listing the conflicts, which
+        // git's command line would strip when committing.
         fs::read_to_string(repo.path().join("MERGE_MSG"))
             .ok()
+            .and_then(|text| git2::message_prettify(text, Some(b'#')).ok())
             .map(|text| text.trim_end().to_owned())
             .filter(|text| !text.is_empty())
     } else {
         None
     };
+    let rebase = rebase_status(&repo);
     let submodules = changed_submodules(&repo);
     Ok(Snapshot {
         unstaged,
@@ -921,9 +1008,31 @@ fn snapshot(workdir: &Path, amend: bool) -> Result<Snapshot, git2::Error> {
         unborn,
         merging,
         merge_message,
+        rebase,
         head_message,
         conflicts,
     })
+}
+
+/// The unstaged changes of the working directory's diff against the
+/// index. A submodule in conflict has no entry of its own in the index
+/// for its directory to be compared with, so the diff has the directory
+/// as untracked too: that is the conflict, already listed, and not
+/// something new to stage (or, discarded, to delete), so it is left out.
+fn unstaged_changes(diff: &git2::Diff<'_>, stats: bool) -> Result<Vec<FileChange>, git2::Error> {
+    let mut changes = list_changes(diff, |_| true, stats)?;
+    let conflicted: HashSet<String> = changes
+        .iter()
+        .filter(|change| change.kind == ChangeKind::Conflicted)
+        .map(|change| change.path.clone())
+        .collect();
+    if !conflicted.is_empty() {
+        changes.retain(|change| {
+            change.kind != ChangeKind::Untracked
+                || !conflicted.contains(change.path.trim_end_matches('/'))
+        });
+    }
+    Ok(changes)
 }
 
 /// The files of a diff whose status `keep` accepts, with their lines
@@ -1208,6 +1317,60 @@ mod tests {
         assert_eq!(repo.repo.state(), RepositoryState::Clean);
         assert!(!changes.is_merging());
         assert!(changes.is_clean());
+    }
+
+    #[test]
+    fn a_rebase_conflict_is_resolved_and_continued_or_aborted() {
+        use crate::git::operation::tests::diverged;
+        use crate::git::{Integration, Target};
+        let mut repo = TestRepo::new();
+        configure_user(&repo);
+        let (_, main, side) = diverged(&mut repo, true);
+        let rebase = Integration::Rebase(Target::Branch {
+            name: "side".to_owned(),
+            remote: false,
+        });
+        let stopped = rebase.run_with(&repo.repo, &mut |_, _| {}).unwrap();
+        assert!(matches!(stopped, Outcome::Conflicts { files: 1, .. }));
+
+        let mut changes = open(&repo);
+        let status = changes.rebase().unwrap();
+        assert_eq!((status.step, status.total), (1, 1));
+        assert_eq!(status.onto, "side");
+        assert_eq!(status.message.as_deref(), Some("Main"));
+        assert!(!changes.is_merging());
+        assert_eq!(changes.conflict_count(), 1);
+        assert!(changes.set_amend(true).is_err(), "no amending mid-rebase");
+        assert!(changes.commit("Main").is_err(), "a rebase continues");
+        assert!(matches!(
+            changes.continue_rebase(""),
+            Err(OperationError::Unresolved { files: 1, .. })
+        ));
+        settle(&mut changes);
+
+        // Abort: back on main as it was.
+        assert_eq!(changes.abort().unwrap(), InProgress::Rebase);
+        settle(&mut changes);
+        assert!(changes.rebase().is_none());
+        assert!(changes.is_clean());
+        assert_eq!(repo.repo.head().unwrap().target(), Some(main));
+
+        // Again, resolved and continued this time, with a new message.
+        rebase.run_with(&repo.repo, &mut |_, _| {}).unwrap();
+        changes.refresh();
+        settle(&mut changes);
+        fs::write(repo.path().join("f.txt"), "main and side\n").unwrap();
+        changes.stage(["f.txt"]).unwrap();
+        settle(&mut changes);
+        let outcome = changes.continue_rebase("Main, on side").unwrap();
+        assert!(matches!(outcome, Outcome::Rebased { commits: 1, .. }));
+        settle(&mut changes);
+        assert!(changes.rebase().is_none());
+        assert!(changes.is_clean());
+        assert_eq!(changes.head_message(), Some("Main, on side"));
+        let head = repo.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.parent_ids().collect::<Vec<_>>(), [side]);
+        assert_eq!(repo.repo.head().unwrap().shorthand().unwrap(), "master");
     }
 
     #[test]

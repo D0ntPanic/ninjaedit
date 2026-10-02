@@ -424,12 +424,33 @@ const GIT_LOG_MENU: &[MenuEntry] = &[
     MenuEntry::Command(Command::RestoreCommitVersion),
     MenuEntry::Command(Command::RestoreParentVersion),
 ];
+/// What a right click on a commit in the git log offers: checking it
+/// out first; then bringing it into the branch HEAD is on, by merging
+/// the branch there or rebasing onto it; and, set apart below since it
+/// moves the branch off its commits, resetting the branch to it. Only
+/// a commit HEAD isn't at has anything but checking out, and merging
+/// is for one with another branch there.
+const GIT_LOG_COMMIT_MENU: &[MenuEntry] = &[
+    MenuEntry::Command(Command::CheckoutCommit),
+    MenuEntry::Separator,
+    MenuEntry::Command(Command::MergeCommit),
+    MenuEntry::Command(Command::RebaseOntoCommit),
+    MenuEntry::Separator,
+    MenuEntry::Command(Command::ResetToCommit),
+];
 /// What a right click on a branch in the git log's sidebar offers:
-/// checking it out first, and, set apart below, deleting it, which is
-/// only for a local branch HEAD isn't on.
+/// checking it out first; then merging it into the branch HEAD is on or
+/// rebasing onto it; and, set apart below, resetting HEAD's branch to
+/// it and deleting it, which is only for a local branch HEAD isn't on.
+/// Merging, rebasing, and resetting are for a branch HEAD isn't on or
+/// at.
 const GIT_LOG_BRANCH_MENU: &[MenuEntry] = &[
     MenuEntry::Command(Command::CheckoutBranch),
     MenuEntry::Separator,
+    MenuEntry::Command(Command::MergeBranch),
+    MenuEntry::Command(Command::RebaseOntoBranch),
+    MenuEntry::Separator,
+    MenuEntry::Command(Command::ResetToBranch),
     MenuEntry::Command(Command::DeleteBranch),
 ];
 /// What the status bar shows on the settings page.
@@ -1332,13 +1353,15 @@ impl App {
         self.context_menu = ContextMenu::new(CHANGES_MENU, &context, x, y);
     }
 
-    /// A right click on a file or directory among the git log's
-    /// selected commit's files, or on a branch in its sidebar, which
-    /// the page selected: open the menu for it at the pointer (see
-    /// [`GIT_LOG_MENU`] and [`GIT_LOG_BRANCH_MENU`]).
+    /// A right click on a commit in the git log, on a file or
+    /// directory among its selected commit's files, or on a branch in
+    /// its sidebar, which the page selected: open the menu for it at
+    /// the pointer (see [`GIT_LOG_COMMIT_MENU`], [`GIT_LOG_MENU`], and
+    /// [`GIT_LOG_BRANCH_MENU`]).
     fn open_git_log_menu(&mut self, menu: GitLogMenu, x: u16, y: u16) {
         let context = self.command_context();
         let entries = match menu {
+            GitLogMenu::Commit => GIT_LOG_COMMIT_MENU,
             GitLogMenu::Files => GIT_LOG_MENU,
             GitLogMenu::Branch => GIT_LOG_BRANCH_MENU,
         };
@@ -1505,6 +1528,11 @@ impl App {
             can_restore_selected: log.is_some_and(|view| view.can_restore_selected()),
             can_checkout_branch: log.is_some_and(|view| view.can_checkout_branch()),
             can_delete_branch: log.is_some_and(|view| view.can_delete_branch()),
+            other_commit_selected: log.is_some_and(|view| view.other_commit_selected()),
+            can_merge_commit: log.is_some_and(|view| view.can_merge_commit()),
+            other_branch_selected: log.is_some_and(|view| view.other_branch_selected()),
+            merging: changes.is_some_and(|view| view.is_merging()),
+            rebasing: changes.is_some_and(|view| view.is_rebasing()),
             has_repository: self.heads.head(self.status_repository()).is_some(),
         }
     }
@@ -1584,6 +1612,16 @@ impl App {
                     self.follow_git_log();
                 }
             }
+            Command::MergeCommit => self.on_git_log_page(GitLogTabs::merge_selected_commit),
+            Command::RebaseOntoCommit => {
+                self.on_git_log_page(GitLogTabs::rebase_onto_selected_commit)
+            }
+            Command::ResetToCommit => self.on_git_log_page(GitLogTabs::reset_to_selected_commit),
+            Command::MergeBranch => self.on_git_log_page(GitLogTabs::merge_selected_branch),
+            Command::RebaseOntoBranch => {
+                self.on_git_log_page(GitLogTabs::rebase_onto_selected_branch)
+            }
+            Command::ResetToBranch => self.on_git_log_page(GitLogTabs::reset_to_selected_branch),
             Command::Commit => self.on_changes_page(ChangesTabs::commit),
             Command::StageAll => self.on_changes_page(ChangesTabs::stage_all),
             Command::UnstageAll => self.on_changes_page(ChangesTabs::unstage_all),
@@ -1600,6 +1638,8 @@ impl App {
             Command::RestoreCommitVersion => self.restore_on_git_log(Version::Commit),
             Command::RestoreParentVersion => self.restore_on_git_log(Version::Parent),
             Command::ToggleAmend => self.toggle_amend(),
+            Command::ContinueRebase => self.on_changes_page(ChangesTabs::commit),
+            Command::AbortMerge | Command::AbortRebase => self.on_changes_page(ChangesTabs::abort),
             Command::SwitchView => self.open_modes_palette(),
             Command::NextView => self.focus_next(),
             Command::PreviousView => self.focus_previous(),
@@ -1616,15 +1656,32 @@ impl App {
         }
     }
 
-    /// Act on what the git log page asks for after a key, a click, or a
-    /// command: a file to open in the editor, and what to say in the
-    /// status bar.
+    /// Do one of the git log page's actions from the command palette or
+    /// a menu, when the page is showing, and act on what it asks for.
+    fn on_git_log_page(&mut self, action: fn(&mut GitLogTabs)) {
+        if let Mode::GitLog(tabs) = &mut self.mode {
+            action(tabs);
+            self.follow_git_log();
+        }
+    }
+
+    /// Act on what the git log page asks for after a key, a click, a
+    /// command, or something it had under way finishing: a file to open
+    /// in the editor, the changes page to resolve a merge or rebase's
+    /// conflicts on, and what to say in the status bar.
     fn follow_git_log(&mut self) {
         let Mode::GitLog(tabs) = &mut self.mode else {
             return;
         };
         let notice = tabs.take_notice();
         let open = tabs.take_file_to_open();
+        let changes = tabs.take_show_changes();
+        if let Some((workdir, submodule)) = changes {
+            self.open_changes();
+            if submodule && let Mode::Changes(tabs) = &mut self.mode {
+                tabs.show_repository(&workdir);
+            }
+        }
         if let Some(notice) = notice {
             self.status = Some(notice);
         }
@@ -3358,10 +3415,10 @@ impl App {
         let polled = match &mut self.mode {
             Mode::GitLog(tabs) => {
                 let polled = tabs.poll();
-                // A fetch that finished says how it went.
-                if let Some(notice) = tabs.take_notice() {
-                    self.status = Some(notice);
-                }
+                // A fetch, checkout, merge, or rebase that finished says
+                // how it went, and one that stopped at conflicts brings
+                // up the changes page.
+                self.follow_git_log();
                 polled
             }
             Mode::Changes(tabs) => tabs.poll(),
@@ -9618,6 +9675,130 @@ mod tests {
             status.as_deref(),
             Some(format!("Deleted branch topic (was {})", &first.to_string()[..8]).as_str())
         );
+    }
+
+    #[test]
+    fn a_merge_from_a_commits_menu_that_conflicts_goes_to_the_changes_page() {
+        let (dir, mut app) = app_with_files(&[]);
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Ann").unwrap();
+        config.set_str("user.email", "ann@example.com").unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        let commit = |files: &[(&str, &str)], message: &str, parent: Option<git2::Oid>| {
+            let mut index = repo.index().unwrap();
+            for (name, content) in files {
+                std::fs::write(dir.path().join(name), content).unwrap();
+                index.add_path(Path::new(name)).unwrap();
+            }
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit<'_>> = parent
+                .map(|id| repo.find_commit(id).unwrap())
+                .into_iter()
+                .collect();
+            let refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &refs)
+                .unwrap()
+        };
+        let base = commit(
+            &[(".gitignore", ".storage/\n"), ("f.txt", "base\n")],
+            "Base",
+            None,
+        );
+        let main = repo.head().unwrap().shorthand().unwrap().to_owned();
+        repo.branch("topic", &repo.find_commit(base).unwrap(), false)
+            .unwrap();
+        repo.set_head("refs/heads/topic").unwrap();
+        commit(&[("f.txt", "topic\n")], "On topic", Some(base));
+        repo.set_head(&format!("refs/heads/{main}")).unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let ours = commit(&[("f.txt", "main\n")], "On main", Some(base));
+
+        ctrl(&mut app, 'l');
+        let wait_log = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Mode::GitLog(tabs) = &app.mode
+                && tabs.is_loading()
+                && Instant::now() < deadline
+            {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_log(&mut app);
+        let screen = draw(&mut app, 100, 30);
+        let row_of = |text: &str| -> u16 {
+            screen
+                .iter()
+                .position(|row| row.contains(text))
+                .unwrap_or_else(|| panic!("no {text:?} in {screen:#?}")) as u16
+        };
+        let (topic, head_row) = (row_of("On topic"), row_of("On main"));
+        let column = screen[topic as usize].find("On topic").unwrap() as u16;
+
+        // HEAD's own commit can only be checked out.
+        right_click(&mut app, column, head_row);
+        assert_eq!(menu_commands(&app), [Some(Command::CheckoutCommit)]);
+        press(&mut app, KeyCode::Esc);
+        // Another branch's commit can be merged, rebased onto, and reset
+        // to, the reset set apart.
+        right_click(&mut app, column, topic);
+        assert_eq!(
+            menu_commands(&app),
+            [
+                Some(Command::CheckoutCommit),
+                None,
+                Some(Command::MergeCommit),
+                Some(Command::RebaseOntoCommit),
+                None,
+                Some(Command::ResetToCommit),
+            ]
+        );
+        let screen = draw(&mut app, 100, 30);
+        let merge = screen
+            .iter()
+            .position(|row| row.contains("│ Merge into current branch"))
+            .unwrap() as u16;
+        click(&mut app, column + 3, merge);
+        assert!(app.context_menu.is_none());
+
+        // The merge conflicts: the changes page comes up to resolve it,
+        // and the status bar says why.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while matches!(app.mode, Mode::GitLog(_)) && Instant::now() < deadline {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(app.mode, Mode::Changes(_)));
+        let status = app
+            .status
+            .as_ref()
+            .map(StatusLine::text)
+            .unwrap_or_default();
+        assert_eq!(
+            status,
+            format!(
+                "Merging topic into {main} stopped with conflicts in 1 file: resolve and stage them, then commit"
+            )
+        );
+        assert_eq!(repo.state(), git2::RepositoryState::Merge);
+        assert_eq!(repo.head().unwrap().target(), Some(ours));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Mode::Changes(tabs) = &app.mode
+            && tabs.is_loading()
+            && Instant::now() < deadline
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The palette offers committing the merge, or aborting it.
+        let context = app.command_context();
+        assert!(context.merging && !context.rebasing);
+        assert!(Command::AbortMerge.is_available(&context));
+        assert!(Command::Commit.is_available(&context));
+        assert!(!Command::AbortRebase.is_available(&context));
     }
 
     /// A screen row's text without the scrollbar in its last column and

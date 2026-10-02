@@ -13,7 +13,8 @@
 //!   fast-forwarded to the commit and checked out. A local branch that
 //!   is ahead of the remote's, or has diverged from it, isn't moved:
 //!   the checkout is refused and says so, since bringing the two
-//!   together needs a merge, which isn't done here yet.
+//!   together is a merge or a rebase, for the user to choose (see the
+//!   [`merge`](super::merge) and [`rebase`](super::rebase) modules).
 //! * With no local branch tracking the remote's, a local branch of the
 //!   same name is made at the commit, tracking the remote's, and
 //!   checked out, as `git checkout feature` does when only
@@ -107,7 +108,8 @@ pub enum CheckoutError {
     NameTaken(String),
     /// The local branch tracking the remote's branch at the commit has
     /// commits of its own: `ahead` of them, and `behind` the remote's.
-    /// Bringing them together is a merge, which isn't done here.
+    /// Bringing them together is a merge or a rebase, which a checkout
+    /// doesn't choose between.
     NotFastForward {
         name: String,
         upstream: String,
@@ -161,7 +163,7 @@ impl fmt::Display for CheckoutError {
                     write!(
                         f,
                         "{name} and {upstream} have diverged ({ahead} and {behind} {} apart); \
-                         merging them isn't supported yet",
+                         check out {name} and merge or rebase onto {upstream}",
                         commits(&(ahead + behind))
                     )
                 }
@@ -419,7 +421,7 @@ fn gitlinks(commit: &git2::Commit<'_>) -> Result<Vec<(String, Oid)>, git2::Error
 
 /// A submodule's repository, at `path` from the working directory, if
 /// the submodule is initialized: its directory holds a repository.
-fn open_submodule(repo: &Repository, path: &str) -> Option<Repository> {
+pub(super) fn open_submodule(repo: &Repository, path: &str) -> Option<Repository> {
     let workdir = repo.workdir()?;
     Repository::open(workdir.join(path)).ok()
 }
@@ -438,7 +440,10 @@ fn in_submodule<T>(
 /// See that every initialized submodule of a commit, nested ones
 /// included, can follow it: none has changes it could lose, and each
 /// has the commit it is to go to.
-fn check_submodules(repo: &Repository, commit: &git2::Commit<'_>) -> Result<(), CheckoutError> {
+pub(super) fn check_submodules(
+    repo: &Repository,
+    commit: &git2::Commit<'_>,
+) -> Result<(), CheckoutError> {
     for (path, id) in gitlinks(commit)? {
         let Some(sub) = open_submodule(repo, &path) else {
             continue;
@@ -459,32 +464,75 @@ fn check_submodules(repo: &Repository, commit: &git2::Commit<'_>) -> Result<(), 
 /// there is one, and its own submodules likewise. One already at its
 /// commit is left as it is. Returns how many were moved, nested ones
 /// included.
-fn update_submodules(
+pub(super) fn update_submodules(
     repo: &Repository,
     commit: &git2::Commit<'_>,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<usize, CheckoutError> {
     let mut updated = 0;
     for (path, id) in gitlinks(commit)? {
-        let Some(sub) = open_submodule(repo, &path) else {
-            continue;
-        };
-        updated += in_submodule(&path, || {
-            if head_is_at(&sub, id) {
-                // Already there: its index and working tree are left
-                // untouched (a checkout would rewrite the index even
-                // with nothing to do), but its own submodules may
-                // still be behind.
-                return update_submodules(&sub, &sub.find_commit(id)?, progress);
-            }
-            let how = match local_branch_at(&sub, id)? {
-                Some(name) => Checkout::Branch(name),
-                None => Checkout::Detached,
-            };
-            Ok(how.run_with(&sub, id, progress)? + 1)
-        })?;
+        updated += follow_gitlink(repo, &path, id, progress)?;
     }
     Ok(updated)
+}
+
+/// Bring every initialized submodule to the commit the index records
+/// for it, as [`update_submodules`] does for a commit's: for a merge or
+/// rebase part way, whose result is in the index and not yet a commit.
+/// A submodule in conflict has no one commit recorded, and is left for
+/// the user to resolve. Returns the paths of those moved (nested ones
+/// moving with them aren't named).
+pub(super) fn follow_index(
+    repo: &Repository,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<Vec<String>, CheckoutError> {
+    // An index entry's stage, in its flags: 0 for one not in conflict.
+    const STAGE_MASK: u16 = 0x3000;
+    const GITLINK: u32 = 0o160000;
+    let links: Vec<(String, Oid)> = repo
+        .index()?
+        .iter()
+        .filter(|entry| entry.mode == GITLINK && entry.flags & STAGE_MASK == 0)
+        .map(|entry| (String::from_utf8_lossy(&entry.path).into_owned(), entry.id))
+        .collect();
+    let mut moved = Vec::new();
+    for (path, id) in links {
+        if follow_gitlink(repo, &path, id, progress)? > 0 {
+            moved.push(path);
+        }
+    }
+    Ok(moved)
+}
+
+/// Bring the submodule at `path`, if initialized, to `id`, and its own
+/// submodules likewise; see [`update_submodules`]. Returns how many
+/// were moved, nested ones included.
+pub(super) fn follow_gitlink(
+    repo: &Repository,
+    path: &str,
+    id: Oid,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<usize, CheckoutError> {
+    let Some(sub) = open_submodule(repo, path) else {
+        return Ok(0);
+    };
+    in_submodule(path, || {
+        let commit = sub
+            .find_commit(id)
+            .map_err(|_| CheckoutError::MissingCommit(id))?;
+        if head_is_at(&sub, id) {
+            // Already there: its index and working tree are left
+            // untouched (a checkout would rewrite the index even with
+            // nothing to do), but its own submodules may still be
+            // behind.
+            return update_submodules(&sub, &commit, progress);
+        }
+        let how = match local_branch_at(&sub, id)? {
+            Some(name) => Checkout::Branch(name),
+            None => Checkout::Detached,
+        };
+        Ok(how.run_with(&sub, id, progress)? + 1)
+    })
 }
 
 /// Whether a repository's HEAD is at `id`: on a branch there, or
@@ -769,7 +817,7 @@ pub(super) fn branch_exists(repo: &Repository, name: &str) -> Result<bool, git2:
 
 /// Refuse while tracked files have changes, staged or not, that a
 /// checkout could lose.
-fn ensure_clean(repo: &Repository) -> Result<(), CheckoutError> {
+pub(super) fn ensure_clean(repo: &Repository) -> Result<(), CheckoutError> {
     let mut options = StatusOptions::new();
     options
         .include_untracked(false)
@@ -1247,7 +1295,7 @@ mod tests {
             err.to_string(),
             format!(
                 "{main} and origin/{main} have diverged (2 and 1 commits apart); \
-                 merging them isn't supported yet"
+                 check out {main} and merge or rebase onto origin/{main}"
             )
         );
         // A plan made before the divergence doesn't go through either.

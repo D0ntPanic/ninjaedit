@@ -4,7 +4,8 @@
 //! the mouse's, for the few that are wanted right where one is looking
 //! (cut, copy, and paste over the text; staging and discarding over a
 //! changed file; opening and restoring over a file a commit changed;
-//! later merging and the like over a commit).
+//! checking out, merging, rebasing, and resetting over a commit or a
+//! branch).
 //!
 //! A menu is opened with a list of [`MenuEntry`]s: the commands it
 //! offers, with separators between groups of them. It lists only the

@@ -75,9 +75,12 @@
 //! done at once. Submodules are left alone, and the status bar says so.
 //!
 //! A right click on a branch in the sidebar selects it (without going
-//! to its commit) and opens a menu for it: check it out, and, set apart
-//! below, delete it; both are in the command palette too while the
-//! sidebar has the keyboard. Checking out a local branch puts HEAD on
+//! to its commit) and opens a menu for it: check it out; merge it into
+//! the branch HEAD is on, or rebase that branch onto it; and, set apart
+//! below, reset HEAD's branch to it, and delete it. All are in the
+//! command palette too while the sidebar has the keyboard. Merging,
+//! rebasing, and resetting are for a branch HEAD isn't on or at, and do
+//! as they do for a commit in the log (below). Checking out a local branch puts HEAD on
 //! it; a remote's branch is checked out as its commit would be from
 //! the log were it the only branch there (see below): on the local
 //! branch tracking it, fast-forwarded if behind, or on a new one made
@@ -86,6 +89,37 @@
 //! nor its upstream has, which would be left on no branch; otherwise
 //! it is done at once, the status bar saying which commit the branch
 //! was at. A remote's branch isn't deleted here.
+//!
+//! A right click on a commit in the log selects it and opens a menu of
+//! what can be done with it, each in the command palette too: check it
+//! out (as Space does, below); merge the branch there into the branch
+//! HEAD is on, or rebase HEAD's branch onto the commit; and, set apart
+//! below, reset HEAD's branch to it. Only a commit HEAD isn't at offers
+//! more than checking out, and merging needs a branch there other than
+//! HEAD's: a local one, or failing that a remote's (see the core
+//! crate's `git::merge` and `git::rebase` modules). A merge or rebase
+//! does what `git merge` and `git rebase` do, in the background as a
+//! checkout does, with the status bar saying how it goes: nothing when
+//! HEAD has the commits already, a fast-forward when HEAD has nothing
+//! of its own, and otherwise a merge commit or the branch's commits
+//! replayed on the target. Changes to tracked files refuse either, as
+//! they refuse a checkout. One whose changes conflict stops part way,
+//! leaving the conflicts in the files as git does, and brings up the
+//! changes page, where they are resolved and the merge committed or
+//! the rebase continued, or either aborted. A submodule in conflict is
+//! resolved without stopping when its own branch was rebased first onto
+//! the commit the target uses, as `git sub-resolve` resolves it (see
+//! the core crate's `git::submodule_conflicts` module), so a rebase in
+//! that workflow goes through by itself; the status bar says how many
+//! were, and names any submodule left in conflict with why; a merge, rebase, or reset
+//! is refused until then. A reset is `git reset` in its mixed mode
+//! (see the core crate's `git::reset` module): HEAD's branch moves to
+//! the commit and the index with it, but the working directory stays
+//! as it is, so what differs shows on the changes page as unstaged
+//! changes. Commits it would leave on no branch (none other, nor a
+//! tag, has them) are named in a box that asks first; otherwise it is
+//! done at once. The page refreshes after each, so the log shows where
+//! HEAD is now.
 //!
 //! The log and the content pane scroll sideways as the editor does
 //! (see `EditorView`): only as far as the longest line on screen now
@@ -145,7 +179,7 @@
 //! only a remote's branch points there, the local branch tracking it
 //! is fast-forwarded to the commit and checked out if it is merely
 //! behind (one that is ahead, or has diverged, refuses: that needs a
-//! merge, which will come later); with no branch tracking it, a local
+//! merge or a rebase, below); with no branch tracking it, a local
 //! branch of the same name is made tracking it, and if a local branch
 //! by that name already exists elsewhere a box over the log asks for
 //! another name (see the `branch_prompt` module). With nothing
@@ -178,8 +212,9 @@ use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
     ChangeKind, Checkout, CheckoutError, CheckoutJob, CheckoutOutcome, CommitDetail,
-    DeleteBranchError, Fetch, FileChange, FileDiff, FileTree, History, Oid, Restored, TreeRow,
-    delete_branch, restore, short_id, submodules, unstaged_among,
+    DeleteBranchError, Fetch, FileChange, FileDiff, FileTree, History, Integration, IntegrationJob,
+    Oid, OperationError, Outcome, RefKind, Restored, Target, TreeRow, delete_branch, left_behind,
+    reset, restore, short_id, submodules, unstaged_among,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
@@ -242,10 +277,18 @@ const DELETE_HELP: &[(&str, &str)] = &[
     ("←→", "button"),
     ("Enter", "press"),
 ];
+const RESET_HELP: &[(&str, &str)] = &[
+    ("y", "reset"),
+    ("n/Esc", "cancel"),
+    ("←→", "button"),
+    ("Enter", "press"),
+];
 /// The restore box's button.
 const RESTORE: &str = "Restore";
 /// The delete branch box's button.
 const DELETE: &str = "Delete";
+/// The reset box's button.
+const RESET: &str = "Reset";
 const FILES_HELP: &[(&str, &str)] = &[
     ("↑↓", "file"),
     ("Enter", "view"),
@@ -398,6 +441,22 @@ struct PendingDelete {
     name: String,
 }
 
+/// A reset waiting on the reset box, which asks because commits of
+/// HEAD's would be left on no branch.
+struct PendingReset {
+    dialog: ConfirmBox,
+    /// The commit to reset to, and what to call it in the status bar:
+    /// a branch's name or the commit's short id.
+    id: Oid,
+    what: String,
+}
+
+/// A merge or rebase under way, and what of.
+struct RunningIntegration {
+    what: Integration,
+    job: IntegrationJob,
+}
+
 /// A checkout under way, and what of.
 struct RunningCheckout {
     /// What is being checked out, for the status bar: a commit's short
@@ -422,6 +481,8 @@ struct SideBranch {
 /// Which of the page's right-click menus to open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GitLogMenu {
+    /// For a commit in the log.
+    Commit,
     /// For a file or directory of the selected commit.
     Files,
     /// For a branch in the sidebar.
@@ -435,9 +496,9 @@ pub struct GitLogMouseOutcome {
     /// The pane sizes changed (a drag of a rule ended), so the layout
     /// is worth keeping.
     pub resized: bool,
-    /// A right press on a file or directory of the selected commit, or
-    /// on a branch in the sidebar, which it selected: open that menu
-    /// of the page at the pointer, for it.
+    /// A right press on a commit in the log, on a file or directory of
+    /// the selected commit, or on a branch in the sidebar, which it
+    /// selected: open that menu of the page at the pointer, for it.
     pub menu: Option<GitLogMenu>,
 }
 
@@ -612,6 +673,58 @@ impl GitLogTabs {
         self.active().delete_selected_branch();
     }
 
+    /// The command palette's "Merge into current branch": the branch at
+    /// the shown page's selected commit, in the background.
+    pub fn merge_selected_commit(&mut self) {
+        self.active().merge_selected_commit();
+    }
+
+    /// The command palette's "Rebase current branch onto commit": the
+    /// shown page's selected commit, in the background.
+    pub fn rebase_onto_selected_commit(&mut self) {
+        self.active().rebase_onto_selected_commit();
+    }
+
+    /// The command palette's "Reset current branch to commit": the
+    /// shown page's selected commit, asking first if commits would be
+    /// left on no branch.
+    pub fn reset_to_selected_commit(&mut self) {
+        self.active().reset_to_selected_commit();
+        self.follow_checkout();
+    }
+
+    /// The command palette's "Merge branch into current branch": the
+    /// branch selected in the shown page's sidebar, in the background.
+    pub fn merge_selected_branch(&mut self) {
+        self.active().merge_selected_branch();
+    }
+
+    /// The command palette's "Rebase current branch onto branch": the
+    /// branch selected in the shown page's sidebar, in the background.
+    pub fn rebase_onto_selected_branch(&mut self) {
+        self.active().rebase_onto_selected_branch();
+    }
+
+    /// The command palette's "Reset current branch to branch": the
+    /// branch selected in the shown page's sidebar, asking first if
+    /// commits would be left on no branch.
+    pub fn reset_to_selected_branch(&mut self) {
+        self.active().reset_to_selected_branch();
+        self.follow_checkout();
+    }
+
+    /// The repository whose changes page is to be shown, as the tabs
+    /// open it (see [`active_repository`](Self::active_repository)),
+    /// when a merge or rebase on the shown page stopped at conflicts
+    /// since this was last asked: they are resolved there.
+    pub fn take_show_changes(&mut self) -> Option<(PathBuf, bool)> {
+        let shown = self.tabs[self.active]
+            .view
+            .as_mut()
+            .is_some_and(GitLogView::take_show_changes);
+        shown.then(|| self.active_repository())
+    }
+
     /// Open the selected file of the shown page's commit in the editor,
     /// as its `o` does; see [`take_file_to_open`](Self::take_file_to_open).
     pub fn open_selected_change(&mut self) {
@@ -782,6 +895,9 @@ pub struct GitLogView {
     /// A checkout under way (Space or a double-click in the log, or a
     /// branch from the sidebar); the page refreshes once it is done.
     checkout: Option<RunningCheckout>,
+    /// A merge or rebase under way; the page refreshes once it is
+    /// done.
+    integration: Option<RunningIntegration>,
     /// What the status bar is to say, once: how a fetch or a checkout
     /// went.
     notice: Option<StatusLine>,
@@ -867,6 +983,12 @@ pub struct GitLogView {
     restore: Option<PendingRestore>,
     /// The delete branch box, while it asks whether to go ahead.
     branch_delete: Option<PendingDelete>,
+    /// The reset box, while it asks whether to go ahead.
+    reset_box: Option<PendingReset>,
+    /// Whether a merge or rebase stopped at conflicts and the changes
+    /// page, where they are resolved, is to be shown, and that hasn't
+    /// been asked since (see [`take_show_changes`](Self::take_show_changes)).
+    show_changes: bool,
 }
 
 impl GitLogView {
@@ -900,6 +1022,7 @@ impl GitLogView {
             pending: None,
             fetch: None,
             checkout: None,
+            integration: None,
             notice: None,
             pane: Pane::Log,
             side_rows: Vec::new(),
@@ -947,6 +1070,8 @@ impl GitLogView {
             file_to_open: None,
             restore: None,
             branch_delete: None,
+            reset_box: None,
+            show_changes: false,
         };
         view.install(GitLogView::open_history(root, exact));
         view
@@ -1019,7 +1144,7 @@ impl GitLogView {
     /// Take in commits the walk has produced, and the refresh's once
     /// it is done. Returns whether the page needs redrawing.
     pub fn poll(&mut self) -> bool {
-        let checked_out = self.poll_checkout();
+        let checked_out = self.poll_checkout() | self.poll_integration();
         let fetched = self.poll_fetch() || checked_out;
         let refreshed = self.poll_refresh() || fetched;
         let Some(history) = &mut self.history else {
@@ -1273,6 +1398,16 @@ impl GitLogView {
                 None => format!("checking out {what}…"),
             });
         }
+        if let Some(RunningIntegration { what, job }) = &self.integration {
+            let doing = match what {
+                Integration::Merge(target) => format!("merging {}", target.name()),
+                Integration::Rebase(target) => format!("rebasing onto {}", target.name()),
+            };
+            return StatusLine::progress(match job.progress() {
+                Some((written, total)) => format!("{doing}… {written}/{total} files"),
+                None => format!("{doing}…"),
+            });
+        }
         if let Some(history) = &self.history
             && history.is_loading()
         {
@@ -1295,6 +1430,9 @@ impl GitLogView {
         }
         if self.branch_delete.is_some() {
             return StatusLine::help(DELETE_HELP);
+        }
+        if self.reset_box.is_some() {
+            return StatusLine::help(RESET_HELP);
         }
         StatusLine::help(match self.pane {
             Pane::Sidebar => SIDEBAR_HELP,
@@ -1344,6 +1482,7 @@ impl GitLogView {
             || self.pending.is_some()
             || self.fetch.is_some()
             || self.checkout.is_some()
+            || self.integration.is_some()
     }
 
     /// Where the rule under the log was drawn.
@@ -1590,8 +1729,7 @@ impl GitLogView {
     /// otherwise it is done now. The status bar says how it went.
     pub fn restore_selected(&mut self, version: Version) {
         self.ensure_detail();
-        if self.checkout.is_some() {
-            self.notice = Some(StatusLine::error("A checkout is under way"));
+        if self.busy() {
             return;
         }
         let (Some(detail), Some(row), Some(history)) =
@@ -1731,8 +1869,7 @@ impl GitLogView {
     /// delete branch box ask first. The status bar says how it went,
     /// and the page refreshes.
     pub fn delete_selected_branch(&mut self) {
-        if self.checkout.is_some() {
-            self.notice = Some(StatusLine::error("A checkout is under way"));
+        if self.busy() {
             return;
         }
         let Some(branch) = self.selected_branch() else {
@@ -2117,6 +2254,308 @@ impl GitLogView {
 
     // ----- Input ----------------------------------------------------------
 
+    // ----- Merging, rebasing, and resetting -------------------------------
+
+    /// Whether a checkout, merge, or rebase is under way, beside which
+    /// nothing else that changes the repository starts; the status bar
+    /// says so.
+    fn busy(&mut self) -> bool {
+        let what = if self.checkout.is_some() {
+            "A checkout"
+        } else if let Some(running) = &self.integration {
+            match running.what {
+                Integration::Merge(_) => "A merge",
+                Integration::Rebase(_) => "A rebase",
+            }
+        } else {
+            return false;
+        };
+        self.notice = Some(StatusLine::error(format!("{what} is under way")));
+        true
+    }
+
+    /// The selected commit's id, unless HEAD is at it.
+    fn other_selected_id(&self) -> Option<Oid> {
+        let id = self.selected_id()?;
+        let head = self.history.as_ref()?.head()?;
+        (id != head).then_some(id)
+    }
+
+    /// Whether the selected commit is one HEAD isn't at, for "Rebase
+    /// current branch onto commit" and "Reset current branch to
+    /// commit".
+    pub fn other_commit_selected(&self) -> bool {
+        self.other_selected_id().is_some()
+    }
+
+    /// The branch to merge for the selected commit, unless HEAD is at
+    /// it: a local branch there other than HEAD's, or failing that a
+    /// remote's, the first as the log lists them.
+    fn branch_at_selected(&self) -> Option<Target> {
+        self.other_selected_id()?;
+        let commit = self.history.as_ref()?.commits().get(self.selected)?;
+        let local = commit
+            .refs
+            .iter()
+            .find(|label| label.kind == RefKind::Branch && !label.is_head);
+        let label = local.or_else(|| {
+            commit
+                .refs
+                .iter()
+                .find(|label| label.kind == RefKind::RemoteBranch)
+        })?;
+        Some(Target::Branch {
+            name: label.name.clone(),
+            remote: label.kind == RefKind::RemoteBranch,
+        })
+    }
+
+    /// Whether the selected commit has a branch to merge, for "Merge
+    /// into current branch".
+    pub fn can_merge_commit(&self) -> bool {
+        self.branch_at_selected().is_some()
+    }
+
+    /// The branch selected in the sidebar, with the keyboard there,
+    /// unless HEAD is on it or at its commit.
+    fn other_selected_branch(&self) -> Option<SideBranch> {
+        if self.pane != Pane::Sidebar {
+            return None;
+        }
+        let branch = self.selected_branch()?;
+        let head = self.history.as_ref()?.head()?;
+        (!branch.is_head && branch.target != head).then_some(branch)
+    }
+
+    /// Whether the keyboard is in the sidebar with a branch selected
+    /// there that HEAD isn't on or at, for merging it, rebasing onto
+    /// it, or resetting to it.
+    pub fn other_branch_selected(&self) -> bool {
+        self.other_selected_branch().is_some()
+    }
+
+    /// "Merge into current branch": merge the branch at the selected
+    /// commit into HEAD's (see [`start_integration`](Self::start_integration)).
+    pub fn merge_selected_commit(&mut self) {
+        if let Some(target) = self.branch_at_selected() {
+            self.start_integration(Integration::Merge(target));
+        }
+    }
+
+    /// "Rebase current branch onto commit": rebase HEAD's branch onto
+    /// the selected commit.
+    pub fn rebase_onto_selected_commit(&mut self) {
+        if let Some(id) = self.other_selected_id() {
+            self.start_integration(Integration::Rebase(Target::Commit(id)));
+        }
+    }
+
+    /// "Reset current branch to commit": reset HEAD's branch to the
+    /// selected commit (see [`request_reset`](Self::request_reset)).
+    pub fn reset_to_selected_commit(&mut self) {
+        if let Some(id) = self.other_selected_id() {
+            self.request_reset(id, short_id(id));
+        }
+    }
+
+    /// "Merge branch into current branch": merge the branch selected in
+    /// the sidebar into HEAD's.
+    pub fn merge_selected_branch(&mut self) {
+        if let Some(branch) = self.other_selected_branch() {
+            self.start_integration(Integration::Merge(Target::Branch {
+                name: branch.name,
+                remote: branch.remote,
+            }));
+        }
+    }
+
+    /// "Rebase current branch onto branch": rebase HEAD's branch onto
+    /// the branch selected in the sidebar.
+    pub fn rebase_onto_selected_branch(&mut self) {
+        if let Some(branch) = self.other_selected_branch() {
+            self.start_integration(Integration::Rebase(Target::Branch {
+                name: branch.name,
+                remote: branch.remote,
+            }));
+        }
+    }
+
+    /// "Reset current branch to branch": reset HEAD's branch to where
+    /// the branch selected in the sidebar is.
+    pub fn reset_to_selected_branch(&mut self) {
+        if let Some(branch) = self.other_selected_branch() {
+            self.request_reset(branch.target, branch.name);
+        }
+    }
+
+    /// Start merging or rebasing in the background (see the core
+    /// crate's `git::operation` module), unless something else is under
+    /// way. The status bar says how it is going, and then how it went.
+    fn start_integration(&mut self, what: Integration) {
+        if self.busy() {
+            return;
+        }
+        let Some(history) = &self.history else {
+            return;
+        };
+        match IntegrationJob::start(history.git_dir(), what.clone()) {
+            Ok(job) => self.integration = Some(RunningIntegration { what, job }),
+            Err(err) => {
+                self.notice = Some(StatusLine::error(format!(
+                    "Could not {}: {err}",
+                    integration_words(&what)
+                )));
+            }
+        }
+    }
+
+    /// Take in what the merge or rebase has reported, and once it is
+    /// done say how it went and read the repository again so the log
+    /// shows where HEAD is now. One that stopped at conflicts asks for
+    /// the changes page, where they are resolved (see
+    /// [`take_show_changes`](Self::take_show_changes)). Returns
+    /// whether anything changed.
+    fn poll_integration(&mut self) -> bool {
+        let Some(running) = &mut self.integration else {
+            return false;
+        };
+        let changed = running.job.poll();
+        if !running.job.is_done() {
+            return changed;
+        }
+        let Some(RunningIntegration { what, job }) = self.integration.take() else {
+            return changed;
+        };
+        let head = self
+            .history
+            .as_ref()
+            .and_then(History::head_branch)
+            .map(str::to_owned);
+        let moved = match job.outcome() {
+            Some(Ok(outcome)) => {
+                self.notice = Some(StatusLine::info(what.summary(head.as_deref(), &outcome)));
+                if matches!(outcome, Outcome::Conflicts { .. }) {
+                    self.show_changes = true;
+                }
+                outcome != Outcome::UpToDate
+            }
+            // Left in progress part way: the changes page is where it
+            // is continued or aborted.
+            Some(Err(err @ OperationError::Stopped(_))) => {
+                let doing = match &what {
+                    Integration::Merge(target) => format!("Merging {}", target.name()),
+                    Integration::Rebase(target) => format!("Rebasing onto {}", target.name()),
+                };
+                self.notice = Some(StatusLine::error(format!("{doing} {err}")));
+                self.show_changes = true;
+                true
+            }
+            Some(Err(err @ OperationError::SubmodulesBehind(_))) => {
+                let done = match &what {
+                    Integration::Merge(target) => format!("Merged {}", target.name()),
+                    Integration::Rebase(target) => format!("Rebased onto {}", target.name()),
+                };
+                self.notice = Some(StatusLine::error(format!("{done}: {err}")));
+                true
+            }
+            Some(Err(err)) => {
+                self.notice = Some(StatusLine::error(format!(
+                    "Could not {}: {err}",
+                    integration_words(&what)
+                )));
+                false
+            }
+            None => {
+                self.notice = Some(StatusLine::error(format!(
+                    "Could not {}: it stopped",
+                    integration_words(&what)
+                )));
+                false
+            }
+        };
+        if moved {
+            self.checked_out = true;
+            self.refresh();
+        }
+        true
+    }
+
+    /// Whether a merge or rebase stopped at conflicts since the last
+    /// time this was asked, for the changes page to be shown, where
+    /// they are resolved.
+    fn take_show_changes(&mut self) -> bool {
+        std::mem::take(&mut self.show_changes)
+    }
+
+    /// Reset HEAD's branch to `id` (called `what` in the status bar),
+    /// keeping the working directory (see the core crate's
+    /// `git::reset` module): at once if every commit it leaves behind
+    /// is on another branch or tag, otherwise once the reset box has
+    /// asked.
+    fn request_reset(&mut self, id: Oid, what: String) {
+        if self.busy() {
+            return;
+        }
+        let Some(history) = &self.history else {
+            return;
+        };
+        match left_behind(history.git_dir(), id) {
+            Ok(0) => self.finish_reset(id, what),
+            Ok(commits) => {
+                let head = history.head_branch().unwrap_or("HEAD");
+                let noun = if commits == 1 { "commit" } else { "commits" };
+                let dialog = ConfirmBox::new(
+                    format!("Reset {head} to {what}?"),
+                    format!(
+                        "{commits} {noun} of {head} that no other branch or tag has would be left on no branch (git's reflog keeps them for a while). The working directory stays as it is."
+                    ),
+                    RESET,
+                );
+                self.reset_box = Some(PendingReset { dialog, id, what });
+            }
+            Err(err) => {
+                self.notice = Some(StatusLine::error(format!(
+                    "Could not reset to {what}: {err}"
+                )));
+            }
+        }
+    }
+
+    /// Act on the reset box's answer: reset as it asked, or drop it.
+    fn handle_reset_outcome(&mut self, outcome: ConfirmOutcome) {
+        match outcome {
+            ConfirmOutcome::Continue => {}
+            ConfirmOutcome::Cancel => self.reset_box = None,
+            ConfirmOutcome::Confirm => {
+                if let Some(pending) = self.reset_box.take() {
+                    self.finish_reset(pending.id, pending.what);
+                }
+            }
+        }
+    }
+
+    /// Do a reset, say how it went, and read the repository again.
+    fn finish_reset(&mut self, id: Oid, what: String) {
+        let Some(history) = &self.history else {
+            return;
+        };
+        let head = history.head_branch().unwrap_or("HEAD").to_owned();
+        match reset(history.git_dir(), id) {
+            Ok(()) => {
+                self.notice = Some(StatusLine::info(format!(
+                    "Reset {head} to {what}; the working directory is unchanged"
+                )));
+                self.checked_out = true;
+                self.refresh();
+            }
+            Err(err) => {
+                self.notice = Some(StatusLine::error(format!(
+                    "Could not reset to {what}: {err}"
+                )));
+            }
+        }
+    }
+
     // ----- Checking out --------------------------------------------------
 
     /// Space or a double-click in the log: check the selected commit
@@ -2124,8 +2563,7 @@ impl GitLogView {
     /// box asking for a new branch's name when one is wanted. The
     /// status bar says what was done, or why it couldn't be.
     pub fn checkout_selected(&mut self) {
-        if self.checkout.is_some() {
-            self.notice = Some(StatusLine::error("A checkout is under way"));
+        if self.busy() {
             return;
         }
         let Some(id) = self.selected_id() else {
@@ -2145,8 +2583,7 @@ impl GitLogView {
     /// the box asking for a name if its own is taken. The status bar
     /// says what was done, or why it couldn't be.
     pub fn checkout_selected_branch(&mut self) {
-        if self.checkout.is_some() {
-            self.notice = Some(StatusLine::error("A checkout is under way"));
+        if self.busy() {
             return;
         }
         let (Some(branch), Some(history)) = (self.selected_branch(), &self.history) else {
@@ -2241,7 +2678,7 @@ impl GitLogView {
             BranchPromptOutcome::Continue => {}
             BranchPromptOutcome::Close => self.branch_prompt = None,
             BranchPromptOutcome::Accept(name) => {
-                if self.checkout.is_some() {
+                if self.checkout.is_some() || self.integration.is_some() {
                     return;
                 }
                 let (Some(prompt), Some(history)) = (&self.branch_prompt, &self.history) else {
@@ -2279,10 +2716,15 @@ impl GitLogView {
             self.handle_restore_outcome(outcome);
             return;
         }
-        // So has the delete branch box.
+        // So has the delete branch box, and the reset box.
         if let Some(pending) = &mut self.branch_delete {
             let outcome = pending.dialog.handle_key(key);
             self.handle_delete_outcome(outcome);
+            return;
+        }
+        if let Some(pending) = &mut self.reset_box {
+            let outcome = pending.dialog.handle_key(key);
+            self.handle_reset_outcome(outcome);
             return;
         }
         // The file list follows the selected commit's detail, which is
@@ -2578,6 +3020,11 @@ impl GitLogView {
             self.handle_delete_outcome(answer);
             return outcome;
         }
+        if let Some(pending) = &mut self.reset_box {
+            let answer = pending.dialog.handle_mouse(mouse);
+            self.handle_reset_outcome(answer);
+            return outcome;
+        }
         self.ensure_detail();
         let at = ScreenPosition::new(mouse.column, mouse.row);
         // A rule being dragged owns the mouse until the button comes up.
@@ -2643,6 +3090,18 @@ impl GitLogView {
             return outcome;
         };
         match mouse.kind {
+            // A right press on a commit in the log selects it, and asks
+            // for the menu of what can be done with it.
+            MouseEventKind::Down(MouseButton::Right) if pane == Pane::Log => {
+                let index = self.log_scroll + (mouse.row - self.log_area.y) as usize / 2;
+                if index < self.commit_count() {
+                    self.pane = Pane::Log;
+                    self.head_shown = true;
+                    self.pending_jump = None;
+                    self.select_commit(index);
+                    outcome.menu = Some(GitLogMenu::Commit);
+                }
+            }
             // A right press on a file or directory of the commit selects
             // it, without folding a directory, and asks for the menu of
             // what can be done to it.
@@ -2797,6 +3256,9 @@ impl GitLogView {
             pending.dialog.render(area, buf, theme);
         }
         if let Some(pending) = &mut self.branch_delete {
+            pending.dialog.render(area, buf, theme);
+        }
+        if let Some(pending) = &mut self.reset_box {
             pending.dialog.render(area, buf, theme);
         }
         match &mut self.branch_prompt {
@@ -3296,6 +3758,15 @@ impl GitLogView {
 
 /// A description line for a time: in the user's zone, and in the zone
 /// it was recorded in when that reads differently.
+/// What a merge or rebase does, in words for "Could not …": `merge
+/// feature`, `rebase onto origin/main`.
+fn integration_words(what: &Integration) -> String {
+    match what {
+        Integration::Merge(target) => format!("merge {}", target.name()),
+        Integration::Rebase(target) => format!("rebase onto {}", target.name()),
+    }
+}
+
 fn date_line(label: &str, time: ninjaedit_core::git::CommitTime) -> String {
     let local = time.to_string();
     let own = time.in_own_zone();
@@ -5606,10 +6077,215 @@ mod tests {
         assert!(!view.can_open_selected_change());
         assert!(view.can_restore_selected());
         assert!(view.dirs_collapsed.iter().all(|folded| !folded));
-        // The description, and the log, ask for no menu.
+        // The description asks for no menu.
         assert_eq!(right_press(&mut view, x, description).menu, None);
+        // A commit in the log selects it and asks for the commit's.
         let log = view.log_area;
-        assert_eq!(right_press(&mut view, log.x + 4, log.y).menu, None);
+        let outcome = right_press(&mut view, log.x + 4, log.y + 2);
+        assert_eq!(outcome.menu, Some(GitLogMenu::Commit));
+        assert_eq!(view.pane, Pane::Log);
+        assert_eq!(view.selected, 1);
+    }
+
+    /// A repository with `main` at a base and a commit changing `f.txt`,
+    /// and `side` from the base with a commit changing `g.txt`, or
+    /// `f.txt` too when `clash`, so that the two conflict. HEAD is on
+    /// main, with its files, and the configuration names someone to
+    /// commit as. Returns the base, main's commit, and side's.
+    fn diverged_repo(clash: bool) -> (tempfile::TempDir, [Oid; 3]) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Ann Author").unwrap();
+        config.set_str("user.email", "ann@example.com").unwrap();
+        let sig = Signature::new(
+            "Ann Author",
+            "ann@example.com",
+            &git2::Time::new(1_700_000_000, 0),
+        )
+        .unwrap();
+        let commit = |files: &[(&str, &str)], message: &str, parent: Option<Oid>| {
+            let mut index = repo.index().unwrap();
+            for (name, content) in files {
+                fs::write(dir.path().join(name), content).unwrap();
+                index.add_path(Path::new(name)).unwrap();
+            }
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit<'_>> = parent
+                .map(|id| repo.find_commit(id).unwrap())
+                .into_iter()
+                .collect();
+            let refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &refs)
+                .unwrap()
+        };
+        let base = commit(&[("f.txt", "base\n")], "Base", None);
+        let main = commit(&[("f.txt", "main\n")], "Main", Some(base));
+        let head = repo.head().unwrap().name().unwrap().to_owned();
+        repo.branch("side", &repo.find_commit(base).unwrap(), false)
+            .unwrap();
+        repo.set_head("refs/heads/side").unwrap();
+        let force = || {
+            let mut options = git2::build::CheckoutBuilder::new();
+            options.force().remove_untracked(true);
+            options
+        };
+        repo.checkout_head(Some(&mut force())).unwrap();
+        let side_file = if clash { "f.txt" } else { "g.txt" };
+        let side = commit(&[(side_file, "side\n")], "Side", Some(base));
+        repo.set_head(&head).unwrap();
+        repo.checkout_head(Some(&mut force())).unwrap();
+        (dir, [base, main, side])
+    }
+
+    #[test]
+    fn a_commit_in_the_log_is_merged_or_reset_to() {
+        let (dir, [base, main, side]) = diverged_repo(false);
+        let head = head_of(&dir).0.unwrap();
+        let mut view = view(&dir);
+        draw(&mut view, 110, 24);
+        let at = |view: &GitLogView, id: Oid| view.history.as_ref().unwrap().position(id).unwrap();
+
+        // HEAD's own commit has nothing to merge, rebase onto, or reset
+        // to; side's has a branch to merge; the base has no branch.
+        view.select_commit(at(&view, main));
+        assert!(!view.other_commit_selected());
+        assert!(!view.can_merge_commit());
+        view.select_commit(at(&view, base));
+        assert!(view.other_commit_selected());
+        assert!(!view.can_merge_commit());
+        view.select_commit(at(&view, side));
+        assert!(view.can_merge_commit());
+
+        view.merge_selected_commit();
+        assert!(
+            view.hint().text().starts_with("merging side…"),
+            "{}",
+            view.hint()
+        );
+        wait(&mut view);
+        let merged = head_of(&dir).1;
+        assert_eq!(
+            notice_of(&mut view),
+            Some(format!("Merged side into {head} as {}", short_id(merged)))
+        );
+        assert!(!view.take_show_changes());
+        let repo = Repository::open(dir.path()).unwrap();
+        let parents: Vec<Oid> = repo.find_commit(merged).unwrap().parent_ids().collect();
+        assert_eq!(parents, [main, side]);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("g.txt")).unwrap(),
+            "side\n"
+        );
+        // The log follows: HEAD is the merge now.
+        assert_eq!(view.history.as_ref().unwrap().head(), Some(merged));
+
+        // Resetting back to main's commit leaves the merge on no branch,
+        // so the box asks; No keeps it, Yes resets, keeping the files.
+        view.select_commit(at(&view, main));
+        view.reset_to_selected_commit();
+        assert_eq!(view.hint(), StatusLine::help(RESET_HELP));
+        let screen = draw(&mut view, 110, 24);
+        let asked = format!("Reset {head} to {}?", short_id(main));
+        assert!(screen.iter().any(|r| r.contains(&asked)), "{screen:#?}");
+        view.handle_key(key(KeyCode::Char('n')), &mut Clipboard::new());
+        assert!(view.reset_box.is_none());
+        assert_eq!(head_of(&dir).1, merged);
+        view.reset_to_selected_commit();
+        view.handle_key(key(KeyCode::Char('y')), &mut Clipboard::new());
+        assert_eq!(
+            notice_of(&mut view),
+            Some(format!(
+                "Reset {head} to {}; the working directory is unchanged",
+                short_id(main)
+            ))
+        );
+        assert_eq!(head_of(&dir), (Some(head.clone()), main));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("g.txt")).unwrap(),
+            "side\n"
+        );
+        assert_eq!(
+            repo.status_file(Path::new("g.txt")).unwrap(),
+            git2::Status::WT_NEW
+        );
+        wait(&mut view);
+
+        // Back to side's commit: main's commit is on no other branch
+        // either, but a tag keeps it, so nothing is asked.
+        repo.tag_lightweight("kept", &repo.find_object(main, None).unwrap(), false)
+            .unwrap();
+        view.select_commit(at(&view, side));
+        view.reset_to_selected_commit();
+        assert!(view.reset_box.is_none());
+        assert_eq!(head_of(&dir), (Some(head), side));
+    }
+
+    #[test]
+    fn a_rebase_onto_a_branch_that_conflicts_asks_for_the_changes_page() {
+        let (dir, [_base, main, side]) = diverged_repo(true);
+        let head = head_of(&dir).0.unwrap();
+        let mut view = view(&dir);
+        let screen = draw(&mut view, 110, 24);
+        let row_of = |screen: &[String], name: &str| {
+            screen
+                .iter()
+                .position(|row| row.starts_with(&format!("   {name} ")))
+                .unwrap_or_else(|| panic!("no {name} in {screen:#?}")) as u16
+        };
+        let right_press = |view: &mut GitLogView, row: u16| {
+            view.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: 4,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        // HEAD's branch is nothing to rebase onto; side is.
+        right_press(&mut view, row_of(&screen, &head));
+        assert!(!view.other_branch_selected());
+        let outcome = right_press(&mut view, row_of(&screen, "side"));
+        assert_eq!(outcome.menu, Some(GitLogMenu::Branch));
+        assert!(view.other_branch_selected());
+
+        view.rebase_onto_selected_branch();
+        // Nothing else starts meanwhile.
+        view.checkout_selected_branch();
+        assert_eq!(
+            notice_of(&mut view).as_deref(),
+            Some("A rebase is under way")
+        );
+        wait(&mut view);
+        assert_eq!(
+            notice_of(&mut view),
+            Some(format!(
+                "Rebasing {head} onto side stopped at commit 1 of 1 with conflicts in 1 file: resolve and stage them, then continue"
+            ))
+        );
+        assert!(view.take_show_changes());
+        assert!(!view.take_show_changes(), "asked for once");
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(repo.state(), git2::RepositoryState::RebaseMerge);
+        assert_eq!(repo.head().unwrap().target(), Some(side));
+
+        // Another rebase, or a merge or reset, waits for it. HEAD is
+        // detached at side meanwhile, so it is main's commit that is
+        // another.
+        wait(&mut view);
+        let position = view.history.as_ref().unwrap().position(main).unwrap();
+        view.select_commit(position);
+        view.rebase_onto_selected_commit();
+        wait(&mut view);
+        let notice = notice_of(&mut view).unwrap();
+        let refused = format!(
+            "Could not rebase onto {}: a rebase is in progress",
+            short_id(main)
+        );
+        assert!(notice.starts_with(&refused), "{notice}");
+        view.reset_to_selected_commit();
+        let notice = notice_of(&mut view).unwrap();
+        assert!(notice.contains("a rebase is in progress"), "{notice}");
     }
 
     #[test]

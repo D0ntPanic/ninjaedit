@@ -85,6 +85,24 @@ pub enum Command {
     /// The git log page's deleting of the local branch selected in the
     /// sidebar.
     DeleteBranch,
+    /// The git log page's merging of the branch at the selected commit
+    /// into HEAD's.
+    MergeCommit,
+    /// The git log page's rebasing of HEAD's branch onto the selected
+    /// commit.
+    RebaseOntoCommit,
+    /// The git log page's resetting of HEAD's branch to the selected
+    /// commit.
+    ResetToCommit,
+    /// The git log page's merging of the branch selected in the sidebar
+    /// into HEAD's.
+    MergeBranch,
+    /// The git log page's rebasing of HEAD's branch onto the branch
+    /// selected in the sidebar.
+    RebaseOntoBranch,
+    /// The git log page's resetting of HEAD's branch to the branch
+    /// selected in the sidebar.
+    ResetToBranch,
     /// The changes page's Ctrl+S.
     Commit,
     /// The changes page's `a` in the unstaged list.
@@ -109,6 +127,14 @@ pub enum Command {
     RestoreParentVersion,
     /// The changes page's `m`.
     ToggleAmend,
+    /// The changes page's Ctrl+S while a rebase is in progress.
+    ContinueRebase,
+    /// The changes page's giving up of the merge in progress, once
+    /// confirmed.
+    AbortMerge,
+    /// The changes page's giving up of the rebase in progress, once
+    /// confirmed.
+    AbortRebase,
     SwitchView,
     NextView,
     PreviousView,
@@ -219,6 +245,22 @@ pub struct Context {
     /// On the git log page, with the keyboard in the sidebar, whether a
     /// local branch HEAD isn't on is selected there, to delete.
     pub can_delete_branch: bool,
+    /// On the git log page, whether the selected commit is one HEAD
+    /// isn't at, to rebase onto or reset to.
+    pub other_commit_selected: bool,
+    /// On the git log page, whether the selected commit is one HEAD
+    /// isn't at with a branch at it other than HEAD's, to merge.
+    pub can_merge_commit: bool,
+    /// On the git log page, with the keyboard in the sidebar, whether a
+    /// branch (local or a remote's) HEAD isn't on is selected there, to
+    /// merge, rebase onto, or reset to.
+    pub other_branch_selected: bool,
+    /// On the changes page, whether a merge is in progress, to commit
+    /// or abort.
+    pub merging: bool,
+    /// On the changes page, whether a rebase is in progress, to
+    /// continue or abort.
+    pub rebasing: bool,
     /// Whether the status bar shows a repository to make a branch in:
     /// the one the file being edited is in, the shown git page's, or
     /// the project's own. A property of where the user is in the
@@ -230,7 +272,7 @@ impl Command {
     /// Every command, in the order the palette lists them before
     /// anything is typed: files, searching, editing, building, the
     /// pages, views, and quitting last.
-    pub const ALL: [Command; 48] = [
+    pub const ALL: [Command; 57] = [
         Command::OpenFile,
         Command::SwitchTab,
         Command::Save,
@@ -264,6 +306,12 @@ impl Command {
         Command::CheckoutCommit,
         Command::CheckoutBranch,
         Command::DeleteBranch,
+        Command::MergeCommit,
+        Command::RebaseOntoCommit,
+        Command::ResetToCommit,
+        Command::MergeBranch,
+        Command::RebaseOntoBranch,
+        Command::ResetToBranch,
         Command::RestoreCommitVersion,
         Command::RestoreParentVersion,
         Command::Commit,
@@ -274,6 +322,9 @@ impl Command {
         Command::DiscardSelected,
         Command::OpenChange,
         Command::ToggleAmend,
+        Command::ContinueRebase,
+        Command::AbortMerge,
+        Command::AbortRebase,
         Command::SwitchView,
         Command::NextView,
         Command::PreviousView,
@@ -324,7 +375,17 @@ impl Command {
             Command::CheckoutCommit => on(Page::GitLog) && context.commit_selected,
             Command::CheckoutBranch => on(Page::GitLog) && context.can_checkout_branch,
             Command::DeleteBranch => on(Page::GitLog) && context.can_delete_branch,
-            Command::Commit | Command::ToggleAmend => on(Page::Changes),
+            Command::MergeCommit => on(Page::GitLog) && context.can_merge_commit,
+            Command::RebaseOntoCommit | Command::ResetToCommit => {
+                on(Page::GitLog) && context.other_commit_selected
+            }
+            Command::MergeBranch | Command::RebaseOntoBranch | Command::ResetToBranch => {
+                on(Page::GitLog) && context.other_branch_selected
+            }
+            Command::Commit => on(Page::Changes) && !context.rebasing,
+            Command::ToggleAmend => on(Page::Changes) && !context.merging && !context.rebasing,
+            Command::ContinueRebase | Command::AbortRebase => on(Page::Changes) && context.rebasing,
+            Command::AbortMerge => on(Page::Changes) && context.merging,
             Command::StageAll => on(Page::Changes) && context.has_unstaged,
             Command::UnstageAll => on(Page::Changes) && context.has_staged,
             Command::OpenChange => {
@@ -377,6 +438,12 @@ impl Command {
             Command::CheckoutCommit => "Check out commit",
             Command::CheckoutBranch => "Check out branch",
             Command::DeleteBranch => "Delete branch",
+            Command::MergeCommit => "Merge into current branch",
+            Command::RebaseOntoCommit => "Rebase current branch onto commit",
+            Command::ResetToCommit => "Reset current branch to commit",
+            Command::MergeBranch => "Merge branch into current branch",
+            Command::RebaseOntoBranch => "Rebase current branch onto branch",
+            Command::ResetToBranch => "Reset current branch to branch",
             Command::Commit => "Commit",
             Command::StageAll => "Stage all changes",
             Command::UnstageAll => "Unstage all changes",
@@ -387,6 +454,9 @@ impl Command {
             Command::UnstageSelected => "Unstage changes",
             Command::DiscardSelected => "Discard changes",
             Command::ToggleAmend => "Toggle amend",
+            Command::ContinueRebase => "Continue rebase",
+            Command::AbortMerge => "Abort merge",
+            Command::AbortRebase => "Abort rebase",
             Command::SwitchView => "Switch view",
             Command::NextView => "Focus next view",
             Command::PreviousView => "Focus previous view",
@@ -462,6 +532,24 @@ impl Command {
             Command::DeleteBranch => {
                 "On the git log page, delete the local branch selected in the sidebar, asking first if it has commits that neither HEAD nor its upstream has"
             }
+            Command::MergeCommit => {
+                "On the git log page, merge the branch at the selected commit into the branch HEAD is on (git merge): a fast-forward when it can be, else a merge commit; conflicts stop it on the changes page, to resolve and commit"
+            }
+            Command::RebaseOntoCommit => {
+                "On the git log page, replay the commits of the branch HEAD is on onto the selected commit (git rebase); conflicts stop it on the changes page, to resolve and continue"
+            }
+            Command::ResetToCommit => {
+                "On the git log page, move the branch HEAD is on to the selected commit (git reset, mixed): the index follows, the working directory stays as it is, so what differs shows as unstaged changes; asks first if commits would be left on no branch"
+            }
+            Command::MergeBranch => {
+                "On the git log page, merge the branch selected in the sidebar into the branch HEAD is on (git merge): a fast-forward when it can be, else a merge commit; conflicts stop it on the changes page, to resolve and commit"
+            }
+            Command::RebaseOntoBranch => {
+                "On the git log page, replay the commits of the branch HEAD is on onto the branch selected in the sidebar (git rebase); conflicts stop it on the changes page, to resolve and continue"
+            }
+            Command::ResetToBranch => {
+                "On the git log page, move the branch HEAD is on to where the branch selected in the sidebar is (git reset, mixed), keeping the working directory as it is; asks first if commits would be left on no branch"
+            }
             Command::Commit => {
                 "On the changes page, commit what is staged with the message in the box"
             }
@@ -491,6 +579,15 @@ impl Command {
             }
             Command::ToggleAmend => {
                 "On the changes page, make the commit replace the last one (git commit --amend), or follow it (m in a list)"
+            }
+            Command::ContinueRebase => {
+                "On the changes page, commit the commit the rebase stopped at, its conflicts resolved and staged, with the message in the box, and replay the rest (git rebase --continue)"
+            }
+            Command::AbortMerge => {
+                "On the changes page, give up the merge in progress after asking, putting the branch and its files back as they were before it (git merge --abort)"
+            }
+            Command::AbortRebase => {
+                "On the changes page, give up the rebase in progress after asking, putting the branch and its files back as they were before it (git rebase --abort)"
             }
             Command::SwitchView => "Editor, a page, or a tool",
             Command::NextView => "Move the keyboard to the next view",
@@ -528,7 +625,7 @@ impl Command {
             Command::DuplicateBuildEntry => "Ctrl+D",
             Command::ResetSetting => "Ctrl+D",
             Command::Fetch => "F5",
-            Command::Commit => "Ctrl+S",
+            Command::Commit | Command::ContinueRebase => "Ctrl+S",
             Command::SwitchView => "Ctrl+E",
             Command::NextView => "Ctrl+.",
             Command::PreviousView => "Ctrl+,",
@@ -546,6 +643,14 @@ impl Command {
             | Command::CheckoutCommit
             | Command::CheckoutBranch
             | Command::DeleteBranch
+            | Command::MergeCommit
+            | Command::RebaseOntoCommit
+            | Command::ResetToCommit
+            | Command::MergeBranch
+            | Command::RebaseOntoBranch
+            | Command::ResetToBranch
+            | Command::AbortMerge
+            | Command::AbortRebase
             | Command::StageAll
             | Command::UnstageAll
             | Command::OpenChange
@@ -757,6 +862,108 @@ mod tests {
         let listed = available(&changes);
         assert!(listed.contains(&Command::OpenChange));
         assert!(restore.iter().all(|c| !listed.contains(c)), "{listed:?}");
+    }
+
+    #[test]
+    fn the_git_log_offers_merging_rebasing_and_resetting_as_the_selection_allows() {
+        let commit_commands = [
+            Command::MergeCommit,
+            Command::RebaseOntoCommit,
+            Command::ResetToCommit,
+        ];
+        let branch_commands = [
+            Command::MergeBranch,
+            Command::RebaseOntoBranch,
+            Command::ResetToBranch,
+        ];
+        // HEAD's own commit: nothing to merge, rebase onto, or reset to.
+        let log = Context {
+            page: Page::GitLog,
+            commit_selected: true,
+            ..Context::default()
+        };
+        let listed = available(&log);
+        assert!(listed.contains(&Command::CheckoutCommit));
+        assert!(
+            commit_commands.iter().all(|c| !listed.contains(c)),
+            "{listed:?}"
+        );
+        // Another commit, with no branch to merge.
+        let other = Context {
+            other_commit_selected: true,
+            ..log
+        };
+        let listed = available(&other);
+        assert!(!listed.contains(&Command::MergeCommit));
+        assert!(listed.contains(&Command::RebaseOntoCommit));
+        assert!(listed.contains(&Command::ResetToCommit));
+        let branch = Context {
+            can_merge_commit: true,
+            ..other
+        };
+        assert!(available(&branch).contains(&Command::MergeCommit));
+        assert!(
+            branch_commands
+                .iter()
+                .all(|c| !available(&branch).contains(c))
+        );
+        // A branch in the sidebar that HEAD isn't on.
+        let sidebar = Context {
+            other_branch_selected: true,
+            ..log
+        };
+        let listed = available(&sidebar);
+        assert!(
+            branch_commands.iter().all(|c| listed.contains(c)),
+            "{listed:?}"
+        );
+        // None of them off the page.
+        let elsewhere = Context {
+            page: Page::Changes,
+            ..branch
+        };
+        let listed = available(&elsewhere);
+        assert!(
+            commit_commands.iter().all(|c| !listed.contains(c)),
+            "{listed:?}"
+        );
+    }
+
+    #[test]
+    fn the_changes_page_continues_or_aborts_what_is_in_progress() {
+        let changes = Context {
+            page: Page::Changes,
+            ..Context::default()
+        };
+        let listed = available(&changes);
+        assert!(listed.contains(&Command::Commit));
+        assert!(listed.contains(&Command::ToggleAmend));
+        for command in [
+            Command::ContinueRebase,
+            Command::AbortMerge,
+            Command::AbortRebase,
+        ] {
+            assert!(!listed.contains(&command), "{command:?}");
+        }
+        let merging = Context {
+            merging: true,
+            ..changes
+        };
+        let listed = available(&merging);
+        assert!(listed.contains(&Command::Commit));
+        assert!(listed.contains(&Command::AbortMerge));
+        assert!(!listed.contains(&Command::ToggleAmend));
+        assert!(!listed.contains(&Command::AbortRebase));
+        let rebasing = Context {
+            rebasing: true,
+            ..changes
+        };
+        let listed = available(&rebasing);
+        assert!(!listed.contains(&Command::Commit));
+        assert!(listed.contains(&Command::ContinueRebase));
+        assert!(listed.contains(&Command::AbortRebase));
+        assert!(!listed.contains(&Command::AbortMerge));
+        assert!(!listed.contains(&Command::ToggleAmend));
     }
 
     #[test]
