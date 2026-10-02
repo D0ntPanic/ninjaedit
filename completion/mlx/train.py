@@ -197,9 +197,9 @@ def main():
     optimizer.state["step"] = mx.array(start_step)
     if args.resume:
         if load_training_state(optimizer, out):
-            print(f"resumed at step {start_step} with optimizer state")
+            print(f"resumed at step {start_step} of {args.steps} with optimizer state")
         else:
-            print(f"resumed at step {start_step} WITHOUT optimizer state (old checkpoint); expect a loss bump")
+            print(f"resumed at step {start_step} of {args.steps} WITHOUT optimizer state (old checkpoint); expect a loss bump")
     step_fn = nn.value_and_grad(model, loss_fn)
 
     def train_step(inputs, targets, mask):
