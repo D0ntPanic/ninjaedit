@@ -454,7 +454,6 @@ impl Worker {
         }
     }
 
-    /// Returns false when the worker should shut down.
     /// Whether a path is inside the root's `.git` directory, where
     /// git's own activity is constant and never changes the tree.
     fn in_git_dir(&self, path: &Path) -> bool {
@@ -462,6 +461,7 @@ impl Worker {
             .is_ok_and(|rel| rel.components().any(|c| c.as_os_str() == GIT_DIR))
     }
 
+    /// Returns false when the worker should shut down.
     fn handle(&mut self, msg: Msg) -> bool {
         let event = match msg {
             Msg::Shutdown => return false,
@@ -471,14 +471,15 @@ impl Worker {
         if event.paths.iter().any(|path| !self.in_git_dir(path)) {
             self.shared.activity.fetch_add(1, Ordering::Release);
         }
-        // Content and metadata changes don't affect the index; name changes
-        // (renames) and creations/removals do.
-        match event.kind {
-            EventKind::Access(_)
-            | EventKind::Modify(ModifyKind::Data(_))
-            | EventKind::Modify(ModifyKind::Metadata(_)) => return true,
-            _ => {}
-        }
+        // Access and metadata changes never affect the index. Content changes
+        // only matter for a .gitignore, whose rules decide what's ignored;
+        // for anything else, only name changes (renames) and
+        // creations/removals do.
+        let content_change = match event.kind {
+            EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_)) => return true,
+            EventKind::Modify(ModifyKind::Data(_)) => true,
+            _ => false,
+        };
         for path in &event.paths {
             let Ok(rel) = path.strip_prefix(&self.shared.root_path) else {
                 continue;
@@ -488,7 +489,11 @@ impl Worker {
             if rel.components().any(|c| c.as_os_str() == GIT_DIR) {
                 continue;
             }
-            if path.file_name() == Some(OsStr::new(GITIGNORE)) {
+            let is_gitignore = path.file_name() == Some(OsStr::new(GITIGNORE));
+            if content_change && !is_gitignore {
+                continue;
+            }
+            if is_gitignore {
                 // A changed .gitignore can flip the ignored state of anything
                 // beneath its directory: drop the cached matcher and rescan
                 // the whole subtree.
@@ -967,6 +972,33 @@ mod tests {
         );
         // But they remain in the full index, flagged as ignored.
         assert!(relative(index.files(true), &root).contains(&"src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn gitignore_content_change_event_reflags_files() {
+        // Editing an existing .gitignore in place is reported as a content
+        // change only (inotify always; FSEvents unless the file's creation
+        // flag is still sticky from moments earlier, which made the
+        // watcher-driven test above pass by luck). Drive the worker with
+        // exactly that event so the result doesn't depend on the watcher.
+        let dir = tempfile::tempdir().unwrap();
+        build_tree(dir.path());
+        let mut index = FileIndex::new(dir.path());
+        assert!(index.wait_for_full(WAIT));
+        index.watcher = None;
+        let root = index.root().to_path_buf();
+        assert!(!relative(index.files(false), &root).contains(&"notes.log".to_string()));
+
+        write(&root.join(".gitignore"), "target/\n");
+        let event = notify::Event::new(EventKind::Modify(ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )))
+        .add_path(root.join(".gitignore"));
+        index.tx.send(Msg::Fs(Ok(event))).unwrap();
+        assert!(
+            eventually(|| relative(index.files(false), &root).contains(&"notes.log".to_string())),
+            "gitignore content change was not applied to the index"
+        );
     }
 
     #[test]
