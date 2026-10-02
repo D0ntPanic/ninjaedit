@@ -56,7 +56,7 @@ unfocused-active-tab-background = "mid"
 unfocused-active-tab-text = "alt"
 
 # Terminals in the tool pane.
-terminal-background = "tool"
+terminal-background = "very-dark"
 terminal-text = "content"
 terminal-link = "blue"
 terminal-black = "light"
@@ -132,6 +132,7 @@ syntax-conflict-marker = "*red"
 
 [names]
 black = "#000000"
+very-dark = "#161616"
 dark = "#1c1c1c"
 mid = "#2a2a2a"
 tool = "#202020"
