@@ -7,14 +7,22 @@
 //! The page lists every [`SettingKey`] under its category as a field
 //! with the setting's name above it and a line about it below (wrapped
 //! to the page's width). The field is a control for the setting's
-//! [kind](SettingKind): a text field, or for a setting with a fixed set
-//! of options, a choice showing them all. A list setting has a text
+//! [kind](SettingKind): a text field, a checkbox, or for a setting with
+//! a fixed set of options, a choice showing them all. A list setting has a text
 //! field per item, each with a note of its own (for the completion
 //! models, the languages each serves), and one more after them in which
 //! typing adds an item; Alt+Up and Alt+Down move the focused item, and
 //! Ctrl+D or clearing its text removes it.
+//! Toggles that belong to a [table](ninjaedit_core::SettingTable) are
+//! laid out as one, under its name: a row of checkboxes for each of its
+//! rows, under its column labels, and a note under it all about the
+//! focused checkbox, or the table as a whole. The arrows move between
+//! its checkboxes as they are laid out, leaving the table from its top
+//! and bottom rows.
 //! The fields are a [`Fields`], so Tab and Up and Down move between them.
-//! A choice is applied as soon as another option is chosen. Text is
+//! A choice is applied as soon as another option is chosen, and a
+//! checkbox as soon as it is turned over (with Space, Enter, or a
+//! click). Text is
 //! applied when its field is left (Tab, an arrow, a click elsewhere,
 //! leaving the page) or with Enter; Ctrl+S applies every field. Text that
 //! isn't a valid value is refused: the setting keeps its value and the
@@ -26,11 +34,11 @@
 //! applies them to what is running whenever the page reports a change.
 
 use crate::clipboard::Clipboard;
-use crate::fields::{FieldKey, FieldKind, Fields, wrap_words};
+use crate::fields::{CHECKBOX_WIDTH, FieldKey, FieldKind, Fields, wrap_words};
 use crate::palette::palette_background;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use ninjaedit_core::{Category, SettingKey, SettingKind, Settings};
+use ninjaedit_core::{Category, SettingKey, SettingKind, SettingTable, Settings};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
 use ratatui::style::Modifier;
@@ -47,6 +55,9 @@ const HEADER_INDENT: u16 = 1;
 const INDENT: u16 = 3;
 /// Rows scrolled per mouse wheel notch.
 const WHEEL_LINES: usize = 3;
+/// Columns between a table's row labels and its first column, and
+/// between one column and the next.
+const TABLE_GAP: u16 = 2;
 
 /// What the application should do after the page handled an event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +85,34 @@ enum Part {
     Add,
 }
 
+/// A table of toggles on the page: its fields, one per checkbox, row
+/// by row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Grid {
+    table: &'static SettingTable,
+    /// The field of the first checkbox.
+    first: usize,
+    rows: usize,
+    columns: usize,
+}
+
+impl Grid {
+    /// The field after the table's last.
+    fn end(self) -> usize {
+        self.first + self.rows * self.columns
+    }
+
+    fn contains(self, index: usize) -> bool {
+        (self.first..self.end()).contains(&index)
+    }
+
+    /// The fields of one of the table's rows.
+    fn row(self, row: usize) -> std::ops::Range<usize> {
+        let start = self.first + row * self.columns;
+        start..start + self.columns
+    }
+}
+
 /// One entry of the page, as laid out before the width is known; a
 /// note wraps into as many rows as it needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +126,12 @@ enum Line {
     /// The line under a field: the setting's description, a list item's
     /// note, or the reason the field's text was refused.
     Note(usize),
+    /// A table's name, its column labels, one of its rows, and the
+    /// line under it.
+    TableName(Grid),
+    TableColumns(Grid),
+    Checkboxes(Grid, usize),
+    TableNote(Grid),
 }
 
 /// One screen row of the page, after wrapping to a width.
@@ -99,6 +144,61 @@ enum Row {
     /// One line of a field's note: the field, whether it is the reason
     /// its value was refused, and the line.
     Note(usize, bool, String),
+    TableName(Grid),
+    TableColumns(Grid),
+    Checkboxes(Grid, usize),
+    /// One line of the note under a table.
+    TableNote(Grid, String),
+}
+
+impl Row {
+    /// Whether the row shows a field.
+    fn has_field(&self, index: usize) -> bool {
+        match self {
+            Row::Field(field) => *field == index,
+            Row::Checkboxes(grid, row) => grid.row(*row).contains(&index),
+            _ => false,
+        }
+    }
+
+    /// Whether the row is a line of the note about a field.
+    fn is_note_of(&self, index: usize) -> bool {
+        match self {
+            Row::Note(field, ..) => *field == index,
+            Row::TableNote(grid, _) => grid.contains(index),
+            _ => false,
+        }
+    }
+}
+
+/// How a table is laid out across the page: where its checkboxes'
+/// columns start, from the page's left edge, and how wide each is.
+struct GridLayout {
+    columns: Vec<(u16, u16)>,
+}
+
+impl GridLayout {
+    fn new(grid: Grid, slots: &[Slot]) -> GridLayout {
+        let cells = slots[grid.first..grid.end()]
+            .iter()
+            .filter_map(|slot| slot.key.cell());
+        let label_width = cells
+            .clone()
+            .map(|cell| Span::raw(cell.row).width() as u16)
+            .max()
+            .unwrap_or(0);
+        let mut x = INDENT + label_width + TABLE_GAP;
+        let columns = cells
+            .take(grid.columns)
+            .map(|cell| {
+                let width = (Span::raw(cell.column).width() as u16).max(CHECKBOX_WIDTH);
+                let column = (x, width);
+                x += width + TABLE_GAP;
+                column
+            })
+            .collect();
+        GridLayout { columns }
+    }
 }
 
 pub struct SettingsView {
@@ -159,7 +259,46 @@ impl SettingsView {
             lines.push(Line::Blank);
             lines.push(Line::Header(category));
             lines.push(Line::Blank);
-            for key in category.keys() {
+            let keys: Vec<SettingKey> = category.keys().collect();
+            let mut next = 0;
+            while next < keys.len() {
+                let key = keys[next];
+                next += 1;
+                // A table's toggles follow one another, row by row.
+                if let Some(cell) = key.cell() {
+                    let members: Vec<SettingKey> = std::iter::once(key)
+                        .chain(
+                            keys[next..]
+                                .iter()
+                                .copied()
+                                .take_while(|k| k.cell().is_some_and(|c| c.table == cell.table)),
+                        )
+                        .collect();
+                    next += members.len() - 1;
+                    let columns = members
+                        .iter()
+                        .take_while(|k| k.cell().is_some_and(|c| c.row == cell.row))
+                        .count();
+                    let grid = Grid {
+                        table: cell.table,
+                        first: slots.len(),
+                        rows: members.len().div_ceil(columns),
+                        columns,
+                    };
+                    for key in members {
+                        slots.push(Slot {
+                            key,
+                            part: Part::Whole,
+                        });
+                        kinds.push(FieldKind::Checkbox);
+                    }
+                    lines.push(Line::TableName(grid));
+                    lines.push(Line::TableColumns(grid));
+                    lines.extend((0..grid.rows).map(|row| Line::Checkboxes(grid, row)));
+                    lines.push(Line::TableNote(grid));
+                    lines.push(Line::Blank);
+                    continue;
+                }
                 lines.push(Line::Name(key));
                 let parts: Vec<Part> = match key.kind() {
                     SettingKind::List => (0..settings.list(key).len())
@@ -175,6 +314,7 @@ impl SettingsView {
                         SettingKind::Choice(choices) => {
                             FieldKind::Choice(choices.iter().map(|c| c.label.to_owned()).collect())
                         }
+                        SettingKind::Toggle => FieldKind::Checkbox,
                         SettingKind::Text | SettingKind::List => FieldKind::Text,
                     });
                     lines.push(Line::Field(index));
@@ -195,7 +335,7 @@ impl SettingsView {
                 .position(|s| *s == slot)
                 .filter(|_| fresh.is_some() && fresh != Some(slot.key));
             match kept {
-                Some(old) if !Self::is_choice(slot) => {
+                Some(old) if !Self::applies_at_once(slot) => {
                     self.fields.set_text(index, old_fields.text(old));
                     self.errors[index] = old_errors[old].clone();
                 }
@@ -233,6 +373,10 @@ impl SettingsView {
                     self.fields.choose(index, option);
                 }
             }
+            (SettingKind::Toggle, _) => {
+                self.fields
+                    .set_checked(index, settings.text(slot.key) == true.to_string());
+            }
             (_, Part::Whole) => self.fields.set_text(index, &settings.text(slot.key)),
             (_, Part::Item(item)) => {
                 let items = settings.list(slot.key);
@@ -244,8 +388,8 @@ impl SettingsView {
         self.errors[index] = None;
     }
 
-    /// A field's value in the setting's text form: the text typed, or
-    /// the chosen option's value.
+    /// A field's value in the setting's text form: the text typed, the
+    /// chosen option's value, or whether the box is checked.
     fn value(&self, index: usize) -> String {
         match self.slots[index].key.kind() {
             SettingKind::Choice(choices) => self
@@ -253,13 +397,45 @@ impl SettingsView {
                 .chosen(index)
                 .map(|option| choices[option].value.to_owned())
                 .unwrap_or_default(),
+            SettingKind::Toggle => self.fields.checked(index).unwrap_or(false).to_string(),
             SettingKind::Text | SettingKind::List => self.fields.text(index).to_owned(),
         }
     }
 
-    /// Whether a field is a choice, which applies as soon as it changes.
-    fn is_choice(slot: Slot) -> bool {
-        matches!(slot.key.kind(), SettingKind::Choice(_))
+    /// Whether a field is a choice or a checkbox, which applies as soon
+    /// as it changes.
+    fn applies_at_once(slot: Slot) -> bool {
+        matches!(
+            slot.key.kind(),
+            SettingKind::Choice(_) | SettingKind::Toggle
+        )
+    }
+
+    /// The table a field is a checkbox of, if it is.
+    fn grid_of(&self, index: usize) -> Option<Grid> {
+        self.lines.iter().find_map(|line| match line {
+            Line::TableNote(grid) if grid.contains(index) => Some(*grid),
+            _ => None,
+        })
+    }
+
+    /// Where an arrow key moves the focus from a table's checkbox: to
+    /// the one beside it or above or below it, or out of the table from
+    /// its top and bottom rows to the fields before and after it.
+    /// `None` at a side.
+    fn grid_step(&self, grid: Grid, index: usize, code: KeyCode) -> Option<usize> {
+        let offset = index - grid.first;
+        let (row, column) = (offset / grid.columns, offset % grid.columns);
+        let target = match code {
+            KeyCode::Left => (column > 0).then(|| index - 1)?,
+            KeyCode::Right => (column + 1 < grid.columns).then_some(index + 1)?,
+            KeyCode::Up if row > 0 => index - grid.columns,
+            KeyCode::Up => grid.first.checked_sub(1)?,
+            KeyCode::Down if row + 1 < grid.rows => index + grid.columns,
+            KeyCode::Down => grid.end(),
+            _ => return None,
+        };
+        (target < self.slots.len()).then_some(target)
     }
 
     /// The fields of a list setting's items, in order, then its add field.
@@ -443,8 +619,32 @@ impl SettingsView {
     ) -> SettingsOutcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let focused = self.fields.focused();
+        // The arrows follow a table as it is laid out.
+        if key.modifiers.is_empty()
+            && let Some(grid) = self.grid_of(focused)
+            && matches!(
+                key.code,
+                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+            )
+        {
+            let from = self
+                .grid_step(grid, focused, key.code)
+                .and_then(|target| self.fields.focus(target));
+            return match from {
+                Some(from) => {
+                    self.reveal = true;
+                    self.commit(from, settings)
+                }
+                None => SettingsOutcome::Continue,
+            };
+        }
         match key.code {
-            KeyCode::Enter => self.commit(self.fields.focused(), settings),
+            KeyCode::Enter => {
+                // On a checkbox, Enter turns it over as Space does.
+                self.fields.toggle(focused);
+                self.commit(focused, settings)
+            }
             KeyCode::Esc => {
                 self.revert_focused(settings);
                 SettingsOutcome::Continue
@@ -466,7 +666,7 @@ impl SettingsView {
                     self.reveal = true;
                     self.commit(from, settings)
                 }
-                FieldKey::Changed if Self::is_choice(self.slots[self.fields.focused()]) => {
+                FieldKey::Changed if Self::applies_at_once(self.slots[self.fields.focused()]) => {
                     self.commit(self.fields.focused(), settings)
                 }
                 FieldKey::Changed => {
@@ -511,9 +711,10 @@ impl SettingsView {
                     Some(from) => self.commit(from, settings),
                     None => SettingsOutcome::Continue,
                 };
-                // A click on a choice's option chooses it.
+                // A click on a choice's option chooses it, and on a
+                // checkbox turns it over.
                 let focused = self.fields.focused();
-                if Self::is_choice(self.slots[focused])
+                if Self::applies_at_once(self.slots[focused])
                     && self.commit(focused, settings) == SettingsOutcome::Changed
                 {
                     result = SettingsOutcome::Changed;
@@ -548,14 +749,16 @@ impl SettingsView {
                     .unwrap_or_default();
                 (note, false)
             }
-            Part::Add => (key.description().to_owned(), false),
-            Part::Whole if settings.is_default(key) => (key.description().to_owned(), false),
+            Part::Add => (key.description(), false),
+            Part::Whole if settings.is_default(key) => (key.description(), false),
             Part::Whole => {
                 let default = match (key.kind(), key.default_text()) {
                     (SettingKind::Choice(choices), text) => choices
                         .iter()
                         .find(|c| c.value == text)
                         .map_or(text, |c| c.label.to_owned()),
+                    (SettingKind::Toggle, text) if text == true.to_string() => "checked".to_owned(),
+                    (SettingKind::Toggle, _) => "unchecked".to_owned(),
                     (_, text) if text.is_empty() => "blank".to_owned(),
                     (_, text) => text,
                 };
@@ -602,6 +805,16 @@ impl SettingsView {
                         .map(|text| Row::Note(index, is_error, text))
                         .collect()
                 }
+                Line::TableName(grid) => vec![Row::TableName(grid)],
+                Line::TableColumns(grid) => vec![Row::TableColumns(grid)],
+                Line::Checkboxes(grid, row) => vec![Row::Checkboxes(grid, row)],
+                Line::TableNote(grid) => {
+                    let text = self.table_note(grid, settings);
+                    wrap_words(&text, text_width)
+                        .into_iter()
+                        .map(|text| Row::TableNote(grid, text))
+                        .collect()
+                }
             })
             .collect();
 
@@ -612,14 +825,20 @@ impl SettingsView {
         if self.reveal {
             self.reveal = false;
             let focused = self.fields.focused();
-            let field = rows.iter().position(|row| *row == Row::Field(focused));
-            let last = rows
-                .iter()
-                .rposition(|row| matches!(row, Row::Note(index, ..) if *index == focused));
+            let field = rows.iter().position(|row| row.has_field(focused));
+            let last = rows.iter().rposition(|row| row.is_note_of(focused));
             if let (Some(field), Some(last)) = (field, last) {
+                // A table shows from its name down, so the checkbox can
+                // be told by its row and column.
                 let first = match rows.get(field.wrapping_sub(1)) {
                     Some(Row::Name(_)) => field - 1,
-                    _ => field,
+                    _ => match &rows[field] {
+                        Row::Checkboxes(grid, _) => rows
+                            .iter()
+                            .position(|row| *row == Row::TableName(*grid))
+                            .unwrap_or(field),
+                        _ => field,
+                    },
                 };
                 if first < self.scroll {
                     self.scroll = first;
@@ -685,9 +904,70 @@ impl SettingsView {
                     let style = if is_error { error } else { note };
                     buf.set_stringn(area.x + INDENT, y, &text, text_width, style);
                 }
+                Row::TableName(grid) => {
+                    let x = area.x + INDENT;
+                    let table = grid.table.name;
+                    buf.set_stringn(x, y, table, width, name);
+                    let modified = (grid.first..grid.end())
+                        .any(|index| !settings.is_default(self.slots[index].key));
+                    let x = x + Span::raw(table).width() as u16 + 2;
+                    if modified && x < area.right() {
+                        buf.set_stringn(x, y, MODIFIED_TAG, (area.right() - x) as usize, tag);
+                    }
+                }
+                Row::TableColumns(grid) => {
+                    let layout = GridLayout::new(grid, &self.slots);
+                    for (index, &(x, column_width)) in grid.row(0).zip(&layout.columns) {
+                        let Some(cell) = self.slots[index].key.cell() else {
+                            continue;
+                        };
+                        if x + column_width <= area.width {
+                            buf.set_stringn(area.x + x, y, cell.column, width, background);
+                        }
+                    }
+                }
+                Row::Checkboxes(grid, row) => {
+                    let layout = GridLayout::new(grid, &self.slots);
+                    let fields = grid.row(row);
+                    if let Some(cell) = self.slots[fields.start].key.cell() {
+                        buf.set_stringn(area.x + INDENT, y, cell.row, width, background);
+                    }
+                    // Each checkbox under the middle of its column's
+                    // label, left out where the page is too narrow for
+                    // it, and in the tag's color where it isn't at its
+                    // default.
+                    for (index, &(x, column_width)) in fields.zip(&layout.columns) {
+                        let x = x + (column_width - CHECKBOX_WIDTH) / 2;
+                        if x + CHECKBOX_WIDTH > area.width {
+                            break;
+                        }
+                        let checkbox = Rect::new(area.x + x, y, CHECKBOX_WIDTH, 1);
+                        if let Some(at) = self.fields.render_field(index, checkbox, "", buf, theme)
+                        {
+                            cursor = Some(at);
+                        }
+                        if !settings.is_default(self.slots[index].key) {
+                            buf.set_style(checkbox, tag);
+                        }
+                    }
+                }
+                Row::TableNote(_, text) => {
+                    buf.set_stringn(area.x + INDENT, y, &text, text_width, note);
+                }
             }
         }
         cursor
+    }
+
+    /// The note under a table: about the focused checkbox when it is
+    /// one of the table's, as a field's note is, else about the table.
+    fn table_note(&self, grid: Grid, settings: &Settings) -> String {
+        let focused = self.fields.focused();
+        if grid.contains(focused) {
+            self.note(focused, settings).0
+        } else {
+            grid.table.description.to_owned()
+        }
     }
 }
 
@@ -760,7 +1040,7 @@ mod tests {
     fn lists_settings_by_category_with_placeholders_and_values() {
         let settings = Settings::default();
         let mut view = SettingsView::new(&settings);
-        let screen = draw(&mut view, &settings, 80, 24);
+        let screen = draw(&mut view, &settings, 80, 60);
         let terminal = screen
             .iter()
             .position(|r| r.contains(" Terminal "))
@@ -801,17 +1081,15 @@ mod tests {
     fn enter_applies_a_value_and_moving_on_applies_the_field_left() {
         let mut settings = Settings::default();
         let mut view = SettingsView::new(&settings);
-        // Down past the continuation indent and shell fields to the
-        // scrollback field; the fields left as they were are applied
+        // Down past the continuation indent, shell, and agent fields to
+        // the scrollback field; the fields left as they were are applied
         // without changing anything.
-        assert_eq!(
-            press(&mut view, &mut settings, KeyCode::Down),
-            SettingsOutcome::Continue
-        );
-        assert_eq!(
-            press(&mut view, &mut settings, KeyCode::Down),
-            SettingsOutcome::Continue
-        );
+        for _ in 0..3 {
+            assert_eq!(
+                press(&mut view, &mut settings, KeyCode::Down),
+                SettingsOutcome::Continue
+            );
+        }
         assert_eq!(view.focused_key(), SettingKey::TerminalScrollback);
         ctrl(&mut view, &mut settings, 'a');
         type_str(&mut view, &mut settings, " 250 ");
@@ -841,7 +1119,7 @@ mod tests {
 
         // Typing into the results field and leaving it with Tab applies
         // it; Shift+Tab back applies the (unchanged) results field.
-        press(&mut view, &mut settings, KeyCode::Tab);
+        focus_key(&mut view, &mut settings, SettingKey::SearchMaxResults);
         ctrl(&mut view, &mut settings, 'a');
         type_str(&mut view, &mut settings, "42");
         assert_eq!(
@@ -950,8 +1228,7 @@ mod tests {
     fn bad_text_is_refused_with_a_note_and_escape_reverts() {
         let mut settings = Settings::default();
         let mut view = SettingsView::new(&settings);
-        press(&mut view, &mut settings, KeyCode::Down);
-        press(&mut view, &mut settings, KeyCode::Down);
+        focus_key(&mut view, &mut settings, SettingKey::TerminalScrollback);
         ctrl(&mut view, &mut settings, 'a');
         type_str(&mut view, &mut settings, "many");
         assert_eq!(
@@ -983,6 +1260,7 @@ mod tests {
         ctrl(&mut view, &mut settings, 'a');
         type_str(&mut view, &mut settings, "x");
         press(&mut view, &mut settings, KeyCode::Up);
+        press(&mut view, &mut settings, KeyCode::Up);
         type_str(&mut view, &mut settings, "/bin/dash");
         assert_eq!(view.commit_all(&mut settings), SettingsOutcome::Changed);
         assert_eq!(settings.shell(), Some("/bin/dash"));
@@ -1012,8 +1290,7 @@ mod tests {
         );
         assert_eq!(settings.search_max_results(), 5, "only the focused one");
         // Ctrl+D with bad text typed drops the text along with the note.
-        press(&mut view, &mut settings, KeyCode::Tab);
-        press(&mut view, &mut settings, KeyCode::Tab);
+        focus_key(&mut view, &mut settings, SettingKey::SearchMaxResults);
         type_str(&mut view, &mut settings, "x");
         press(&mut view, &mut settings, KeyCode::Enter);
         assert!(view.error(SettingKey::SearchMaxResults).is_some());
@@ -1032,7 +1309,7 @@ mod tests {
         let mut view = SettingsView::new(&settings);
         press(&mut view, &mut settings, KeyCode::Down);
         type_str(&mut view, &mut settings, "/bin/sh");
-        let screen = draw(&mut view, &settings, 80, 24);
+        let screen = draw(&mut view, &settings, 80, 60);
         let row = screen
             .iter()
             .position(|r| r.contains("Maximum search results"))
@@ -1059,7 +1336,7 @@ mod tests {
         let mut settings = Settings::default();
         let mut view = SettingsView::new(&settings);
         // Wide enough for the note in one row, then not.
-        let screen = draw(&mut view, &settings, 80, 40);
+        let screen = draw(&mut view, &settings, 80, 60);
         let name = screen
             .iter()
             .position(|r| r.contains("Maximum search results"))
@@ -1070,7 +1347,7 @@ mod tests {
         );
         assert!(screen[name + 3].trim().is_empty(), "{screen:#?}");
 
-        let screen = draw(&mut view, &settings, 40, 40);
+        let screen = draw(&mut view, &settings, 40, 90);
         let name = screen
             .iter()
             .position(|r| r.contains("Maximum search results"))
@@ -1088,9 +1365,7 @@ mod tests {
 
         // Moving to the field on a short screen scrolls so the whole
         // note shows, not just its first row.
-        for _ in 0..3 {
-            press(&mut view, &mut settings, KeyCode::Down);
-        }
+        focus_key(&mut view, &mut settings, SettingKey::SearchMaxResults);
         let screen = draw(&mut view, &settings, 40, 5);
         assert!(
             screen.iter().any(|r| r.contains("this many matches")),
@@ -1125,9 +1400,7 @@ mod tests {
             !screen.iter().any(|r| r.contains("Maximum search")),
             "{screen:#?}"
         );
-        for _ in 0..3 {
-            press(&mut view, &mut settings, KeyCode::Down);
-        }
+        focus_key(&mut view, &mut settings, SettingKey::SearchMaxResults);
         let screen = draw(&mut view, &settings, 60, 6);
         assert!(
             screen.iter().any(|r| r.contains("Maximum search")),
@@ -1138,7 +1411,7 @@ mod tests {
             "the note is shown with the field: {screen:#?}"
         );
         // The wheel scrolls back up without moving the focus.
-        for _ in 0..10 {
+        for _ in 0..30 {
             view.handle_mouse(
                 MouseEvent {
                     kind: MouseEventKind::ScrollUp,
@@ -1155,6 +1428,140 @@ mod tests {
             "{screen:#?}"
         );
         assert_eq!(view.focused_key(), SettingKey::SearchMaxResults);
+    }
+
+    #[test]
+    fn terminal_keys_are_a_table_of_checkboxes_the_arrows_move_around() {
+        use ninjaedit_core::{EditorKey, TerminalKind};
+        let cell = |terminal, key| SettingKey::TerminalKey(terminal, key);
+        let mut settings = Settings::default();
+        let mut view = SettingsView::new(&settings);
+        let screen = draw(&mut view, &settings, 80, 60);
+        let name = screen
+            .iter()
+            .position(|r| r.contains("Editor keys in terminals"))
+            .expect("the table's name");
+        assert!(!screen[name].contains(MODIFIED_TAG), "{screen:#?}");
+        // The column labels, then a row of checkboxes per terminal, each
+        // box under the middle of its label.
+        let columns = &screen[name + 1];
+        let rows = &screen[name + 2..name + 5];
+        assert!(columns.trim_start().starts_with("Ctrl+E"), "{screen:#?}");
+        assert!(columns.trim_end().ends_with("Ctrl+R"), "{screen:#?}");
+        let ctrl_u = columns.find("Ctrl+U").unwrap();
+        assert!(rows[0].trim_start().starts_with("Output"), "{screen:#?}");
+        assert!(rows[1].trim_start().starts_with("Shell"), "{screen:#?}");
+        assert!(rows[2].trim_start().starts_with("Agent"), "{screen:#?}");
+        assert_eq!(&rows[0][ctrl_u + 1..ctrl_u + 4], "[x]", "{screen:#?}");
+        assert_eq!(&rows[1][ctrl_u + 1..ctrl_u + 4], "[ ]", "{screen:#?}");
+        assert_eq!(rows[0].matches("[x]").count(), 6, "{screen:#?}");
+        assert_eq!(rows[1].matches("[ ]").count(), 6, "{screen:#?}");
+        assert!(
+            screen[name + 5].contains("Which of the editor's keys"),
+            "the table's note while the focus is elsewhere: {screen:#?}"
+        );
+
+        // Tab reaches the first box; the arrows go along a row and
+        // between rows as laid out, stopping at the sides.
+        focus_key(
+            &mut view,
+            &mut settings,
+            cell(TerminalKind::Output, EditorKey::Modes),
+        );
+        press(&mut view, &mut settings, KeyCode::Left);
+        assert_eq!(
+            view.focused_key(),
+            cell(TerminalKind::Output, EditorKey::Modes)
+        );
+        press(&mut view, &mut settings, KeyCode::Right);
+        press(&mut view, &mut settings, KeyCode::Down);
+        assert_eq!(
+            view.focused_key(),
+            cell(TerminalKind::Shell, EditorKey::Changes)
+        );
+        let screen = draw(&mut view, &settings, 80, 60);
+        assert!(
+            screen[name + 5]
+                .starts_with("   Ctrl+U in a shell: checked, it opens the changes page"),
+            "the note is the focused box's: {screen:#?}"
+        );
+
+        // Space turns it over, applied at once and tagged; Enter turns
+        // it back.
+        assert_eq!(
+            press(&mut view, &mut settings, KeyCode::Char(' ')),
+            SettingsOutcome::Changed
+        );
+        assert!(settings.editor_takes_key(TerminalKind::Shell, EditorKey::Changes));
+        let screen = draw(&mut view, &settings, 80, 60);
+        assert!(screen[name].contains(MODIFIED_TAG), "{screen:#?}");
+        assert_eq!(&screen[name + 3][ctrl_u + 1..ctrl_u + 4], "[x]");
+        assert!(
+            screen.iter().any(|r| r.contains("(default: unchecked)")),
+            "{screen:#?}"
+        );
+        assert_eq!(
+            press(&mut view, &mut settings, KeyCode::Enter),
+            SettingsOutcome::Changed
+        );
+        assert!(!settings.editor_takes_key(TerminalKind::Shell, EditorKey::Changes));
+
+        // The arrows leave the table from its top and bottom rows.
+        press(&mut view, &mut settings, KeyCode::Down);
+        press(&mut view, &mut settings, KeyCode::Down);
+        assert_eq!(view.focused_key(), SettingKey::SearchMaxResults);
+        press(&mut view, &mut settings, KeyCode::Up);
+        assert_eq!(
+            view.focused_key(),
+            cell(TerminalKind::Agent, EditorKey::Run),
+            "back in at its last box"
+        );
+        for _ in 0..2 {
+            press(&mut view, &mut settings, KeyCode::Up);
+        }
+        assert_eq!(
+            view.focused_key(),
+            cell(TerminalKind::Output, EditorKey::Run)
+        );
+        press(&mut view, &mut settings, KeyCode::Up);
+        assert_eq!(view.focused_key(), SettingKey::TerminalScrollback);
+
+        // A click on a box turns it over; Ctrl+D puts it back.
+        let screen = draw(&mut view, &settings, 80, 60);
+        let x = screen[name + 4].find("[x]").unwrap() as u16 + 1;
+        let outcome = view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: (name + 4) as u16,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut settings,
+        );
+        assert_eq!(outcome, SettingsOutcome::Changed);
+        assert_eq!(
+            view.focused_key(),
+            cell(TerminalKind::Agent, EditorKey::Modes)
+        );
+        assert!(!settings.editor_takes_key(TerminalKind::Agent, EditorKey::Modes));
+        assert_eq!(
+            ctrl(&mut view, &mut settings, 'd'),
+            SettingsOutcome::Changed
+        );
+        assert!(settings.editor_takes_key(TerminalKind::Agent, EditorKey::Modes));
+        assert_eq!(
+            view.text(cell(TerminalKind::Agent, EditorKey::Modes)),
+            "true"
+        );
+
+        // Too narrow for every column, the table keeps the ones that fit.
+        let screen = draw(&mut view, &settings, 30, 60);
+        let name = screen
+            .iter()
+            .position(|r| r.contains("Editor keys in"))
+            .unwrap();
+        assert!(screen[name + 1].contains("Ctrl+U"), "{screen:#?}");
+        assert!(!screen[name + 1].contains("Ctrl+O"), "{screen:#?}");
     }
 
     fn alt(view: &mut SettingsView, settings: &mut Settings, code: KeyCode) -> SettingsOutcome {

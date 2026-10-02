@@ -12,7 +12,10 @@
 //!
 //! [terminal]
 //! shell = "/opt/homebrew/bin/fish"
+//! agent = "claude --model opus"
 //! scrollback = 50000
+//! shell-ctrl-o = true
+//! agent-ctrl-p = false
 //!
 //! [search]
 //! max-results = 1000
@@ -33,18 +36,22 @@
 //! its category, name, description, and [kind](SettingKind), and through
 //! the text form of each value: a setting is read as text and set from
 //! text (a number's digits, a program's path, the value of one of its
-//! choices), with the parsing and the checking done here; a list's items
-//! are each read and set as text the same way. The kind tells a
-//! frontend which control suits the setting, a text field, a choice
-//! among a fixed set of options, or a list of text fields, and a
-//! settings page is so a list of such controls whatever the settings
-//! are: adding a setting means a variant here and nothing in the
-//! frontend. Code that uses a setting reads it through its typed
-//! accessor, [`terminal_scrollback`](Settings::terminal_scrollback) and
-//! the like.
+//! choices, `true` or `false`), with the parsing and the checking done
+//! here; a list's items are each read and set as text the same way. The
+//! kind tells a frontend which control suits the setting, a text field,
+//! a choice among a fixed set of options, a checkbox, or a list of text
+//! fields, and a settings page is so a list of such controls whatever
+//! the settings are: adding a setting means a variant here and nothing
+//! in the frontend. Toggles that only make sense together, as the
+//! editor's keys in each kind of terminal do, name a
+//! [table](SettingTable) and their [place in it](TableCell), for a
+//! frontend to lay them out as rows and columns of checkboxes rather
+//! than one under another. Code that uses a setting reads it through
+//! its typed accessor,
+//! [`terminal_scrollback`](Settings::terminal_scrollback) and the like.
 
 use crate::auto_indent::{CodeStyle, ContinuationIndent};
-use crate::build::DEFAULT_CMAKE_GENERATOR;
+use crate::build::{DEFAULT_CMAKE_GENERATOR, split_args};
 use crate::completion::ConfidenceThresholds;
 use crate::project_search::MAX_MATCHES;
 use crate::terminal::emulator::DEFAULT_SCROLLBACK;
@@ -112,11 +119,176 @@ pub enum SettingKind {
     /// One of a fixed set of options, listed in the order a frontend
     /// shows them.
     Choice(&'static [SettingChoice]),
+    /// On or off, `true` or `false` in text form: a checkbox. One with
+    /// a [cell](SettingKey::cell) belongs in a table of them.
+    Toggle,
     /// An ordered list of text items, each typed like a text field; see
     /// [`Settings::list`] and [`Settings::set_list`]. A frontend shows a
     /// field per item and one more to add an item, and lets items be
     /// moved and removed.
     List,
+}
+
+/// Toggles that go together, for a frontend to lay out as a table: a
+/// row of checkboxes for each of one thing, a column for each of
+/// another. The toggles of a table follow one another in
+/// [`SettingKey::ALL`], row by row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettingTable {
+    /// What the table is, shown above it.
+    pub name: &'static str,
+    /// A line about the table as a whole, for under it.
+    pub description: &'static str,
+}
+
+/// Where a toggle goes in its table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableCell {
+    pub table: &'static SettingTable,
+    /// The label of the toggle's row and of its column.
+    pub row: &'static str,
+    pub column: &'static str,
+}
+
+/// The table of [`SettingKey::TerminalKey`] toggles.
+const TERMINAL_KEYS: SettingTable = SettingTable {
+    name: "Editor keys in terminals",
+    description: "Which of the editor's keys work in each kind of terminal without Ctrl+] first. Ctrl+] does the opposite: it sends a checked key to the program, and gives the editor an unchecked one",
+};
+
+/// A kind of terminal the editor runs programs in, for the settings
+/// that differ between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalKind {
+    /// The output of builds and runs, below the editor.
+    Output,
+    /// A shell, below the editor.
+    Shell,
+    /// The coding agent, in agent mode.
+    Agent,
+}
+
+impl TerminalKind {
+    /// Every kind, in the order a settings page lists them.
+    pub const ALL: [TerminalKind; 3] = [
+        TerminalKind::Output,
+        TerminalKind::Shell,
+        TerminalKind::Agent,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TerminalKind::Output => "Output",
+            TerminalKind::Shell => "Shell",
+            TerminalKind::Agent => "Agent",
+        }
+    }
+
+    /// The kind as the settings file spells it, ahead of the key in the
+    /// name of a [`SettingKey::TerminalKey`] setting.
+    fn key(self) -> &'static str {
+        match self {
+            TerminalKind::Output => "output",
+            TerminalKind::Shell => "shell",
+            TerminalKind::Agent => "agent",
+        }
+    }
+
+    /// What the kind is called in a sentence about it.
+    fn in_sentence(self) -> &'static str {
+        match self {
+            TerminalKind::Output => "the output tool",
+            TerminalKind::Shell => "a shell",
+            TerminalKind::Agent => "the coding agent",
+        }
+    }
+
+    /// Whether the editor's keys work in this kind of terminal without
+    /// the prefix unless the settings say otherwise. A shell's line
+    /// editing wants them all; the output is mostly read, not typed
+    /// into; and the point of an agent working away is to be able to
+    /// look around the editor meanwhile.
+    fn editor_takes_keys_by_default(self) -> bool {
+        match self {
+            TerminalKind::Output | TerminalKind::Agent => true,
+            TerminalKind::Shell => false,
+        }
+    }
+}
+
+/// One of the editor's Ctrl keys that each kind of terminal can leave
+/// to the editor, so it works there without the prefix (Ctrl+]), or
+/// send to the program; see [`SettingKey::TerminalKey`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditorKey {
+    /// Ctrl+E, the modes palette.
+    Modes,
+    /// Ctrl+U, the changes page.
+    Changes,
+    /// Ctrl+O, the file search.
+    OpenFile,
+    /// Ctrl+L, the git log.
+    GitLog,
+    /// Ctrl+P, the command palette.
+    Commands,
+    /// Ctrl+R, building and running the current target.
+    Run,
+}
+
+impl EditorKey {
+    /// Every key, in the order a settings page lists them.
+    pub const ALL: [EditorKey; 6] = [
+        EditorKey::Modes,
+        EditorKey::Changes,
+        EditorKey::OpenFile,
+        EditorKey::GitLog,
+        EditorKey::Commands,
+        EditorKey::Run,
+    ];
+
+    /// The letter pressed with Ctrl.
+    pub fn letter(self) -> char {
+        match self {
+            EditorKey::Modes => 'e',
+            EditorKey::Changes => 'u',
+            EditorKey::OpenFile => 'o',
+            EditorKey::GitLog => 'l',
+            EditorKey::Commands => 'p',
+            EditorKey::Run => 'r',
+        }
+    }
+
+    /// The key Ctrl and `letter` make, if it is one of these.
+    pub fn from_letter(letter: char) -> Option<EditorKey> {
+        EditorKey::ALL
+            .into_iter()
+            .find(|key| key.letter() == letter)
+    }
+
+    /// The key as the user presses it, `Ctrl+E` and so on.
+    pub fn label(self) -> &'static str {
+        match self {
+            EditorKey::Modes => "Ctrl+E",
+            EditorKey::Changes => "Ctrl+U",
+            EditorKey::OpenFile => "Ctrl+O",
+            EditorKey::GitLog => "Ctrl+L",
+            EditorKey::Commands => "Ctrl+P",
+            EditorKey::Run => "Ctrl+R",
+        }
+    }
+
+    /// What the key does in the editor, as the rest of a sentence
+    /// about it.
+    fn action(self) -> &'static str {
+        match self {
+            EditorKey::Modes => "opens the modes palette",
+            EditorKey::Changes => "opens the changes page",
+            EditorKey::OpenFile => "opens the file search",
+            EditorKey::GitLog => "opens the git log",
+            EditorKey::Commands => "opens the command palette",
+            EditorKey::Run => "builds and runs the current target",
+        }
+    }
 }
 
 /// One option of a [`SettingKind::Choice`].
@@ -151,8 +323,16 @@ pub enum SettingKey {
     ContinuationIndent,
     /// The program the shell tool runs; blank to detect the user's shell.
     Shell,
+    /// The command agent mode runs: the program and its arguments.
+    AgentCommand,
     /// How many lines of output a terminal keeps to scroll back through.
     TerminalScrollback,
+    /// Whether a kind of terminal leaves one of the editor's keys to the
+    /// editor, so it works there without the prefix, rather than sending
+    /// it to the program. The prefix does the other: it sends a key the
+    /// editor would take to the program, and gives the editor one the
+    /// program would get.
+    TerminalKey(TerminalKind, EditorKey),
     /// How many matches a project search stops at.
     SearchMaxResults,
     /// The generator CMake configures with, passed as `-G`; blank to let
@@ -175,22 +355,36 @@ pub enum SettingKey {
 
 impl SettingKey {
     /// Every setting, in the order a settings page lists them (grouped by
-    /// category, in [`Category::ALL`]'s order).
-    pub const ALL: [SettingKey; 8] = [
-        SettingKey::ContinuationIndent,
-        SettingKey::Shell,
-        SettingKey::TerminalScrollback,
-        SettingKey::SearchMaxResults,
-        SettingKey::CMakeGenerator,
-        SettingKey::CompletionModels,
-        SettingKey::CompletionLineConfidence,
-        SettingKey::CompletionTokenConfidence,
-    ];
+    /// category, in [`Category::ALL`]'s order). A table's toggles follow
+    /// one another, row by row.
+    pub const ALL: [SettingKey; 27] = {
+        const KEYS: usize = EditorKey::ALL.len();
+        const TERMINAL_KEYS: usize = TerminalKind::ALL.len() * KEYS;
+        let mut all = [SettingKey::ContinuationIndent; 9 + TERMINAL_KEYS];
+        all[1] = SettingKey::Shell;
+        all[2] = SettingKey::AgentCommand;
+        all[3] = SettingKey::TerminalScrollback;
+        let mut i = 0;
+        while i < TERMINAL_KEYS {
+            all[4 + i] =
+                SettingKey::TerminalKey(TerminalKind::ALL[i / KEYS], EditorKey::ALL[i % KEYS]);
+            i += 1;
+        }
+        all[4 + TERMINAL_KEYS] = SettingKey::SearchMaxResults;
+        all[5 + TERMINAL_KEYS] = SettingKey::CMakeGenerator;
+        all[6 + TERMINAL_KEYS] = SettingKey::CompletionModels;
+        all[7 + TERMINAL_KEYS] = SettingKey::CompletionLineConfidence;
+        all[8 + TERMINAL_KEYS] = SettingKey::CompletionTokenConfidence;
+        all
+    };
 
     pub fn category(self) -> Category {
         match self {
             SettingKey::ContinuationIndent => Category::Editor,
-            SettingKey::Shell | SettingKey::TerminalScrollback => Category::Terminal,
+            SettingKey::Shell
+            | SettingKey::AgentCommand
+            | SettingKey::TerminalScrollback
+            | SettingKey::TerminalKey(..) => Category::Terminal,
             SettingKey::SearchMaxResults => Category::Search,
             SettingKey::CMakeGenerator => Category::Build,
             SettingKey::CompletionModels
@@ -204,7 +398,9 @@ impl SettingKey {
         match self {
             SettingKey::ContinuationIndent => SettingKind::Choice(&CONTINUATION_CHOICES),
             SettingKey::CompletionModels => SettingKind::List,
+            SettingKey::TerminalKey(..) => SettingKind::Toggle,
             SettingKey::Shell
+            | SettingKey::AgentCommand
             | SettingKey::TerminalScrollback
             | SettingKey::SearchMaxResults
             | SettingKey::CMakeGenerator
@@ -213,12 +409,29 @@ impl SettingKey {
         }
     }
 
-    /// The short name shown beside the setting's field.
+    /// Where the setting goes in a table of toggles, if it is one of
+    /// those; see [`SettingTable`].
+    pub fn cell(self) -> Option<TableCell> {
+        match self {
+            SettingKey::TerminalKey(terminal, key) => Some(TableCell {
+                table: &TERMINAL_KEYS,
+                row: terminal.name(),
+                column: key.label(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The short name shown beside the setting's field. A toggle in a
+    /// table goes by its column's name, its row being plain from where
+    /// it is.
     pub fn name(self) -> &'static str {
         match self {
             SettingKey::ContinuationIndent => "Continuation indent",
             SettingKey::Shell => "Shell executable",
+            SettingKey::AgentCommand => "Coding agent",
             SettingKey::TerminalScrollback => "Scrollback lines",
+            SettingKey::TerminalKey(_, key) => key.label(),
             SettingKey::SearchMaxResults => "Maximum search results",
             SettingKey::CMakeGenerator => "CMake generator",
             SettingKey::CompletionModels => "Models",
@@ -228,12 +441,22 @@ impl SettingKey {
     }
 
     /// A line about what the setting does.
-    pub fn description(self) -> &'static str {
-        match self {
+    pub fn description(self) -> String {
+        let text = match self {
             SettingKey::ContinuationIndent => "How a line continuing inside brackets is indented",
             SettingKey::Shell => "The program the shell tool runs; blank to use your login shell",
+            SettingKey::AgentCommand => {
+                "The command agent mode (Ctrl+I) runs in the project's directory, with any arguments, quoted as in a shell"
+            }
             SettingKey::TerminalScrollback => {
                 "Lines of output each terminal keeps to scroll back through"
+            }
+            SettingKey::TerminalKey(terminal, key) => {
+                let (label, action) = (key.label(), key.action());
+                return format!(
+                    "{label} in {}: checked, it {action}, and Ctrl+] {label} sends it to the program; unchecked, it goes to the program, and Ctrl+] {label} {action}",
+                    terminal.in_sentence(),
+                );
             }
             SettingKey::SearchMaxResults => {
                 "A project search stops after finding this many matches"
@@ -250,21 +473,27 @@ impl SettingKey {
             SettingKey::CompletionTokenConfidence => {
                 "How sure the model must be of every token of a line to offer it: 0 to 1, lower for more eager completion, higher for more cautious"
             }
-        }
+        };
+        text.to_owned()
     }
 
     /// The key within the category's table in the settings file.
-    fn key(self) -> &'static str {
-        match self {
+    fn key(self) -> String {
+        let key = match self {
             SettingKey::ContinuationIndent => "continuation-indent",
             SettingKey::Shell => "shell",
+            SettingKey::AgentCommand => "agent",
             SettingKey::TerminalScrollback => "scrollback",
+            SettingKey::TerminalKey(terminal, key) => {
+                return format!("{}-ctrl-{}", terminal.key(), key.letter());
+            }
             SettingKey::SearchMaxResults => "max-results",
             SettingKey::CMakeGenerator => "cmake-generator",
             SettingKey::CompletionModels => "models",
             SettingKey::CompletionLineConfidence => "min-line-confidence",
             SettingKey::CompletionTokenConfidence => "min-token-confidence",
-        }
+        };
+        key.to_owned()
     }
 
     /// The setting's key as the file spells it, `terminal.shell` and so
@@ -281,7 +510,11 @@ impl SettingKey {
                 continuation_name(ContinuationIndent::default()).to_owned()
             }
             SettingKey::Shell => String::new(),
+            SettingKey::AgentCommand => DEFAULT_AGENT_COMMAND.to_owned(),
             SettingKey::TerminalScrollback => DEFAULT_SCROLLBACK.to_string(),
+            SettingKey::TerminalKey(terminal, _) => {
+                terminal.editor_takes_keys_by_default().to_string()
+            }
             SettingKey::SearchMaxResults => MAX_MATCHES.to_string(),
             SettingKey::CMakeGenerator => DEFAULT_CMAKE_GENERATOR.to_owned(),
             SettingKey::CompletionModels => String::new(),
@@ -322,13 +555,20 @@ impl fmt::Display for SettingsError {
 
 impl std::error::Error for SettingsError {}
 
+/// The command agent mode runs unless the settings name another.
+pub const DEFAULT_AGENT_COMMAND: &str = "claude";
+
 /// The user's settings; see the [module documentation](self). Each field
 /// is `None` at its default.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     continuation_indent: Option<ContinuationIndent>,
     shell: Option<String>,
+    agent_command: Option<String>,
     terminal_scrollback: Option<usize>,
+    /// For each [`TerminalKind`], for each [`EditorKey`], whether the
+    /// editor takes the key, in the order of their `ALL`s.
+    terminal_keys: [[Option<bool>; EditorKey::ALL.len()]; TerminalKind::ALL.len()],
     search_max_results: Option<usize>,
     cmake_generator: Option<String>,
     completion_models: Vec<String>,
@@ -363,9 +603,42 @@ impl Settings {
         self.shell.as_deref()
     }
 
+    /// The command agent mode runs, as typed: the program and its
+    /// arguments, quoted as in a shell.
+    pub fn agent_command(&self) -> &str {
+        self.agent_command
+            .as_deref()
+            .unwrap_or(DEFAULT_AGENT_COMMAND)
+    }
+
+    /// The command agent mode runs, as the program followed by its
+    /// arguments.
+    pub fn agent_args(&self) -> Vec<String> {
+        // The command was checked when it was set.
+        split_args(self.agent_command()).unwrap_or_default()
+    }
+
     /// How many lines of output a terminal keeps to scroll back through.
     pub fn terminal_scrollback(&self) -> usize {
         self.terminal_scrollback.unwrap_or(DEFAULT_SCROLLBACK)
+    }
+
+    /// Whether the editor takes one of its keys in a kind of terminal
+    /// without the prefix, rather than the program getting it.
+    pub fn editor_takes_key(&self, terminal: TerminalKind, key: EditorKey) -> bool {
+        self.terminal_key(terminal, key)
+            .unwrap_or_else(|| terminal.editor_takes_keys_by_default())
+    }
+
+    /// The value of a [`SettingKey::TerminalKey`] setting, `None` at the
+    /// default.
+    fn terminal_key(&self, terminal: TerminalKind, key: EditorKey) -> Option<bool> {
+        self.terminal_keys[terminal_index(terminal)][key_index(key)]
+    }
+
+    fn set_terminal_key(&mut self, terminal: TerminalKind, key: EditorKey, takes: bool) {
+        self.terminal_keys[terminal_index(terminal)][key_index(key)] =
+            (takes != terminal.editor_takes_keys_by_default()).then_some(takes);
     }
 
     /// How many matches a project search stops at.
@@ -450,7 +723,11 @@ impl Settings {
                 continuation_name(self.continuation_indent()).to_owned()
             }
             SettingKey::Shell => self.shell().unwrap_or_default().to_owned(),
+            SettingKey::AgentCommand => self.agent_command().to_owned(),
             SettingKey::TerminalScrollback => self.terminal_scrollback().to_string(),
+            SettingKey::TerminalKey(terminal, key) => {
+                self.editor_takes_key(terminal, key).to_string()
+            }
             SettingKey::SearchMaxResults => self.search_max_results().to_string(),
             SettingKey::CMakeGenerator => self.cmake_generator().to_owned(),
             SettingKey::CompletionModels => self.completion_models.join("\n"),
@@ -475,9 +752,18 @@ impl Settings {
             SettingKey::Shell => {
                 self.shell = (!text.is_empty()).then(|| text.to_owned());
             }
+            SettingKey::AgentCommand => {
+                // Blank is the default, there being no agent to detect.
+                split_args(text)?;
+                self.agent_command =
+                    (!text.is_empty() && text != DEFAULT_AGENT_COMMAND).then(|| text.to_owned());
+            }
             SettingKey::TerminalScrollback => {
                 let lines = parse_count(text, 0)?;
                 self.terminal_scrollback = (lines != DEFAULT_SCROLLBACK).then_some(lines);
+            }
+            SettingKey::TerminalKey(terminal, key) => {
+                self.set_terminal_key(terminal, key, parse_toggle(text)?);
             }
             SettingKey::SearchMaxResults => {
                 let matches = parse_count(text, 1)?;
@@ -511,7 +797,9 @@ impl Settings {
                 self.continuation_indent() == ContinuationIndent::default()
             }
             SettingKey::Shell => self.shell.is_none(),
+            SettingKey::AgentCommand => self.agent_command.is_none(),
             SettingKey::TerminalScrollback => self.terminal_scrollback() == DEFAULT_SCROLLBACK,
+            SettingKey::TerminalKey(terminal, key) => self.terminal_key(terminal, key).is_none(),
             SettingKey::SearchMaxResults => self.search_max_results() == MAX_MATCHES,
             SettingKey::CMakeGenerator => self.cmake_generator() == DEFAULT_CMAKE_GENERATOR,
             SettingKey::CompletionModels => self.completion_models.is_empty(),
@@ -531,7 +819,11 @@ impl Settings {
         match key {
             SettingKey::ContinuationIndent => self.continuation_indent = None,
             SettingKey::Shell => self.shell = None,
+            SettingKey::AgentCommand => self.agent_command = None,
             SettingKey::TerminalScrollback => self.terminal_scrollback = None,
+            SettingKey::TerminalKey(terminal, key) => {
+                self.terminal_keys[terminal_index(terminal)][key_index(key)] = None;
+            }
             SettingKey::SearchMaxResults => self.search_max_results = None,
             SettingKey::CMakeGenerator => self.cmake_generator = None,
             SettingKey::CompletionModels => self.completion_models.clear(),
@@ -562,7 +854,7 @@ impl Settings {
                 )));
             };
             for key in category.keys() {
-                let Some(value) = entries.remove(key.key()) else {
+                let Some(value) = entries.remove(&key.key()) else {
                     continue;
                 };
                 settings.read_value(key, &value)?;
@@ -609,8 +901,21 @@ impl Settings {
                     .ok_or_else(|| SettingsError(format!("`{}` must be a string", key.path())))?;
                 self.shell = (!shell.trim().is_empty()).then(|| shell.trim().to_owned());
             }
+            SettingKey::AgentCommand => {
+                let command = value
+                    .as_str()
+                    .ok_or_else(|| SettingsError(format!("`{}` must be a string", key.path())))?;
+                self.set_text(key, command)
+                    .map_err(|err| SettingsError(format!("`{}`: {err}", key.path())))?;
+            }
             SettingKey::TerminalScrollback => {
                 self.terminal_scrollback = Some(read_count(key, value, 0)?);
+            }
+            SettingKey::TerminalKey(terminal, editor_key) => {
+                let takes = value.as_bool().ok_or_else(|| {
+                    SettingsError(format!("`{}` must be true or false", key.path()))
+                })?;
+                self.set_terminal_key(terminal, editor_key, takes);
             }
             SettingKey::SearchMaxResults => {
                 self.search_max_results = Some(read_count(key, value, 1)?);
@@ -656,8 +961,13 @@ impl Settings {
                 continue;
             }
             let value = match key {
-                SettingKey::ContinuationIndent | SettingKey::Shell => Value::String(self.text(key)),
+                SettingKey::ContinuationIndent | SettingKey::Shell | SettingKey::AgentCommand => {
+                    Value::String(self.text(key))
+                }
                 SettingKey::TerminalScrollback => Value::Integer(self.terminal_scrollback() as i64),
+                SettingKey::TerminalKey(terminal, key) => {
+                    Value::Boolean(self.editor_takes_key(terminal, key))
+                }
                 SettingKey::SearchMaxResults => Value::Integer(self.search_max_results() as i64),
                 SettingKey::CMakeGenerator => Value::String(self.text(key)),
                 SettingKey::CompletionModels => Value::Array(
@@ -677,7 +987,7 @@ impl Settings {
                 .entry(key.category().table())
                 .or_insert_with(|| Value::Table(Table::new()));
             if let Some(entries) = category.as_table_mut() {
-                entries.insert(key.key().to_owned(), value);
+                entries.insert(key.key(), value);
             }
         }
         format!("{FILE_HEADER}\n{table}")
@@ -704,6 +1014,32 @@ fn parse_continuation(text: &str) -> Result<ContinuationIndent, String> {
         .position(|choice| choice.value.eq_ignore_ascii_case(text))
         .map(|index| CONTINUATIONS[index])
         .ok_or_else(|| "must be align or indent".to_owned())
+}
+
+/// Where a terminal kind's keys are in [`Settings::terminal_keys`].
+fn terminal_index(terminal: TerminalKind) -> usize {
+    TerminalKind::ALL
+        .iter()
+        .position(|t| *t == terminal)
+        .expect("every terminal kind is listed")
+}
+
+/// Where a key is among a terminal kind's in [`Settings::terminal_keys`].
+fn key_index(key: EditorKey) -> usize {
+    EditorKey::ALL
+        .iter()
+        .position(|k| *k == key)
+        .expect("every key is listed")
+}
+
+/// Parse the text form of a toggle, in any case: `true` or `false`, or
+/// the like.
+fn parse_toggle(text: &str) -> Result<bool, String> {
+    match text.to_ascii_lowercase().as_str() {
+        "true" | "on" | "yes" => Ok(true),
+        "false" | "off" | "no" => Ok(false),
+        _ => Err("must be true or false".to_owned()),
+    }
 }
 
 /// Parse a count typed into a field: a whole number of at least `min`.
@@ -1057,6 +1393,118 @@ mod tests {
             }
         }
         assert_eq!(SettingKey::Shell.kind(), SettingKind::Text);
+    }
+
+    #[test]
+    fn the_agent_command_is_checked_and_split_like_a_shell_would() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.agent_command(), DEFAULT_AGENT_COMMAND);
+        assert_eq!(settings.agent_args(), ["claude"]);
+        assert_eq!(SettingKey::AgentCommand.placeholder(), "claude");
+        assert_eq!(
+            settings.set_text(SettingKey::AgentCommand, " claude --model 'big one' "),
+            Ok(true)
+        );
+        assert_eq!(settings.agent_command(), "claude --model 'big one'");
+        assert_eq!(settings.agent_args(), ["claude", "--model", "big one"]);
+        assert_eq!(
+            settings.set_text(SettingKey::AgentCommand, "claude 'oops"),
+            Err("unclosed ' quote".to_owned())
+        );
+        assert_eq!(settings.agent_args(), ["claude", "--model", "big one"]);
+
+        let text = settings.to_toml();
+        assert!(
+            text.contains("agent = \"claude --model 'big one'\""),
+            "{text}"
+        );
+        assert_eq!(Settings::parse(&text).unwrap(), settings);
+        assert_eq!(
+            Settings::parse("[terminal]\nagent = \"x \\\"y\"\n")
+                .unwrap_err()
+                .to_string(),
+            "`terminal.agent`: unclosed \" quote"
+        );
+
+        // There is no agent to detect, so blank is the default.
+        assert_eq!(settings.set_text(SettingKey::AgentCommand, "  "), Ok(true));
+        assert!(settings.is_default(SettingKey::AgentCommand));
+        assert_eq!(settings.text(SettingKey::AgentCommand), "claude");
+        assert!(!settings.to_toml().contains("agent"));
+    }
+
+    #[test]
+    fn terminal_keys_are_toggles_in_a_table_by_terminal_and_key() {
+        use EditorKey::*;
+        use TerminalKind::*;
+        let mut settings = Settings::default();
+        // The shell has the keyboard to itself; the editor takes its
+        // keys in the output and the agent.
+        for key in EditorKey::ALL {
+            assert!(settings.editor_takes_key(Output, key), "{key:?}");
+            assert!(!settings.editor_takes_key(Shell, key), "{key:?}");
+            assert!(settings.editor_takes_key(Agent, key), "{key:?}");
+        }
+        let setting = SettingKey::TerminalKey(Agent, OpenFile);
+        assert_eq!(setting.kind(), SettingKind::Toggle);
+        assert_eq!(setting.name(), "Ctrl+O");
+        assert_eq!(settings.text(setting), "true");
+        assert_eq!(setting.default_text(), "true");
+        assert_eq!(
+            SettingKey::TerminalKey(Shell, OpenFile).default_text(),
+            "false"
+        );
+
+        assert_eq!(settings.set_text(setting, "false"), Ok(true));
+        assert!(!settings.editor_takes_key(Agent, OpenFile));
+        assert!(settings.editor_takes_key(Agent, Commands), "only that key");
+        assert!(settings.editor_takes_key(Output, OpenFile), "only there");
+        assert!(!settings.is_default(setting));
+        assert_eq!(settings.set_text(setting, "False"), Ok(false));
+        assert_eq!(
+            settings.set_text(setting, "maybe"),
+            Err("must be true or false".to_owned())
+        );
+        assert_eq!(
+            settings.set_text(SettingKey::TerminalKey(Shell, GitLog), "on"),
+            Ok(true)
+        );
+        assert!(settings.editor_takes_key(Shell, GitLog));
+
+        let text = settings.to_toml();
+        assert!(text.contains("[terminal]"), "{text}");
+        assert!(text.contains("agent-ctrl-o = false"), "{text}");
+        assert!(text.contains("shell-ctrl-l = true"), "{text}");
+        assert!(!text.contains("output-ctrl"), "defaults stay out: {text}");
+        assert_eq!(Settings::parse(&text).unwrap(), settings);
+        assert!(settings.reset(setting));
+        assert!(settings.editor_takes_key(Agent, OpenFile));
+        assert_eq!(
+            Settings::parse("[terminal]\nshell-ctrl-p = \"yes\"\n")
+                .unwrap_err()
+                .to_string(),
+            "`terminal.shell-ctrl-p` must be true or false"
+        );
+
+        // They are a table: a row per terminal, a column per key, row by
+        // row among the terminal settings.
+        let cells: Vec<TableCell> = Category::Terminal
+            .keys()
+            .filter_map(SettingKey::cell)
+            .collect();
+        assert_eq!(cells.len(), 18);
+        assert!(cells.iter().all(|cell| cell.table == cells[0].table));
+        assert_eq!(cells[0].row, "Output");
+        assert_eq!(cells[0].column, "Ctrl+E");
+        assert_eq!(cells[5].column, "Ctrl+R");
+        assert_eq!(cells[6].row, "Shell");
+        assert_eq!(cells[17].row, "Agent");
+        assert_eq!(SettingKey::Shell.cell(), None);
+        assert!(
+            setting.description().contains("Ctrl+] Ctrl+O"),
+            "{}",
+            setting.description()
+        );
     }
 
     #[test]

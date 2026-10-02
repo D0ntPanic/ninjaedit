@@ -2,13 +2,16 @@
 //! them: what a settings page, or any form, is made of.
 //!
 //! [`Fields`] owns a control per field and knows which one has the
-//! focus. A field is one of two [kinds](FieldKind):
+//! focus. A field is one of three [kinds](FieldKind):
 //!
 //! * A text field, an [`Input`], which edits as a text field does.
 //! * A choice among a few options, drawn side by side on the field's row
 //!   with the chosen one marked. Left and Right choose the option before
 //!   or after (stopping at the ends), Space the next (wrapping around),
 //!   Home and End the first and last, and a click the option clicked.
+//! * A checkbox, on or off, drawn as `[x]` or `[ ]`. Space or a click
+//!   turns it over. Its row is just the box, so that a form can set
+//!   several side by side, as a table of them.
 //!
 //! Tab and Down move the focus to the next field and Shift+Tab and Up to
 //! the previous (Tab wraps around at the ends, the arrows stop); every
@@ -87,6 +90,11 @@ const NOT_CHOSEN: &str = "○";
 const CHOICE_INDENT: u16 = 1;
 /// Columns between the options of a choice.
 const CHOICE_GAP: u16 = 2;
+/// A checkbox, checked and not.
+const CHECKED: &str = "[x]";
+const UNCHECKED: &str = "[ ]";
+/// How wide a checkbox is drawn.
+pub const CHECKBOX_WIDTH: u16 = 3;
 
 /// What a field edits.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,12 +103,32 @@ pub enum FieldKind {
     Text,
     /// One of these options, by their labels.
     Choice(Vec<String>),
+    /// On or off.
+    Checkbox,
 }
 
 /// One field's control.
 enum Control {
     Text(Input),
     Choice(Choice),
+    /// Whether the box is checked.
+    Checkbox(bool),
+}
+
+/// Draw a checkbox at the start of `row`. Returns where the terminal
+/// cursor goes if the field has the focus: inside the box.
+fn render_checkbox(
+    checked: bool,
+    row: Rect,
+    buf: &mut Buffer,
+    theme: &Theme,
+) -> Option<ScreenPosition> {
+    let style = Style::default()
+        .fg(theme.command_palette_input_text)
+        .bg(theme.command_palette_background);
+    let text = if checked { CHECKED } else { UNCHECKED };
+    buf.set_stringn(row.x, row.y, text, row.width as usize, style);
+    (row.width > 1).then(|| ScreenPosition::new(row.x + 1, row.y))
 }
 
 /// A choice among options, shown side by side.
@@ -214,6 +242,7 @@ impl Fields {
                     chosen: 0,
                     areas: Vec::new(),
                 }),
+                FieldKind::Checkbox => Control::Checkbox(false),
             })
             .collect();
         Fields {
@@ -236,39 +265,68 @@ impl Fields {
     pub fn input(&self, index: usize) -> &Input {
         match &self.controls[index] {
             Control::Text(input) => input,
-            Control::Choice(_) => panic!("field {index} is a choice"),
+            _ => panic!("field {index} isn't a text field"),
         }
     }
 
-    /// A text field's text; empty for a choice.
+    /// A text field's text; empty for a choice or a checkbox.
     pub fn text(&self, index: usize) -> &str {
         match &self.controls[index] {
             Control::Text(input) => input.text(),
-            Control::Choice(_) => "",
+            _ => "",
         }
     }
 
     /// Replace a text field's text, with the cursor at its end. Does
-    /// nothing to a choice.
+    /// nothing to a choice or a checkbox.
     pub fn set_text(&mut self, index: usize, text: &str) {
         if let Control::Text(input) = &mut self.controls[index] {
             input.set_text(text);
         }
     }
 
-    /// The option chosen in a choice, or `None` for a text field.
+    /// The option chosen in a choice, or `None` for another kind of
+    /// field.
     pub fn chosen(&self, index: usize) -> Option<usize> {
         match &self.controls[index] {
-            Control::Text(_) => None,
             Control::Choice(choice) => Some(choice.chosen),
+            _ => None,
         }
     }
 
-    /// Choose an option of a choice. Does nothing to a text field, or
-    /// with an option the choice doesn't have.
+    /// Choose an option of a choice. Does nothing to another kind of
+    /// field, or with an option the choice doesn't have.
     pub fn choose(&mut self, index: usize, option: usize) {
         if let Control::Choice(choice) = &mut self.controls[index] {
             choice.choose(option);
+        }
+    }
+
+    /// Whether a checkbox is checked, or `None` for another kind of
+    /// field.
+    pub fn checked(&self, index: usize) -> Option<bool> {
+        match &self.controls[index] {
+            Control::Checkbox(checked) => Some(*checked),
+            _ => None,
+        }
+    }
+
+    /// Check a checkbox or clear it. Does nothing to another kind of
+    /// field.
+    pub fn set_checked(&mut self, index: usize, checked: bool) {
+        if let Control::Checkbox(value) = &mut self.controls[index] {
+            *value = checked;
+        }
+    }
+
+    /// Turn a checkbox over. Returns whether the field is one.
+    pub fn toggle(&mut self, index: usize) -> bool {
+        match &mut self.controls[index] {
+            Control::Checkbox(checked) => {
+                *checked = !*checked;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -306,7 +364,7 @@ impl Fields {
     fn inputs(&self) -> impl Iterator<Item = &Input> {
         self.controls.iter().filter_map(|control| match control {
             Control::Text(input) => Some(input),
-            Control::Choice(_) => None,
+            _ => None,
         })
     }
 
@@ -351,6 +409,13 @@ impl Fields {
                     InputKey::Changed => FieldKey::Changed,
                 },
                 Control::Choice(choice) => choice.handle_key(key),
+                Control::Checkbox(checked) => match key.code {
+                    KeyCode::Char(' ') => {
+                        *checked = !*checked;
+                        FieldKey::Changed
+                    }
+                    _ => FieldKey::Ignored,
+                },
             },
         }
     }
@@ -368,8 +433,8 @@ impl Fields {
 
     /// Handle a mouse event: a press in a field's row focuses that field
     /// (returning where the focus came from, if it moved) and goes to it,
-    /// choosing the option clicked in a choice; a drag or release goes to
-    /// the text field being dragged in.
+    /// choosing the option clicked in a choice and turning a checkbox
+    /// over; a drag or release goes to the text field being dragged in.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<usize> {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -385,6 +450,7 @@ impl Fields {
                             choice.choose(option);
                         }
                     }
+                    Control::Checkbox(checked) => *checked = !*checked,
                 }
                 from
             }
@@ -412,7 +478,9 @@ impl Fields {
     }
 
     /// Draw one field into `row`: a text field with `placeholder` while
-    /// it is empty, a choice with its options. Returns where the terminal
+    /// it is empty, a choice with its options, a checkbox at the start of
+    /// the row, which is the box's to be clicked whatever its width.
+    /// Returns where the terminal
     /// cursor belongs when the field is the focused one (and has no
     /// selection), else `None`.
     pub fn render_field(
@@ -427,6 +495,7 @@ impl Fields {
         let cursor = match &mut self.controls[index] {
             Control::Text(input) => input.render(row, placeholder, buf, theme),
             Control::Choice(choice) => choice.render(row, buf, theme),
+            Control::Checkbox(checked) => render_checkbox(*checked, row, buf, theme),
         };
         (index == self.focused).then_some(cursor).flatten()
     }
@@ -640,5 +709,50 @@ mod tests {
         fields.handle_mouse(click(8));
         assert_eq!(fields.chosen(0), Some(1), "between options, nothing");
         assert!(!fields.is_dragging());
+    }
+
+    #[test]
+    fn a_checkbox_turns_over_with_space_and_clicks() {
+        let mut clipboard = Clipboard::local_only();
+        let mut fields = Fields::with_kinds(vec![FieldKind::Checkbox, FieldKind::Checkbox]);
+        assert_eq!(fields.checked(0), Some(false));
+        assert_eq!(fields.chosen(0), None);
+        let mut press = |fields: &mut Fields, code| fields.handle_key(key(code), &mut clipboard);
+        assert_eq!(press(&mut fields, KeyCode::Char(' ')), FieldKey::Changed);
+        assert_eq!(fields.checked(0), Some(true));
+        assert_eq!(press(&mut fields, KeyCode::Char('x')), FieldKey::Ignored);
+        assert_eq!(press(&mut fields, KeyCode::Enter), FieldKey::Ignored);
+        assert!(!fields.paste("text"), "a checkbox takes no text");
+        assert_eq!(
+            press(&mut fields, KeyCode::Tab),
+            FieldKey::Moved { from: 0, to: 1 }
+        );
+        fields.set_checked(1, true);
+        assert!(fields.toggle(1));
+        assert_eq!(fields.checked(1), Some(false));
+
+        // Drawn as a box, with the cursor inside it once focused.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
+        fields.clear_layout();
+        let theme = Theme::default();
+        let row = |x| Rect::new(x, 0, CHECKBOX_WIDTH, 1);
+        assert_eq!(fields.render_field(0, row(0), "", &mut buf, &theme), None);
+        assert_eq!(
+            fields.render_field(1, row(5), "", &mut buf, &theme),
+            Some(ScreenPosition::new(6, 0))
+        );
+        let text: String = (0..10).map(|x| buf[(x, 0)].symbol().to_owned()).collect();
+        assert_eq!(text, "[x]  [ ]  ");
+
+        // A click on a box focuses it and turns it over.
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(fields.handle_mouse(click), Some(1));
+        assert_eq!(fields.focused(), 0);
+        assert_eq!(fields.checked(0), Some(false));
     }
 }

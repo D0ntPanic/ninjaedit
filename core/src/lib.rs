@@ -45,7 +45,10 @@ pub use line_edit::LineEdit;
 pub use project::{Project, ProjectKind};
 pub use project_search::{ProjectMatch, ProjectSearch};
 pub use search::{Search, SearchStep};
-pub use settings::{Category, SettingChoice, SettingKey, SettingKind, Settings, SettingsError};
+pub use settings::{
+    Category, DEFAULT_AGENT_COMMAND, EditorKey, SettingChoice, SettingKey, SettingKind,
+    SettingTable, Settings, SettingsError, TableCell, TerminalKind,
+};
 pub use storage::Storage;
 pub use syntax::{ConflictSide, Highlighter, Language, Token, TokenKind};
 pub use terminal::Terminal;

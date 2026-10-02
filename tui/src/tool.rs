@@ -3,7 +3,7 @@
 //!
 //! A [`Tool`] is one running (or finished) program shown in a
 //! [`TerminalView`]: a shell, the output of a build or of the program
-//! being built, later a debugger or a coding agent. Each keeps the
+//! being built, the coding agent, later a debugger. Each keeps the
 //! [`Session`] driving the pty while it runs; the application supplies
 //! the command each time one is started, since what it is (which shell,
 //! say) comes from the settings and may have changed since the last run.
@@ -25,11 +25,13 @@
 //!
 //! [`ToolKind`] names each kind of tool the editor can open, so the modes
 //! palette (Ctrl+E) can list them all and the pane can find the one
-//! already running.
+//! already running. The coding agent is a tool too, but not one of the
+//! pane's: it has a mode of its own, standing in for the editor, and the
+//! application keeps it apart from the pane.
 
 use crate::terminal_view::TerminalView;
-use ninjaedit_core::Settings;
 use ninjaedit_core::terminal::{Command, ExitStatus, Session, SessionId};
+use ninjaedit_core::{Settings, TerminalKind};
 use std::io;
 use std::path::Path;
 
@@ -40,17 +42,21 @@ pub enum ToolKind {
     Shell,
     /// The output of the last build or run.
     Output,
+    /// The coding agent, shown by agent mode rather than in the pane.
+    Agent,
 }
 
 impl ToolKind {
-    /// Every kind, in the order the modes palette lists them.
-    pub const ALL: [ToolKind; 2] = [ToolKind::Shell, ToolKind::Output];
+    /// The kinds shown in the pane, in the order the modes palette lists
+    /// them.
+    pub const PANE: [ToolKind; 2] = [ToolKind::Shell, ToolKind::Output];
 
     /// The short name shown in the tool's tab and the palette.
     pub fn name(self) -> &'static str {
         match self {
             ToolKind::Shell => "Shell",
             ToolKind::Output => "Output",
+            ToolKind::Agent => "Agent",
         }
     }
 
@@ -60,24 +66,38 @@ impl ToolKind {
         match self {
             ToolKind::Shell => "Run commands in a shell below the editor",
             ToolKind::Output => "The output of the last build (Ctrl+B) or run (Ctrl+R)",
+            ToolKind::Agent => "Run the coding agent, which keeps working when it is left",
+        }
+    }
+
+    /// Which kind of terminal the tool is, for the settings that differ
+    /// between them.
+    pub fn terminal_kind(self) -> TerminalKind {
+        match self {
+            ToolKind::Shell => TerminalKind::Shell,
+            ToolKind::Output => TerminalKind::Output,
+            ToolKind::Agent => TerminalKind::Agent,
         }
     }
 
     /// The command that runs this tool in `directory` when it is opened:
     /// for the shell, the program the settings name, or the user's shell
-    /// when they don't. The output tool has none; a build or run starts
-    /// its programs.
+    /// when they don't; for the agent, the command the settings name.
+    /// The output tool has none; a build or run starts its programs.
     pub fn command(self, directory: &Path, settings: &Settings) -> Option<Command> {
-        match self {
-            ToolKind::Shell => Some(
-                match settings.shell() {
-                    Some(shell) => Command::new(shell),
-                    None => Command::shell(),
-                }
-                .current_dir(directory),
-            ),
-            ToolKind::Output => None,
-        }
+        let command = match self {
+            ToolKind::Shell => match settings.shell() {
+                Some(shell) => Command::new(shell),
+                None => Command::shell(),
+            },
+            ToolKind::Agent => {
+                let mut args = settings.agent_args().into_iter();
+                args.next()
+                    .map(|program| args.fold(Command::new(program), Command::arg))?
+            }
+            ToolKind::Output => return None,
+        };
+        Some(command.current_dir(directory))
     }
 
     /// Whether the tool is worth showing with no program running in it:
@@ -85,7 +105,7 @@ impl ToolKind {
     /// hint before the first.
     pub fn shows_when_idle(self) -> bool {
         match self {
-            ToolKind::Shell => false,
+            ToolKind::Shell | ToolKind::Agent => false,
             ToolKind::Output => true,
         }
     }

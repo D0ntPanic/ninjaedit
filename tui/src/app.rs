@@ -115,8 +115,10 @@
 //! elsewhere), or the commit when HEAD is detached; see the `heads`
 //! module. Ctrl+B builds the current
 //! target with the current configuration and Ctrl+R builds and runs it,
-//! from the editor, a mode, or (after the prefix, or straight away when
-//! nothing is running in it) a tool. Each job runs in the output tool:
+//! from the editor, a mode, or a terminal: there Ctrl+B needs the prefix
+//! while a program is running, and Ctrl+R goes to the editor or the
+//! program as the settings say for that kind of terminal (see below).
+//! Each job runs in the output tool:
 //! its commands one after another on one screen, with a heading before
 //! each and a line saying how it ended. Either gives the output the
 //! keyboard, so Ctrl+C stops the job (or the program) without switching
@@ -140,17 +142,25 @@
 //! test suite can be run now and then without losing the target being
 //! worked on from Ctrl+R.
 //!
-//! With a tool focused its program gets the whole keyboard, since a shell
-//! or a coding agent has uses for nearly every key and its line editing
-//! (Ctrl+E for the end of the line, say) is muscle memory. The one key
-//! the program never sees is the prefix, Ctrl+], telnet's escape
-//! character: it holds the next key back, and that key goes to the
-//! editor instead, meaning what it means there: Ctrl+] Ctrl+P opens the
-//! command palette, Ctrl+E the modes palette, Ctrl+O the file search,
-//! Ctrl+T the tab search, Ctrl+F
+//! With a terminal focused (a tool, or the agent in agent mode) its
+//! program gets the keyboard, since a shell or a coding agent has uses
+//! for nearly every key and its line editing (Ctrl+E for the end of the
+//! line, say) is muscle memory. The exceptions are those of the editor's
+//! keys the settings give the editor in that kind of terminal: of
+//! Ctrl+E, Ctrl+U, Ctrl+O, Ctrl+L, Ctrl+P, and Ctrl+R, by default none in a
+//! shell, and all of them in the output, which is more read than typed
+//! into, and in the agent, so that the editor is a key away while the
+//! agent works. The one key the program never sees is the prefix,
+//! Ctrl+], telnet's escape character: it holds the next key back, and
+//! that key goes the other way from usual. One the program would get
+//! goes to the editor instead, meaning what it means there: Ctrl+]
+//! Ctrl+P opens the command palette, Ctrl+E the modes palette, Ctrl+O
+//! the file search, Ctrl+T the tab search, Ctrl+F
 //! and Ctrl+Shift+F the searches, Ctrl+J the go to line box, Ctrl+L the
 //! git log, Ctrl+U the changes page, Ctrl+Q
-//! quits, and Ctrl+, and Ctrl+. move the focus. So a file named in a
+//! quits, and Ctrl+, and Ctrl+. move the focus; and one the editor
+//! would take goes to the program, so that Ctrl+] Ctrl+O is the agent's
+//! own Ctrl+O. So a file named in a
 //! build's output is a prefix and a few keys away without leaving the
 //! shell first; the overlay takes the keyboard while it is open, and
 //! whichever it ends in the editor (a file opened, a match or a line
@@ -167,9 +177,23 @@
 //! work without the prefix, since there is no program to want them.
 //! Terminals without the kitty keyboard protocol deliver Ctrl+] as
 //! Ctrl+5, which is also how to type it on a layout that puts ] behind
-//! AltGr, so both spellings are the prefix. Ctrl+` toggles the shell
-//! without a prefix from either view: it only arrives at all on terminals
-//! where it is unambiguous.
+//! AltGr, so both spellings are the prefix. Ctrl+` toggles the shell and
+//! Ctrl+I the agent without a prefix from any view: they only arrive at
+//! all on terminals where they are unambiguous (Ctrl+I being Tab
+//! elsewhere).
+//!
+//! Agent mode (Ctrl+I) runs the coding agent the settings name (`claude`
+//! unless they say otherwise) in the project's directory, in a terminal
+//! standing in for the editor as the other modes do. Ctrl+I there goes
+//! back to where the user was before: the mode, and the view the
+//! keyboard was in. So does the agent exiting, since an agent leaves
+//! nothing worth reading on its screen when it goes. Going back doesn't
+//! end the agent: it keeps working in the background, a 🤖 in the status
+//! bar says so (a click on it comes back), and Ctrl+I, the modes palette,
+//! or the 🤖 return to the same session. The git pages read the
+//! repository again when they come back from the agent, which may have
+//! changed it. Opening another mode or a file from the agent goes there
+//! and forgets where agent mode was opened from.
 //!
 //! Closing a modified tab or quitting with unsaved changes asks for the key
 //! to be pressed a second time rather than popping up a dialog.
@@ -203,8 +227,8 @@ use ninjaedit_core::search::literal_query;
 use ninjaedit_core::terminal::{ExitStatus, Output, Session, SessionId};
 use ninjaedit_core::{
     BuildConfig, BuildRoot, Completer, CompletionOutcome, ConflictStep, Discovery, DiscoveryResult,
-    Editor, ExternalChange, Job, Project, ProjectKind, ProjectMatch, SearchStep, Selection,
-    Settings, SourceLocation, Step, Storage,
+    Editor, EditorKey, ExternalChange, Job, Project, ProjectKind, ProjectMatch, SearchStep,
+    Selection, Settings, SourceLocation, Step, Storage,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -245,6 +269,18 @@ enum Mode {
     /// Boxed: the page is far bigger than the others.
     GitLog(Box<GitLogTabs>),
     Changes(Box<ChangesTabs>),
+    /// The coding agent's terminal, with the mode it was opened from and
+    /// where the keyboard was then, to go back to. The agent itself is
+    /// kept apart, in [`App::agent`], since it outlives the mode.
+    Agent(Box<Mode>, Focus),
+}
+
+/// One of the terminals on screen: the active tool in the pane, or the
+/// coding agent in agent mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Console {
+    Pane,
+    Agent,
 }
 
 /// One of the places the keyboard can be, as the modes palette lists
@@ -256,6 +292,7 @@ enum View {
     Build,
     GitLog,
     Changes,
+    Agent,
     Tool(ToolKind),
 }
 
@@ -264,8 +301,14 @@ impl View {
     /// used recently: the pages last, being the least often wanted.
     fn all() -> impl Iterator<Item = View> {
         std::iter::once(View::Editor)
-            .chain(ToolKind::ALL.into_iter().map(View::Tool))
-            .chain([View::GitLog, View::Changes, View::Build, View::Settings])
+            .chain(ToolKind::PANE.into_iter().map(View::Tool))
+            .chain([
+                View::Agent,
+                View::GitLog,
+                View::Changes,
+                View::Build,
+                View::Settings,
+            ])
     }
 
     fn label(self) -> &'static str {
@@ -275,6 +318,7 @@ impl View {
             View::Build => build_view::TITLE,
             View::GitLog => git_view::TITLE,
             View::Changes => changes_view::TITLE,
+            View::Agent => ToolKind::Agent.name(),
             View::Tool(kind) => kind.name(),
         }
     }
@@ -290,6 +334,7 @@ impl View {
             View::Changes => {
                 "Review the uncommitted changes, stage them, and commit them; resolve merge conflicts"
             }
+            View::Agent => ToolKind::Agent.description(),
             View::Tool(kind) => kind.description(),
         }
     }
@@ -299,6 +344,7 @@ impl View {
     fn shortcut(self) -> Option<&'static str> {
         match self {
             View::Tool(ToolKind::Shell) => Some("Ctrl+`"),
+            View::Agent => Some("Ctrl+I"),
             View::GitLog => Some("Ctrl+L"),
             View::Changes => Some("Ctrl+U"),
             _ => None,
@@ -312,6 +358,7 @@ impl View {
             View::Build => PaletteAction::OpenBuildConfig,
             View::GitLog => PaletteAction::OpenGitLog,
             View::Changes => PaletteAction::OpenChanges,
+            View::Agent => PaletteAction::OpenAgent,
             View::Tool(kind) => PaletteAction::OpenTool(kind),
         }
     }
@@ -409,7 +456,16 @@ const OUTPUT_IDLE_HELP: &[(&str, &str)] = &[
     ("Ctrl+E", "mode"),
     ("Ctrl+P", "commands"),
 ];
-/// What the status bar shows while the prefix waits for its key.
+/// What the status bar shows with the coding agent focused.
+const AGENT_HELP: &[(&str, &str)] = &[
+    ("Ctrl+I", "back, the agent keeps running"),
+    ("Ctrl+]", "prefix"),
+];
+/// The status bar's sign of a coding agent running.
+const AGENT_ICON: &str = " 🤖 ";
+/// What the status bar shows while the prefix waits for its key, less
+/// the keys it would send to the program; see
+/// [`prefix_help`](App::prefix_help).
 const PREFIX_HELP: &[(&str, &str)] = &[
     ("Ctrl+]", "then Ctrl+"),
     ("P", "commands"),
@@ -522,10 +578,11 @@ pub struct App {
     /// The directories the last job's commands ran in (and built in),
     /// which the paths in their output are relative to.
     job_dirs: Vec<PathBuf>,
-    /// The status bar's configuration and target segments from the last
-    /// render, to hit-test clicks.
+    /// The status bar's configuration and target segments, and its sign
+    /// of a coding agent, from the last render, to hit-test clicks.
     status_config_area: Rect,
     status_target_area: Rect,
+    status_agent_area: Rect,
     /// Where HEAD is in the repositories the status bar has shown.
     heads: Heads,
     /// What the threads finding roots' targets report back, taken in
@@ -594,6 +651,9 @@ pub struct App {
     editor_area: Rect,
     /// The tools shown below the editor.
     tool_pane: ToolPane,
+    /// The coding agent (Ctrl+I) while it runs, whether agent mode is
+    /// showing it or it is working in the background.
+    agent: Option<Tool>,
     /// The tool pane's own tab bar, one tab per tool.
     tool_tab_bar: TabBar,
     /// Which view the keyboard drives.
@@ -671,6 +731,7 @@ impl App {
             job_dirs: Vec::new(),
             status_config_area: Rect::default(),
             status_target_area: Rect::default(),
+            status_agent_area: Rect::default(),
             heads: Heads::new(),
             discoveries: discovery_rx,
             discovery_tx,
@@ -700,6 +761,7 @@ impl App {
             quit: false,
             editor_area: Rect::default(),
             tool_pane: ToolPane::default(),
+            agent: None,
             tool_tab_bar: TabBar::default(),
             focus: Focus::Editor,
             events,
@@ -908,17 +970,31 @@ impl App {
         self.close_tab(index);
     }
 
+    /// Quit, asking for Ctrl+Q a second time first when that would lose
+    /// unsaved changes or end the coding agent, which may be working
+    /// out of sight.
     fn request_quit(&mut self) {
         let unsaved = self
             .tabs
             .iter()
             .filter(|t| t.view.editor().is_modified())
             .count();
-        if unsaved > 0 && self.confirm != Some(Confirm::Quit) {
+        let agent = self.agent.is_some();
+        if (unsaved > 0 || agent) && self.confirm != Some(Confirm::Quit) {
             self.confirm = Some(Confirm::Quit);
-            self.status = Some(StatusLine::info(format!(
-                "{unsaved} file(s) have unsaved changes: press Ctrl+Q again to quit without saving"
-            )));
+            let message = match (unsaved, agent) {
+                (0, _) => {
+                    "The coding agent is still running: press Ctrl+Q again to quit and end it"
+                        .to_owned()
+                }
+                (_, false) => format!(
+                    "{unsaved} file(s) have unsaved changes: press Ctrl+Q again to quit without saving"
+                ),
+                (_, true) => format!(
+                    "{unsaved} file(s) have unsaved changes and the coding agent is still running: press Ctrl+Q again to quit anyway"
+                ),
+            };
+            self.status = Some(StatusLine::info(message));
             return;
         }
         self.quit = true;
@@ -1353,6 +1429,7 @@ impl App {
             Mode::Build(_) => Page::Build,
             Mode::GitLog(_) => Page::GitLog,
             Mode::Changes(_) => Page::Changes,
+            Mode::Agent(..) => Page::Agent,
         };
         let file = match &self.mode {
             Mode::Editor => self.tabs.get(self.active).map(|tab| {
@@ -1612,6 +1689,7 @@ impl App {
             Mode::Build(_) => View::Build,
             Mode::GitLog(_) => View::GitLog,
             Mode::Changes(_) => View::Changes,
+            Mode::Agent(..) => View::Agent,
         }
     }
 
@@ -1660,6 +1738,7 @@ impl App {
                 }
             }
             PaletteAction::OpenTool(kind) => self.open_tool(kind),
+            PaletteAction::OpenAgent => self.show_agent(),
             PaletteAction::AddBuildRoot(path) => self.add_build_root(path),
             PaletteAction::SelectConfiguration { root, index } => {
                 if self.build.select_configuration(root, index) {
@@ -1683,6 +1762,7 @@ impl App {
     fn open_settings(&mut self) {
         self.close_editor_overlays();
         if !matches!(self.mode, Mode::Settings(_)) {
+            self.leave_mode();
             self.mode = Mode::Settings(SettingsView::new(&self.settings));
         }
         self.focus = Focus::Editor;
@@ -1696,7 +1776,8 @@ impl App {
         self.focus = Focus::Editor;
     }
 
-    /// Put the editor back in the upper part of the screen.
+    /// Put the editor back in the upper part of the screen. Leaving
+    /// agent mode this way leaves the mode it was opened from as well.
     fn leave_mode(&mut self) {
         match std::mem::replace(&mut self.mode, Mode::Editor) {
             Mode::Editor => {}
@@ -1710,6 +1791,10 @@ impl App {
             }
             Mode::GitLog(tabs) => self.git_log = Some(tabs),
             Mode::Changes(_) => {}
+            Mode::Agent(previous, _) => {
+                self.mode = *previous;
+                self.leave_mode();
+            }
         }
     }
 
@@ -1736,15 +1821,15 @@ impl App {
 
     /// Apply the settings to what is running: every open editor's code
     /// style, every terminal's scrollback, the project search's limit,
-    /// and the completion models. The shell setting applies to the next
-    /// shell started.
+    /// and the completion models. The shell and agent settings apply to
+    /// the next shell or agent started, and the keys to the next key.
     fn apply_settings(&mut self) {
         let style = self.settings.code_style();
         for tab in &mut self.tabs {
             tab.view.editor_mut_in_place().set_code_style(style);
         }
         let scrollback = self.settings.terminal_scrollback();
-        for tool in self.tool_pane.tools_mut() {
+        for tool in self.tool_pane.tools_mut().iter_mut().chain(&mut self.agent) {
             tool.set_scrollback_limit(scrollback);
         }
         if let Some(dialog) = &mut self.project_search {
@@ -1825,6 +1910,7 @@ impl App {
     fn open_build_config(&mut self) {
         self.close_editor_overlays();
         if !matches!(self.mode, Mode::Build(_)) {
+            self.leave_mode();
             self.mode = Mode::Build(BuildView::new(&self.build));
         }
         self.focus = Focus::Editor;
@@ -1871,6 +1957,120 @@ impl App {
             }
         }
         self.focus = Focus::Editor;
+    }
+
+    // ----- Coding agent ---------------------------------------------------
+
+    /// Ctrl+I: show the coding agent in the editor's place and give it
+    /// the keyboard, starting it if it isn't running; with it showing but
+    /// the keyboard in the pane below, just focus it; and with it
+    /// focused, go back to where the user was before.
+    fn toggle_agent(&mut self) {
+        if matches!(self.mode, Mode::Agent(..)) && self.focus == Focus::Editor {
+            self.leave_agent();
+        } else {
+            self.show_agent();
+        }
+    }
+
+    /// Show the coding agent in the editor's place and give it the
+    /// keyboard, starting it if it isn't running, as the modes palette
+    /// and the status bar's 🤖 do. The mode and the view the keyboard
+    /// is in are kept, to go back to. A failure to start is reported in
+    /// the status bar instead.
+    fn show_agent(&mut self) {
+        self.close_editor_overlays();
+        if !matches!(self.mode, Mode::Agent(..)) {
+            if !self.start_agent() {
+                return;
+            }
+            let previous = std::mem::replace(&mut self.mode, Mode::Editor);
+            self.mode = Mode::Agent(Box::new(previous), self.focus);
+        }
+        self.focus = Focus::Editor;
+        self.prefix = None;
+    }
+
+    /// Start the coding agent with the command the settings name, unless
+    /// it is running already. Returns whether it is running; a failure
+    /// to start is reported in the status bar.
+    fn start_agent(&mut self) -> bool {
+        if self.agent.is_some() {
+            return true;
+        }
+        let Some(command) = ToolKind::Agent.command(self.project.root(), &self.settings) else {
+            self.status = Some(StatusLine::error("No coding agent command is set"));
+            return false;
+        };
+        // Sized to the editor's area, where it will show, until the
+        // render fits it exactly.
+        let (cols, rows) = if self.editor_area.width > 0 && self.editor_area.height > 0 {
+            (self.editor_area.width, self.editor_area.height)
+        } else {
+            (80, 24)
+        };
+        let scrollback = self.settings.terminal_scrollback();
+        let mut agent = Tool::of_kind(ToolKind::Agent, cols, rows, scrollback);
+        let events = self.events.clone();
+        match agent.start(|cols, rows| spawn_session(&command, cols, rows, events)) {
+            Ok(()) => {
+                self.agent = Some(agent);
+                true
+            }
+            Err(err) => {
+                self.status = Some(StatusLine::error(format!(
+                    "Could not start the coding agent ({}): {err}",
+                    command.display()
+                )));
+                false
+            }
+        }
+    }
+
+    /// Go back from agent mode to the mode it was opened from, leaving
+    /// the agent running. The keyboard goes back to where it was then,
+    /// unless it has moved to the pane since. A git page reads the
+    /// repository again, since the agent may have changed it.
+    fn leave_agent(&mut self) {
+        let mode = std::mem::replace(&mut self.mode, Mode::Editor);
+        let Mode::Agent(previous, focus) = mode else {
+            self.mode = mode;
+            return;
+        };
+        self.mode = *previous;
+        match &mut self.mode {
+            Mode::GitLog(tabs) => tabs.refresh(),
+            Mode::Changes(tabs) => tabs.refresh(),
+            _ => {}
+        }
+        let pane = self.tool_pane.is_visible();
+        if !(self.focus == Focus::Tool && pane) {
+            self.focus = if focus == Focus::Tool && pane {
+                Focus::Tool
+            } else {
+                Focus::Editor
+            };
+        }
+        self.prefix = None;
+        self.close_editor_overlays();
+    }
+
+    /// The coding agent exited: forget it, so the next Ctrl+I starts a
+    /// new one, and go back from agent mode if it is showing. An agent
+    /// that failed, or that ended out of sight, says so.
+    fn agent_exited(&mut self, status: ExitStatus) {
+        self.agent = None;
+        let showing = matches!(self.mode, Mode::Agent(..));
+        self.leave_agent();
+        if !status.success() {
+            let why = match &status.signal {
+                Some(signal) => format!("killed by {signal}"),
+                None => format!("exit code {}", status.code),
+            };
+            self.status = Some(StatusLine::error(format!("The coding agent ended: {why}")));
+        } else if !showing {
+            self.status = Some(StatusLine::info("The coding agent exited"));
+        }
     }
 
     // ----- Changes --------------------------------------------------------
@@ -2877,13 +3077,73 @@ impl App {
         self.context_menu = None;
     }
 
-    /// Send a key press to the focused tool's program, and write back any
-    /// reply the terminal makes to it (a cursor report, say).
+    /// The terminal with the keyboard, if one has it: the pane's active
+    /// tool, or the agent in agent mode.
+    fn focused_console(&self) -> Option<Console> {
+        match self.focus {
+            Focus::Tool => Some(Console::Pane),
+            Focus::Editor if matches!(self.mode, Mode::Agent(..)) && self.agent.is_some() => {
+                Some(Console::Agent)
+            }
+            Focus::Editor => None,
+        }
+    }
+
+    fn console(&self, console: Console) -> Option<&Tool> {
+        match console {
+            Console::Pane => self.tool_pane.active(),
+            Console::Agent => self.agent.as_ref(),
+        }
+    }
+
+    fn console_mut(&mut self, console: Console) -> Option<&mut Tool> {
+        match console {
+            Console::Pane => self.tool_pane.active_mut(),
+            Console::Agent => self.agent.as_mut(),
+        }
+    }
+
+    /// The tool of the terminal with the keyboard, if one has it.
+    fn focused_tool(&self) -> Option<&Tool> {
+        self.focused_console()
+            .and_then(|console| self.console(console))
+    }
+
+    /// The tool, in the pane or the agent, whose program a session runs,
+    /// for routing its output.
+    fn tool_of_session(&mut self, id: SessionId) -> Option<&mut Tool> {
+        if let Some(agent) = &mut self.agent
+            && agent.session().map(Session::id) == Some(id)
+        {
+            return Some(agent);
+        }
+        self.tool_pane.tool_of_session(id)
+    }
+
+    /// Send a key press to the focused terminal's program, and write
+    /// back any reply the terminal makes to it (a cursor report, say).
     fn send_key_to_tool(&mut self, key: KeyEvent) {
-        if let Some(tool) = self.tool_pane.active_mut() {
+        let console = self.focused_console();
+        if let Some(tool) = console.and_then(|console| self.console_mut(console)) {
             let bytes = tool.view_mut().handle_key(key);
             tool.write(bytes);
         }
+    }
+
+    /// Whether a key pressed in the focused terminal is one of the
+    /// editor's that the settings give the editor in that kind of
+    /// terminal, rather than the program; see [`EditorKey`].
+    fn editor_takes_key(&self, key: KeyEvent) -> bool {
+        let KeyCode::Char(letter) = key.code else {
+            return false;
+        };
+        key.modifiers.contains(KeyModifiers::CONTROL)
+            && EditorKey::from_letter(letter)
+                .zip(self.focused_tool())
+                .is_some_and(|(key, tool)| {
+                    self.settings
+                        .editor_takes_key(tool.kind().terminal_kind(), key)
+                })
     }
 
     /// Whether a key is the prefix, Ctrl+], in either of its spellings:
@@ -2894,18 +3154,27 @@ impl App {
             && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
     }
 
-    /// A key pressed with a tool focused: the prefix holds the next key
-    /// for the editor, Ctrl+` toggles the shell, and everything else goes
-    /// to the program. With no program running (the output tool between
-    /// jobs) the editor's keys need no prefix, and Ctrl+D dismisses the
-    /// tool as it would end a shell. `confirm` is the confirmation
-    /// pending before this key, kept alive through the prefix so that
-    /// Ctrl+] Ctrl+Q twice quits with unsaved changes.
+    /// A key pressed with a terminal focused: the prefix holds the next
+    /// key, Ctrl+` and Ctrl+I toggle the shell and the agent, the editor
+    /// keys the settings give the editor in this kind of terminal go to
+    /// it, and everything else goes to the program. After the prefix it
+    /// is the other way about: one of those keys goes to the program,
+    /// and the editor gets any other of its keys. With no program
+    /// running (the output tool between jobs) the editor's keys need no
+    /// prefix, and Ctrl+D dismisses the tool as it would end a shell.
+    /// `confirm` is the confirmation pending before this key, kept alive
+    /// through the prefix so that Ctrl+] Ctrl+Q twice quits with unsaved
+    /// changes.
     fn handle_tool_key(&mut self, key: KeyEvent, confirm: Option<Confirm>) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let running = self.focused_tool().is_some_and(Tool::is_running);
         if let Some(prefix) = self.prefix.take() {
             if Self::is_prefix(key) {
                 self.send_key_to_tool(prefix);
+            } else if running && self.editor_takes_key(key) {
+                // A key the editor would have taken: the program gets
+                // it, without the prefix.
+                self.send_key_to_tool(key);
             } else if !(ctrl && self.handle_shared_key(key, confirm)) {
                 // Not a key of the editor's: the program gets both.
                 self.send_key_to_tool(prefix);
@@ -2918,11 +3187,10 @@ impl App {
             self.confirm = confirm;
             return;
         }
-        if ctrl && key.code == KeyCode::Char('`') {
-            self.toggle_shell();
+        if ctrl && matches!(key.code, KeyCode::Char('`' | 'i')) {
+            self.handle_shared_key(key, confirm);
             return;
         }
-        let running = self.tool_pane.active().is_some_and(Tool::is_running);
         if !running && ctrl {
             if key.code == KeyCode::Char('d') {
                 self.dismiss_tool();
@@ -2932,8 +3200,44 @@ impl App {
                 return;
             }
         }
+        if running && self.editor_takes_key(key) && self.handle_shared_key(key, confirm) {
+            return;
+        }
         self.confirm = confirm;
         self.send_key_to_tool(key);
+    }
+
+    /// What the status bar shows while the prefix waits for its key: the
+    /// keys it sends to the program instead of the editor, the ones the
+    /// editor takes without it here, and then the editor's keys it
+    /// reaches.
+    fn prefix_help(&self) -> StatusLine {
+        let running = self.focused_tool().is_some_and(Tool::is_running);
+        // The keys the prefix sends to the program, as the help names
+        // them.
+        let sent: Vec<String> = EditorKey::ALL
+            .into_iter()
+            .filter(|key| {
+                running
+                    && self.editor_takes_key(KeyEvent::new(
+                        KeyCode::Char(key.letter()),
+                        KeyModifiers::CONTROL,
+                    ))
+            })
+            .map(|key| key.letter().to_ascii_uppercase().to_string())
+            .collect();
+        let mut bindings: Vec<(String, String)> = PREFIX_HELP
+            .iter()
+            .filter(|(key, _)| !sent.iter().any(|letter| letter == key))
+            .map(|(key, action)| ((*key).to_owned(), (*action).to_owned()))
+            .collect();
+        // Those first, after the prefix itself: in a terminal that
+        // leaves them to the editor, they are what the prefix is most
+        // likely pressed for.
+        if !sent.is_empty() {
+            bindings.insert(1, (sent.join("/"), "to the program".to_owned()));
+        }
+        StatusLine::Help(bindings)
     }
 
     /// Hide the pane and give the editor the keyboard, as a shell that
@@ -2955,6 +3259,7 @@ impl App {
                 self.request_quit();
             }
             KeyCode::Char('`') => self.toggle_shell(),
+            KeyCode::Char('i') => self.toggle_agent(),
             KeyCode::Char('p') => self.open_command_palette(),
             KeyCode::Char('e') => self.open_modes_palette(),
             KeyCode::Char(',') => self.focus_previous(),
@@ -2980,12 +3285,12 @@ impl App {
         true
     }
 
-    /// Handle output or the exit of a tool's program.
+    /// Handle output or the exit of a tool's program, or the agent's.
     fn handle_pty(&mut self, id: SessionId, output: Output) {
         match output {
             Output::Bytes(bytes) => {
                 let mut clipboard = Vec::new();
-                if let Some(tool) = self.tool_pane.tool_of_session(id) {
+                if let Some(tool) = self.tool_of_session(id) {
                     tool.process(&bytes);
                     let responses = tool.view_mut().terminal_mut().take_responses();
                     tool.write(responses);
@@ -3002,6 +3307,11 @@ impl App {
                 }
             }
             Output::Exited(status) => {
+                if self.agent.as_ref().and_then(Tool::session).map(Session::id) == Some(id) {
+                    self.agent_exited(status);
+                    self.track_view();
+                    return;
+                }
                 let Some(index) = self.tool_pane.index_of_session(id) else {
                     return;
                 };
@@ -3032,9 +3342,16 @@ impl App {
         redraw |= self.take_discoveries();
         let repository = self.status_repository();
         redraw |= self.heads.look_if_due(repository);
-        // A selection dragged past the tool's edge keeps scrolling.
+        // A selection dragged past the tool's or the agent's edge keeps
+        // scrolling.
         if let Some(tool) = self.tool_pane.active_mut()
             && tool.view_mut().tick()
+        {
+            redraw = true;
+        }
+        if matches!(self.mode, Mode::Agent(..))
+            && let Some(agent) = &mut self.agent
+            && agent.view_mut().tick()
         {
             redraw = true;
         }
@@ -3140,15 +3457,15 @@ impl App {
             && let Some(dialog) = &mut self.project_search
         {
             dialog.paste(text);
-        } else if self.focus == Focus::Tool {
-            // Pasting into the shell sends the text as the program
+        } else if let Some(console) = self.focused_console() {
+            // Pasting into a terminal sends the text as the program
             // reads it, wrapped for bracketed paste if it asked. A
             // prefix waiting for a key goes first, like any other
             // key it isn't followed by one of the editor's.
             if let Some(prefix) = self.prefix.take() {
                 self.send_key_to_tool(prefix);
             }
-            if let Some(tool) = self.tool_pane.active_mut() {
+            if let Some(tool) = self.console_mut(console) {
                 let bytes = tool.view_mut().paste(text);
                 tool.write(bytes);
             }
@@ -3170,11 +3487,11 @@ impl App {
         let confirm = self.confirm.take();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-        // With the tool pane focused the program gets every key but the
-        // prefix and Ctrl+`, so a shell or coding agent has the full
-        // keyboard; only an overlay opened after the prefix takes the
-        // keyboard from it.
-        if self.focus == Focus::Tool && !self.overlay_open() {
+        // With a terminal focused the program gets every key but the
+        // prefix, Ctrl+` and Ctrl+I, and the editor keys the settings
+        // give the editor there; only an overlay opened by one of those
+        // takes the keyboard from it.
+        if self.focused_console().is_some() && !self.overlay_open() {
             self.handle_tool_key(key, confirm);
             return;
         }
@@ -3255,6 +3572,9 @@ impl App {
         if let Mode::Changes(tabs) = &mut self.mode {
             let outcome = tabs.handle_key(key, &mut self.clipboard);
             self.handle_changes_outcome(outcome);
+            return;
+        }
+        if matches!(self.mode, Mode::Agent(..)) {
             return;
         }
 
@@ -3403,6 +3723,22 @@ impl App {
                 self.open_target_palette();
                 return;
             }
+            if self.status_agent_area.contains(at) {
+                self.show_agent();
+                return;
+            }
+        }
+
+        // A drag that started in the agent's terminal (a selection, or
+        // the agent tracking the mouse) follows the pointer anywhere.
+        let agent_dragging = matches!(self.mode, Mode::Agent(..))
+            && self
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.view().is_dragging());
+        if agent_dragging && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_)) {
+            self.route_tool_mouse(Console::Agent, mouse, escaped);
+            return;
         }
 
         // ----- The tool pane, when it's showing -----
@@ -3424,7 +3760,7 @@ impl App {
             if tool_dragging
                 && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
             {
-                self.route_tool_mouse(mouse, escaped);
+                self.route_tool_mouse(Console::Pane, mouse, escaped);
                 return;
             }
             // The tool pane's tab bar: switch tools, or close (kill) one.
@@ -3454,17 +3790,21 @@ impl App {
                 if matches!(mouse.kind, MouseEventKind::Down(_)) {
                     self.focus = Focus::Tool;
                 }
-                self.route_tool_mouse(mouse, escaped);
+                self.route_tool_mouse(Console::Pane, mouse, escaped);
                 return;
             }
         }
 
         // ----- A mode in the editor's place -----
         if !matches!(self.mode, Mode::Editor) {
-            // The mode's tab: its close button leaves the mode.
+            // The mode's tab: its close button leaves the mode, agent
+            // mode for where it was opened from.
             if let Some(hit) = self.mode_tab_bar.hit(x, y) {
                 if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
                     match hit {
+                        TabHit::Close(_) if matches!(self.mode, Mode::Agent(..)) => {
+                            self.leave_agent()
+                        }
                         TabHit::Close(_) => self.enter_editor(),
                         TabHit::Tab(index) => {
                             // The git pages' tabs are their repositories.
@@ -3480,6 +3820,28 @@ impl App {
                 return;
             }
             let pressed = matches!(mouse.kind, MouseEventKind::Down(_));
+            // The agent's terminal, where a click on a source location
+            // opens the file instead of going to the agent.
+            if matches!(self.mode, Mode::Agent(..)) {
+                if !self.editor_area.contains(at) {
+                    return;
+                }
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                    && let Some(location) = self
+                        .agent
+                        .as_ref()
+                        .and_then(|agent| agent.view().link_at(x, y))
+                        .cloned()
+                {
+                    self.open_source_location(&location);
+                    return;
+                }
+                if pressed {
+                    self.focus = Focus::Editor;
+                }
+                self.route_tool_mouse(Console::Agent, mouse, escaped);
+                return;
+            }
             match &mut self.mode {
                 Mode::Settings(view) if view.contains(x, y) || view.is_dragging() => {
                     if pressed {
@@ -3592,12 +3954,12 @@ impl App {
         }
     }
 
-    /// Send a mouse event to the focused tool's view, writing any report
-    /// it makes to the program and copying any text a selection ended
-    /// with. `escaped` says the prefix was waiting when the event came,
-    /// which takes the mouse from a program reading it.
-    fn route_tool_mouse(&mut self, mouse: MouseEvent, escaped: bool) {
-        let Some(tool) = self.tool_pane.active_mut() else {
+    /// Send a mouse event to a terminal's view, writing any report it
+    /// makes to the program and copying any text a selection ended with.
+    /// `escaped` says the prefix was waiting when the event came, which
+    /// takes the mouse from a program reading it.
+    fn route_tool_mouse(&mut self, console: Console, mouse: MouseEvent, escaped: bool) {
+        let Some(tool) = self.console_mut(console) else {
             return;
         };
         let bytes = tool.view_mut().handle_mouse(mouse, escaped);
@@ -3728,6 +4090,22 @@ impl App {
                     .render(tab_area, buf, theme, &labels, active, editor_focused);
                 cursor = tabs.render(self.editor_area, buf, theme);
             }
+            Mode::Agent(..) => {
+                let label = TabLabel {
+                    title: self
+                        .agent
+                        .as_ref()
+                        .map_or_else(|| ToolKind::Agent.name().to_owned(), Tool::title),
+                    modified: false,
+                };
+                self.mode_tab_bar
+                    .render(tab_area, buf, theme, &[label], 0, editor_focused);
+                if let Some(agent) = &mut self.agent {
+                    cursor = agent.view_mut().render(self.editor_area, buf, theme);
+                    // The pty follows the size the render settled on.
+                    agent.sync_size();
+                }
+            }
         }
 
         // The tool pane: the divider, the tool tab bar, and the active
@@ -3854,7 +4232,7 @@ impl App {
                 .map_or_else(root, |dir| (dir.to_path_buf(), false)),
             Mode::GitLog(tabs) => tabs.active_repository(),
             Mode::Changes(tabs) => tabs.active_repository(),
-            Mode::Settings(_) | Mode::Build(_) => root(),
+            Mode::Settings(_) | Mode::Build(_) | Mode::Agent(..) => root(),
         }
     }
 
@@ -3866,17 +4244,17 @@ impl App {
         buf.set_style(area, base);
         self.status_config_area = Rect::default();
         self.status_target_area = Rect::default();
+        self.status_agent_area = Rect::default();
+        let prefix_help = self.prefix.is_some().then(|| self.prefix_help());
         let tab = self.tabs.get(self.active);
-        // With the tool pane focused the position report is about the
-        // tool, not the editor: nothing to show, unless the user has
-        // scrolled back through the shell's output.
+        // With a terminal focused the position report is about the
+        // terminal, not the editor: nothing to show, unless the user has
+        // scrolled back through the program's output.
         let tool_focused = self.focus == Focus::Tool && self.tool_pane.is_visible();
         let in_editor = matches!(self.mode, Mode::Editor);
-        let position = if tool_focused {
-            self.tool_pane.active().and_then(|tool| {
-                let back = tool.view().scrollback_offset();
-                (back > 0).then(|| format!(" scrollback −{back} "))
-            })
+        let position = if let Some(tool) = self.focused_tool() {
+            let back = tool.view().scrollback_offset();
+            (back > 0).then(|| format!(" scrollback −{back} "))
         } else if !in_editor {
             None
         } else {
@@ -3928,8 +4306,13 @@ impl App {
         let width_of = |text: &str| Span::raw(text).width() as u16;
         let position_width = position.as_deref().map_or(0, width_of);
         // Drop the branch and build segments when there's no room for
-        // them beside the position.
-        if position_width + width_of(&branch) + width_of(&configuration) + width_of(&target) + 20
+        // them beside the position and the agent's robot.
+        if position_width
+            + width_of(&branch)
+            + width_of(&configuration)
+            + width_of(&target)
+            + width_of(AGENT_ICON)
+            + 20
             > area.width
         {
             branch.clear();
@@ -3941,11 +4324,15 @@ impl App {
         } else {
             theme.status_bar_position_text
         };
+        // A coding agent running, in agent mode or out of sight, is a
+        // robot at the right end, which a click goes to.
+        let agent = if self.agent.is_some() { AGENT_ICON } else { "" };
         let right = [
             (position.unwrap_or_default(), theme.status_bar_position_text),
             (branch, branch_color),
             (configuration, theme.status_bar_position_text),
             (target, target_color),
+            (agent.to_owned(), theme.status_bar_position_text),
         ];
         let mode_hint = match &self.mode {
             Mode::Editor => StatusLine::default(),
@@ -3953,12 +4340,13 @@ impl App {
             Mode::Build(_) => StatusLine::help(BUILD_HELP),
             Mode::GitLog(tabs) => tabs.hint(),
             Mode::Changes(tabs) => tabs.hint(),
+            Mode::Agent(..) => StatusLine::help(AGENT_HELP),
         };
         // Something under way on a page has the bar to itself: it is
         // what the user is waiting on, and the message that came
         // before it has been seen.
         let left = match &self.status {
-            _ if self.prefix.is_some() => StatusLine::help(PREFIX_HELP),
+            _ if let Some(help) = prefix_help => help,
             _ if mode_hint.is_progress() => mode_hint,
             Some(message) => message.clone(),
             None if tool_focused => match self.tool_pane.active() {
@@ -3993,6 +4381,7 @@ impl App {
                 match index {
                     2 => self.status_config_area = segment,
                     3 => self.status_target_area = segment,
+                    4 => self.status_agent_area = segment,
                     _ => {}
                 }
                 x += width;
@@ -4058,13 +4447,14 @@ fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme, project: &Project) 
         ProjectKind::Project => ("open a project file", None),
         ProjectKind::Directory => ("open a file in this directory", Some(NOT_A_PROJECT)),
     };
-    let keys: [(&str, &str); 12] = [
+    let keys: [(&str, &str); 13] = [
         ("Ctrl+O", open_hint),
         ("Ctrl+Shift+F", "search in project files"),
         ("Ctrl+T", "switch between open tabs"),
         ("Ctrl+L", "browse the git history"),
         ("Ctrl+U", "review, stage, and commit changes"),
         ("Ctrl+`", "open a shell below the editor"),
+        ("Ctrl+I", "switch to and from the coding agent"),
         ("Ctrl+B", "build the current target"),
         ("Ctrl+R", "run the current target"),
         ("Ctrl+E", "switch views: editor, pages, tools"),
@@ -4158,7 +4548,7 @@ mod tests {
 
     use super::*;
     use crossterm::event::KeyEventState;
-    use ninjaedit_core::{ContinuationIndent, Language, Position, SettingKey};
+    use ninjaedit_core::{ContinuationIndent, Language, Position, SettingKey, TerminalKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
@@ -4605,10 +4995,12 @@ mod tests {
         assert!(screen[3].contains(EDITOR_MODE_LABEL), "{screen:#?}");
         assert!(screen[4].contains("Shell"), "{screen:#?}");
         assert!(screen[5].contains("Output"), "{screen:#?}");
-        assert!(screen[6].contains(git_view::TITLE), "{screen:#?}");
-        assert!(screen[7].contains(changes_view::TITLE), "{screen:#?}");
-        assert!(screen[8].contains(build_view::TITLE), "{screen:#?}");
-        assert!(screen[9].contains(settings_view::TITLE), "{screen:#?}");
+        assert!(screen[6].contains("Agent"), "{screen:#?}");
+        assert!(screen[6].contains("Ctrl+I"), "{screen:#?}");
+        assert!(screen[7].contains(git_view::TITLE), "{screen:#?}");
+        assert!(screen[8].contains(changes_view::TITLE), "{screen:#?}");
+        assert!(screen[9].contains(build_view::TITLE), "{screen:#?}");
+        assert!(screen[10].contains(settings_view::TITLE), "{screen:#?}");
         type_str(&mut app, "sett");
         press(&mut app, KeyCode::Enter);
         assert!(matches!(app.mode, Mode::Settings(_)));
@@ -4629,8 +5021,9 @@ mod tests {
         // Down to the scrollback field, a new value, Enter: applied and
         // saved to the storage, where nothing was before.
         assert_eq!(settings_file(&app), None);
-        press(&mut app, KeyCode::Down);
-        press(&mut app, KeyCode::Down);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
         ctrl(&mut app, 'a');
         type_str(&mut app, "250");
         press(&mut app, KeyCode::Enter);
@@ -4648,7 +5041,9 @@ mod tests {
         // Ctrl+E now lists the settings first and the editor, where the
         // user came from, second: Enter goes back to it. A value typed but
         // not applied is applied on the way out.
-        press(&mut app, KeyCode::Down);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Down);
+        }
         ctrl(&mut app, 'a');
         type_str(&mut app, "77");
         ctrl(&mut app, 'e');
@@ -5207,8 +5602,10 @@ mod tests {
         let screen = draw(&mut app, 200, 10);
         assert!(screen[9].contains("search.max-results"), "{screen:#?}");
 
+        // Down past the continuation indent, the shell, the agent, the
+        // scrollback, and the terminal keys' rows to the results.
         app.open_settings();
-        for _ in 0..3 {
+        for _ in 0..7 {
             press(&mut app, KeyCode::Down);
         }
         ctrl(&mut app, 'a');
@@ -5671,10 +6068,9 @@ mod tests {
         assert!(text.contains("Deleting"), "{text}");
         assert!(text.contains("cmake-build-debug"), "{text}");
 
-        // The output tool has the keyboard now, so the palette comes
-        // after the prefix.
+        // The output tool has the keyboard now, and leaves Ctrl+P to the
+        // editor.
         assert_eq!(app.focus, Focus::Tool);
-        ctrl(&mut app, ']');
         ctrl(&mut app, 'p');
         type_str(&mut app, "delete all");
         press(&mut app, KeyCode::Enter);
@@ -5758,8 +6154,8 @@ mod tests {
         assert!(build_file(&app).is_none(), "nothing to save");
 
         // One from the other root configures its build directory and
-        // looks there for the files its compiler names.
-        ctrl(&mut app, ']');
+        // looks there for the files its compiler names. Ctrl+P is the
+        // editor's in the output, running or not.
         ctrl(&mut app, 'p');
         type_str(&mut app, "run tool");
         press(&mut app, KeyCode::Enter);
@@ -5989,8 +6385,9 @@ mod tests {
         assert!(matches!(app.mode, Mode::Settings(_)));
         assert_eq!(app.focus, Focus::Editor);
         assert!(app.tool_pane.is_visible());
-        press(&mut app, KeyCode::Down);
-        press(&mut app, KeyCode::Down);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
         ctrl(&mut app, 'a');
         type_str(&mut app, "3");
         press(&mut app, KeyCode::Enter);
@@ -6358,6 +6755,321 @@ mod tests {
         assert_eq!(app.focus, Focus::Tool);
     }
 
+    /// An app on a project with one file and an event channel of its
+    /// own, for a test to feed it the agent's output and exit, with the
+    /// agent command set to `command`.
+    #[cfg(unix)]
+    fn app_with_agent(command: &str) -> (tempfile::TempDir, App, Receiver<AppEvent>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hi\n").unwrap();
+        let (events, events_rx) = std::sync::mpsc::channel();
+        let storage = Storage::new(dir.path().join(".storage"));
+        let mut app = App::new(Project::open(dir.path()).unwrap(), storage, events);
+        app.wait_for_discovery();
+        app.open_file(dir.path().join("a.txt"));
+        app.settings
+            .set_text(SettingKey::AgentCommand, command)
+            .unwrap();
+        (dir, app, events_rx)
+    }
+
+    /// The text on the agent's screen.
+    fn agent_text(app: &App) -> String {
+        let agent = app.agent.as_ref().expect("an agent");
+        let terminal = agent.view().terminal_mut_for_test();
+        let rows = agent.view().size().1 as usize;
+        (0..rows)
+            .map(|row| terminal.row_text(row))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn agent_session(app: &App) -> Option<SessionId> {
+        app.agent.as_ref().and_then(Tool::session).map(Session::id)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_i_shows_the_agent_and_goes_back_leaving_it_running() {
+        let (_dir, mut app, _events) = app_with_agent("cat");
+        draw(&mut app, 80, 20);
+        assert!(app.agent.is_none(), "nothing runs until asked");
+
+        // Ctrl+I starts the agent in a mode of its own, with the
+        // keyboard, its tab in place of the editor's, and a robot in the
+        // status bar.
+        ctrl(&mut app, 'i');
+        assert!(matches!(app.mode, Mode::Agent(..)));
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.focused_console(), Some(Console::Agent));
+        let session = agent_session(&app).expect("running");
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[0].contains("Agent"), "{screen:#?}");
+        assert!(!screen[0].contains("a.txt"), "{screen:#?}");
+        assert!(screen[19].contains("Ctrl+I back"), "{screen:#?}");
+        assert!(screen[19].contains("🤖"), "{screen:#?}");
+        assert_eq!(
+            app.agent.as_ref().unwrap().view().size(),
+            (80, 18),
+            "the agent fills the editor's place"
+        );
+
+        // Ctrl+I again goes back to the editor; the agent runs on, and
+        // the robot says so.
+        ctrl(&mut app, 'i');
+        assert!(matches!(app.mode, Mode::Editor));
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(agent_session(&app), Some(session));
+        let screen = draw(&mut app, 80, 20);
+        assert!(screen[0].contains("a.txt"), "{screen:#?}");
+        assert!(screen[19].trim_end().ends_with("🤖"), "{screen:#?}");
+
+        // A click on the robot comes back to the same session.
+        let robot = app.status_agent_area;
+        click(&mut app, robot.x + 1, robot.y);
+        assert!(matches!(app.mode, Mode::Agent(..)));
+        assert_eq!(agent_session(&app), Some(session));
+
+        // From the shell, Ctrl+I goes to the agent, and back to the
+        // shell; the pane stays below the agent meanwhile.
+        ctrl(&mut app, 'i');
+        ctrl(&mut app, '`');
+        assert_eq!(app.focus, Focus::Tool);
+        ctrl(&mut app, 'i');
+        assert!(matches!(app.mode, Mode::Agent(..)));
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(app.tool_pane.is_visible());
+        // With the keyboard in the pane, Ctrl+I focuses the agent
+        // rather than leaving it.
+        ctrl(&mut app, ']');
+        ctrl(&mut app, '.');
+        assert_eq!(app.focus, Focus::Tool);
+        ctrl(&mut app, 'i');
+        assert!(matches!(app.mode, Mode::Agent(..)));
+        assert_eq!(app.focus, Focus::Editor);
+        ctrl(&mut app, 'i');
+        assert!(matches!(app.mode, Mode::Editor));
+        assert_eq!(app.focus, Focus::Tool, "back in the shell");
+        ctrl(&mut app, '`');
+        assert_eq!(app.focus, Focus::Editor);
+
+        // From a page, back to the page as it was.
+        app.open_settings();
+        press(&mut app, KeyCode::Down);
+        type_str(&mut app, "fish");
+        ctrl(&mut app, 'i');
+        assert!(matches!(app.mode, Mode::Agent(..)));
+        ctrl(&mut app, 'i');
+        let Mode::Settings(view) = &app.mode else {
+            panic!("back on the settings page");
+        };
+        assert_eq!(view.text(SettingKey::Shell), "fish", "as it was left");
+        assert_eq!(app.settings.shell(), None, "and not yet applied");
+
+        // The modes palette lists the agent, and Ctrl+E is the editor's
+        // in it, so Ctrl+E, Enter flips back and forth. Opening another
+        // mode from the agent goes there, leaving the agent running and
+        // the page it was opened from, which applies what was typed.
+        ctrl(&mut app, 'e');
+        type_str(&mut app, "agent");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Agent(..)));
+        ctrl(&mut app, 'e');
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Settings(_)));
+        assert_eq!(app.settings.shell(), Some("fish"), "the page was left");
+        ctrl(&mut app, 'i');
+        ctrl(&mut app, 'e');
+        type_str(&mut app, "editor");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Editor));
+        assert_eq!(agent_session(&app), Some(session));
+
+        // The tab's close button goes back too.
+        ctrl(&mut app, 'i');
+        let screen = draw(&mut app, 80, 20);
+        let close = screen[0].chars().position(|c| c == '×').unwrap() as u16;
+        click(&mut app, close, 0);
+        assert!(matches!(app.mode, Mode::Editor));
+        assert_eq!(agent_session(&app), Some(session));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_agent_ending_goes_back_to_where_the_user_was() {
+        let (_dir, mut app, events) = app_with_agent("sh");
+        draw(&mut app, 80, 20);
+        app.open_settings();
+        ctrl(&mut app, 'i');
+        pump(&mut app, &events, |app| agent_text(app).contains('$'));
+        type_str(&mut app, "exit");
+        press(&mut app, KeyCode::Enter);
+        pump(&mut app, &events, |app| app.agent.is_none());
+        assert!(matches!(app.mode, Mode::Settings(_)));
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.status, None, "the user ended it; nothing to say");
+        let screen = draw(&mut app, 80, 20);
+        assert!(!screen[19].contains("🤖"), "{screen:#?}");
+
+        // One that fails out of sight says so, and the next Ctrl+I
+        // starts afresh.
+        app.settings
+            .set_text(SettingKey::AgentCommand, "sh -c 'sleep 0.2; exit 3'")
+            .unwrap();
+        ctrl(&mut app, 'i');
+        let first = agent_session(&app).expect("running");
+        ctrl(&mut app, 'i');
+        assert!(matches!(app.mode, Mode::Settings(_)));
+        pump(&mut app, &events, |app| app.agent.is_none());
+        assert!(matches!(app.mode, Mode::Settings(_)));
+        assert_eq!(
+            status_text(&app).as_deref(),
+            Some("The coding agent ended: exit code 3")
+        );
+        ctrl(&mut app, 'i');
+        assert!(agent_session(&app).is_some_and(|id| id != first));
+
+        // One that can't start leaves things as they were.
+        ctrl(&mut app, 'i');
+        pump(&mut app, &events, |app| app.agent.is_none());
+        app.settings
+            .set_text(SettingKey::AgentCommand, "/nonexistent/agent")
+            .unwrap();
+        ctrl(&mut app, 'i');
+        assert!(matches!(app.mode, Mode::Settings(_)));
+        assert!(app.agent.is_none());
+        let status = status_text(&app).unwrap_or_default();
+        assert!(
+            status.starts_with("Could not start the coding agent (/nonexistent/agent)"),
+            "{status}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_keys_in_terminals_follow_the_settings_and_the_prefix_turns_them_around() {
+        let (_dir, mut app, events) = app_with_agent("cat");
+        draw(&mut app, 80, 20);
+
+        // The agent leaves Ctrl+O to the editor by default: the file
+        // search opens over it, and Escape leaves the agent focused.
+        ctrl(&mut app, 'i');
+        pump(&mut app, &events, |_| true);
+        ctrl(&mut app, 'o');
+        assert!(app.palette.is_some());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focused_console(), Some(Console::Agent));
+
+        // After the prefix it goes to the agent, as the status bar says
+        // while the prefix waits.
+        ctrl(&mut app, ']');
+        let screen = draw(&mut app, 140, 20);
+        assert!(
+            screen[19].contains("E/U/O/L/P/R to the program"),
+            "{screen:#?}"
+        );
+        assert!(!screen[19].contains("P commands"), "{screen:#?}");
+        ctrl(&mut app, 'e');
+        assert!(app.palette.is_none());
+        assert!(app.prefix.is_none());
+        pump(&mut app, &events, |app| agent_text(app).contains("^E"));
+        // Keys the agent gets by default reach the editor after the
+        // prefix, as ever.
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 't');
+        assert!(app.palette.is_some());
+        press(&mut app, KeyCode::Esc);
+
+        // Unchecked for the agent, Ctrl+P is the agent's, and the
+        // command palette is a prefix away.
+        app.settings
+            .set_text(
+                SettingKey::TerminalKey(TerminalKind::Agent, EditorKey::Commands),
+                "false",
+            )
+            .unwrap();
+        ctrl(&mut app, 'p');
+        assert!(app.palette.is_none());
+        ctrl(&mut app, ']');
+        let screen = draw(&mut app, 140, 20);
+        assert!(screen[19].contains("P commands"), "{screen:#?}");
+        assert!(
+            screen[19].contains("E/U/O/L/R to the program"),
+            "{screen:#?}"
+        );
+        ctrl(&mut app, 'p');
+        assert!(app.palette.is_some());
+        press(&mut app, KeyCode::Esc);
+
+        // The shell keeps every key by default; checked, Ctrl+O is the
+        // editor's there too.
+        ctrl(&mut app, '`');
+        assert_eq!(app.focused_console(), Some(Console::Pane));
+        ctrl(&mut app, 'o');
+        assert!(app.palette.is_none());
+        ctrl(&mut app, ']');
+        let screen = draw(&mut app, 140, 20);
+        assert!(!screen[19].contains("to the program"), "{screen:#?}");
+        ctrl(&mut app, 'o');
+        assert!(app.palette.is_some());
+        press(&mut app, KeyCode::Esc);
+        app.settings
+            .set_text(
+                SettingKey::TerminalKey(TerminalKind::Shell, EditorKey::OpenFile),
+                "true",
+            )
+            .unwrap();
+        ctrl(&mut app, 'o');
+        assert!(app.palette.is_some());
+        press(&mut app, KeyCode::Esc);
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'o');
+        assert!(app.palette.is_none());
+        // Ctrl+I reaches the agent from the shell without the prefix.
+        ctrl(&mut app, 'i');
+        assert_eq!(app.focused_console(), Some(Console::Agent));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quitting_with_the_agent_running_asks_first() {
+        let (_dir, mut app, _events) = app_with_agent("cat");
+        ctrl(&mut app, 'i');
+        ctrl(&mut app, 'i');
+        assert!(app.agent.is_some(), "working in the background");
+        ctrl(&mut app, 'q');
+        assert!(!app.should_quit());
+        assert_eq!(
+            status_text(&app).as_deref(),
+            Some("The coding agent is still running: press Ctrl+Q again to quit and end it")
+        );
+        // Any other key in between, and it asks again.
+        press(&mut app, KeyCode::Right);
+        ctrl(&mut app, 'q');
+        assert!(!app.should_quit());
+        ctrl(&mut app, 'q');
+        assert!(app.should_quit());
+
+        // With unsaved changes too, it says both; from the agent, after
+        // the prefix both times, as quitting from any terminal is.
+        let (_dir, mut app, _events) = app_with_agent("cat");
+        press(&mut app, KeyCode::Char('z'));
+        ctrl(&mut app, 'i');
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'q');
+        assert!(!app.should_quit());
+        let status = status_text(&app).unwrap_or_default();
+        assert!(
+            status.starts_with(
+                "1 file(s) have unsaved changes and the coding agent is still running"
+            ),
+            "{status}"
+        );
+        ctrl(&mut app, ']');
+        ctrl(&mut app, 'q');
+        assert!(app.should_quit());
+    }
+
     #[test]
     fn renders_tabs_gutter_scrollbar_and_status() {
         let (_dir, mut app) = app_with_files(&[("a.txt", "one\ntwo\nthree\n")]);
@@ -6397,7 +7109,7 @@ mod tests {
             .iter()
             .filter(|l| l.contains("Ctrl+"))
             .collect();
-        assert_eq!(rows.len(), 12, "{screen:#?}");
+        assert_eq!(rows.len(), 13, "{screen:#?}");
         // Every key starts in the same column, and so does every description.
         let key_column = rows[0].find("Ctrl+").unwrap();
         let description_column = rows[0].find("open a project file").unwrap();
@@ -8345,10 +9057,9 @@ mod tests {
             steps: vec![step("Step one", "sleep 30"), step("Step two", "echo two")],
         });
         assert!(app.tool_pane.active().unwrap().is_running());
-        // The job has the keyboard, so the palette opens after the
-        // prefix; the command is listed while the job runs, and
-        // dismissing the output isn't.
-        ctrl(&mut app, ']');
+        // The job has the keyboard, but leaves Ctrl+P to the editor; the
+        // command is listed while the job runs, and dismissing the
+        // output isn't.
         ctrl(&mut app, 'p');
         type_str(&mut app, "stop build");
         let screen = draw(&mut app, 60, 20);

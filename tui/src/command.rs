@@ -127,6 +127,8 @@ pub enum Page {
     Build,
     GitLog,
     Changes,
+    /// The coding agent's terminal.
+    Agent,
 }
 
 /// The state of the editor's active file, for the commands that act on
@@ -766,6 +768,7 @@ mod tests {
             Page::Build,
             Page::GitLog,
             Page::Changes,
+            Page::Agent,
         ] {
             let context = Context {
                 page,

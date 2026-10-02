@@ -100,6 +100,9 @@ pub enum PaletteAction {
     /// Show a tool in the pane below the editor, starting it if need be,
     /// and give it the keyboard.
     OpenTool(ToolKind),
+    /// Show the coding agent in the editor's place, starting it if it
+    /// isn't running, and give it the keyboard.
+    OpenAgent,
     /// Add a build root (the path of a `Cargo.toml` or `CMakeLists.txt`,
     /// relative to the project) to the build configuration.
     AddBuildRoot(PathBuf),
