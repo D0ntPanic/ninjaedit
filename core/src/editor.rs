@@ -68,6 +68,12 @@
 //! cursor, and typing a closing bracket over the same bracket steps over
 //! it. A line break between a pair, as in `{}`, puts the closing bracket
 //! on a line of its own below an indented blank line for the cursor.
+//! Quotes pair the same way: a quote that opens a string gets its
+//! closing quote, and one typed over the closing quote steps over it,
+//! unless it is escaped by a backslash. A third quote just after an
+//! empty string opens a triple-quoted string in languages that have
+//! them, closing quotes and all, so typing a Python docstring through
+//! from its first quote to its last leaves just what was typed.
 //! Closing brackets (and `{` in C-like languages) typed at the start of a
 //! line move the line to the level they belong at.
 //!
@@ -1042,8 +1048,8 @@ impl Editor {
     /// there is one. `'\n'` and `'\r'` insert the buffer's line ending and
     /// carry the line's indentation on as pending indentation (see the
     /// [module documentation](self)); any other character first commits
-    /// pending indentation to the buffer. Brackets are paired and
-    /// stepped over, and some characters reindent their line; see the
+    /// pending indentation to the buffer. Brackets and quotes are
+    /// paired and stepped over, and some characters reindent their line; see the
     /// [module documentation](self).
     ///
     /// Typing what the suggestion at the cursor proposes consumes it from
@@ -1116,7 +1122,12 @@ impl Editor {
     /// * Any other character finishing a Ruby `end`, `else`, `when`, ... at
     ///   the start of a line moves the line level with the line that
     ///   opened its block.
+    /// * Quotes are paired and stepped over much as brackets are; see
+    ///   [`type_quote`](Self::type_quote).
     fn type_code_char(&mut self, c: u8) -> bool {
+        if c == b'"' || c == b'\'' {
+            return self.type_quote(c);
+        }
         let closer = auto_indent::closer_of(c);
         let rules = Rules::for_language(self.language());
         let ends_word = rules.ruby && !(c.is_ascii_alphanumeric() || c == b'_');
@@ -1181,6 +1192,137 @@ impl Editor {
         inserted.extend(pair);
         self.commit_with_cursor(from..self.cursor, inserted, EditKind::Typing, cursor, None);
         true
+    }
+
+    /// Type a quote `q` (`"` or `'`), with no selection. Returns whether
+    /// it was handled; if not, it is for the caller to insert as usual.
+    ///
+    /// * A quote typed in a string, over the quotes that close it, steps
+    ///   over one of them, as a closing bracket steps over its bracket.
+    /// * A quote that opens a string gets its closing quote inserted
+    ///   after the cursor, unless it is typed right before other text or
+    ///   right after a word (other than a string prefix such as `f`).
+    /// * A third quote typed just after an empty string, as in `""|`,
+    ///   opens a triple-quoted string in a language that has them, and
+    ///   gets the three closing quotes: `"""|"""`. Typing on to the end
+    ///   of a docstring then steps over each of them in turn.
+    /// * A quote typed after a backslash is escaped, so it is inserted
+    ///   as it is, never stepping over the closing quote.
+    ///
+    /// Single quotes are lifetimes and labels in Rust as often as not,
+    /// so there they are always typed as they are.
+    fn type_quote(&mut self, q: u8) -> bool {
+        if q == b'\'' && self.language() == Language::Rust {
+            return false;
+        }
+        let line = self.buffer.line_of_offset(self.cursor);
+        let start = self.buffer.offset_of_line(line);
+        let col = self.cursor - start;
+        let text = self
+            .buffer
+            .bytes_in_range(self.buffer.line_content_range(line));
+        let before = &text[..col];
+        if before.iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 1 {
+            return false;
+        }
+        if self
+            .closing_quotes_at_cursor()
+            .is_some_and(|(closing, _)| closing == q)
+        {
+            self.cursor += 1;
+            self.grouping = false;
+            self.desired_column = None;
+            self.search = None;
+            return true;
+        }
+        let next = text.get(col).copied();
+        if !pairs_before(next) {
+            return false;
+        }
+        let tokens = self.highlighter.tokens_of(&self.buffer, line, &text);
+        let mut probe = before.to_vec();
+        probe.push(q);
+        let probe_tokens = self.highlighter.tokens_of(&self.buffer, line, &probe);
+        // Just after an empty string (with any prefix), if the lexer
+        // takes the three quotes together as the start of one string.
+        let triple = col >= 2
+            && before.ends_with(&[q, q])
+            && token_at(&tokens, col - 1).is_some_and(|literal| {
+                literal.start + 2 <= col
+                    && literal.end == col
+                    && before[literal.start..col - 2]
+                        .iter()
+                        .all(|&b| is_word_byte(b))
+            })
+            && token_at(&probe_tokens, col).is_some_and(|literal| literal.start <= col - 2);
+        let closer = if triple {
+            vec![q; 3]
+        } else {
+            // A string starting at the quote, or at the prefix before it.
+            let word = before
+                .iter()
+                .rev()
+                .take_while(|&&b| is_word_byte(b))
+                .count();
+            match token_at(&probe_tokens, col) {
+                Some(literal) if literal.start == col - word => vec![q],
+                _ => return false,
+            }
+        };
+        let mut inserted = self.pending.clone().unwrap_or_default().into_bytes();
+        inserted.push(q);
+        let cursor = self.cursor + inserted.len();
+        inserted.extend(closer);
+        self.commit_with_cursor(
+            self.cursor..self.cursor,
+            inserted,
+            EditKind::Typing,
+            cursor,
+            None,
+        );
+        true
+    }
+
+    /// The quote and how many of them close the string the cursor is in,
+    /// when they come right after the cursor, as in `"abc|"`. The
+    /// cursor may be between tokens, after an escape or the end of an
+    /// interpolation, so it is in the string if what it types is.
+    fn closing_quotes_at_cursor(&self) -> Option<(u8, usize)> {
+        let line = self.buffer.line_of_offset(self.cursor);
+        let content = self.buffer.line_content_range(line);
+        let col = self.cursor.checked_sub(content.start)?;
+        let text = self.buffer.bytes_in_range(content);
+        let q = *text.get(col).filter(|&&b| b == b'"' || b == b'\'')?;
+        let tokens = self.highlighter.tokens_of(&self.buffer, line, &text);
+        let literal = token_at(&tokens, col)?;
+        let closes = text[col..literal.end].iter().all(|&b| b == q)
+            && !self.typed_as_code(line, &text[..col], b'x');
+        closes.then_some((q, literal.end - col))
+    }
+
+    /// Where the closing quotes end when the cursor is between the
+    /// quotes of an empty string, as in `"|"`, or of an empty
+    /// triple-quoted one, as in `"""|"""`.
+    fn empty_string_end(&self) -> Option<usize> {
+        let line = self.buffer.line_of_offset(self.cursor);
+        let start = self.buffer.offset_of_line(line);
+        let col = self.cursor - start;
+        let text = self
+            .buffer
+            .bytes_in_range(self.buffer.line_content_range(line));
+        let q = *text.get(col).filter(|&&b| b == b'"' || b == b'\'')?;
+        let tokens = self.highlighter.tokens_of(&self.buffer, line, &text);
+        let literal = token_at(&tokens, col)?;
+        let prefix = text[literal.clone()]
+            .iter()
+            .take_while(|&&b| is_word_byte(b))
+            .count();
+        let quotes = literal.start + prefix..literal.end;
+        let half = col.checked_sub(quotes.start)?;
+        let empty = matches!(half, 1 | 3)
+            && quotes.end == col + half
+            && text[quotes].iter().all(|&b| b == q);
+        empty.then_some(start + col + half)
     }
 
     /// Whether `c`, typed on `line` after `before`, would be code rather
@@ -1331,8 +1473,11 @@ impl Editor {
     /// Delete the selection, or the character before the cursor if nothing
     /// is selected. With pending indentation, removes one level of it
     /// instead. Between an empty pair of brackets, as in `(|)`, removes
-    /// both. In a space-indented buffer, when only spaces precede the
-    /// cursor on its line, removes back to the previous indentation stop.
+    /// both, and likewise the quotes of an empty string, as in `"|"`;
+    /// in an empty triple-quoted string, `"""|"""`, removes the third
+    /// opening quote and the closing ones it was paired with. In a
+    /// space-indented buffer, when only spaces precede the cursor on its
+    /// line, removes back to the previous indentation stop.
     pub fn backspace(&mut self) {
         self.drop_suggestion();
         self.backspace_inner();
@@ -1361,6 +1506,13 @@ impl Editor {
                     Vec::new(),
                     EditKind::Backspace,
                 );
+                return;
+            }
+            // Between the quotes of an empty string, likewise; of an
+            // empty triple-quoted one, back to the empty string the
+            // third quote was typed after.
+            if let Some(end) = self.empty_string_end() {
+                self.commit(self.cursor - 1..end, Vec::new(), EditKind::Backspace);
                 return;
             }
         }
@@ -2064,12 +2216,22 @@ impl Editor {
     /// `code` and `brackets` are which of its bytes are code and its
     /// brackets, as [`code_of_insertion`](Self::code_of_insertion) and
     /// [`brackets_in`] find them.
+    ///
+    /// In a string the buffer closes right after the cursor, as after
+    /// typing its opening quote paired, the scope is the string: the
+    /// suggestion ends where it closes the string, before its own
+    /// closing quotes.
     fn scope_end<'a>(
         &self,
         text: &'a str,
         code: &[bool],
         brackets: &[(usize, u8)],
     ) -> (&'a str, ScopeEnd<'a>) {
+        if let Some((q, n)) = self.closing_quotes_at_cursor()
+            && let Some(at) = closing_quotes_in(text.as_bytes(), code, q, n)
+        {
+            return (&text[..at], ScopeEnd::BeforeLineRest);
+        }
         let mut depth = 0usize;
         let mut closer = None;
         for &(at, b) in brackets {
@@ -2684,6 +2846,48 @@ fn repeat_of_line_rest(
 /// not right before other text.
 fn pairs_before(next: Option<u8>) -> bool {
     next.is_none_or(|b| b.is_ascii_whitespace() || matches!(b, b')' | b']' | b'}' | b',' | b';'))
+}
+
+/// Whether a token is a string or character literal, which quotes
+/// delimit.
+fn is_string(kind: TokenKind) -> bool {
+    matches!(kind, TokenKind::String | TokenKind::Char)
+}
+
+/// The range of the string or character literal token at `i`, if
+/// there is one there.
+fn token_at(tokens: &[Token], i: usize) -> Option<Range<usize>> {
+    tokens
+        .iter()
+        .find(|token| token.range.contains(&i) && is_string(token.kind))
+        .map(|token| token.range.clone())
+}
+
+/// Where `text`, proposed in a string that `n` quotes `q` close, closes
+/// it, if it does: at the first `n` of them that aren't escaped and
+/// that code, a line break, or the end of `text` follows. `code` is
+/// which bytes of `text` are code, as for [`Editor::scope_end`].
+fn closing_quotes_in(text: &[u8], code: &[bool], q: u8, n: usize) -> Option<usize> {
+    let mut i = 0;
+    while i + n <= text.len() {
+        if text[i] == b'\\' && !code[i] {
+            i += 2;
+            continue;
+        }
+        let after = i + n;
+        if !code[i]
+            && text[i..after].iter().all(|&b| b == q)
+            && (after == text.len() || text[after] == b'\n' || code[after])
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// Where the first line of a suggestion ends: at its first line break
@@ -4379,6 +4583,185 @@ mod tests {
     }
 
     #[test]
+    fn quotes_are_paired_and_closing_ones_stepped_over() {
+        let mut ed = code(Language::Python, "x = ‸");
+        type_str(&mut ed, "\"");
+        assert_eq!(shown(&ed), "x = \"‸\"");
+        type_str(&mut ed, "\"");
+        assert_eq!(shown(&ed), "x = \"\"‸", "an empty string");
+
+        let mut ed = code(Language::Python, "x = ‸");
+        type_str(&mut ed, "'abc'");
+        assert_eq!(shown(&ed), "x = 'abc'‸");
+        type_str(&mut ed, ", f'");
+        assert_eq!(shown(&ed), "x = 'abc', f'‸'", "after a string prefix");
+
+        let mut ed = code(Language::JavaScript, "f(‸)");
+        type_str(&mut ed, "\"a\", 'b'");
+        assert_eq!(shown(&ed), "f(\"a\", 'b'‸)");
+
+        let mut ed = code(Language::C, "char c = ‸;");
+        type_str(&mut ed, "'a'");
+        assert_eq!(shown(&ed), "char c = 'a'‸;", "a character literal");
+
+        let mut ed = code(Language::Json, "{‸}");
+        type_str(&mut ed, "\"a\": \"b\"");
+        assert_eq!(shown(&ed), "{\"a\": \"b\"‸}");
+    }
+
+    #[test]
+    fn quotes_are_not_paired_before_or_after_text_or_in_comments() {
+        let mut ed = code(Language::Python, "x = ‸foo");
+        type_str(&mut ed, "\"");
+        assert_eq!(shown(&ed), "x = \"‸foo");
+
+        let mut ed = code(Language::Python, "# don‸");
+        type_str(&mut ed, "'");
+        assert_eq!(shown(&ed), "# don'‸");
+        let mut ed = code(Language::Python, "# say ‸");
+        type_str(&mut ed, "\"");
+        assert_eq!(shown(&ed), "# say \"‸", "in a comment");
+
+        let mut ed = code(Language::Python, "x = don‸");
+        type_str(&mut ed, "'");
+        assert_eq!(shown(&ed), "x = don'‸", "right after a word");
+
+        let mut ed = code(Language::Python, "x = \"it‸\"");
+        type_str(&mut ed, "'");
+        assert_eq!(shown(&ed), "x = \"it'‸\"", "in a string");
+        let mut ed = code(Language::Python, "x = \"it‸'\"");
+        type_str(&mut ed, "'");
+        assert_eq!(
+            shown(&ed),
+            "x = \"it'‸'\"",
+            "a quote that doesn't close the string isn't stepped over"
+        );
+
+        let mut ed = code(Language::Rust, "fn f<‸>() {}");
+        type_str(&mut ed, "'a");
+        assert_eq!(shown(&ed), "fn f<'a‸>() {}", "a Rust lifetime");
+        let mut ed = code(Language::Rust, "let s = ‸;");
+        type_str(&mut ed, "\"a\"");
+        assert_eq!(shown(&ed), "let s = \"a\"‸;");
+
+        let mut ed = code(Language::Plain, "‸");
+        type_str(&mut ed, "\"");
+        assert_eq!(shown(&ed), "\"‸", "no strings in plain text");
+    }
+
+    #[test]
+    fn escaped_quotes_are_not_closing_ones() {
+        let mut ed = code(Language::Python, "x = \"foo\\‸\"");
+        type_str(&mut ed, "\"");
+        assert_eq!(shown(&ed), "x = \"foo\\\"‸\"");
+        type_str(&mut ed, "\"");
+        assert_eq!(shown(&ed), "x = \"foo\\\"\"‸", "the escape is done with");
+
+        let mut ed = code(Language::C, "s = \"a\\\\‸\";");
+        type_str(&mut ed, "\"");
+        assert_eq!(shown(&ed), "s = \"a\\\\\"‸;", "an escaped backslash");
+
+        let mut ed = code(Language::Python, "x = \"a\\n‸\"");
+        type_str(&mut ed, "\"");
+        assert_eq!(shown(&ed), "x = \"a\\n\"‸", "after an escape sequence");
+        let mut ed = code(Language::Python, "x = f\"{y}‸\"");
+        type_str(&mut ed, "\"");
+        assert_eq!(shown(&ed), "x = f\"{y}\"‸", "after an interpolation");
+    }
+
+    #[test]
+    fn a_third_quote_pairs_a_docstring() {
+        let mut ed = code(Language::Python, "def f():\n    ‸");
+        type_str(&mut ed, "\"\"\"");
+        assert_eq!(shown(&ed), "def f():\n    \"\"\"‸\"\"\"");
+        type_str(&mut ed, "My documentation.");
+        assert_eq!(shown(&ed), "def f():\n    \"\"\"My documentation.‸\"\"\"");
+        type_str(&mut ed, "\"\"\"");
+        assert_eq!(shown(&ed), "def f():\n    \"\"\"My documentation.\"\"\"‸");
+
+        // Typed through from the first quote to the last, with no text
+        // in between, it is just what was typed.
+        let mut ed = code(Language::Python, "x = ‸");
+        type_str(&mut ed, "''''''");
+        assert_eq!(shown(&ed), "x = ''''''‸");
+
+        // Closed on a later line.
+        let mut ed = code(Language::Python, "x = ‸");
+        type_str(&mut ed, "\"\"\"a");
+        ed.insert_char('\n');
+        type_str(&mut ed, "b\"\"\"");
+        assert_eq!(shown(&ed), "x = \"\"\"a\nb\"\"\"‸");
+
+        let mut ed = code(Language::Python, "x = ‸");
+        type_str(&mut ed, "rb\"\"\"");
+        assert_eq!(shown(&ed), "x = rb\"\"\"‸\"\"\"", "with a prefix");
+        let mut ed = code(Language::Kotlin, "val x = ‸");
+        type_str(&mut ed, "\"\"\"");
+        assert_eq!(shown(&ed), "val x = \"\"\"‸\"\"\"");
+
+        // Without triple quotes, a third quote is a string of its own.
+        let mut ed = code(Language::JavaScript, "x = ‸");
+        type_str(&mut ed, "\"\"\"");
+        assert_eq!(shown(&ed), "x = \"\"\"‸\"");
+        // Not after a string with text in it.
+        let mut ed = code(Language::Python, "x = \"a\"\"‸");
+        type_str(&mut ed, "\"");
+        assert_eq!(shown(&ed), "x = \"a\"\"\"‸");
+    }
+
+    #[test]
+    fn backspace_deletes_empty_quotes() {
+        let mut ed = code(Language::Python, "x = ‸");
+        type_str(&mut ed, "\"");
+        ed.backspace();
+        assert_eq!(shown(&ed), "x = ‸");
+        type_str(&mut ed, "\"\"\"");
+        ed.backspace();
+        assert_eq!(shown(&ed), "x = \"\"‸", "back to before the third quote");
+        ed.backspace();
+        ed.backspace();
+        assert_eq!(shown(&ed), "x = ‸");
+
+        let mut ed = code(Language::Python, "x = \"a‸\"");
+        ed.backspace();
+        assert_eq!(shown(&ed), "x = \"‸\"");
+        ed.backspace();
+        assert_eq!(shown(&ed), "x = ‸");
+        let mut ed = code(Language::Python, "# \"‸\"");
+        ed.backspace();
+        assert_eq!(shown(&ed), "# ‸\"", "not in a comment");
+    }
+
+    #[test]
+    fn quotes_pair_the_same_whether_or_not_a_suggestion_came_first() {
+        // Typed before the suggestion arrives: paired, and the answer
+        // stops short of the closing quote the pair supplied.
+        let mut ed = code(Language::Python, "print(‸)");
+        ed.insert_char('"');
+        assert_eq!(offer(&mut ed, "hello\")").as_deref(), Some("hello"));
+        assert!(ed.accept_suggestion());
+        assert_eq!(shown(&ed), "print(\"hello‸\")");
+
+        // Typed along with a suggestion that has it: paired all the same.
+        let mut ed = code(Language::Python, "print(‸)");
+        ed.insert_char('x');
+        ed.backspace();
+        assert_eq!(offer(&mut ed, "\"hello\")").as_deref(), Some("\"hello\""));
+        ed.insert_char('"');
+        assert_eq!(shown(&ed), "print(\"‸\")");
+        assert_eq!(ed.suggestion(), Some("hello"));
+
+        // A docstring's suggestion ends before its closing quotes, with
+        // any spacing kept in it.
+        let mut ed = code(Language::Python, "def f():\n    ‸");
+        type_str(&mut ed, "\"\"\"");
+        assert_eq!(
+            offer(&mut ed, "Do the thing. \"\"\"\n    pass").as_deref(),
+            Some("Do the thing. ")
+        );
+    }
+
+    #[test]
     fn newline_between_braces_puts_the_closing_one_on_its_own_line() {
         let mut ed = code(Language::Rust, "‸");
         type_str(&mut ed, "fn main() {\n");
@@ -5109,7 +5492,7 @@ mod tests {
         ed.insert_char('"');
         offer(&mut ed, "{\n");
         ed.accept_suggestion();
-        assert_eq!(shown(&ed), "f(\"{‸)");
+        assert_eq!(shown(&ed), "f(\"{‸\")");
     }
 
     #[test]
@@ -5185,10 +5568,10 @@ mod tests {
 
         // Brackets in strings and comments don't count.
         let mut ed = code(Language::Rust, "foo(‸)");
-        ed.insert_char('"');
+        ed.insert_char('a');
         assert_eq!(
-            offer(&mut ed, ")\", 1 /* ) */);").as_deref(),
-            Some(")\", 1 /* ) */")
+            offer(&mut ed, ", \")\", 1 /* ) */);").as_deref(),
+            Some(", \")\", 1 /* ) */")
         );
     }
 
