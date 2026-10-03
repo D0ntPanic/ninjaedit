@@ -681,11 +681,6 @@ fn term_style(style: &TermStyle, theme: &Theme) -> Style {
     let default_bg = theme.terminal_background;
     let mut fg = color(style.fg, theme).unwrap_or(default_fg);
     let mut bg = color(style.bg, theme).unwrap_or(default_bg);
-    // A dim default foreground is nudged toward the background so it reads
-    // as dim even though the theme gives no separate color for it.
-    if style.dim && style.fg == TermColor::Default {
-        fg = blend(default_fg, default_bg);
-    }
     if style.inverse {
         std::mem::swap(&mut fg, &mut bg);
     }
@@ -732,14 +727,6 @@ fn rgb(color: Color) -> (u8, u8, u8) {
         Color::Rgb(r, g, b) => (r, g, b),
         _ => (0x80, 0x80, 0x80),
     }
-}
-
-/// The midpoint of two colors, for a dimmed default foreground.
-fn blend(a: Color, b: Color) -> Color {
-    let (ar, ag, ab) = rgb(a);
-    let (br, bg, bb) = rgb(b);
-    let mix = |x: u8, y: u8| ((x as u16 + y as u16) / 2) as u8;
-    Color::Rgb(mix(ar, br), mix(ag, bg), mix(ab, bb))
 }
 
 #[cfg(test)]
