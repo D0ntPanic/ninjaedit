@@ -211,7 +211,6 @@ const RESOLVE: &str = "Resolve";
 const ABORT: &str = "Abort";
 /// The key bindings the status bar lists, pane by pane.
 const UNSTAGED_HELP: &[(&str, &str)] = &[
-    ("↑↓", "move"),
     ("←→", "fold"),
     ("Space", "stage"),
     ("a", "all"),
@@ -222,7 +221,6 @@ const UNSTAGED_HELP: &[(&str, &str)] = &[
     ("Tab", "pane"),
 ];
 const STAGED_HELP: &[(&str, &str)] = &[
-    ("↑↓", "move"),
     ("←→", "fold"),
     ("Space", "unstage"),
     ("a", "all"),
@@ -233,51 +231,25 @@ const STAGED_HELP: &[(&str, &str)] = &[
     ("Tab", "pane"),
 ];
 const COMMIT_HELP: &[(&str, &str)] = &[
-    ("", "type the message"),
+    ("", "Type the message"),
     ("Ctrl+S", "commit"),
     ("Tab", "pane"),
     ("Ctrl+E", "leave"),
 ];
-const DISCARD_HELP: &[(&str, &str)] = &[
-    ("y", "discard"),
-    ("n/Esc", "cancel"),
-    ("←→", "button"),
-    ("Enter", "press"),
-];
-const RESOLVE_HELP: &[(&str, &str)] = &[
-    ("y", "resolve"),
-    ("n/Esc", "cancel"),
-    ("←→", "button"),
-    ("Enter", "press"),
-];
-const ABORT_HELP: &[(&str, &str)] = &[
-    ("y", "abort"),
-    ("n/Esc", "cancel"),
-    ("←→", "button"),
-    ("Enter", "press"),
-];
-const REVERT_HELP: &[(&str, &str)] = &[
-    ("y", "revert"),
-    ("n/Esc", "cancel"),
-    ("←→", "button"),
-    ("Enter", "press"),
-];
+const DISCARD_HELP: &[(&str, &str)] = &[("y", "discard"), ("n/Esc", "cancel")];
+const RESOLVE_HELP: &[(&str, &str)] = &[("y", "resolve"), ("n/Esc", "cancel")];
+const ABORT_HELP: &[(&str, &str)] = &[("y", "abort"), ("n/Esc", "cancel")];
+const REVERT_HELP: &[(&str, &str)] = &[("y", "revert"), ("n/Esc", "cancel")];
 /// The diff of an unstaged file, and of a staged one.
 const CONTENT_HELP: &[(&str, &str)] = &[
-    ("↑↓←→", "move"),
-    ("Shift", "select"),
     ("Space", "stage lines"),
-    ("Ctrl+C", "copy"),
     ("Enter", "expand"),
     ("o", "open"),
     ("Tab", "pane"),
     ("Ctrl+E", "leave"),
 ];
 const STAGED_CONTENT_HELP: &[(&str, &str)] = &[
-    ("↑↓←→", "move"),
-    ("Shift", "select"),
     ("Space", "unstage lines"),
-    ("Ctrl+C", "copy"),
     ("Enter", "expand"),
     ("o", "open"),
     ("Tab", "pane"),

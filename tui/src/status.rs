@@ -140,31 +140,15 @@ mod tests {
 
     #[test]
     fn help_reads_as_keys_and_actions_in_their_colors() {
-        let help = StatusLine::help(&[
-            ("↑↓", "commit"),
-            ("", "type the message"),
-            ("Esc", "cancel"),
-        ]);
-        assert_eq!(help.text(), "↑↓ commit · type the message · Esc cancel");
+        let help = StatusLine::help(&[("", "Type the message"), ("Esc", "cancel")]);
+        assert_eq!(help.text(), "Type the message · Esc cancel");
         assert_eq!(help.to_string(), help.text());
         let theme = Theme::default();
         let pieces = help.pieces(&theme, Style::default());
         let texts: Vec<&str> = pieces.iter().map(|(text, _)| text.as_str()).collect();
-        assert_eq!(
-            texts,
-            [
-                "↑↓ ",
-                "commit",
-                " · ",
-                "type the message",
-                " · ",
-                "Esc ",
-                "cancel"
-            ]
-        );
-        assert_eq!(pieces[0].1.fg, Some(theme.status_bar_key_text));
-        assert_eq!(pieces[1].1.fg, Some(theme.status_bar_help_text));
-        assert_eq!(pieces[5].1.fg, Some(theme.status_bar_key_text));
+        assert_eq!(texts, ["Type the message", " · ", "Esc ", "cancel"]);
+        assert_eq!(pieces[2].1.fg, Some(theme.status_bar_key_text));
+        assert_eq!(pieces[3].1.fg, Some(theme.status_bar_help_text));
     }
 
     #[test]

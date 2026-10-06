@@ -250,7 +250,6 @@ const NO_COMMITS: &str = "No commits yet";
 const NO_BRANCHES: &str = "none";
 /// The key bindings the status bar lists, pane by pane.
 const SIDEBAR_HELP: &[(&str, &str)] = &[
-    ("↑↓", "branch"),
     ("Enter", "go to"),
     ("←→", "fold remote"),
     ("F5", "fetch"),
@@ -258,33 +257,16 @@ const SIDEBAR_HELP: &[(&str, &str)] = &[
     ("Ctrl+E", "leave"),
 ];
 const LOG_HELP: &[(&str, &str)] = &[
-    ("↑↓", "commit"),
     ("Enter", "files"),
     ("Space", "checkout"),
-    ("←→", "sideways"),
     ("F5", "fetch"),
     ("Tab", "pane"),
     ("Ctrl+E", "leave"),
 ];
 const PROMPT_HELP: &[(&str, &str)] = &[("Enter", "create branch and check out"), ("Esc", "cancel")];
-const CONFIRM_HELP: &[(&str, &str)] = &[
-    ("y", "restore"),
-    ("n/Esc", "cancel"),
-    ("←→", "button"),
-    ("Enter", "press"),
-];
-const DELETE_HELP: &[(&str, &str)] = &[
-    ("y", "delete"),
-    ("n/Esc", "cancel"),
-    ("←→", "button"),
-    ("Enter", "press"),
-];
-const RESET_HELP: &[(&str, &str)] = &[
-    ("y", "reset"),
-    ("n/Esc", "cancel"),
-    ("←→", "button"),
-    ("Enter", "press"),
-];
+const CONFIRM_HELP: &[(&str, &str)] = &[("y", "restore"), ("n/Esc", "cancel")];
+const DELETE_HELP: &[(&str, &str)] = &[("y", "delete"), ("n/Esc", "cancel")];
+const RESET_HELP: &[(&str, &str)] = &[("y", "reset"), ("n/Esc", "cancel")];
 /// The restore box's button.
 const RESTORE: &str = "Restore";
 /// The delete branch box's button.
@@ -292,7 +274,6 @@ const DELETE: &str = "Delete";
 /// The reset box's button.
 const RESET: &str = "Reset";
 const FILES_HELP: &[(&str, &str)] = &[
-    ("↑↓", "file"),
     ("Enter", "view"),
     ("←→", "fold/unfold"),
     ("o", "open"),
@@ -301,9 +282,6 @@ const FILES_HELP: &[(&str, &str)] = &[
     ("Ctrl+E", "leave"),
 ];
 const CONTENT_HELP: &[(&str, &str)] = &[
-    ("↑↓←→", "move"),
-    ("Shift", "select"),
-    ("Ctrl+C", "copy"),
     ("Enter", "expand"),
     ("o", "open"),
     ("F5", "fetch"),
