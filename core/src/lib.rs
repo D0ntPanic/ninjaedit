@@ -33,7 +33,7 @@ pub use build::{
     BuildConfig, BuildRoot, BuildSystem, ConfigurationKey, DEFAULT_CMAKE_GENERATOR, Directories,
     Discovery, DiscoveryResult, Job, Selection, Step, TargetKey, Variable,
 };
-pub use caret::Movement;
+pub use caret::{Caret, LineSelection, LineSource, Movement, TextPos};
 pub use completion::{
     Completer, CompletionOutcome, CompletionRequest, ConfidenceThresholds, LineConfidence,
     TokenConfidence,

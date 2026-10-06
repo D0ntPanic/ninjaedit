@@ -2,8 +2,9 @@
 //! history. The [`history`] module walks the commits of every branch
 //! and lays them out as a graph (the [`graph`] module); the [`diff`]
 //! module says what a commit changed, file by file, with the context
-//! around each change expandable, and the [`tree`] module arranges
-//! those files as a tree of directories. The [`submodules`] module
+//! around each change expandable, the [`diff_model`] module puts a
+//! cursor and a selection in one file's diff for reading it, and the
+//! [`tree`] module arranges those files as a tree of directories. The [`submodules`] module
 //! lists a repository's submodules, each of which has a history of its
 //! own, and the commits of one that a change to it moved over. The [`changes`] module is the working tree: what is changed and
 //! not yet committed, staged or not, with staging, unstaging,
@@ -45,6 +46,7 @@ pub mod branch;
 pub mod changes;
 pub mod checkout;
 pub mod diff;
+pub mod diff_model;
 pub mod fetch;
 pub mod graph;
 pub mod head;
@@ -65,6 +67,7 @@ pub use diff::{
     ChangeKind, CommitDetail, DiffLine, DiffRow, FileChange, FileDiff, LineKind, Person, Side,
     Unshown,
 };
+pub use diff_model::{DiffModel, EXPAND_LINES, GapAction};
 pub use fetch::{Fetch, FetchReport};
 pub use graph::{GraphCell, GraphRow, NODE, cells_for};
 pub use head::{Head, head, head_of};

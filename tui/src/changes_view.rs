@@ -56,11 +56,14 @@
 //! the editor, at its first conflict if it has one; and `m` toggles
 //! amending. Ctrl+S, from any pane, makes the commit with the message
 //! in the box, as the person the repository's configuration names; a
-//! merge in progress starts with the message git prepared for it. In
-//! the diff the arrows scroll, Page Up and Page Down by a screenful,
-//! with a scrollbar down the side saying where in the diff the pane is
-//! and how much of it shows. The wheel scrolls whichever pane it is
-//! over.
+//! merge in progress starts with the message git prepared for it. The
+//! diff has a cursor and a selection, as the editor has, to read it by
+//! and copy from it (see the `diff_pane` module), with a scrollbar down
+//! the side saying where in the diff the pane is and how much of it
+//! shows; `o` there opens the file at the line the cursor is on, and a
+//! right click opens a menu to copy the selection or select it all. A
+//! scan that builds the diff again keeps the cursor on the same row.
+//! The wheel scrolls whichever pane it is over.
 //!
 //! A right click on a file or directory in a list selects it and opens
 //! a menu of what can be done to it (the application draws the menu;
@@ -140,7 +143,8 @@
 use crate::clipboard::Clipboard;
 use crate::confirm_box::{ConfirmBox, ConfirmOutcome};
 use crate::diff_pane::{
-    ContentPane, Piece, Shown, clamp_between, display_width, fit_end, share_for, share_of,
+    self, ContentPane, Piece, Shown, ShownMut, TAB_WIDTH, clamp_between, display_width, fit_end,
+    share_for, share_of,
 };
 use crate::editor_view::EditorView;
 use crate::git_layout::{ChangesSizes, GitChangesLayout, MAIN_REPOSITORY};
@@ -149,7 +153,7 @@ use crate::status::StatusLine;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
-    ChangeKind, Changes, ConflictSide, FileChange, FileDiff, FileTree, InProgress, TreeRow,
+    ChangeKind, Changes, ConflictSide, DiffModel, FileChange, FileTree, InProgress, TreeRow,
     short_id,
 };
 use ninjaedit_core::{Editor, FileBuffer};
@@ -238,9 +242,11 @@ const ABORT_HELP: &[(&str, &str)] = &[
     ("Enter", "press"),
 ];
 const CONTENT_HELP: &[(&str, &str)] = &[
-    ("↑↓", "scroll"),
-    ("←→", "sideways"),
-    ("▲▼", "expand context"),
+    ("↑↓←→", "move"),
+    ("Shift", "select"),
+    ("Ctrl+C", "copy"),
+    ("Enter", "expand"),
+    ("o", "open"),
     ("Tab", "pane"),
     ("Ctrl+E", "leave"),
 ];
@@ -309,7 +315,7 @@ enum Content {
     Message(String),
     /// What is under a selected directory.
     Directory(Vec<Piece>),
-    Diff(Box<FileDiff>),
+    Diff(Box<DiffModel>),
     Failed(String),
 }
 
@@ -319,7 +325,27 @@ fn shown(content: Option<&Content>) -> Shown<'_> {
         None => Shown::Nothing,
         Some(Content::Message(message) | Content::Failed(message)) => Shown::Note(message),
         Some(Content::Directory(lines)) => Shown::Lines(lines),
-        Some(Content::Diff(diff)) => Shown::Diff(diff),
+        Some(Content::Diff(model)) => Shown::Diff(model),
+    }
+}
+
+/// Drop what the diff pane shows, for it to be built again on the next
+/// draw, keeping a diff as `stale`, to put the new one's cursor where
+/// its was.
+fn drop_content(content: &mut Option<Content>, stale: &mut Option<Box<DiffModel>>) {
+    if let Some(Content::Diff(model)) = content.take() {
+        *stale = Some(model);
+    }
+}
+
+/// [`shown`], for input that may move the cursor in a diff, or expand
+/// it.
+fn shown_mut(content: Option<&mut Content>) -> ShownMut<'_> {
+    match content {
+        None => ShownMut::Nothing,
+        Some(Content::Message(message) | Content::Failed(message)) => ShownMut::Note(message),
+        Some(Content::Directory(lines)) => ShownMut::Lines(lines),
+        Some(Content::Diff(model)) => ShownMut::Diff(model),
     }
 }
 
@@ -340,10 +366,11 @@ pub enum ChangesOutcome {
     /// that failed.
     Notice(StatusLine),
     /// Open a file in the editor; `conflicted` asks for the cursor at
-    /// its first merge conflict.
+    /// its first merge conflict, and a `line` (from zero) for it there.
     OpenFile {
         path: PathBuf,
         conflicted: bool,
+        line: Option<usize>,
     },
 }
 
@@ -357,6 +384,9 @@ pub struct ChangesMouseOutcome {
     /// A right press on a row of a list, which it selected: open the
     /// page's menu at the pointer, for that row.
     pub menu: bool,
+    /// A right press in a diff: open the menu for its selection at the
+    /// pointer.
+    pub diff_menu: bool,
     /// Something to say in the status bar: a discard confirmed with a
     /// click, an action that failed.
     pub notice: Option<StatusLine>,
@@ -865,6 +895,10 @@ pub struct ChangesView {
     /// What the diff pane shows, and what it was built for.
     shown: Option<(List, RowKey)>,
     content: Option<Content>,
+    /// The diff the content was before it was dropped to be built
+    /// again, for the new one to put its cursor where this one's was
+    /// when it is of the same file.
+    stale: Option<Box<DiffModel>>,
     content_pane: ContentPane,
     /// The commit message, in an editor of its own.
     message: EditorView,
@@ -935,6 +969,7 @@ impl ChangesView {
             staged: FileList::default(),
             shown: None,
             content: None,
+            stale: None,
             content_pane: ContentPane::default(),
             message: message_editor(""),
             auto_message: None,
@@ -987,7 +1022,7 @@ impl ChangesView {
         };
         self.unstaged.rebuild(changes.unstaged());
         self.staged.rebuild(changes.staged());
-        self.content = None;
+        drop_content(&mut self.content, &mut self.stale);
         // A rebase's commit keeps its message unless another is written.
         let rebase_message = changes
             .rebase()
@@ -1155,9 +1190,11 @@ impl ChangesView {
         if self.content.is_some() && self.shown == wanted {
             return;
         }
+        let stale = self.stale.take();
         if self.shown != wanted {
             self.content_pane.reset();
         }
+        let same = self.shown == wanted;
         self.shown = wanted;
         let Some(changes) = &self.changes else {
             return;
@@ -1186,7 +1223,16 @@ impl ChangesView {
                         List::Staged => changes.staged_diff(change),
                     };
                     match diff {
-                        Ok(diff) => Content::Diff(Box::new(diff)),
+                        Ok(diff) => {
+                            let mut model = DiffModel::new(diff, TAB_WIDTH);
+                            // The same file's diff built again keeps the
+                            // cursor where it was, as near as the rows
+                            // allow.
+                            if let Some(stale) = stale.filter(|_| same) {
+                                model.set_cursor_at(stale.cursor().line, stale.cursor_column());
+                            }
+                            Content::Diff(Box::new(model))
+                        }
                         Err(err) => Content::Failed(err.message().to_owned()),
                     }
                 }
@@ -1430,7 +1476,7 @@ impl ChangesView {
             FilesAction::Resolve(side) => changes.resolve(paths, side),
         };
         self.acted = true;
-        self.content = None;
+        drop_content(&mut self.content, &mut self.stale);
         self.follow_lists();
         let what = &pending.what;
         match (pending.action, result) {
@@ -1515,7 +1561,7 @@ impl ChangesView {
             ),
         };
         self.acted = true;
-        self.content = None;
+        drop_content(&mut self.content, &mut self.stale);
         match result {
             Ok(()) => {
                 self.follow_lists();
@@ -1548,7 +1594,7 @@ impl ChangesView {
             )));
         }
         self.acted = true;
-        self.content = None;
+        drop_content(&mut self.content, &mut self.stale);
         if amend {
             if let Some(message) = changes.head_message().map(str::to_owned) {
                 self.offer_message(message);
@@ -1617,7 +1663,7 @@ impl ChangesView {
         };
         let result = changes.continue_rebase(&message);
         self.acted = true;
-        self.content = None;
+        drop_content(&mut self.content, &mut self.stale);
         match result {
             Ok(outcome) => {
                 self.message = message_editor("");
@@ -1668,7 +1714,7 @@ impl ChangesView {
         };
         let result = changes.abort();
         self.acted = true;
-        self.content = None;
+        drop_content(&mut self.content, &mut self.stale);
         self.withdraw_message();
         match result {
             Ok(InProgress::Rebase) => ChangesOutcome::Notice(StatusLine::info("Rebase aborted")),
@@ -1702,9 +1748,15 @@ impl ChangesView {
         if change.kind == ChangeKind::Deleted {
             return ChangesOutcome::Notice(StatusLine::info(format!("{} is deleted", change.path)));
         }
+        // From the diff, at the line its cursor is on.
+        let line = match &self.content {
+            Some(Content::Diff(model)) if self.pane == Pane::Content => model.new_line_at_cursor(),
+            _ => None,
+        };
         ChangesOutcome::OpenFile {
             path: changes.workdir().join(&change.path),
             conflicted: change.kind == ChangeKind::Conflicted,
+            line,
         }
     }
 
@@ -1767,10 +1819,7 @@ impl ChangesView {
                 self.message.handle_key(key, clipboard);
                 ChangesOutcome::Continue
             }
-            Pane::Content => {
-                self.handle_content_key(key);
-                ChangesOutcome::Continue
-            }
+            Pane::Content => self.handle_content_key(key, clipboard),
         }
     }
 
@@ -1839,9 +1888,58 @@ impl ChangesView {
         ChangesOutcome::Continue
     }
 
-    fn handle_content_key(&mut self, key: KeyEvent) {
-        self.content_pane
-            .handle_key(key, shown(self.content.as_ref()));
+    fn handle_content_key(&mut self, key: KeyEvent, clipboard: &mut Clipboard) -> ChangesOutcome {
+        if key.code == KeyCode::Char('o') && key.modifiers.is_empty() {
+            return self.open_selected();
+        }
+        let content = shown_mut(self.content.as_mut());
+        match self.content_pane.handle_key(key, content, clipboard) {
+            Some(notice) => ChangesOutcome::Notice(notice),
+            None => ChangesOutcome::Continue,
+        }
+    }
+
+    // ----- The diff's selection ---------------------------------------------
+
+    /// Whether the diff pane shows a diff with lines, for the cursor to
+    /// move through and select in.
+    pub fn shows_diff_lines(&self) -> bool {
+        matches!(&self.content, Some(Content::Diff(model)) if !model.rows().is_empty())
+    }
+
+    /// What is selected on the page, for a search to start from: the
+    /// text selected in the commit message while that has the keyboard,
+    /// and otherwise in the diff shown.
+    pub fn selected_text(&self) -> Option<String> {
+        if self.pane == Pane::Commit {
+            return self.message.editor().selected_text();
+        }
+        match &self.content {
+            Some(Content::Diff(model)) => model.selected_text(),
+            _ => None,
+        }
+    }
+
+    /// Whether anything is selected in the diff shown.
+    pub fn has_diff_selection(&self) -> bool {
+        matches!(&self.content, Some(Content::Diff(model)) if model.selection().is_some())
+    }
+
+    /// "Copy": put the diff's selection on the clipboard. Returns what
+    /// to say about it, nothing without a selection.
+    pub fn copy_diff_selection(&self, clipboard: &mut Clipboard) -> Option<StatusLine> {
+        diff_pane::copy(shown(self.content.as_ref()), clipboard)
+    }
+
+    /// "Select all": select the whole diff shown, and give the keyboard
+    /// to it.
+    pub fn select_all_in_diff(&mut self) {
+        if let Some(Content::Diff(model)) = &mut self.content
+            && !model.rows().is_empty()
+        {
+            model.select_all();
+            self.pane = Pane::Content;
+        }
     }
 
     /// Add pasted text to the commit message, if that is where the
@@ -2048,7 +2146,7 @@ impl ChangesView {
         {
             if self.content_pane.is_dragging() {
                 self.content_pane
-                    .handle_mouse(mouse, wheel, shown(self.content.as_ref()));
+                    .handle_mouse(mouse, wheel, shown_mut(self.content.as_mut()));
             } else {
                 self.message.handle_mouse(mouse, wheel);
             }
@@ -2068,20 +2166,17 @@ impl ChangesView {
         let Some(pane) = pane else {
             return outcome;
         };
-        // The diff pane scrolls itself, and says which of the diff's
-        // expand buttons was pressed.
+        // The diff pane scrolls itself, and moves the diff's cursor and
+        // selects in it; a right press in a diff with lines asks for the
+        // menu of what can be done with the selection.
         if pane == Pane::Content {
-            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.pane = Pane::Content;
             }
-            let button = self
-                .content_pane
-                .handle_mouse(mouse, wheel, shown(self.content.as_ref()));
-            if let Some(button) = button
-                && let Some(Content::Diff(diff)) = &mut self.content
-            {
-                button.press(diff);
-            }
+            self.content_pane
+                .handle_mouse(mouse, wheel, shown_mut(self.content.as_mut()));
+            outcome.diff_menu =
+                mouse.kind == MouseEventKind::Down(MouseButton::Right) && self.shows_diff_lines();
             return outcome;
         }
         match mouse.kind {
@@ -2256,8 +2351,9 @@ impl ChangesView {
 
         self.render_list(List::Unstaged, buf, theme);
         self.render_list(List::Staged, buf, theme);
-        let cursor = self.render_commit_box(buf, theme);
-        self.render_content(buf, theme);
+        let message_cursor = self.render_commit_box(buf, theme);
+        let content_cursor = self.render_content(buf, theme);
+        let cursor = message_cursor.or(content_cursor);
         // The discard or resolve box over it all, while it asks; the
         // message's cursor doesn't show through it.
         if let Some(pending) = &mut self.pending {
@@ -2515,9 +2611,17 @@ impl ChangesView {
         }
     }
 
-    fn render_content(&mut self, buf: &mut Buffer, theme: &Theme) {
-        self.content_pane
-            .render(self.content_area, buf, theme, shown(self.content.as_ref()));
+    /// Draw the diff pane. Returns where the terminal cursor goes while
+    /// the pane has the keyboard: on a diff's cursor.
+    fn render_content(&mut self, buf: &mut Buffer, theme: &Theme) -> Option<ScreenPosition> {
+        let focused = self.pane == Pane::Content;
+        self.content_pane.render(
+            self.content_area,
+            buf,
+            theme,
+            shown(self.content.as_ref()),
+            focused,
+        )
     }
 }
 
@@ -2675,6 +2779,7 @@ mod tests {
     use crate::diff_pane::UNCOMMITTED_HEADING;
     use crossterm::event::{KeyEventKind, KeyEventState};
     use git2::{Repository, Signature};
+    use ninjaedit_core::TextPos;
     use ninjaedit_core::git::NODE;
     use std::fs;
     use std::time::Duration;
@@ -3473,7 +3578,7 @@ mod tests {
         let outcome = press(&mut view, KeyCode::Char('o'));
         let expected = fs::canonicalize(dir.path().join("f.txt")).unwrap();
         assert!(
-            matches!(&outcome, ChangesOutcome::OpenFile { path, conflicted: true }
+            matches!(&outcome, ChangesOutcome::OpenFile { path, conflicted: true, .. }
                 if fs::canonicalize(path).unwrap() == expected),
             "{outcome:?}"
         );
@@ -3924,6 +4029,58 @@ mod tests {
         let screen = draw(&mut view, 60, 10);
         assert!(screen[1].contains(NOT_A_REPOSITORY), "{screen:#?}");
         assert!(!view.poll());
+    }
+
+    #[test]
+    fn the_diffs_cursor_stays_through_a_scan_and_opens_the_file_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        configure_user(&repo);
+        let old: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        commit_files(&repo, &[("f.txt", &old)], "Base");
+        fs::write(
+            dir.path().join("f.txt"),
+            old.replace("line 10\n", "line ten\n"),
+        )
+        .unwrap();
+        let mut view = view(&dir);
+        draw(&mut view, 100, 30);
+        press(&mut view, KeyCode::Enter);
+        assert_eq!(view.pane, Pane::Content);
+        // Down past the gap and the context to the removed line.
+        for _ in 0..4 {
+            press(&mut view, KeyCode::Down);
+        }
+        let cursor = |view: &ChangesView| match &view.content {
+            Some(Content::Diff(model)) => Some(model.cursor()),
+            _ => None,
+        };
+        let removed = Some(TextPos::new(4, 0));
+        assert_eq!(cursor(&view), removed);
+        // A scan builds the diff again, with the cursor where it was.
+        view.refresh();
+        settle(&mut view);
+        draw(&mut view, 100, 30);
+        assert_eq!(cursor(&view), removed);
+        // `o` opens the file at the line that replaced the removed one.
+        assert!(matches!(
+            press(&mut view, KeyCode::Char('o')),
+            ChangesOutcome::OpenFile { line: Some(9), .. }
+        ));
+        // A right press in the diff asks for the selection's menu, and
+        // the menu's commands work on the diff.
+        let content = view.content_area;
+        let outcome = right_click(&mut view, content.x + 10, content.y + 2);
+        assert!(outcome.diff_menu && !outcome.menu);
+        assert!(view.shows_diff_lines() && !view.has_diff_selection());
+        view.select_all_in_diff();
+        assert!(view.has_diff_selection());
+        let mut clipboard = Clipboard::local_only();
+        assert!(view.copy_diff_selection(&mut clipboard).is_some());
+        assert_eq!(
+            clipboard.get().as_deref(),
+            Some("line 7\nline 8\nline 9\nline 10\nline ten\nline 11\nline 12\nline 13\n")
+        );
     }
 
     fn right_click(view: &mut ChangesView, column: u16, row: u16) -> ChangesMouseOutcome {

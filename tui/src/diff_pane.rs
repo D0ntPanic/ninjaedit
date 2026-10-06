@@ -8,8 +8,11 @@
 //! new line numbers in a gutter that stays put while the text scrolls
 //! sideways. Where lines are hidden between changes a row says how
 //! many, with buttons to reveal more: ▲ from the change below it
-//! upward, ▼ from the change above it downward, or all of them; the
-//! page hit-tests clicks against the [`Button`]s the render records.
+//! upward, ▼ from the change above it downward, or all of them (the
+//! gap's [`GapAction`]s); the pane hit-tests clicks against the
+//! [`Button`]s the render records. The diff's cursor stops on each
+//! button in turn, which is drawn as a dialog's focused button is while
+//! the pane has the keyboard, and Enter presses it.
 //!
 //! A submodule's diff has no lines: it is the graph of the submodule's
 //! commits the change moved over, drawn as the log draws its commits
@@ -23,11 +26,20 @@
 //!
 //! Both pages show the diff in a [`ContentPane`], which shows lines of
 //! text (a commit's description, a directory's files) and notes in
-//! place of content as well, and keeps the pane's scrolling: the keys
-//! and the wheel scroll it, a scrollbar down its right edge ([`VScroll`],
-//! always shown, as the editor's is) says where in the content it is
-//! and how much of it fits, and a click on an expand button is handed
-//! back to the page, which holds the diff, to press.
+//! place of content as well, and keeps the pane's scrolling, with a
+//! scrollbar down its right edge ([`VScroll`], always shown, as the
+//! editor's is) saying where in the content it is and how much of it
+//! fits. A diff has a cursor and a selection (see the core crate's
+//! `git::diff_model` module), which the keys and the mouse work as in
+//! the editor, without the editing: the arrows, Home and End, and Page
+//! Up and Page Down move the cursor, with Shift they select, a click
+//! puts the cursor under the pointer and a drag selects, and a click
+//! or drag in the line numbers selects whole lines. The view follows
+//! the cursor; the wheel and the scrollbars scroll without moving it.
+//! The selection is drawn in the theme's selection colors over the
+//! text, and Ctrl+C copies it as shown, without the hidden lines. On a
+//! row of hidden lines the cursor stops on each of its buttons, and
+//! Enter presses the one it is on. Lines of text only scroll.
 //!
 //! [`HScroll`] is the sideways scrolling of a pane, with the editor's
 //! rules (see `EditorView`): the limit is set by the longest line
@@ -38,15 +50,18 @@
 //! text drawn end to end ([`draw_pieces`]), and the small sums the
 //! pages' layouts are made of.
 
+use crate::clicks::ClickTracker;
+use crate::clipboard::Clipboard;
 use crate::commit_row::{CommitLine, Highlight, commit_extent, draw_commit_line, lane_cap};
 use crate::palette::palette_background;
+use crate::status::StatusLine;
 use crate::theme::Theme;
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
-    ChangeKind, Commit, DiffRow, FileDiff, LineKind, RANGE_LIMIT, SubmoduleRange,
-    UncommittedChange, Unshown, short_id,
+    ChangeKind, Commit, DiffModel, DiffRow, EXPAND_LINES, FileDiff, GapAction, LineKind,
+    RANGE_LIMIT, SubmoduleRange, UncommittedChange, Unshown, short_id,
 };
-use ninjaedit_core::{Token, TokenKind, text};
+use ninjaedit_core::{Movement, Token, TokenKind, text};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
 use ratatui::style::{Modifier, Style};
@@ -57,29 +72,35 @@ pub(crate) const ARROW_COLUMNS: usize = 4;
 /// Columns a pane may scroll past the longest visible line, as in the
 /// editor.
 pub(crate) const HSCROLL_SLACK: usize = 2;
-/// Lines of context one press of an expand button reveals.
-pub(crate) const EXPAND_LINES: usize = 10;
 pub(crate) const TAB_WIDTH: usize = 4;
-/// A button drawn in a diff's gap row, and what pressing it reveals.
+/// A button drawn in a diff's gap row: which row and gap, and what
+/// pressing it reveals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Button {
-    /// Reveal lines above the change below the gap.
-    Up(usize),
-    /// Reveal lines below the change above the gap.
-    Down(usize),
-    /// Reveal the whole gap.
-    All(usize),
+pub(crate) struct Button {
+    row: usize,
+    gap: usize,
+    action: GapAction,
 }
 
 impl Button {
-    /// Press the button: reveal what it stands for.
-    pub(crate) fn press(self, diff: &mut FileDiff) {
-        match self {
-            Button::Up(gap) => diff.expand_up(gap, EXPAND_LINES),
-            Button::Down(gap) => diff.expand_down(gap, EXPAND_LINES),
-            Button::All(gap) => diff.expand_all(gap),
-        }
+    /// Press the button, as a click does: the cursor goes to it, and
+    /// what it stands for is revealed.
+    fn press(self, model: &mut DiffModel) {
+        model.put_cursor_on_action(self.row, self.action);
+        model.take_action(self.gap, self.action);
     }
+}
+
+/// Put a diff's selection on the clipboard, saying so; nothing without
+/// one.
+pub(crate) fn copy(content: Shown<'_>, clipboard: &mut Clipboard) -> Option<StatusLine> {
+    let Shown::Diff(model) = content else {
+        return None;
+    };
+    let text = model.selected_text()?;
+    let notice = StatusLine::copied(&text);
+    clipboard.set(text);
+    Some(notice)
 }
 
 /// A drawn piece of text: what and in which style.
@@ -238,16 +259,52 @@ pub(crate) enum Shown<'a> {
     Nothing,
     /// Lines of text, each in a style of its own.
     Lines(&'a [Piece]),
-    Diff(&'a FileDiff),
+    Diff(&'a DiffModel),
     /// A note in place of content, such as why there is none.
     Note(&'a str),
 }
 
+/// What a page's content pane shows, for input that may move the
+/// cursor in a diff or expand it.
+pub(crate) enum ShownMut<'a> {
+    Nothing,
+    Lines(&'a [Piece]),
+    Diff(&'a mut DiffModel),
+    Note(&'a str),
+}
+
+impl ShownMut<'_> {
+    fn shown(&self) -> Shown<'_> {
+        match self {
+            ShownMut::Nothing => Shown::Nothing,
+            ShownMut::Lines(lines) => Shown::Lines(lines),
+            ShownMut::Diff(model) => Shown::Diff(model),
+            ShownMut::Note(note) => Shown::Note(note),
+        }
+    }
+}
+
+/// A drag in a diff in progress.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Drag {
+    #[default]
+    None,
+    /// Selecting text from where the button went down.
+    Text,
+    /// Selecting whole rows, in the line numbers, from this row.
+    Rows(usize),
+}
+
 /// The pane the git pages show the selection's content in, a diff or
 /// lines of text: how it is scrolled, both ways, with a scrollbar for
-/// each, and the expand buttons a diff's gaps drew. The page keeps what
-/// is shown and hands it over for each render and input, as a
-/// [`Shown`]; the pane keeps the rest.
+/// each, the expand buttons a diff's gaps drew, and a drag in progress.
+/// The page keeps what is shown and hands it over for each render and
+/// input, as a [`Shown`] (or a [`ShownMut`], for input that may change a
+/// diff); the pane keeps the rest.
+///
+/// A diff has a cursor, kept by its [`DiffModel`], which the keys move
+/// as the editor's do and the view follows; the wheel and the
+/// scrollbars scroll without moving it. Lines of text only scroll.
 #[derive(Default)]
 pub(crate) struct ContentPane {
     /// The rows scrolled off the top.
@@ -260,8 +317,16 @@ pub(crate) struct ContentPane {
     shown: usize,
     /// Where the pane was drawn.
     area: Rect,
+    /// Where a diff's text was drawn, right of its line numbers: empty
+    /// while a diff has none.
+    text: Rect,
     /// The expand buttons drawn in a diff, to hit-test clicks.
     buttons: Vec<(Rect, Button)>,
+    /// Whether the next render is to scroll the diff's cursor into
+    /// view: it has moved since.
+    follow: bool,
+    drag: Drag,
+    clicks: ClickTracker,
 }
 
 impl ContentPane {
@@ -269,19 +334,20 @@ impl ContentPane {
     pub(crate) fn reset(&mut self) {
         self.scroll = 0;
         self.h.col = 0;
+        self.follow = false;
     }
 
-    /// Whether a scrollbar is being dragged, in which case the pane
-    /// wants drag and release events wherever they happen.
+    /// Whether a scrollbar is being dragged, or a selection, in which
+    /// case the pane wants drag and release events wherever they happen.
     pub(crate) fn is_dragging(&self) -> bool {
-        self.h.dragging || self.v.dragging
+        self.h.dragging || self.v.dragging || self.drag != Drag::None
     }
 
     /// The columns the visible rows of the content reach.
     pub(crate) fn extent(&self, content: Shown<'_>) -> usize {
         match content {
             Shown::Lines(lines) => text_extent(lines, self.scroll, self.shown),
-            Shown::Diff(diff) => diff_extent(diff, &diff.rows(), self.scroll, self.shown),
+            Shown::Diff(model) => diff_extent(model.diff(), model.rows(), self.scroll, self.shown),
             Shown::Nothing | Shown::Note(_) => 0,
         }
     }
@@ -299,10 +365,35 @@ impl ContentPane {
         self.h.scroll_by(columns, extent);
     }
 
-    /// Handle a key while the pane has the keyboard: the arrows scroll
-    /// it, Page Up and Page Down by a page, Home and End to either end.
-    /// Returns whether the key meant something to the pane.
-    pub(crate) fn handle_key(&mut self, key: KeyEvent, content: Shown<'_>) -> bool {
+    /// Handle a key while the pane has the keyboard. In a diff with
+    /// lines the keys work as in the editor, without the editing: the
+    /// arrows, Home and End, and Page Up and Page Down move the cursor
+    /// (by word and to either end of the diff with Ctrl), Shift with any
+    /// of them selects, Ctrl+↑ and Ctrl+↓ scroll without moving it,
+    /// Ctrl+A selects everything, Ctrl+C copies the selection, Escape
+    /// clears it, and Enter on a gap presses the button the cursor is
+    /// on, the cursor staying on it while the gap is left. Anything
+    /// else only scrolls: the arrows (sideways too), Page Up and Page
+    /// Down by a page, Home and End to either end. Returns what to say
+    /// in the status bar, if anything: what was copied.
+    pub(crate) fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        content: ShownMut<'_>,
+        clipboard: &mut Clipboard,
+    ) -> Option<StatusLine> {
+        match content {
+            ShownMut::Diff(model) if !model.rows().is_empty() => {
+                self.handle_diff_key(key, model, clipboard)
+            }
+            content => {
+                self.scroll_key(key, content.shown());
+                None
+            }
+        }
+    }
+
+    fn scroll_key(&mut self, key: KeyEvent, content: Shown<'_>) {
         let page = (self.area.height as usize).saturating_sub(1).max(1);
         match key.code {
             KeyCode::Up => self.scroll_by(-1),
@@ -313,84 +404,236 @@ impl ContentPane {
             KeyCode::End => self.scroll = usize::MAX,
             KeyCode::Right => self.scroll_sideways(ARROW_COLUMNS as isize, content),
             KeyCode::Left => self.scroll_sideways(-(ARROW_COLUMNS as isize), content),
-            _ => return false,
+            _ => {}
         }
-        true
+    }
+
+    fn handle_diff_key(
+        &mut self,
+        key: KeyEvent,
+        model: &mut DiffModel,
+        clipboard: &mut Clipboard,
+    ) -> Option<StatusLine> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        // Page Up and Down scroll by a page and move the cursor as far,
+        // so it stays on its screen row; the page is a row short of the
+        // pane's, as in the editor, to keep some context across it.
+        let page = self.shown.saturating_sub(1).max(1);
+        let movement = match key.code {
+            KeyCode::Left if ctrl => Movement::WordLeft,
+            KeyCode::Right if ctrl => Movement::WordRight,
+            KeyCode::Left => Movement::Left,
+            KeyCode::Right => Movement::Right,
+            KeyCode::Up if ctrl => {
+                self.scroll_by(-1);
+                return None;
+            }
+            KeyCode::Down if ctrl => {
+                self.scroll_by(1);
+                return None;
+            }
+            KeyCode::Up => Movement::Up,
+            KeyCode::Down => Movement::Down,
+            KeyCode::Home if ctrl => Movement::DocumentStart,
+            KeyCode::End if ctrl => Movement::DocumentEnd,
+            KeyCode::Home => Movement::LineStart,
+            KeyCode::End => Movement::LineEnd,
+            KeyCode::PageUp => {
+                self.scroll_by(-(page as isize));
+                Movement::PageUp(page)
+            }
+            KeyCode::PageDown => {
+                self.scroll_by(page as isize);
+                Movement::PageDown(page)
+            }
+            KeyCode::Char(c) if ctrl => {
+                match c.to_ascii_lowercase() {
+                    'a' => model.select_all(),
+                    'c' => return copy(Shown::Diff(model), clipboard),
+                    _ => {}
+                }
+                return None;
+            }
+            KeyCode::Esc => {
+                model.clear_selection();
+                return None;
+            }
+            KeyCode::Enter => {
+                if let Some((gap, action)) = model.action_at_cursor() {
+                    model.take_action(gap, action);
+                    self.follow = true;
+                }
+                return None;
+            }
+            _ => return None,
+        };
+        if shift {
+            model.extend_selection(movement);
+        } else {
+            model.move_cursor(movement);
+        }
+        self.follow = true;
+        None
     }
 
     /// Handle a mouse event over the pane, or any drag or release while
-    /// a scrollbar is being dragged. `wheel` is how many rows (or
-    /// columns, sideways) the wheel scrolls. Returns the expand button
-    /// pressed, if any, for the page to press: it holds the diff.
-    pub(crate) fn handle_mouse(
-        &mut self,
-        mouse: MouseEvent,
-        wheel: usize,
-        content: Shown<'_>,
-    ) -> Option<Button> {
+    /// [dragging](Self::is_dragging). `wheel` is how many rows (or
+    /// columns, sideways) the wheel scrolls. In a diff a click puts the
+    /// cursor under the pointer and a drag selects, a double-click
+    /// selects a word and a Shift+click selects to the pointer; in the
+    /// line numbers, they select whole rows. A right press puts the
+    /// cursor under the pointer too, unless it is in the selection, which
+    /// is what a menu there is for. A click on an expand button reveals
+    /// what it says.
+    pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, wheel: usize, content: ShownMut<'_>) {
         let at = ScreenPosition::new(mouse.column, mouse.row);
         let wheel = wheel as isize;
         match mouse.kind {
             MouseEventKind::Drag(_) if self.h.dragging => {
-                let extent = self.extent(content);
+                let extent = self.extent(content.shown());
                 self.h.scroll_to(mouse.column, extent);
             }
             MouseEventKind::Drag(_) if self.v.dragging => self.scroll = self.v.scroll_at(mouse.row),
+            MouseEventKind::Drag(_) => {
+                if let ShownMut::Diff(model) = content {
+                    match self.drag {
+                        Drag::Text => {
+                            let (row, column) = self.position_at(mouse.column, mouse.row);
+                            model.extend_to(row, column);
+                            self.follow = true;
+                        }
+                        Drag::Rows(anchor) => {
+                            model.select_rows(anchor, self.row_at(mouse.row));
+                            self.follow = true;
+                        }
+                        Drag::None => {}
+                    }
+                }
+            }
             MouseEventKind::Up(_) => {
                 self.h.dragging = false;
                 self.v.dragging = false;
+                self.drag = Drag::None;
             }
             MouseEventKind::ScrollUp => self.scroll_by(-wheel),
             MouseEventKind::ScrollDown => self.scroll_by(wheel),
-            MouseEventKind::ScrollRight => self.scroll_sideways(wheel, content),
-            MouseEventKind::ScrollLeft => self.scroll_sideways(-wheel, content),
+            MouseEventKind::ScrollRight => self.scroll_sideways(wheel, content.shown()),
+            MouseEventKind::ScrollLeft => self.scroll_sideways(-wheel, content.shown()),
             MouseEventKind::Down(MouseButton::Left) if self.h.bar.contains(at) => {
                 self.h.dragging = true;
-                let extent = self.extent(content);
+                let extent = self.extent(content.shown());
                 self.h.scroll_to(mouse.column, extent);
             }
             MouseEventKind::Down(MouseButton::Left) if self.v.bar.contains(at) => {
                 self.v.dragging = true;
                 self.scroll = self.v.scroll_at(mouse.row);
             }
-            MouseEventKind::Down(MouseButton::Left) => {
-                return self
-                    .buttons
-                    .iter()
-                    .find(|(area, _)| area.contains(at))
-                    .map(|(_, button)| *button);
+            MouseEventKind::Down(button @ (MouseButton::Left | MouseButton::Right)) => {
+                let ShownMut::Diff(model) = content else {
+                    return;
+                };
+                if button == MouseButton::Left
+                    && let Some((_, pressed)) =
+                        self.buttons.iter().find(|(area, _)| area.contains(at))
+                {
+                    pressed.press(model);
+                    return;
+                }
+                let rows = Rect::new(self.area.x, self.text.y, self.area.width, self.text.height);
+                if !rows.contains(at) || self.text.width == 0 {
+                    return;
+                }
+                let (row, mut column) = self.position_at(mouse.column, mouse.row);
+                // A gap's row, off its buttons, is its first button.
+                if !model.gap_actions(row).is_empty() {
+                    column = 0;
+                }
+                if button == MouseButton::Right {
+                    let pos = model.position_at(row, column);
+                    if !model.selection().is_some_and(|range| range.contains(&pos)) {
+                        model.set_cursor_at(row, column);
+                    }
+                } else if mouse.column < self.text.x {
+                    model.select_rows(row, row);
+                    self.drag = Drag::Rows(row);
+                } else {
+                    if self.clicks.press(mouse.column, mouse.row) == 2 {
+                        model.select_word_at(row, column);
+                    } else if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                        model.extend_to(row, column);
+                    } else {
+                        model.set_cursor_at(row, column);
+                    }
+                    self.drag = Drag::Text;
+                }
+                self.follow = true;
             }
             _ => {}
         }
-        None
+    }
+
+    /// The row of the diff at screen row `y`. Above the rows shown it is
+    /// the one before them, and below them the one after, so a drag past
+    /// an edge scrolls that way.
+    fn row_at(&self, y: u16) -> usize {
+        if y < self.text.y {
+            self.scroll.saturating_sub(1)
+        } else if y >= self.text.bottom() {
+            self.scroll + self.text.height as usize
+        } else {
+            self.scroll + (y - self.text.y) as usize
+        }
+    }
+
+    /// The row and display column of the diff at a screen position; past
+    /// the text's edges, one beyond what shows, as for [`row_at`].
+    ///
+    /// [`row_at`]: Self::row_at
+    fn position_at(&self, x: u16, y: u16) -> (usize, usize) {
+        let column = if x < self.text.x {
+            self.h.col.saturating_sub(1)
+        } else if x >= self.text.right() {
+            self.h.col + self.text.width as usize
+        } else {
+            self.h.col + (x - self.text.x) as usize
+        };
+        (self.row_at(y), column)
     }
 
     /// Draw the content into `area`, with the vertical scrollbar down
     /// its right edge, and the horizontal one along the bottom of the
-    /// rest when anything is out of view sideways.
+    /// rest when anything is out of view sideways. A diff's cursor is
+    /// scrolled into view if it has moved since the last render. Returns
+    /// where the terminal's cursor goes, while the pane is `focused`: on
+    /// a diff's cursor when it is in view and nothing is selected.
     pub(crate) fn render(
         &mut self,
         area: Rect,
         buf: &mut Buffer,
         theme: &Theme,
         content: Shown<'_>,
-    ) {
+        focused: bool,
+    ) -> Option<ScreenPosition> {
         self.area = area;
+        self.text = Rect::default();
         self.buttons.clear();
+        let follow = std::mem::take(&mut self.follow);
         let background = content_background(theme);
         buf.set_style(area, background);
         if area.width < 4 || area.height == 0 {
             self.h.bar = Rect::default();
             self.v.bar = Rect::default();
-            return;
+            return None;
         }
         let dim = background.fg(theme.command_palette_result_context_text);
         let inner = Rect::new(area.x, area.y, area.width - 1, area.height);
+        let mut cursor = None;
         match content {
             Shown::Nothing => {
                 self.h.render(0, 0, Rect::default(), buf, theme);
                 self.v.bar = Rect::default();
-                return;
+                return None;
             }
             Shown::Note(note) => {
                 buf.set_stringn(inner.x + 1, inner.y, note, inner.width as usize - 1, dim);
@@ -401,19 +644,25 @@ impl ContentPane {
                 self.scroll = 0;
             }
             Shown::Lines(lines) => self.render_lines(inner, buf, theme, lines),
-            Shown::Diff(diff) => {
+            Shown::Diff(model) => {
                 let drawn = render_diff(
-                    diff,
+                    model,
                     inner,
                     buf,
                     theme,
                     self.scroll,
                     &mut self.h,
                     &mut self.buttons,
+                    follow,
+                    focused,
                 );
                 self.rows = drawn.rows;
                 self.shown = drawn.shown;
                 self.scroll = drawn.scroll;
+                self.text = drawn.text;
+                if focused && model.selection().is_none() {
+                    cursor = self.cursor_position(model);
+                }
             }
         }
         // The bar runs down beside the rows shown, leaving the corner
@@ -426,6 +675,35 @@ impl ContentPane {
         );
         self.v
             .render(self.rows, self.shown, self.scroll, bar, buf, theme);
+        cursor
+    }
+
+    /// Where a diff's cursor is on the screen, if it is in view: in the
+    /// text, or at the start of a gap's row.
+    fn cursor_position(&self, model: &DiffModel) -> Option<ScreenPosition> {
+        let row = model.cursor().line;
+        if self.text.width == 0
+            || row < self.scroll
+            || row >= self.scroll + self.text.height as usize
+        {
+            return None;
+        }
+        let y = self.text.y + (row - self.scroll) as u16;
+        // On a gap's row, on the arrow of the button it is on (or at the
+        // row's start, if that didn't fit).
+        if let Some((_, action)) = model.action_at_cursor() {
+            let button = self
+                .buttons
+                .iter()
+                .find(|(_, button)| button.row == row && button.action == action);
+            let x = button.map_or(self.area.x + 1, |(area, _)| area.x + 1);
+            return Some(ScreenPosition::new(x, y));
+        }
+        let column = model.cursor_column();
+        let visible = self.h.col..self.h.col + self.text.width as usize;
+        visible
+            .contains(&column)
+            .then(|| ScreenPosition::new(self.text.x + (column - self.h.col) as u16, y))
     }
 
     /// Draw lines of text, each in its own style over the pane's
@@ -549,19 +827,29 @@ pub(crate) struct DiffDrawn {
     pub(crate) shown: usize,
     /// The vertical scroll position.
     pub(crate) scroll: usize,
+    /// Where the rows' text was drawn, right of the line numbers, one
+    /// screen row a row shown; empty for a diff without lines.
+    pub(crate) text: Rect,
 }
 
 /// Draw a diff into `area`, scrolled by `scroll` rows and sideways by
-/// `h`, recording the expand buttons drawn.
+/// `h`, with its selection, recording the expand buttons drawn. With
+/// `follow`, the scroll is first changed as little as brings the
+/// cursor into view. The button the cursor is on is drawn as focused
+/// while the pane is.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_diff(
-    diff: &FileDiff,
+    model: &DiffModel,
     area: Rect,
     buf: &mut Buffer,
     theme: &Theme,
     scroll: usize,
     h: &mut HScroll,
     buttons: &mut Vec<(Rect, Button)>,
+    follow: bool,
+    focused: bool,
 ) -> DiffDrawn {
+    let diff = model.diff();
     let background = content_background(theme);
     let dim = background.fg(theme.command_palette_result_context_text);
     let height = area.height as usize;
@@ -580,9 +868,10 @@ pub(crate) fn render_diff(
             rows: 1,
             shown: 1,
             scroll: 0,
+            text: Rect::default(),
         };
     }
-    let rows = diff.rows();
+    let rows = model.rows();
     if rows.is_empty() {
         let message = match diff.kind {
             ChangeKind::Renamed => "Renamed without changes",
@@ -595,6 +884,7 @@ pub(crate) fn render_diff(
             rows: 1,
             shown: 1,
             scroll: 0,
+            text: Rect::default(),
         };
     }
     // The gutter: the old and new line numbers, then the marker.
@@ -609,14 +899,25 @@ pub(crate) fn render_diff(
             rows: rows.len(),
             shown: height,
             scroll: scroll.min(rows.len().saturating_sub(height)),
+            text: Rect::default(),
         };
     }
     let text_width = area.right() - text_x;
     // The sideways scrollbar takes the last row; see `render_log`.
     let capacity = text_width as usize;
+    let cursor = model.cursor().line;
+    if follow {
+        let column = model.cursor_column();
+        if column < h.col {
+            h.col = column;
+        } else if column >= h.col + capacity {
+            h.col = column + 1 - capacity;
+        }
+    }
     // Clamp the scroll asked for afresh on each pass: the first pass
     // clamps it for the full height, and once the bar takes a row the
-    // last row of the diff has to be reachable again.
+    // last row of the diff has to be reachable again (and the cursor
+    // may be on it).
     let wanted = scroll;
     let mut show_bar = false;
     let mut shown;
@@ -625,7 +926,14 @@ pub(crate) fn render_diff(
     loop {
         shown = height - usize::from(show_bar);
         scroll = wanted.min(rows.len().saturating_sub(shown));
-        extent = diff_extent(diff, &rows, scroll, shown);
+        if follow {
+            if cursor < scroll {
+                scroll = cursor;
+            } else if cursor >= scroll + shown {
+                scroll = cursor + 1 - shown;
+            }
+        }
+        extent = diff_extent(diff, rows, scroll, shown);
         let needed = h.needs_bar(extent, capacity) && height > 1;
         if needed && !show_bar {
             show_bar = true;
@@ -640,9 +948,13 @@ pub(crate) fn render_diff(
     let button_style = background
         .fg(theme.active_tab_text)
         .bg(theme.command_palette_background);
+    // As a dialog draws its focused button.
+    let focused_button_style = background
+        .fg(theme.command_palette_selection_text)
+        .bg(theme.command_palette_selection_background);
 
-    for (row, entry) in rows.iter().skip(scroll).take(shown).enumerate() {
-        let y = area.y + row as u16;
+    for (row, entry) in rows.iter().enumerate().skip(scroll).take(shown) {
+        let y = area.y + (row - scroll) as u16;
         match entry {
             DiffRow::Line(line) => {
                 let (row_style, marker, marker_style) = match line.kind {
@@ -676,13 +988,23 @@ pub(crate) fn render_diff(
                         theme.syntax(kind).apply(row_style)
                     }
                 });
+                // The selection over the text drawn: its background, and
+                // the theme's text color for it if it has one, else the
+                // syntax colors. The gaps' rows are left out of it, as
+                // they are out of what it copies.
+                if let Some(selected) = model.selected_columns(row) {
+                    let from = selected.start.max(col);
+                    let to = selected.end.min(col + capacity);
+                    for column in from..to {
+                        let cell = &mut buf[(text_x + (column - col) as u16, y)];
+                        cell.set_bg(theme.selection_background);
+                        if let Some(color) = theme.selection_text {
+                            cell.set_fg(color);
+                        }
+                    }
+                }
             }
-            DiffRow::Gap {
-                gap,
-                hidden,
-                up,
-                down,
-            } => {
+            DiffRow::Gap { gap, hidden, .. } => {
                 let mut x = area.x + 1;
                 let mut place = |text: String, style: Style, button: Option<Button>| {
                     let width = display_width(&text) as u16;
@@ -696,18 +1018,27 @@ pub(crate) fn render_diff(
                     x += width + 1;
                 };
                 let step = (*hidden).min(EXPAND_LINES);
-                if *up {
-                    place(format!(" ▲ {step} "), button_style, Some(Button::Up(*gap)));
-                }
-                if *down {
-                    place(
-                        format!(" ▼ {step} "),
-                        button_style,
-                        Some(Button::Down(*gap)),
-                    );
-                }
-                if *hidden > EXPAND_LINES {
-                    place(" all ".to_owned(), button_style, Some(Button::All(*gap)));
+                let chosen = match model.action_at_cursor() {
+                    Some((_, action)) if focused && cursor == row => Some(action),
+                    _ => None,
+                };
+                for action in model.gap_actions(row) {
+                    let label = match action {
+                        GapAction::Up => format!(" ▲ {step} "),
+                        GapAction::Down => format!(" ▼ {step} "),
+                        GapAction::All => " all ".to_owned(),
+                    };
+                    let style = if chosen == Some(action) {
+                        focused_button_style
+                    } else {
+                        button_style
+                    };
+                    let button = Button {
+                        row,
+                        gap: *gap,
+                        action,
+                    };
+                    place(label, style, Some(button));
                 }
                 let noun = if *hidden == 1 { "line" } else { "lines" };
                 place(format!("⋯ {hidden} {noun} hidden"), dim, None);
@@ -724,6 +1055,7 @@ pub(crate) fn render_diff(
         rows: rows.len(),
         shown,
         scroll,
+        text: Rect::new(text_x, area.y, text_width, shown as u16),
     }
 }
 
@@ -954,6 +1286,7 @@ fn render_submodule(
         rows: rows.len(),
         shown,
         scroll,
+        text: Rect::default(),
     }
 }
 

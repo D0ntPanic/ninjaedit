@@ -50,13 +50,15 @@
 //! to the files, and Space (or a double-click) checks the commit out.
 //! In the files ↑ and ↓ choose what the right pane shows, Enter or a
 //! double-click on a file moves into it, and ← on a file goes to its
-//! directory. In the diff the arrows scroll, Page Up and Page Down by a
-//! screenful, with a scrollbar down the side saying where in the diff
-//! the pane is and how much of it shows. The wheel scrolls whichever
-//! pane it is over, sideways too.
-//! In the files and the diff, `o` opens the selected file in the editor
-//! as it is in the working directory now (one that isn't there any
-//! more has nothing to open, and the status bar says so).
+//! directory. The diff has a cursor and a selection, as the editor has,
+//! to read it by and copy from it (see the `diff_pane` module), with a
+//! scrollbar down the side saying where in the diff the pane is and
+//! how much of it shows. The wheel scrolls whichever pane it is over,
+//! sideways too. In the files and the diff, `o` opens the selected file
+//! in the editor as it is in the working directory now, from the diff
+//! at the line its cursor is on (one that isn't there any more has
+//! nothing to open, and the status bar says so). A right click in the
+//! diff opens a menu to copy the selection or select it all.
 //!
 //! A right click on a file or directory of the selected commit selects
 //! it and opens a menu of what can be done to it (the application
@@ -201,8 +203,8 @@ use crate::clipboard::Clipboard;
 use crate::commit_row::{CommitLine, Highlight, commit_extent, draw_commit_line, lane_cap};
 use crate::confirm_box::{ConfirmBox, ConfirmOutcome};
 use crate::diff_pane::{
-    ARROW_COLUMNS, Button, ContentPane, HScroll, Piece, Shown, clamp_between, display_width,
-    fit_end, share_for, share_of,
+    self, ARROW_COLUMNS, ContentPane, HScroll, Piece, Shown, ShownMut, TAB_WIDTH, clamp_between,
+    display_width, fit_end, share_for, share_of,
 };
 use crate::git_layout::{GitLogLayout, MAIN_REPOSITORY, PaneSizes};
 use crate::palette::palette_background;
@@ -211,9 +213,9 @@ use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
     ChangeKind, Checkout, CheckoutError, CheckoutJob, CheckoutOutcome, CommitDetail,
-    DeleteBranchError, Fetch, FileChange, FileDiff, FileTree, History, Integration, IntegrationJob,
-    Oid, OperationError, Outcome, RefKind, Restored, Target, TreeRow, delete_branch, left_behind,
-    reset, restore, short_id, submodules, unstaged_among,
+    DeleteBranchError, DiffModel, Fetch, FileChange, FileTree, History, Integration,
+    IntegrationJob, Oid, OperationError, Outcome, RefKind, Restored, Target, TreeRow,
+    delete_branch, left_behind, reset, restore, short_id, submodules, unstaged_among,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
@@ -298,9 +300,10 @@ const FILES_HELP: &[(&str, &str)] = &[
     ("Ctrl+E", "leave"),
 ];
 const CONTENT_HELP: &[(&str, &str)] = &[
-    ("↑↓", "scroll"),
-    ("←→", "sideways"),
-    ("▲▼", "expand context"),
+    ("↑↓←→", "move"),
+    ("Shift", "select"),
+    ("Ctrl+C", "copy"),
+    ("Enter", "expand"),
     ("o", "open"),
     ("F5", "fetch"),
     ("Tab", "pane"),
@@ -383,7 +386,7 @@ enum Content {
     Description,
     /// The files under a directory of the tree, by its index.
     Directory(usize),
-    Diff(Box<FileDiff>),
+    Diff(Box<DiffModel>),
     Failed(String),
 }
 
@@ -392,10 +395,21 @@ enum Content {
 /// [`GitLogView::content_lines`]).
 fn shown<'a>(content: Option<&'a Content>, lines: Option<&'a [Piece]>) -> Shown<'a> {
     match (content, lines) {
-        (Some(Content::Diff(diff)), _) => Shown::Diff(diff),
+        (Some(Content::Diff(model)), _) => Shown::Diff(model),
         (Some(Content::Failed(why)), _) => Shown::Note(why),
         (Some(_), Some(lines)) => Shown::Lines(lines),
         _ => Shown::Nothing,
+    }
+}
+
+/// [`shown`], for input that may move the cursor in a diff, or expand
+/// it.
+fn shown_mut<'a>(content: Option<&'a mut Content>, lines: Option<&'a [Piece]>) -> ShownMut<'a> {
+    match (content, lines) {
+        (Some(Content::Diff(model)), _) => ShownMut::Diff(model),
+        (Some(Content::Failed(why)), _) => ShownMut::Note(why),
+        (Some(_), Some(lines)) => ShownMut::Lines(lines),
+        _ => ShownMut::Nothing,
     }
 }
 
@@ -498,6 +512,8 @@ pub enum GitLogMenu {
     Files,
     /// For a branch in the sidebar.
     Branch,
+    /// For the selection in a file's diff.
+    Diff,
 }
 
 /// What the application should do after the page handled a mouse
@@ -751,8 +767,9 @@ impl GitLogTabs {
     }
 
     /// The file of the working directory the shown page asks to have
-    /// opened in the editor, if it has asked since this was last asked.
-    pub fn take_file_to_open(&mut self) -> Option<PathBuf> {
+    /// opened in the editor, if it has asked since this was last asked,
+    /// with the line (from zero) to open it at, if any.
+    pub fn take_file_to_open(&mut self) -> Option<(PathBuf, Option<usize>)> {
         self.tabs[self.active]
             .view
             .as_mut()
@@ -984,7 +1001,7 @@ pub struct GitLogView {
     /// A file of the working directory to open in the editor, asked
     /// for with `o` or "Open changed file" and not yet taken (see
     /// [`take_file_to_open`](Self::take_file_to_open)).
-    file_to_open: Option<PathBuf>,
+    file_to_open: Option<(PathBuf, Option<usize>)>,
     /// The restore box, while it asks whether to go ahead.
     restore: Option<PendingRestore>,
     /// The delete branch box, while it asks whether to go ahead.
@@ -1218,14 +1235,15 @@ impl GitLogView {
         // A submodule diff on show that couldn't find its commits
         // names them, so that the fetch brings them whatever else says.
         let wanted = match &self.content {
-            Some(Content::Diff(diff)) => diff
+            Some(Content::Diff(model)) => model
+                .diff()
                 .submodule
                 .as_ref()
                 .map(|range| {
                     range
                         .missing
                         .iter()
-                        .map(|id| (diff.path.clone(), *id))
+                        .map(|id| (model.diff().path.clone(), *id))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -1280,7 +1298,7 @@ impl GitLogView {
         // A submodule's diff is read from the submodule's repository,
         // which the fetch may have filled in: build it again. A file's
         // diff keeps its revealed context.
-        if matches!(&self.content, Some(Content::Diff(diff)) if diff.submodule.is_some()) {
+        if matches!(&self.content, Some(Content::Diff(model)) if model.diff().submodule.is_some()) {
             self.content = None;
         }
         self.refresh();
@@ -1604,20 +1622,23 @@ impl GitLogView {
         // The submodule's diff carries the commits it moved over.
         self.ensure_content();
         match &self.content {
-            Some(Content::Diff(diff)) => match diff.submodule.as_ref().and_then(|r| r.new) {
-                Some(id) => {
-                    self.submodule_jump = Some(SubmoduleJump {
-                        path: diff.path.clone(),
-                        id,
-                    });
+            Some(Content::Diff(model)) => {
+                let diff = model.diff();
+                match diff.submodule.as_ref().and_then(|r| r.new) {
+                    Some(id) => {
+                        self.submodule_jump = Some(SubmoduleJump {
+                            path: diff.path.clone(),
+                            id,
+                        });
+                    }
+                    None => {
+                        self.notice = Some(StatusLine::error(format!(
+                            "Submodule {} was removed: no commit to go to",
+                            diff.path
+                        )));
+                    }
                 }
-                None => {
-                    self.notice = Some(StatusLine::error(format!(
-                        "Submodule {} was removed: no commit to go to",
-                        diff.path
-                    )));
-                }
-            },
+            }
             Some(Content::Failed(why)) => self.notice = Some(StatusLine::error(why.clone())),
             _ => {}
         }
@@ -1642,9 +1663,10 @@ impl GitLogView {
 
     /// `o`, or "Open changed file": ask for the selected file to be
     /// opened in the editor as it is in the working directory now (see
-    /// [`GitLogTabs::take_file_to_open`]). A file that isn't there (the
-    /// commit deleted it, or a later one did) has nothing to open, and
-    /// the status bar says so.
+    /// [`GitLogTabs::take_file_to_open`]); from the diff, at the line
+    /// its cursor is on, as near as the commit's lines say. A file that
+    /// isn't there (the commit deleted it, or a later one did) has
+    /// nothing to open, and the status bar says so.
     pub fn open_selected_change(&mut self) {
         self.ensure_detail();
         let Some(change) = self.selected_change() else {
@@ -1662,7 +1684,14 @@ impl GitLogView {
         };
         let path = workdir.join(&change.path);
         if path.is_file() {
-            self.file_to_open = Some(path);
+            self.ensure_content();
+            let line = match &self.content {
+                Some(Content::Diff(model)) if self.pane == Pane::Content => {
+                    model.new_line_at_cursor()
+                }
+                _ => None,
+            };
+            self.file_to_open = Some((path, line));
         } else {
             self.notice = Some(StatusLine::info(format!(
                 "{} isn't in the working directory",
@@ -2091,7 +2120,7 @@ impl GitLogView {
             Some(TreeRow::File { file, .. }) => match detail.files.get(file) {
                 Some(file) => {
                     match history.file_diff(detail.id, &file.path, file.old_path.as_deref()) {
-                        Ok(diff) => Content::Diff(Box::new(diff)),
+                        Ok(diff) => Content::Diff(Box::new(DiffModel::new(diff, TAB_WIDTH))),
                         Err(err) => Content::Failed(err.message().to_owned()),
                     }
                 }
@@ -2750,7 +2779,7 @@ impl GitLogView {
             Pane::Sidebar => self.handle_sidebar_key(key),
             Pane::Log => self.handle_log_key(key),
             Pane::Files => self.handle_files_key(key),
-            Pane::Content => self.handle_content_key(key),
+            Pane::Content => self.handle_content_key(key, clipboard),
         }
     }
 
@@ -2868,10 +2897,52 @@ impl GitLogView {
         }
     }
 
-    fn handle_content_key(&mut self, key: KeyEvent) {
+    fn handle_content_key(&mut self, key: KeyEvent, clipboard: &mut Clipboard) {
         let lines = self.content_lines();
-        let content = shown(self.content.as_ref(), lines.as_deref());
-        self.content_pane.handle_key(key, content);
+        let content = shown_mut(self.content.as_mut(), lines.as_deref());
+        if let Some(notice) = self.content_pane.handle_key(key, content, clipboard) {
+            self.notice = Some(notice);
+        }
+    }
+
+    // ----- The diff's selection ---------------------------------------------
+
+    /// Whether the content pane shows a diff with lines, for the cursor
+    /// to move through and select in.
+    pub fn shows_diff_lines(&self) -> bool {
+        matches!(&self.content, Some(Content::Diff(model)) if !model.rows().is_empty())
+    }
+
+    /// What is selected on the page, for a search to start from: the
+    /// text selected in the diff shown.
+    pub fn selected_text(&self) -> Option<String> {
+        match &self.content {
+            Some(Content::Diff(model)) => model.selected_text(),
+            _ => None,
+        }
+    }
+
+    /// Whether anything is selected in the diff shown.
+    pub fn has_diff_selection(&self) -> bool {
+        matches!(&self.content, Some(Content::Diff(model)) if model.selection().is_some())
+    }
+
+    /// "Copy": put the diff's selection on the clipboard. Returns what
+    /// to say about it, nothing without a selection.
+    pub fn copy_diff_selection(&self, clipboard: &mut Clipboard) -> Option<StatusLine> {
+        let lines = self.content_lines();
+        diff_pane::copy(shown(self.content.as_ref(), lines.as_deref()), clipboard)
+    }
+
+    /// "Select all": select the whole diff shown, and give the keyboard
+    /// to it.
+    pub fn select_all_in_diff(&mut self) {
+        if let Some(Content::Diff(model)) = &mut self.content
+            && !model.rows().is_empty()
+        {
+            model.select_all();
+            self.pane = Pane::Content;
+        }
     }
 
     /// Whether the screen position is over the page.
@@ -3040,7 +3111,7 @@ impl GitLogView {
                 MouseEventKind::Up(_) if self.log_h.dragging => self.log_h.dragging = false,
                 MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
                     let lines = self.content_lines();
-                    let content = shown(self.content.as_ref(), lines.as_deref());
+                    let content = shown_mut(self.content.as_mut(), lines.as_deref());
                     self.content_pane.handle_mouse(mouse, wheel, content);
                 }
                 _ => {}
@@ -3061,16 +3132,18 @@ impl GitLogView {
         let Some(pane) = pane else {
             return outcome;
         };
-        // The content pane scrolls itself, and says which of a diff's
-        // expand buttons was pressed.
+        // The content pane scrolls itself, and moves a diff's cursor
+        // and selects in it; a right press in a diff with lines asks for
+        // the menu of what can be done with the selection.
         if pane == Pane::Content {
-            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.pane = Pane::Content;
             }
             let lines = self.content_lines();
-            let content = shown(self.content.as_ref(), lines.as_deref());
-            if let Some(button) = self.content_pane.handle_mouse(mouse, wheel, content) {
-                self.press(button);
+            let content = shown_mut(self.content.as_mut(), lines.as_deref());
+            self.content_pane.handle_mouse(mouse, wheel, content);
+            if mouse.kind == MouseEventKind::Down(MouseButton::Right) && self.shows_diff_lines() {
+                outcome.menu = Some(GitLogMenu::Diff);
             }
             return outcome;
         }
@@ -3191,41 +3264,45 @@ impl GitLogView {
         }
     }
 
-    /// Press one of a diff's expand buttons.
-    fn press(&mut self, button: Button) {
-        if let Some(Content::Diff(diff)) = &mut self.content {
-            button.press(diff);
-        }
-    }
-
     // ----- Rendering ------------------------------------------------------
 
     /// Draw the page into `area`. Returns where the terminal cursor
-    /// belongs: in the branch name box while it is open, and nowhere
-    /// otherwise.
+    /// belongs: in the branch name box while it is open, on a diff's
+    /// cursor while the diff has the keyboard and no box is open over
+    /// it, and nowhere otherwise.
     pub fn render(
         &mut self,
         area: Rect,
         buf: &mut Buffer,
         theme: &Theme,
     ) -> Option<ScreenPosition> {
-        self.render_panes(area, buf, theme);
+        let mut cursor = self.render_panes(area, buf, theme);
         if let Some(pending) = &mut self.restore {
             pending.dialog.render(area, buf, theme);
+            cursor = None;
         }
         if let Some(pending) = &mut self.branch_delete {
             pending.dialog.render(area, buf, theme);
+            cursor = None;
         }
         if let Some(pending) = &mut self.reset_box {
             pending.dialog.render(area, buf, theme);
+            cursor = None;
         }
         match &mut self.branch_prompt {
             Some(prompt) => prompt.render(area, buf, theme),
-            None => None,
+            None => cursor,
         }
     }
 
-    fn render_panes(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+    /// Draw the panes. Returns where the terminal cursor goes: see
+    /// [`render_content`](Self::render_content).
+    fn render_panes(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        theme: &Theme,
+    ) -> Option<ScreenPosition> {
         self.area = area;
         let background = palette_background(theme);
         buf.set_style(area, background);
@@ -3234,7 +3311,7 @@ impl GitLogView {
             self.log_area = Rect::default();
             self.files_area = Rect::default();
             self.content_area = Rect::default();
-            return;
+            return None;
         }
         if self.history.is_none() {
             let message = self.no_history_message();
@@ -3246,7 +3323,7 @@ impl GitLogView {
                 area.width as usize - 2,
                 dim,
             );
-            return;
+            return None;
         }
         self.ensure_detail();
         self.ensure_content();
@@ -3310,8 +3387,9 @@ impl GitLogView {
         self.render_log(buf, theme);
         if detail_height > 0 {
             self.render_files(buf, theme);
-            self.render_content(buf, theme);
+            return self.render_content(buf, theme);
         }
+        None
     }
 
     /// The background of a list's selected row: brighter when the pane
@@ -3623,11 +3701,14 @@ impl GitLogView {
         }
     }
 
-    fn render_content(&mut self, buf: &mut Buffer, theme: &Theme) {
+    /// Draw the content pane. Returns where the terminal cursor goes
+    /// while the pane has the keyboard: on a diff's cursor.
+    fn render_content(&mut self, buf: &mut Buffer, theme: &Theme) -> Option<ScreenPosition> {
         let lines = self.content_lines();
         let content = shown(self.content.as_ref(), lines.as_deref());
+        let focused = self.pane == Pane::Content;
         self.content_pane
-            .render(self.content_area, buf, theme, content);
+            .render(self.content_area, buf, theme, content, focused)
     }
 }
 
@@ -3794,6 +3875,10 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn ctrl_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -4271,8 +4356,11 @@ mod tests {
         assert_ne!(tabs.active().selected_commit(), Some(subs[2]));
     }
 
-    #[test]
-    fn gap_buttons_reveal_hidden_lines() {
+    /// A repository whose last commit changes `line 20` of a forty-line
+    /// `f.txt` to `line twenty`, with a page showing that file's diff,
+    /// the keyboard in it. Its rows: a gap of 16 lines, lines 17 to 19,
+    /// the change, lines 21 to 23, and a gap of 17.
+    fn diff_of_a_changed_line() -> (tempfile::TempDir, GitLogView) {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         let sig = Signature::now("T", "t@example.com").unwrap();
@@ -4298,6 +4386,221 @@ mod tests {
         view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
         view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        assert_eq!(view.pane, Pane::Content);
+        (dir, view)
+    }
+
+    #[test]
+    fn the_diff_has_a_cursor_that_moves_selects_and_copies() {
+        let (_dir, mut view) = diff_of_a_changed_line();
+        let mut clipboard = Clipboard::local_only();
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 90, 30);
+        // The screen, and where the terminal's cursor is.
+        let render = |view: &mut GitLogView| {
+            let mut buf = Buffer::empty(area);
+            let cursor = view.render(area, &mut buf, &theme);
+            (buf, cursor)
+        };
+        let screen = draw(&mut view, 90, 30);
+        let row_of = |text: &str| screen.iter().position(|r| r.contains(text)).unwrap() as u16;
+        let (line_17, line_19) = (row_of("line 17"), row_of("line 19"));
+        let text_x = column_of(&screen[line_17 as usize], "line 17");
+        // The cursor starts on the first row, the gap above the change,
+        // on its first button, which is drawn as focused.
+        let gap_row = line_17 - 1;
+        let up = column_of(&screen[gap_row as usize], "▲");
+        let (buf, cursor) = render(&mut view);
+        assert_eq!(cursor, Some(ScreenPosition::new(up, gap_row)));
+        assert_eq!(
+            buf[(up, gap_row)].bg,
+            theme.command_palette_selection_background
+        );
+        // → goes on to its next button, and → again to the next row.
+        view.handle_key(key(KeyCode::Right), &mut clipboard);
+        let all = column_of(&screen[gap_row as usize], "all");
+        let (buf, cursor) = render(&mut view);
+        assert_eq!(cursor, Some(ScreenPosition::new(all, gap_row)));
+        assert_ne!(
+            buf[(up, gap_row)].bg,
+            theme.command_palette_selection_background
+        );
+        view.handle_key(key(KeyCode::Left), &mut clipboard);
+        // Down to line 17 and along it, past "line ".
+        view.handle_key(key(KeyCode::Down), &mut clipboard);
+        for _ in 0..5 {
+            view.handle_key(key(KeyCode::Right), &mut clipboard);
+        }
+        let (_, cursor) = render(&mut view);
+        assert_eq!(cursor, Some(ScreenPosition::new(text_x + 5, line_17)));
+        // Shift+End selects to the end of the line, drawn in the
+        // selection's colors, and the terminal's cursor hides.
+        view.handle_key(
+            KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT),
+            &mut clipboard,
+        );
+        let (buf, cursor) = render(&mut view);
+        assert_eq!(cursor, None);
+        assert_eq!(buf[(text_x + 5, line_17)].bg, theme.selection_background);
+        assert_eq!(buf[(text_x + 6, line_17)].bg, theme.selection_background);
+        assert_ne!(buf[(text_x + 4, line_17)].bg, theme.selection_background);
+        // Ctrl+C copies it, and says so.
+        view.handle_key(ctrl_key(KeyCode::Char('c')), &mut clipboard);
+        assert_eq!(clipboard.get().as_deref(), Some("17"));
+        assert_eq!(
+            notice_of(&mut view).as_deref(),
+            Some("Copied 1 line to the clipboard")
+        );
+        // Down over the removed line: the text as shown, without the
+        // diff's markers.
+        for _ in 0..3 {
+            view.handle_key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+                &mut clipboard,
+            );
+        }
+        view.handle_key(ctrl_key(KeyCode::Char('c')), &mut clipboard);
+        assert_eq!(
+            clipboard.get().as_deref(),
+            Some("17\nline 18\nline 19\nline 20")
+        );
+        assert_eq!(
+            notice_of(&mut view).as_deref(),
+            Some("Copied 4 lines to the clipboard")
+        );
+        // Escape clears the selection, and the cursor shows again.
+        view.handle_key(key(KeyCode::Esc), &mut clipboard);
+        let (_, cursor) = render(&mut view);
+        assert_eq!(cursor, Some(ScreenPosition::new(text_x + 7, line_19 + 1)));
+        // Ctrl+End goes to the gap at the end, onto its last button,
+        // all; ← goes back to ▼, and Enter presses it: ten lines below
+        // the change appear, the cursor still on ▼.
+        view.handle_key(ctrl_key(KeyCode::End), &mut clipboard);
+        view.handle_key(key(KeyCode::Left), &mut clipboard);
+        view.handle_key(key(KeyCode::Enter), &mut clipboard);
+        let (_, cursor) = render(&mut view);
+        let screen = draw(&mut view, 90, 30);
+        let gap_row = screen
+            .iter()
+            .position(|r| r.contains("7 lines hidden"))
+            .unwrap_or_else(|| panic!("{screen:#?}"));
+        assert!(screen.iter().any(|r| r.contains("line 33")), "{screen:#?}");
+        let down = column_of(&screen[gap_row], "▼");
+        assert_eq!(cursor, Some(ScreenPosition::new(down, gap_row as u16)));
+        // Again, and the rest appear, the cursor on the first of them.
+        view.handle_key(key(KeyCode::Enter), &mut clipboard);
+        let screen = draw(&mut view, 90, 30);
+        assert!(
+            !screen.iter().any(|r| r.contains("7 lines hidden")),
+            "{screen:#?}"
+        );
+        let line_34 = screen.iter().position(|r| r.contains("line 34")).unwrap() as u16;
+        let (_, cursor) = render(&mut view);
+        assert_eq!(cursor, Some(ScreenPosition::new(text_x, line_34)));
+    }
+
+    #[test]
+    fn the_mouse_puts_the_cursor_in_the_diff_and_selects() {
+        let (_dir, mut view) = diff_of_a_changed_line();
+        let screen = draw(&mut view, 90, 30);
+        let row_of = |text: &str| screen.iter().position(|r| r.contains(text)).unwrap() as u16;
+        let (line_18, twenty, line_22) =
+            (row_of("line 18"), row_of("line twenty"), row_of("line 22"));
+        let text_x = column_of(&screen[line_18 as usize], "line 18");
+        let selected = |view: &GitLogView| match &view.content {
+            Some(Content::Diff(model)) => model.selected_text(),
+            _ => None,
+        };
+        let mouse = |view: &mut GitLogView, kind, column, row| {
+            view.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                WHEEL,
+            )
+        };
+        // A press puts the cursor there, and a drag selects from it.
+        mouse(
+            &mut view,
+            MouseEventKind::Down(MouseButton::Left),
+            text_x + 5,
+            twenty,
+        );
+        mouse(
+            &mut view,
+            MouseEventKind::Drag(MouseButton::Left),
+            text_x + 4,
+            line_22,
+        );
+        assert!(view.is_dragging());
+        mouse(
+            &mut view,
+            MouseEventKind::Up(MouseButton::Left),
+            text_x + 4,
+            line_22,
+        );
+        assert!(!view.is_dragging());
+        assert_eq!(selected(&view).as_deref(), Some("twenty\nline 21\nline"));
+        // A double-click selects a word.
+        for _ in 0..2 {
+            mouse(
+                &mut view,
+                MouseEventKind::Down(MouseButton::Left),
+                text_x + 7,
+                twenty,
+            );
+            mouse(
+                &mut view,
+                MouseEventKind::Up(MouseButton::Left),
+                text_x + 7,
+                twenty,
+            );
+        }
+        assert_eq!(selected(&view).as_deref(), Some("twenty"));
+        // A press in the line numbers selects the whole line.
+        let numbers_x = view.content_area.x + 1;
+        mouse(
+            &mut view,
+            MouseEventKind::Down(MouseButton::Left),
+            numbers_x,
+            line_18,
+        );
+        mouse(
+            &mut view,
+            MouseEventKind::Up(MouseButton::Left),
+            numbers_x,
+            line_18,
+        );
+        assert_eq!(selected(&view).as_deref(), Some("line 18\n"));
+        // A right press in the selection keeps it, and asks for the menu.
+        let outcome = mouse(
+            &mut view,
+            MouseEventKind::Down(MouseButton::Right),
+            text_x + 2,
+            line_18,
+        );
+        assert_eq!(outcome.menu, Some(GitLogMenu::Diff));
+        assert_eq!(selected(&view).as_deref(), Some("line 18\n"));
+        assert!(view.has_diff_selection());
+        let mut clipboard = Clipboard::local_only();
+        assert!(view.copy_diff_selection(&mut clipboard).is_some());
+        assert_eq!(clipboard.get().as_deref(), Some("line 18\n"));
+        // Outside it, the press moves the cursor there first.
+        mouse(
+            &mut view,
+            MouseEventKind::Down(MouseButton::Right),
+            text_x + 2,
+            line_22,
+        );
+        assert!(!view.has_diff_selection());
+    }
+
+    #[test]
+    fn gap_buttons_reveal_hidden_lines() {
+        let (_dir, mut view) = diff_of_a_changed_line();
         let screen = draw(&mut view, 90, 30);
         let gap = screen
             .iter()
@@ -4317,18 +4620,26 @@ mod tests {
             screen[last].contains("▼ 10") && !screen[last].contains("▲"),
             "{screen:#?}"
         );
-        // Press ▲ on the first gap: ten lines above the hunk appear.
+        // Press ▲ on the first gap: ten lines above the hunk appear, and
+        // the cursor goes to the button, for Enter to press it again.
         let x = column_of(&screen[gap], "▲");
         click(&mut view, x, gap as u16);
+        let Some(Content::Diff(model)) = &view.content else {
+            panic!("the file's diff is shown");
+        };
+        assert_eq!(
+            model.action_at_cursor(),
+            Some((0, ninjaedit_core::git::GapAction::Up))
+        );
         let screen = draw(&mut view, 90, 30);
         assert!(
             screen.iter().any(|r| r.contains("6 lines hidden")),
             "{screen:#?}"
         );
         assert!(screen.iter().any(|r| r.contains(" line 7")), "{screen:#?}");
-        // "all" on the last gap (End scrolls down to it) reveals the
-        // rest of the file.
-        view.handle_key(key(KeyCode::End), &mut Clipboard::new());
+        // "all" on the last gap (Ctrl+End takes the cursor down to it)
+        // reveals the rest of the file.
+        view.handle_key(ctrl_key(KeyCode::End), &mut Clipboard::new());
         let screen = draw(&mut view, 90, 30);
         let last = screen
             .iter()
@@ -4336,7 +4647,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{screen:#?}"));
         let x = column_of(&screen[last], "all");
         click(&mut view, x, last as u16);
-        view.handle_key(key(KeyCode::End), &mut Clipboard::new());
+        view.handle_key(ctrl_key(KeyCode::End), &mut Clipboard::new());
         let screen = draw(&mut view, 90, 30);
         assert!(screen.iter().any(|r| r.contains("line 40")), "{screen:#?}");
         assert!(
@@ -4751,10 +5062,9 @@ mod tests {
             "{screen:#?}"
         );
         let number_column = column_of(&screen[line], "1 +");
-        for _ in 0..50 {
-            view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
-        }
-        let col = view.content_pane.h().col;
+        // End takes the cursor to the end of the line, and the view
+        // follows it there, the line numbers staying put.
+        view.handle_key(key(KeyCode::End), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 30);
         assert!(screen[line].contains("TAIL"), "{screen:#?}");
         assert_eq!(
@@ -4762,23 +5072,41 @@ mod tests {
             number_column,
             "{screen:#?}"
         );
+        assert!(view.content_pane.h().col > 0);
+        // The wheel scrolls sideways as far as the longest line shown
+        // and a little more, as in the editor.
+        let wheel = |view: &mut GitLogView, kind| {
+            let area = view.content_area;
+            view.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column: area.x + 10,
+                    row: area.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                WHEEL,
+            );
+        };
+        for _ in 0..50 {
+            wheel(&mut view, MouseEventKind::ScrollRight);
+        }
+        let col = view.content_pane.h().col;
         let Some(Content::Diff(diff)) = &view.content else {
             panic!("the file's diff is shown");
         };
         let extent = view.content_pane.extent(Shown::Diff(diff));
         assert_eq!(col, extent + HSCROLL_SLACK - view.content_pane.h().capacity);
-        // ← scrolls back to the edge, and stays in the diff there.
-        for _ in 0..100 {
-            view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
-        }
-        assert_eq!(view.pane, Pane::Content);
-        assert_eq!(view.content_pane.h().col, 0);
-        view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
-        assert_eq!(view.content_pane.h().col, ARROW_COLUMNS);
-        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
+        // Home takes the cursor back to the start and the view with it;
+        // ← there stays in the diff.
+        view.handle_key(key(KeyCode::Home), &mut Clipboard::new());
+        draw(&mut view, 100, 30);
         assert_eq!(view.content_pane.h().col, 0);
         view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Content);
+        wheel(&mut view, MouseEventKind::ScrollRight);
+        assert_eq!(view.content_pane.h().col, WHEEL);
+        wheel(&mut view, MouseEventKind::ScrollLeft);
+        assert_eq!(view.content_pane.h().col, 0);
         // Coming back to the file starts at the left again, and the
         // description, with nothing out of view, has no scrollbar.
         view.handle_key(key(KeyCode::BackTab), &mut Clipboard::new());
@@ -4863,7 +5191,7 @@ mod tests {
         let thumb = track.chars().filter(|c| *c == '█').count();
         assert!(thumb < bar.height as usize / 2, "{track:?}");
         // At the end of the diff it is at the bottom.
-        view.handle_key(key(KeyCode::End), &mut Clipboard::new());
+        view.handle_key(ctrl_key(KeyCode::End), &mut Clipboard::new());
         let track = column(&draw(&mut view, 100, 30));
         assert!(track.starts_with('│') && track.ends_with('█'), "{track:?}");
         // A click halfway down the bar scrolls halfway through the
@@ -4914,7 +5242,7 @@ mod tests {
         view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Content);
-        view.handle_key(key(KeyCode::End), &mut Clipboard::new());
+        view.handle_key(ctrl_key(KeyCode::End), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 30);
         let content_bottom = view.content_area.bottom() as usize - 1;
         assert!(
@@ -4927,10 +5255,12 @@ mod tests {
         );
         let (rows, shown) = view.content_pane.rows();
         assert_eq!(view.content_pane.scroll() + shown, rows);
-        // Scrolling down a line at a time gets there too.
-        view.handle_key(key(KeyCode::Home), &mut Clipboard::new());
+        // Scrolling down a line at a time (Ctrl+↓, which leaves the
+        // cursor at the top) gets there too.
+        view.handle_key(ctrl_key(KeyCode::Home), &mut Clipboard::new());
+        draw(&mut view, 100, 30);
         for _ in 0..100 {
-            view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+            view.handle_key(ctrl_key(KeyCode::Down), &mut Clipboard::new());
         }
         let screen = draw(&mut view, 100, 30);
         assert!(
@@ -6065,19 +6395,21 @@ mod tests {
         let top = file_row_of(tabs.active(), "top.txt");
         tabs.active().select_file(top);
         assert!(tabs.active().can_open_selected_change());
-        // `o` from the file list, or from the diff.
+        // `o` from the file list, or from the diff, which opens it at
+        // the line of the diff's cursor.
         let mut clipboard = Clipboard::local_only();
         tabs.active().pane = Pane::Files;
         tabs.handle_key(key(KeyCode::Char('o')), &mut clipboard);
-        let path = tabs.take_file_to_open().unwrap();
+        let (path, line) = tabs.take_file_to_open().unwrap();
         assert_eq!(
             fs::canonicalize(path).unwrap(),
             fs::canonicalize(dir.path().join("top.txt")).unwrap()
         );
+        assert_eq!(line, None);
         assert_eq!(tabs.take_file_to_open(), None);
         tabs.active().pane = Pane::Content;
         tabs.handle_key(key(KeyCode::Char('o')), &mut clipboard);
-        assert!(tabs.take_file_to_open().is_some());
+        assert!(matches!(tabs.take_file_to_open(), Some((_, Some(_)))));
         // The palette's and the menu's "Open changed file" does the same.
         tabs.open_selected_change();
         assert!(tabs.take_file_to_open().is_some());

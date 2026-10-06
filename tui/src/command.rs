@@ -275,6 +275,12 @@ pub struct Context {
     /// the project's own. A property of where the user is in the
     /// project, not of what the editor is doing.
     pub has_repository: bool,
+    /// On the git pages, whether a diff with lines is shown, to select
+    /// in.
+    pub shows_diff: bool,
+    /// On the git pages, whether anything is selected in the diff shown,
+    /// to copy.
+    pub diff_has_selection: bool,
 }
 
 impl Command {
@@ -362,8 +368,8 @@ impl Command {
             | Command::CloseTab
             | Command::Find
             | Command::GoToLine
-            | Command::Paste
-            | Command::SelectAll => file.is_some(),
+            | Command::Paste => file.is_some(),
+            Command::SelectAll => file.is_some() || context.shows_diff,
             Command::DiscardChanges => file.is_some_and(|f| f.modified),
             Command::FindNext => file.is_some_and(|f| f.can_find_next),
             Command::NextConflict | Command::PreviousConflict => {
@@ -371,7 +377,8 @@ impl Command {
             }
             Command::Undo => file.is_some_and(|f| f.can_undo),
             Command::Redo => file.is_some_and(|f| f.can_redo),
-            Command::Cut | Command::Copy => file.is_some_and(|f| f.has_selection),
+            Command::Cut => file.is_some_and(|f| f.has_selection),
+            Command::Copy => file.is_some_and(|f| f.has_selection) || context.diff_has_selection,
             Command::Build | Command::Run | Command::DeleteBuildDir => build.has_current,
             Command::StopJob => context.job_running,
             Command::SelectConfiguration => build.has_configurations,
@@ -507,7 +514,7 @@ impl Command {
             Command::Cut => "Cut the selection to the clipboard",
             Command::Copy => "Copy the selection to the clipboard",
             Command::Paste => "Paste from the clipboard",
-            Command::SelectAll => "Select the whole file",
+            Command::SelectAll => "Select the whole file, or the whole diff on a git page",
             Command::Build => "Build the current target with the current configuration",
             Command::Run => "Build and run the current target",
             Command::StopJob => {
@@ -896,6 +903,36 @@ mod tests {
         let listed = available(&changes);
         assert!(listed.contains(&Command::OpenChange));
         assert!(restore.iter().all(|c| !listed.contains(c)), "{listed:?}");
+    }
+
+    #[test]
+    fn a_diff_on_a_git_page_offers_selecting_and_copying() {
+        for page in [Page::GitLog, Page::Changes] {
+            let none = Context {
+                page,
+                ..Context::default()
+            };
+            let listed = available(&none);
+            assert!(!listed.contains(&Command::SelectAll), "{listed:?}");
+            assert!(!listed.contains(&Command::Copy), "{listed:?}");
+            // A diff can be selected in, and copied from once it is.
+            let diff = Context {
+                shows_diff: true,
+                ..none
+            };
+            let listed = available(&diff);
+            assert!(listed.contains(&Command::SelectAll), "{listed:?}");
+            assert!(!listed.contains(&Command::Copy), "{listed:?}");
+            let selected = Context {
+                diff_has_selection: true,
+                ..diff
+            };
+            let listed = available(&selected);
+            assert!(listed.contains(&Command::Copy), "{listed:?}");
+            // The editor's other edits stay the editor's.
+            assert!(!listed.contains(&Command::Cut), "{listed:?}");
+            assert!(!listed.contains(&Command::Paste), "{listed:?}");
+        }
     }
 
     #[test]

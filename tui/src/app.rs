@@ -18,8 +18,10 @@
 //!
 //! The project search dialog (Ctrl+Shift+F) searches every file in the
 //! project; see the `project_search` module. It is seeded from a
-//! single-line selection like the search box, but only when that text
-//! isn't what it is already searching for: otherwise it comes back just
+//! single-line selection like the search box (on a git page, where
+//! Ctrl+F opens it, the selection in the diff, or in the commit message
+//! while that has the keyboard), but only when that text isn't what it
+//! is already searching for: otherwise it comes back just
 //! as it was closed, so that Enter (go to the match, closing the dialog)
 //! and Ctrl+Shift+F, Down, Enter work through the matches one by one.
 //! Either way the query is selected, so typing starts a new search.
@@ -398,6 +400,13 @@ const EDITOR_MENU: &[MenuEntry] = &[
     MenuEntry::Command(Command::Cut),
     MenuEntry::Command(Command::Copy),
     MenuEntry::Command(Command::Paste),
+    MenuEntry::Separator,
+    MenuEntry::Command(Command::SelectAll),
+];
+/// What a right click in a diff on the git pages offers: copying what is
+/// selected, and selecting it all.
+const DIFF_MENU: &[MenuEntry] = &[
+    MenuEntry::Command(Command::Copy),
     MenuEntry::Separator,
     MenuEntry::Command(Command::SelectAll),
 ];
@@ -1374,6 +1383,7 @@ impl App {
             GitLogMenu::Commit => GIT_LOG_COMMIT_MENU,
             GitLogMenu::Files => GIT_LOG_MENU,
             GitLogMenu::Branch => GIT_LOG_BRANCH_MENU,
+            GitLogMenu::Diff => DIFF_MENU,
         };
         self.context_menu = ContextMenu::new(entries, &context, x, y);
     }
@@ -1545,6 +1555,10 @@ impl App {
             merging: changes.is_some_and(|view| view.is_merging()),
             rebasing: changes.is_some_and(|view| view.is_rebasing()),
             has_repository: self.heads.head(self.status_repository()).is_some(),
+            shows_diff: changes.is_some_and(|view| view.shows_diff_lines())
+                || log.is_some_and(|view| view.shows_diff_lines()),
+            diff_has_selection: changes.is_some_and(|view| view.has_diff_selection())
+                || log.is_some_and(|view| view.has_diff_selection()),
         }
     }
 
@@ -1567,9 +1581,9 @@ impl App {
             Command::Undo => self.press_editor_key('z'),
             Command::Redo => self.press_editor_key('y'),
             Command::Cut => self.press_editor_key('x'),
-            Command::Copy => self.press_editor_key('c'),
+            Command::Copy => self.copy(),
             Command::Paste => self.press_editor_key('v'),
-            Command::SelectAll => self.press_editor_key('a'),
+            Command::SelectAll => self.select_all(),
             Command::Build => self.build(),
             Command::Run => self.run(),
             Command::StopJob => self.stop_job(),
@@ -1702,9 +1716,21 @@ impl App {
         if let Some(notice) = notice {
             self.status = Some(notice);
         }
-        if let Some(path) = open {
+        if let Some((path, line)) = open {
             self.enter_editor();
-            self.open_file(&path);
+            self.open_file_at_line(&path, line);
+        }
+    }
+
+    /// Open a file in the editor, at a line (from zero) when one is
+    /// given.
+    fn open_file_at_line(&mut self, path: &Path, line: Option<usize>) {
+        self.open_file(path);
+        if let Some(line) = line
+            && let Some(tab) = self.tabs.get_mut(self.active)
+            && tab.path() == Some(path)
+        {
+            tab.view.go_to_line(line);
         }
     }
 
@@ -1736,6 +1762,29 @@ impl App {
     /// source of what it does. With a mode in the editor's place there
     /// is no editor to press it in. An edit made this way from a tool
     /// brings the editor into focus, so it can be seen.
+    /// "Copy": the selection in the editor, or in a git page's diff.
+    fn copy(&mut self) {
+        let notice = match &mut self.mode {
+            Mode::GitLog(tabs) => tabs.active().copy_diff_selection(&mut self.clipboard),
+            Mode::Changes(tabs) => tabs.active().copy_diff_selection(&mut self.clipboard),
+            _ => return self.press_editor_key('c'),
+        };
+        if let Some(notice) = notice {
+            self.status = Some(notice);
+        }
+    }
+
+    /// "Select all": in the editor, or a git page's diff, which gets the
+    /// keyboard.
+    fn select_all(&mut self) {
+        match &mut self.mode {
+            Mode::GitLog(tabs) => tabs.active().select_all_in_diff(),
+            Mode::Changes(tabs) => tabs.active().select_all_in_diff(),
+            _ => return self.press_editor_key('a'),
+        }
+        self.focus = Focus::Editor;
+    }
+
     fn press_editor_key(&mut self, letter: char) {
         if !matches!(self.mode, Mode::Editor) {
             return;
@@ -2204,9 +2253,13 @@ impl App {
         match outcome {
             ChangesOutcome::Continue => {}
             ChangesOutcome::Notice(message) => self.status = Some(message),
-            ChangesOutcome::OpenFile { path, conflicted } => {
+            ChangesOutcome::OpenFile {
+                path,
+                conflicted,
+                line,
+            } => {
                 self.enter_editor();
-                self.open_file(&path);
+                self.open_file_at_line(&path, line);
                 // A failure to open is in the status bar; the cursor
                 // goes to the first conflict of the file that opened.
                 if conflicted && self.status.is_none() {
@@ -2661,11 +2714,11 @@ impl App {
         self.goto_line = None;
         self.new_branch = None;
         self.hide_project_search();
+        let seed = self.search_seed();
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
         let editor = tab.view.editor_mut_in_place();
-        let seed = single_line_selection(editor);
         editor.start_search();
         let mut search_box = SearchBox::new();
         let seeded = seed.is_some();
@@ -2914,11 +2967,25 @@ impl App {
 
     // ----- Project search -------------------------------------------------
 
+    /// What a search opened now starts out looking for: the text
+    /// selected in whatever shows in the editor's place (the active
+    /// tab, or a git page's diff or commit message), when the selection
+    /// lies within one line.
+    fn search_seed(&self) -> Option<String> {
+        let selected = match &self.mode {
+            Mode::Editor => self.tabs.get(self.active)?.view.editor().selected_text(),
+            Mode::GitLog(tabs) => tabs.active_view()?.selected_text(),
+            Mode::Changes(tabs) => tabs.active_view()?.selected_text(),
+            _ => None,
+        };
+        selected.filter(|text| !text.contains(['\n', '\r']))
+    }
+
     /// Ctrl+Shift+F: show the project search dialog, seeded with the
-    /// active tab's selection when that lies within one line and isn't
-    /// what the dialog is already searching for; otherwise the dialog
-    /// comes back as it was, its query selected so that typing replaces
-    /// it.
+    /// selection when that lies within one line and isn't what the
+    /// dialog is already searching for (see
+    /// [`search_seed`](Self::search_seed)); otherwise the dialog comes
+    /// back as it was, its query selected so that typing replaces it.
     fn open_project_search(&mut self) {
         self.show_project_search(None);
     }
@@ -2931,11 +2998,7 @@ impl App {
             return;
         };
         let query = search_box.query().to_owned();
-        let seed = self
-            .tabs
-            .get(self.active)
-            .and_then(|tab| single_line_selection(tab.view.editor()))
-            .map(|seed| literal_query(&seed));
+        let seed = self.search_seed().map(|seed| literal_query(&seed));
         let typed = !query.is_empty() && seed.as_deref() != Some(query.as_str());
         self.show_project_search(typed.then_some(query));
     }
@@ -2947,10 +3010,7 @@ impl App {
         self.palette = None;
         self.goto_line = None;
         self.new_branch = None;
-        let seed = self
-            .tabs
-            .get(self.active)
-            .and_then(|tab| single_line_selection(tab.view.editor()));
+        let seed = self.search_seed();
         self.close_search_box(true);
         // Files with unsaved changes are searched as their editors have
         // them; the dialog notices when these differ from last time.
@@ -4000,6 +4060,10 @@ impl App {
                     if outcome.menu {
                         self.open_changes_menu(x, y);
                     }
+                    if outcome.diff_menu {
+                        let context = self.command_context();
+                        self.context_menu = ContextMenu::new(DIFF_MENU, &context, x, y);
+                    }
                 }
                 _ => {}
             }
@@ -4054,12 +4118,7 @@ impl App {
         let copied = tool.view_mut().take_copied();
         tool.write(bytes);
         if let Some(text) = copied {
-            let lines = text.lines().count();
-            self.status = Some(StatusLine::info(if lines == 1 {
-                "Copied 1 line to the clipboard".to_owned()
-            } else {
-                format!("Copied {lines} lines to the clipboard")
-            }));
+            self.status = Some(StatusLine::copied(&text));
             self.clipboard.set(text);
         }
     }
@@ -4608,14 +4667,6 @@ fn render_empty(area: Rect, buf: &mut Buffer, theme: &Theme, project: &Project) 
         };
         buf.set_stringn(x, y, text, area.width as usize, style);
     }
-}
-
-/// The selected text, when the selection lies within one line: what a
-/// search opened over it starts out looking for.
-fn single_line_selection(editor: &Editor) -> Option<String> {
-    editor
-        .selected_text()
-        .filter(|text| !text.contains(['\n', '\r']))
 }
 
 /// The directory part of a displayed path, or empty for a bare file name.
@@ -8781,6 +8832,52 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.tabs[app.active].title(), "b.rs");
         assert_eq!(app.tabs[app.active].view.editor().selection(), Some(3..9));
+    }
+
+    #[test]
+    fn a_git_pages_selection_seeds_the_project_search() {
+        let (dir, mut app) = app_with_files(&[("a.txt", "needle here\n")]);
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".storage/\n").unwrap();
+        let mut index = repo.index().unwrap();
+        for path in [".gitignore", "a.txt"] {
+            index.add_path(Path::new(path)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Add", &tree, &[])
+            .unwrap();
+        // A selection in the editor, left behind for the git log.
+        app.tabs[app.active].view.editor_mut().set_selection(7, 11);
+        ctrl(&mut app, 'l');
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Mode::GitLog(tabs) = &app.mode
+            && tabs.is_loading()
+            && Instant::now() < deadline
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Into the commit's files, down past .gitignore to a.txt, and
+        // into its diff. With nothing selected there, the editor's
+        // selection behind the page doesn't seed the search.
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        draw(&mut app, 100, 24);
+        ctrl(&mut app, 'f');
+        assert!(app.project_search_open);
+        assert_eq!(app.project_search.as_ref().unwrap().query(), "");
+        press(&mut app, KeyCode::Esc);
+        // A word selected in the diff does.
+        app.handle_event(key(
+            KeyCode::Right,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        ctrl(&mut app, 'f');
+        assert_eq!(app.project_search.as_ref().unwrap().query(), "needle");
     }
 
     #[test]

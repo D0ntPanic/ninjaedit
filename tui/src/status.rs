@@ -61,6 +61,16 @@ impl StatusLine {
         StatusLine::Error(text.into())
     }
 
+    /// What was put on the clipboard, by how many lines it has.
+    pub fn copied(text: &str) -> StatusLine {
+        let lines = text.lines().count();
+        StatusLine::info(if lines == 1 {
+            "Copied 1 line to the clipboard".to_owned()
+        } else {
+            format!("Copied {lines} lines to the clipboard")
+        })
+    }
+
     pub fn progress(text: impl Into<String>) -> StatusLine {
         StatusLine::Progress(text.into())
     }
