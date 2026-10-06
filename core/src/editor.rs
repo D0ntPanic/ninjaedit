@@ -8,7 +8,7 @@
 //!
 //! Positions are byte offsets into the buffer, which is what the buffer's own
 //! line and range queries use. A "character" for movement is a grapheme
-//! cluster (see the [`text`](crate::text) module), so the cursor is always
+//! cluster (see the [`text`] module), so the cursor is always
 //! kept on a cluster boundary: never inside a multi-byte sequence, between a
 //! base character and its combining marks, or inside a CRLF pair.
 //! [`Position`] converts to and from line/column pairs for display, where a
@@ -43,12 +43,12 @@
 //! [`Editor::line_cells`] reports each character's [`TokenKind`] for the
 //! frontend to style. Merge conflict markers are highlighted in every
 //! language, and [`Editor::conflict_side`] says which side of a conflict a
-//! line is on so a frontend can tint it. See the [`syntax`](crate::syntax)
+//! line is on so a frontend can tint it. See the [`syntax`]
 //! module. [`Editor::next_conflict`] and [`Editor::previous_conflict`]
 //! move the cursor from conflict to conflict, wrapping around the buffer.
 //!
 //! Indentation: the editor guesses the buffer's [`Indentation`] style when
-//! it is created (see the [`indent`](crate::indent) module) and uses it for
+//! it is created (see the [`indent`] module) and uses it for
 //! [`Editor::indent`] and [`Editor::outdent`], which the frontend binds to
 //! Tab and Shift+Tab. With a selection they shift whole lines; without one,
 //! Tab inserts one level at the cursor and Shift+Tab shifts the cursor's
@@ -64,7 +64,7 @@
 //! Moving the cursor, or any other edit, discards it.
 //!
 //! Typing code: the indentation of a new line is predicted from the code
-//! before it (see the [`auto_indent`](crate::auto_indent) module), so a
+//! before it (see the [`auto_indent`] module), so a
 //! line after `if x {` or `def f():` is indented a level deeper, and one
 //! after the end of a statement goes back to the level the statement
 //! started at. Typing an opening bracket inserts its closing one after the
@@ -96,7 +96,7 @@
 //! change and brings it in. With no unsaved edits the buffer simply takes
 //! the new contents. With unsaved edits, the buffer's changes and the
 //! file's are merged three ways from the remembered contents, the way git
-//! merges branches (see the [`merge`](crate::merge) module); overlapping
+//! merges branches (see the [`merge`] module); overlapping
 //! changes are left as conflict markers for the user to resolve. Either
 //! way the change lands as one ordinary undoable edit, so "I didn't want
 //! that" is just undo, and undo then save puts the buffer's own version
@@ -461,7 +461,7 @@ impl Editor {
 
     /// Whether the file holds a merge conflict, so that stepping between
     /// conflicts has somewhere to go. Read from the buffer like
-    /// [`conflict_starts`](Self::conflict_starts), stopping at the
+    /// `conflict_starts`, stopping at the
     /// first.
     pub fn has_conflicts(&self) -> bool {
         let snapshot = self.buffer.snapshot();
@@ -932,7 +932,7 @@ impl Editor {
     ///   indentation) moves the line level with the statement of the
     ///   bracket it closes; likewise `{` in C-like languages, level with
     ///   the statement it opens the body of. See the
-    ///   [`auto_indent`](crate::auto_indent) module.
+    ///   [`auto_indent`] module.
     /// * A `:` completing a `case` label or a Python `else:` (and the like)
     ///   moves the line level with the label or block it continues.
     /// * Any other character finishing a Ruby `end`, `else`, `when`, ... at
@@ -1155,7 +1155,7 @@ impl Editor {
     }
 
     /// A line's content, with which bytes are code, as the
-    /// [`auto_indent`](crate::auto_indent) rules read it.
+    /// [`auto_indent`] rules read it.
     fn code_line(&self, line: usize) -> CodeLine {
         let content = self
             .buffer
@@ -1176,7 +1176,7 @@ impl Editor {
 
     /// Insert a line break at the cursor (replacing the selection),
     /// indenting the new line by the rules of the
-    /// [`auto_indent`](crate::auto_indent) module. When the cursor is in
+    /// [`auto_indent`] module. When the cursor is in
     /// a line's leading whitespace, the whitespace before it is carried on
     /// instead. When nothing follows the cursor on its line, the
     /// indentation becomes pending on the new line; otherwise the text

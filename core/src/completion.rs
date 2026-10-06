@@ -11,7 +11,7 @@
 //! request and then answers requests one at a time. The prompts of a
 //! model of several languages name the language, as its training
 //! documents do; a model of one is trained without it. Models name
-//! languages as the training corpus does (see [`model_language`]), which
+//! languages as the training corpus does (see `model_language`), which
 //! mostly follows the editor's syntax, but not always: a `Cargo.toml` is
 //! TOML to the editor and `cargo` to a model. Inference is
 //! slow next to typing, so a request supersedes any earlier one that hasn't started,
@@ -95,7 +95,7 @@ pub struct CompletionRequest {
     /// The file the buffer was loaded from, if any. The model was trained
     /// with each file opening with the name of its module (a crate, or a
     /// source package) and its path in it, so the prompt opens with them
-    /// too when they can be named; see [`location_of`].
+    /// too when they can be named; see `location_of`.
     pub path: Option<PathBuf>,
 }
 
@@ -254,7 +254,7 @@ pub struct Completer {
     /// The workers, by checkpoint directory.
     workers: HashMap<PathBuf, Worker>,
     /// The model each language's requests go to, by the name models know
-    /// the language by (see [`model_language`]).
+    /// the language by (see `model_language`).
     routes: HashMap<&'static str, PathBuf>,
     /// The models the settings list, highest priority first, as the user
     /// typed them.
@@ -661,7 +661,7 @@ impl<'a> Engine<'a> {
     /// The header the prompt opens with, as training documents do: the
     /// language, for a model trained on several, then the module and
     /// file the request is in, when they can be named (see
-    /// [`location_of`]). Worked out once per file.
+    /// `location_of`). Worked out once per file.
     fn header(&mut self, request: &CompletionRequest) -> Vec<u32> {
         let tok = self.tokenizer;
         // Requests only come in languages the model was routed for, which

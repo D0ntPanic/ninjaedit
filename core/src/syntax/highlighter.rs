@@ -86,8 +86,8 @@ enum Merge {
     Stale,
 }
 
-/// Incremental syntax highlighting for one buffer. See the [module
-/// documentation](self).
+/// Incremental syntax highlighting for one buffer. See the `highlighter`
+/// module documentation.
 pub struct Highlighter {
     language: Language,
     lexer: &'static dyn Lexer,

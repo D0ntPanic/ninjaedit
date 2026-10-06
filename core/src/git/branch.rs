@@ -7,7 +7,7 @@
 //! unborn as it was, as git does.
 //!
 //! The repository is named as the status bar names one (see the
-//! [`head`](super::head) module): a path inside it, or, with `exact`,
+//! [`head`](mod@super::head) module): a path inside it, or, with `exact`,
 //! exactly its working directory, so that a submodule's branch is made
 //! in the submodule and not in whatever contains it.
 //!

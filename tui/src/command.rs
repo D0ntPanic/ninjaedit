@@ -34,7 +34,7 @@
 //!
 //! The application runs the commands; this module only describes them.
 //! The views the modes palette (Ctrl+E) lists sit alongside them in
-//! the palette, as does "Run <target>" for each build target, but
+//! the palette, as does "Run \<target\>" for each build target, but
 //! those come from the application, which knows what is open and what
 //! the project builds.
 

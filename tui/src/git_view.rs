@@ -1007,7 +1007,7 @@ pub struct GitLogView {
     checked_out: bool,
     /// A file of the working directory to open in the editor, asked
     /// for with `o` or "Open changed file" and not yet taken (see
-    /// [`take_file_to_open`](Self::take_file_to_open)).
+    /// [`GitLogTabs::take_file_to_open`]).
     file_to_open: Option<(PathBuf, Option<usize>)>,
     /// The restore box, while it asks whether to go ahead.
     restore: Option<PendingRestore>,

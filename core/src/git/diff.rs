@@ -13,11 +13,11 @@
 //! whole (see the [`syntax`] module) so that every line of the diff,
 //! shown or expanded, is highlighted as it would be in the file.
 //!
-//! A [`FileDiff`] is built from a libgit2 patch and the [`Contents`] of
+//! A [`FileDiff`] is built from a libgit2 patch and the `Contents` of
 //! each side, wherever they come from: a commit's blobs, the index's, or
 //! a file in the working directory. A submodule has no lines: its diff
 //! carries the submodule's commits the change moved over instead (see
-//! the [`submodules`](super::submodules) module).
+//! the [`submodules`](mod@super::submodules) module).
 //!
 //! [`syntax`]: crate::syntax
 
@@ -103,7 +103,7 @@ pub struct FileChange {
     pub path: String,
     /// The path before the change, when it differs (a rename or copy).
     pub old_path: Option<String>,
-    /// Lines added and removed, when counted (see [`STATS_LIMIT`]).
+    /// Lines added and removed, when counted (see `STATS_LIMIT`).
     pub additions: usize,
     pub deletions: usize,
     pub binary: bool,

@@ -4,7 +4,7 @@
 //! module says what a commit changed, file by file, with the context
 //! around each change expandable, the [`diff_model`] module puts a
 //! cursor and a selection in one file's diff for reading it, and the
-//! [`tree`] module arranges those files as a tree of directories. The [`submodules`] module
+//! [`tree`] module arranges those files as a tree of directories. The [`submodules`](mod@submodules) module
 //! lists a repository's submodules, each of which has a history of its
 //! own, and the commits of one that a change to it moved over. The [`changes`] module is the working tree: what is changed and
 //! not yet committed, staged or not, with staging, unstaging,
@@ -13,22 +13,22 @@
 //! those of the submodules that need it, as `git fetch`'s on-demand
 //! recursion does. The [`checkout`] module moves HEAD, and the working
 //! tree with it, to a commit picked from the log, on to whatever
-//! branch points there. The [`head`] module says where HEAD is, the
+//! branch points there. The [`head`](mod@head) module says where HEAD is, the
 //! branch or the commit, for the status bar, and the [`branch`] module
 //! makes a new branch there and moves HEAD on to it, or deletes one.
-//! The [`restore`] module writes files into the working directory as a commit (or the
+//! The [`restore`](mod@restore) module writes files into the working directory as a commit (or the
 //! one before it) has them, leaving the index alone. The [`merge`] and
 //! [`rebase`] modules bring another branch's commits into HEAD's, as
 //! `git merge` and `git rebase` do, stopping at conflicts for the
 //! changes page to resolve, with what the two share (and the job that
 //! runs either in the background) in the [`operation`] module; the
-//! [`reset`] module moves HEAD's branch to a commit as `git reset`
+//! [`reset`](mod@reset) module moves HEAD's branch to a commit as `git reset`
 //! does, keeping the working directory.
 //! Everything goes through libgit2, by way of the `git2` crate; nothing
 //! shells out to git.
 //!
 //! Only the [`changes`], [`fetch`], [`checkout`], [`branch`],
-//! [`restore`], [`merge`], [`rebase`], and [`reset`] modules change the
+//! [`restore`](mod@restore), [`merge`], [`rebase`], and [`reset`](mod@reset) modules change the
 //! repository. The first two touch only its index,
 //! HEAD, and remote-tracking references, except that discarding a
 //! change puts a file of the working directory back to the index's

@@ -15,7 +15,7 @@
 //! and lost, along with what a commit would be: the branch it goes on,
 //! whether a merge is in progress and the message git prepared for it,
 //! and the submodules with changes of their own (see the
-//! [`submodules`](super::submodules) module).
+//! [`submodules`](mod@super::submodules) module).
 //!
 //! With [`amend`](Changes::set_amend) on, the commit will replace HEAD
 //! rather than follow it, as `git commit --amend` does: the staged
@@ -73,7 +73,7 @@
 //!
 //! The diff of a change is read on demand, on the caller's thread, by
 //! [`Changes::unstaged_diff`] and [`Changes::staged_diff`], as a
-//! [`FileDiff`] like a commit's (see the [`diff`](super::diff) module).
+//! [`FileDiff`] like a commit's (see the [`diff`] module).
 //! A conflicted file is shown against our side of the merge, so the
 //! diff is what the conflict markers and their side's lines add to it.
 

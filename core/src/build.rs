@@ -666,7 +666,7 @@ impl BuildRoot {
 
     /// Look at the project again, on this thread, and bring the targets
     /// up to date with what is there; see
-    /// [`apply_discovered`](Self::apply_discovered).
+    /// `apply_discovered`.
     pub fn sync_discovered(&mut self, project_root: &Path) {
         let found = self.discovery(project_root).run(None).found;
         self.apply_discovered(found);

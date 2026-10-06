@@ -16,19 +16,19 @@
 //! says "in a block comment", so drawing costs the same wherever the
 //! comment began. Re-lexing after an edit happens on a worker thread, with
 //! a short synchronous pass at draw time so the lines around an edit are
-//! never behind; see the [`highlighter`] module.
+//! never behind; see the `highlighter` module.
 //!
 //! Classification is done by the lexer alone, with a little lookahead
 //! within the line, so it works without a language server and on partial
 //! text such as diff hunks. `self.field` and `self.func()` are told apart
 //! by whether a call follows, `Foo::bar` marks `Foo` as a type by its
 //! capital and `foo::bar` marks `foo` as a namespace, and so on; see the
-//! [`clike`] module for the rules. The [`Language`] of a file is chosen by
+//! `clike` module for the rules. The [`Language`] of a file is chosen by
 //! its extension; a file whose kind isn't known is [`Language::Plain`].
 //!
 //! Merge conflict markers belong to no language, so a file's lexer (see
 //! [`Language::file_lexer`]) is its language's lexer wrapped in one that
-//! recognizes them in any file; see the [`conflicts`] module.
+//! recognizes them in any file; see the `conflicts` module.
 
 mod clike;
 mod cmake;
@@ -119,7 +119,7 @@ pub enum TokenKind {
     /// in CMake.
     Variable,
     /// A merge conflict marker line: `<<<<<<<`, `|||||||`, `=======`, or
-    /// `>>>>>>>` with its label. See the [`conflicts`] module.
+    /// `>>>>>>>` with its label. See the `conflicts` module.
     ConflictMarker,
 }
 
@@ -432,7 +432,7 @@ impl Language {
 
     /// The lexer for a file in this language: the language's own lexer,
     /// with merge conflict markers recognized throughout (see the
-    /// [`conflicts`] module).
+    /// `conflicts` module).
     pub fn file_lexer(self) -> &'static dyn Lexer {
         &FILE_LEXERS[self.index() as usize]
     }
@@ -454,7 +454,7 @@ static FILE_LEXERS: [conflicts::Conflicts; Language::ALL.len()] = {
     lexers
 };
 
-/// Which side of a merge conflict a line is on; see the [`conflicts`]
+/// Which side of a merge conflict a line is on; see the `conflicts`
 /// module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConflictSide {
@@ -565,7 +565,7 @@ pub enum Context {
     /// `equals` equals signs.
     Bracket { equals: u8, comment: bool },
     /// Inside one side of a merge conflict. Always the outermost context;
-    /// see the [`conflicts`] module.
+    /// see the `conflicts` module.
     Conflict { side: ConflictSide },
 }
 

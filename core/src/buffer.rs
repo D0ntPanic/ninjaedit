@@ -1,7 +1,7 @@
 //! File buffers: in-memory containers for the contents of a loaded file.
 //!
 //! The buffer is optimized for fast editing of large text files. Contents are
-//! stored as a sequence of chunks (each around [`CHUNK_TARGET`] bytes) so that
+//! stored as a sequence of chunks (each around `CHUNK_TARGET` bytes) so that
 //! an insertion or deletion only rewrites one chunk rather than the whole
 //! file. Line information is stored alongside the data: each chunk records the
 //! offsets of the line breaks it contains, so global line queries only need to

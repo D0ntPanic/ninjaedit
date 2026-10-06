@@ -100,7 +100,7 @@ const RUBY_OPENERS: [&[u8]; 10] = [
 const RUBY_CONTINUATIONS: [&[u8]; 6] = [b"else", b"elsif", b"when", b"in", b"rescue", b"ensure"];
 
 /// Whether `word` is a Ruby keyword whose line goes level with the line
-/// that opened its block: `end`, or one of [`RUBY_CONTINUATIONS`].
+/// that opened its block: `end`, or one of `RUBY_CONTINUATIONS`.
 pub fn is_ruby_dedenter(word: &[u8]) -> bool {
     word == b"end" || RUBY_CONTINUATIONS.contains(&word)
 }

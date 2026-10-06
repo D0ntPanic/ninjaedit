@@ -136,7 +136,7 @@
 //! "Delete all build directories" (every root's); each runs as a job
 //! in the output tool, so what it did and any failure are there to
 //! read. Neither has a key: they are for debugging a build, not for a
-//! slip of the fingers. The command palette also has "Run <target>"
+//! slip of the fingers. The command palette also has "Run \<target\>"
 //! for every target that isn't disabled: it builds and runs that one
 //! with the configuration selecting it would bring (the current one in
 //! its root, or that root's of the same name, or its first) and leaves
@@ -1353,7 +1353,7 @@ impl App {
     /// Ctrl+P: open the command palette, listing every command that
     /// applies to what is showing (see [`Command::is_available`] and
     /// [`command_context`](Self::command_context)), then every view
-    /// with the key bound to each, then "Run <target>" for every
+    /// with the key bound to each, then "Run \<target\>" for every
     /// target that isn't disabled, with whatever it last ran ahead of
     /// them all. The description is searched too, so "clean" finds the
     /// commands that delete build directories.
@@ -1428,7 +1428,7 @@ impl App {
             .chain(self.run_target_items())
             .collect();
         // The entry last run comes first, so Enter alone repeats it. A
-        // "Run <target>" whose target is gone has no entry to move.
+        // "Run \<target\>" whose target is gone has no entry to move.
         if let Some(last) = &self.last_command
             && let Some(index) = items.iter().position(|item| item.action == *last)
         {
@@ -1438,7 +1438,7 @@ impl App {
         items
     }
 
-    /// The command palette's "Run <target>" entries: one for each
+    /// The command palette's "Run \<target\>" entries: one for each
     /// target that isn't disabled, in name order within each root, each
     /// saying what configuration it would run with.
     fn run_target_items(&self) -> Vec<PaletteItem> {
@@ -2501,7 +2501,7 @@ impl App {
         }
     }
 
-    /// "Run <target>" from the command palette: build and run a target
+    /// "Run \<target\>" from the command palette: build and run a target
     /// that needn't be the current one, with the configuration selecting
     /// it would bring, leaving the current target and configuration as
     /// they are.
