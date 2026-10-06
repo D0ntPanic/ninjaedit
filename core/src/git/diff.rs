@@ -700,6 +700,31 @@ impl FileDiff {
         entry.top = (entry.top + top).min(size);
         entry.bottom = (entry.bottom + bottom).min(size - entry.top);
     }
+
+    /// Reveal the hidden lines that `shown` says were shown before, by
+    /// their index on the old side: what a diff built again keeps of the
+    /// context revealed in the one it replaces. Lines are revealed from
+    /// a gap's ends, as expanding does, so only those running on from
+    /// an end are; and at the start and end of the file, where there is
+    /// no change to run on from, only a gap shown in full is.
+    pub(super) fn reveal_where(&mut self, shown: impl Fn(usize) -> bool) {
+        let last = self.gaps.len() - 1;
+        for gap in 0..self.gaps.len() {
+            let (old_start, _, size) = self.gap_extent(gap);
+            let top = (0..size).take_while(|i| shown(old_start + i)).count();
+            let bottom = (top..size)
+                .rev()
+                .take_while(|i| shown(old_start + i))
+                .count();
+            let entry = &mut self.gaps[gap];
+            if top == size {
+                *entry = Gap { top, bottom: 0 };
+            } else {
+                entry.top = if gap == 0 { 0 } else { top };
+                entry.bottom = if gap == last { 0 } else { bottom };
+            }
+        }
+    }
 }
 
 #[cfg(test)]

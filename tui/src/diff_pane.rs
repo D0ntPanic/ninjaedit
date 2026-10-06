@@ -352,6 +352,12 @@ impl ContentPane {
         }
     }
 
+    /// The content's row `from` is now row `to`, the rows above it having
+    /// changed: scroll as far, so it stays where it was on the screen.
+    pub(crate) fn keep_on_screen(&mut self, from: usize, to: usize) {
+        self.scroll = (self.scroll + to).saturating_sub(from);
+    }
+
     /// Scroll by some rows, down for positive. The render clamps the
     /// position to the content.
     pub(crate) fn scroll_by(&mut self, rows: isize) {

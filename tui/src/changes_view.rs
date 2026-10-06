@@ -10,10 +10,10 @@
 //! The page is kept when it is left (for the editor, or another mode)
 //! and comes back as it was, as the git log page does, so that a review
 //! can go to the editor to look something up and carry on where it
-//! was: the same file selected in the same list, the diff scrolled to
-//! the same place, and the commit message as far as it was written.
-//! Coming back scans the working tree again, keeping the selection by
-//! path.
+//! was: the same file selected in the same list, the diff as it was
+//! read (its place kept even when the file was edited meanwhile; see
+//! below), and the commit message as far as it was written. Coming back
+//! scans the working tree again, keeping the selection by path.
 //!
 //! The left of the page is the file lists: `Unstaged changes` above
 //! (the working directory against the index: modified, deleted, and
@@ -62,8 +62,12 @@
 //! the side saying where in the diff the pane is and how much of it
 //! shows; `o` there opens the file at the line the cursor is on, and a
 //! right click opens a menu to copy the selection or select it all. A
-//! scan that builds the diff again keeps the cursor on the same row.
-//! The wheel scrolls whichever pane it is over.
+//! scan builds the diff again, since the file may have changed, and the
+//! new diff keeps the reader's place in the old one (see the core
+//! crate's `git::diff_model` module): the context revealed, and the
+//! cursor and selection on the same lines, which stay where they were
+//! on the screen when lines come or go above them. The wheel scrolls
+//! whichever pane it is over.
 //!
 //! A right click on a file or directory in a list selects it and opens
 //! a menu of what can be done to it (the application draws the menu;
@@ -1200,6 +1204,8 @@ impl ChangesView {
             return;
         };
         let scanning = self.scanning();
+        // Where the cursor of a diff built again was, and is now.
+        let mut moved = None;
         self.content = Some(match self.selected_row() {
             None => Content::Message(
                 if scanning && changes.is_clean() {
@@ -1226,10 +1232,11 @@ impl ChangesView {
                         Ok(diff) => {
                             let mut model = DiffModel::new(diff, TAB_WIDTH);
                             // The same file's diff built again keeps the
-                            // cursor where it was, as near as the rows
-                            // allow.
+                            // reader's place: see the core crate's
+                            // `git::diff_model` module.
                             if let Some(stale) = stale.filter(|_| same) {
-                                model.set_cursor_at(stale.cursor().line, stale.cursor_column());
+                                model.carry_place_from(&stale);
+                                moved = Some((stale.cursor().line, model.cursor().line));
                             }
                             Content::Diff(Box::new(model))
                         }
@@ -1239,6 +1246,11 @@ impl ChangesView {
                 None => Content::Message(String::new()),
             },
         });
+        // Rows added or gone above the cursor move the view as far, so
+        // its line stays where it was on the screen.
+        if let Some((from, to)) = moved {
+            self.content_pane.keep_on_screen(from, to);
+        }
     }
 
     /// The lines for a directory of a list: what is under it, with the
@@ -2780,7 +2792,7 @@ mod tests {
     use crossterm::event::{KeyEventKind, KeyEventState};
     use git2::{Repository, Signature};
     use ninjaedit_core::TextPos;
-    use ninjaedit_core::git::NODE;
+    use ninjaedit_core::git::{DiffRow, NODE};
     use std::fs;
     use std::time::Duration;
 
@@ -4081,6 +4093,62 @@ mod tests {
             clipboard.get().as_deref(),
             Some("line 7\nline 8\nline 9\nline 10\nline ten\nline 11\nline 12\nline 13\n")
         );
+    }
+
+    #[test]
+    fn a_scan_keeps_the_diffs_place_when_lines_are_added_above_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        configure_user(&repo);
+        let old: String = (1..=80).map(|n| format!("line {n}\n")).collect();
+        commit_files(&repo, &[("f.txt", &old)], "Base");
+        let edited = old.replace("line 60\n", "line sixty\n");
+        fs::write(dir.path().join("f.txt"), &edited).unwrap();
+        let mut view = view(&dir);
+        draw(&mut view, 100, 30);
+        press(&mut view, KeyCode::Enter);
+        // Everything revealed, from the gap above the change (its "all"
+        // button) and the gap below; then up to line 62.
+        press(&mut view, KeyCode::Right);
+        press(&mut view, KeyCode::Enter);
+        let mut clipboard = Clipboard::local_only();
+        view.handle_key(key(KeyCode::End, KeyModifiers::CONTROL), &mut clipboard);
+        press(&mut view, KeyCode::Enter);
+        press(&mut view, KeyCode::Up);
+        press(&mut view, KeyCode::Up);
+        let cursor_text = |view: &ChangesView| match &view.content {
+            Some(Content::Diff(model)) => match model.rows()[model.cursor().line] {
+                DiffRow::Line(line) => model.diff().text(&line).to_owned(),
+                DiffRow::Gap { .. } => "…".to_owned(),
+            },
+            _ => String::new(),
+        };
+        let hidden = |view: &ChangesView| match &view.content {
+            Some(Content::Diff(model)) => model
+                .rows()
+                .iter()
+                .filter(|row| matches!(row, DiffRow::Gap { .. }))
+                .count(),
+            _ => usize::MAX,
+        };
+        let area = Rect::new(0, 0, 100, 30);
+        let render = |view: &mut ChangesView| {
+            let mut buf = Buffer::empty(area);
+            view.render(area, &mut buf, &Theme::default())
+        };
+        let before = render(&mut view);
+        assert_eq!(cursor_text(&view), "line 62");
+        assert_eq!(hidden(&view), 0);
+        assert!(before.is_some());
+        // Three lines added at the top of the file, and a scan: the same
+        // line, on the same row of the screen, with all still revealed.
+        fs::write(dir.path().join("f.txt"), format!("a\nb\nc\n{edited}")).unwrap();
+        view.refresh();
+        settle(&mut view);
+        let after = render(&mut view);
+        assert_eq!(cursor_text(&view), "line 62");
+        assert_eq!(hidden(&view), 0);
+        assert_eq!(after, before);
     }
 
     fn right_click(view: &mut ChangesView, column: u16, row: u16) -> ChangesMouseOutcome {

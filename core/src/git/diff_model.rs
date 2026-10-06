@@ -22,11 +22,34 @@
 //! hidden lines it stretches over. Commands that work on lines rather
 //! than text take the selection as [`DiffLine`]s instead
 //! ([`DiffModel::selected_lines`]).
+//!
+//! A diff of the working tree is built again whenever the tree is
+//! scanned, and [`DiffModel::carry_place_from`] keeps the reader's place
+//! across that: the context revealed, the cursor, and the selection.
+//! Places are found again by their line on the old side of the diff,
+//! the index's or HEAD's, which editing the working tree leaves alone;
+//! a line only the new side has is found as so many rows after the
+//! nearest old-side line above it.
 
 use super::diff::{DiffLine, DiffRow, FileDiff};
 use crate::caret::{Caret, LineSelection, LineSource, Movement, TextPos};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::ops::Range;
+
+/// Where a position is in a diff, found again in another diff of the
+/// same file by [`DiffModel::carry_place_from`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    /// So many rows after the row showing a line of the old side.
+    Old {
+        line: usize,
+        after: usize,
+        byte: usize,
+    },
+    /// A row by its number, in a diff with no old side to go by.
+    Row(TextPos),
+}
 
 /// The lines revealing a gap's lines above or below a change reveals at
 /// once.
@@ -395,6 +418,84 @@ impl DiffModel {
         self.reveal(|diff| diff.expand_all(gap));
     }
 
+    // ----- Keeping the place across a rebuild -------------------------------
+
+    /// Take the place `old`, an earlier diff of the same file, was at:
+    /// the context it revealed, as far as the hidden lines of this diff
+    /// run on from the ends of its gaps, and
+    /// its cursor and selection on the same lines. See the [module
+    /// documentation](self).
+    pub fn carry_place_from(&mut self, old: &DiffModel) {
+        let shown: HashSet<usize> = old
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                DiffRow::Line(line) => line.old,
+                DiffRow::Gap { .. } => None,
+            })
+            .collect();
+        self.diff.reveal_where(|line| shown.contains(&line));
+        self.rows = self.diff.rows();
+        let cursor = self.position_of(old.place_of(old.cursor()));
+        let anchor = old
+            .caret
+            .anchor()
+            .map(|anchor| self.position_of(old.place_of(anchor)));
+        let (lines, caret) = self.parts();
+        match anchor {
+            Some(anchor) => caret.set_selection(&lines, anchor, cursor),
+            None => caret.set_cursor(&lines, cursor),
+        }
+    }
+
+    /// Where a position is, in terms another diff of the file can find.
+    fn place_of(&self, pos: TextPos) -> Place {
+        let Some(rows) = self.rows.get(..=pos.line) else {
+            return Place::Row(pos);
+        };
+        rows.iter()
+            .rev()
+            .enumerate()
+            .find_map(|(after, row)| match row {
+                DiffRow::Line(DiffLine {
+                    old: Some(line), ..
+                }) => Some(Place::Old {
+                    line: *line,
+                    after,
+                    byte: pos.byte,
+                }),
+                _ => None,
+            })
+            .unwrap_or(Place::Row(pos))
+    }
+
+    /// The position a place found in another diff of the file is at in
+    /// this one; the caret clamps it to the rows there are. With its
+    /// old-side line no longer shown (hidden in a gap, or gone), it is
+    /// where that line would be: on the gap, or the row after.
+    fn position_of(&self, place: Place) -> TextPos {
+        let old_at = |row: &DiffRow| match row {
+            DiffRow::Line(line) => line.old,
+            DiffRow::Gap { .. } => None,
+        };
+        match place {
+            Place::Old { line, after, byte } => {
+                match self.rows.iter().position(|row| old_at(row) == Some(line)) {
+                    Some(row) => TextPos::new(row + after, byte),
+                    None => {
+                        let row = self
+                            .rows
+                            .iter()
+                            .rposition(|row| old_at(row).is_some_and(|old| old < line))
+                            .map_or(0, |row| row + 1);
+                        TextPos::new(row, 0)
+                    }
+                }
+            }
+            Place::Row(pos) => pos,
+        }
+    }
+
     /// What the row at a position stands for.
     fn key_at(&self, pos: TextPos) -> Option<RowKey> {
         self.rows.get(pos.line).map(RowKey::of)
@@ -673,6 +774,71 @@ mod tests {
         assert_eq!(at(&mut deleted, 1), Some(0), "b, removed: the line before");
         let mut gone = DiffModel::new(diff_of("a\n", ""), 4);
         assert_eq!(at(&mut gone, 0), None);
+    }
+
+    /// The thirty lines `model` diffs against, and its new side.
+    fn base() -> String {
+        (0..30).map(|i| format!("l{i}\n")).collect()
+    }
+
+    fn edited() -> String {
+        base().replace("l5\n", "L5\n").replace("l25\n", "L25\n")
+    }
+
+    /// The text of the cursor's row.
+    fn cursor_text(model: &DiffModel) -> String {
+        shown(model)[model.cursor().line].clone()
+    }
+
+    #[test]
+    fn a_rebuilt_diff_keeps_the_place_when_lines_are_added_above_it() {
+        let mut old = model();
+        // Ten lines revealed below l8, and l22 to inside l24 selected.
+        old.expand_down(1, 10);
+        assert_eq!(shown(&old)[9], "l9");
+        let l22 = shown(&old).iter().position(|t| t == "l22").unwrap();
+        old.set_cursor_at(l22, 0);
+        old.extend_to(l22 + 2, 1);
+        let selected = old.selected_text();
+        // Two lines are added at the top of the file: a new diff, whose
+        // rows all move down with a hunk of its own at the top.
+        let mut new = DiffModel::new(diff_of(&base(), &format!("a\nb\n{}", edited())), 4);
+        new.carry_place_from(&old);
+        assert_eq!(&shown(&new)[..2], ["a", "b"]);
+        assert!(shown(&new).iter().any(|t| t == "l9"), "{:?}", shown(&new));
+        assert!(shown(&new).iter().any(|t| t == "l18"), "{:?}", shown(&new));
+        assert!(!shown(&new).iter().any(|t| t == "l19"), "{:?}", shown(&new));
+        assert_eq!(cursor_text(&new), "l24");
+        assert_eq!(new.cursor().byte, 1);
+        assert_eq!(new.selected_text(), selected);
+    }
+
+    #[test]
+    fn a_rebuilt_diff_finds_added_lines_and_gaps_from_the_line_above() {
+        // On an added line: found as the row after the line it replaced.
+        let mut old = model();
+        old.set_cursor_at(14, 2);
+        assert_eq!(cursor_text(&old), "L25");
+        let mut new = DiffModel::new(diff_of(&base(), &format!("a\n{}", edited())), 4);
+        new.carry_place_from(&old);
+        assert_eq!(cursor_text(&new), "L25");
+        assert_eq!(new.cursor().byte, 2);
+        // On a gap's action: the same action of the same gap.
+        let mut old = model();
+        old.put_cursor_on_action(9, GapAction::Down);
+        let mut new = DiffModel::new(diff_of(&base(), &format!("a\n{}", edited())), 4);
+        new.carry_place_from(&old);
+        assert_eq!(new.action_at_cursor(), Some((1, GapAction::Down)));
+        // On a change that was undone: where its line is now, on the gap
+        // that hides it.
+        let mut old = model();
+        old.set_cursor_at(5, 1);
+        assert_eq!(cursor_text(&old), "L5");
+        let undone = base().replace("l25\n", "L25\n");
+        let mut new = DiffModel::new(diff_of(&base(), &undone), 4);
+        new.carry_place_from(&old);
+        assert_eq!(new.cursor(), TextPos::new(0, 0));
+        assert_eq!(cursor_text(&new), "…");
     }
 
     #[test]

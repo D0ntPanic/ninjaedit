@@ -5792,6 +5792,144 @@ mod tests {
         );
     }
 
+    /// Forty lines, `line 1` to `line 40`, with line 20 changed: what the
+    /// round trips through the editor below review.
+    fn forty_lines() -> (String, String) {
+        let old: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        let new = old.replace("line 20\n", "line twenty\n");
+        (old, new)
+    }
+
+    #[test]
+    fn the_git_logs_diff_keeps_its_place_through_a_trip_to_the_editor() {
+        let (old, new) = forty_lines();
+        let (dir, mut app) = app_with_files(&[("a.txt", &old)]);
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".storage/\n").unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        let mut parents = Vec::new();
+        for (content, message) in [(&old, "Lines"), (&new, "Change one")] {
+            std::fs::write(dir.path().join("a.txt"), content).unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("a.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parent: Vec<git2::Commit<'_>> = parents
+                .iter()
+                .map(|id| repo.find_commit(*id).unwrap())
+                .collect();
+            let refs: Vec<&git2::Commit<'_>> = parent.iter().collect();
+            let id = repo
+                .commit(Some("HEAD"), &sig, &sig, message, &tree, &refs)
+                .unwrap();
+            parents = vec![id];
+        }
+        let wait = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Mode::GitLog(tabs) = &app.mode
+                && tabs.is_loading()
+                && Instant::now() < deadline
+            {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let selected = |app: &App| match &app.mode {
+            Mode::GitLog(tabs) => tabs.active_view().unwrap().selected_text(),
+            _ => None,
+        };
+        ctrl(&mut app, 'l');
+        wait(&mut app);
+        // Into the change's diff; ▲ reveals ten lines above it, and line
+        // 7, the first, is selected.
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        draw(&mut app, 100, 30);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Down);
+        app.handle_event(key(KeyCode::End, KeyModifiers::SHIFT));
+        assert_eq!(selected(&app).as_deref(), Some("line 7"));
+        // `o` opens the file at that line; Ctrl+L comes back to the diff
+        // as it was, read again behind it.
+        press(&mut app, KeyCode::Char('o'));
+        assert!(matches!(app.mode, Mode::Editor));
+        assert_eq!(app.tabs[app.active].view.editor().cursor_position().line, 6);
+        ctrl(&mut app, 'l');
+        wait(&mut app);
+        assert_eq!(selected(&app).as_deref(), Some("line 7"));
+        let screen = draw(&mut app, 100, 30);
+        assert!(
+            screen.iter().any(|r| r.contains("6 lines hidden")),
+            "{screen:#?}"
+        );
+    }
+
+    #[test]
+    fn the_changes_diff_keeps_its_place_through_an_edit_in_the_editor() {
+        let (old, new) = forty_lines();
+        let (dir, mut app) = app_with_files(&[]);
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".storage/\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), &old).unwrap();
+        let mut index = repo.index().unwrap();
+        for path in [".gitignore", "a.txt"] {
+            index.add_path(Path::new(path)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Lines", &tree, &[])
+            .unwrap();
+        std::fs::write(dir.path().join("a.txt"), &new).unwrap();
+        let settle = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Mode::Changes(tabs) = &app.mode
+                && tabs.is_loading()
+                && Instant::now() < deadline
+            {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let selected = |app: &App| match &app.mode {
+            Mode::Changes(tabs) => tabs.active_view().unwrap().selected_text(),
+            _ => None,
+        };
+        ctrl(&mut app, 'u');
+        settle(&mut app);
+        // Into the diff; ▲ reveals ten lines above the change, and line
+        // 7, the first, is selected.
+        draw(&mut app, 100, 30);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Down);
+        app.handle_event(key(KeyCode::End, KeyModifiers::SHIFT));
+        assert_eq!(selected(&app).as_deref(), Some("line 7"));
+        // `o` opens the file at that line, where a line is added at the
+        // top and saved; Ctrl+U comes back to the diff with the same
+        // line selected and the same lines revealed, though they are a
+        // row further down, and the view with them.
+        press(&mut app, KeyCode::Char('o'));
+        assert!(matches!(app.mode, Mode::Editor));
+        assert_eq!(app.tabs[app.active].view.editor().cursor_position().line, 6);
+        app.handle_event(key(KeyCode::Home, KeyModifiers::CONTROL));
+        type_str(&mut app, "top");
+        press(&mut app, KeyCode::Enter);
+        ctrl(&mut app, 's');
+        ctrl(&mut app, 'u');
+        settle(&mut app);
+        let screen = draw(&mut app, 100, 30);
+        assert_eq!(selected(&app).as_deref(), Some("line 7"));
+        // The new line's change takes in lines 1 to 3, and the gap
+        // between it and the revealed lines hides the rest.
+        assert!(
+            screen.iter().any(|r| r.contains("3 lines hidden")),
+            "{screen:#?}"
+        );
+        assert!(screen.iter().any(|r| r.contains("line 7")), "{screen:#?}");
+    }
+
     #[test]
     fn a_bad_settings_file_is_reported_and_replaced_on_save() {
         let dir = tempfile::tempdir().unwrap();
