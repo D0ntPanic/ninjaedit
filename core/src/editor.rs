@@ -140,12 +140,13 @@
 
 use crate::auto_indent::{self, CodeLine, CodeStyle, Indenter, Rules};
 use crate::buffer::{BufferSnapshot, DiskChange, FileBuffer};
+use crate::caret::Movement;
 use crate::completion::CompletionRequest;
 use crate::indent::{self, Indentation};
 use crate::merge;
 use crate::search::{Search, SearchStep};
 use crate::syntax::{self, ConflictSide, Highlighter, Language, Token, TokenKind};
-use crate::text::{self, Grapheme};
+use crate::text::{self, LineLayout};
 use std::io;
 use std::ops::Range;
 use std::path::Path;
@@ -158,44 +159,6 @@ pub const DEFAULT_TAB_WIDTH: usize = 4;
 const COMPLETION_PREFIX_BYTES: usize = 24 * 1024;
 /// How many lines after the cursor's a completion request carries.
 const COMPLETION_SUFFIX_LINES: usize = 48;
-
-/// A cursor movement, used both to move the cursor and to extend a selection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Movement {
-    /// One character left; at the start of a line, to the end of the previous
-    /// line.
-    Left,
-    /// One character right; at the end of a line, to the start of the next.
-    Right,
-    /// One line up, keeping the column. On the first line, to the start of
-    /// the buffer.
-    Up,
-    /// One line down, keeping the column. On the last line, to the end of the
-    /// buffer.
-    Down,
-    /// To the start of the previous word (skipping whitespace first); at the
-    /// start of a line, to the end of the previous line.
-    WordLeft,
-    /// To the end of the next word (skipping whitespace first); at the end of
-    /// a line, to the start of the next line.
-    WordRight,
-    /// To the first non-whitespace byte of the current line, or, when the
-    /// cursor is already at or before it, to the first byte of the line.
-    /// From the first byte the cursor moves to the first non-whitespace one
-    /// again, so pressing the key twice reaches whichever the first press
-    /// didn't. On a blank line, to the first byte.
-    LineStart,
-    /// To the end of the current line's content, before its terminator.
-    LineEnd,
-    /// Up by the given number of lines (the height of the view), keeping the
-    /// column. On the first line, to the start of the buffer.
-    PageUp(usize),
-    /// Down by the given number of lines (the height of the view), keeping
-    /// the column. On the last line, to the end of the buffer.
-    PageDown(usize),
-    DocumentStart,
-    DocumentEnd,
-}
 
 /// A location in the buffer as a zero-based line and column. The column is
 /// a display column in terminal cells (see [`text::width`]), not a byte or
@@ -311,70 +274,13 @@ struct LineRest {
     closes_scope: bool,
 }
 
-/// The layout of one line's content: its characters with their byte ranges
-/// (relative to the start of the line) and display columns.
+/// The layout of one line's content (see [`LineLayout`]), with where the
+/// line starts in the buffer, since the layout's offsets are relative to
+/// it.
 struct Layout {
     /// Byte offset of the line's content in the buffer.
     start: usize,
-    cells: Vec<LayoutCell>,
-    /// The display column after the last character.
-    end_column: usize,
-}
-
-struct LayoutCell {
-    range: Range<usize>,
-    column: usize,
-    width: usize,
-}
-
-impl Layout {
-    fn new(start: usize, bytes: &[u8], tab_width: usize) -> Layout {
-        let mut column = 0;
-        let cells = text::graphemes(bytes)
-            .map(|Grapheme { range, text }| {
-                let width = text::width(text, column, tab_width);
-                let cell = LayoutCell {
-                    range,
-                    column,
-                    width,
-                };
-                column += width;
-                cell
-            })
-            .collect();
-        Layout {
-            start,
-            cells,
-            end_column: column,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.cells.last().map_or(0, |c| c.range.end)
-    }
-
-    /// Index of the character containing the relative offset `rel`.
-    fn cell_at(&self, rel: usize) -> Option<usize> {
-        let i = self.cells.partition_point(|c| c.range.end <= rel);
-        (i < self.cells.len()).then_some(i)
-    }
-
-    /// The display column of a relative offset, which is snapped back to
-    /// the start of the character containing it.
-    fn column_of(&self, rel: usize) -> usize {
-        match self.cell_at(rel) {
-            Some(i) => self.cells[i].column,
-            None => self.end_column,
-        }
-    }
-
-    /// The relative offset of the character covering a display column, or
-    /// the end of the line if the column is past its content. A column in
-    /// the middle of a wide character maps to that character's start.
-    fn offset_at_column(&self, column: usize) -> usize {
-        let i = self.cells.partition_point(|c| c.column + c.width <= column);
-        self.cells.get(i).map_or(self.len(), |c| c.range.start)
-    }
+    line: LineLayout,
 }
 
 /// Rewrite every line break in `text` (LF, CRLF, or lone CR) as `eol`.
@@ -606,18 +512,19 @@ impl Editor {
     /// syntax highlighting. Cheaper than [`line_cells`](Self::line_cells)
     /// when only the width matters.
     pub fn line_width(&self, line: usize) -> usize {
-        self.layout(line).end_column
+        self.layout(line).line.end_column()
     }
 
     pub fn line_cells(&self, line: usize) -> Vec<Cell> {
         let layout = self.layout(line);
         let bytes = self
             .buffer
-            .bytes_in_range(layout.start..layout.start + layout.len());
+            .bytes_in_range(layout.start..layout.start + layout.line.len());
         let tokens = self.highlighter.tokens_of(&self.buffer, line, &bytes);
         let mut next_token = 0;
         layout
-            .cells
+            .line
+            .cells()
             .iter()
             .zip(text::graphemes(&bytes))
             .map(|(cell, grapheme)| {
@@ -940,7 +847,10 @@ impl Editor {
     fn layout(&self, line: usize) -> Layout {
         let content = self.buffer.line_content_range(line);
         let bytes = self.buffer.bytes_in_range(content.clone());
-        Layout::new(content.start, &bytes, self.tab_width)
+        Layout {
+            start: content.start,
+            line: LineLayout::new(&bytes, self.tab_width),
+        }
     }
 
     /// Clamp an offset to the buffer and move it back to the nearest
@@ -949,23 +859,23 @@ impl Editor {
         let offset = offset.min(self.buffer.len());
         let layout = self.layout(self.buffer.line_of_offset(offset));
         let rel = offset - layout.start;
-        match layout.cell_at(rel) {
-            Some(i) => layout.start + layout.cells[i].range.start,
-            None => layout.start + layout.len(), // at the end, or inside a CRLF pair
+        match layout.line.cell_at(rel) {
+            Some(i) => layout.start + layout.line.cells()[i].range.start,
+            None => layout.start + layout.line.len(), // at the end, or inside a CRLF pair
         }
     }
 
     /// The display column of an offset that lies on `line`.
     fn column_of(&self, line: usize, offset: usize) -> usize {
         let layout = self.layout(line);
-        layout.column_of(offset.saturating_sub(layout.start))
+        layout.line.column_of(offset.saturating_sub(layout.start))
     }
 
     /// The offset of a display column on a line, clamped to the end of the
     /// line's content.
     fn offset_at_column(&self, line: usize, column: usize) -> usize {
         let layout = self.layout(line);
-        layout.start + layout.offset_at_column(column)
+        layout.start + layout.line.offset_at_column(column)
     }
 
     /// The offset one character to the right, crossing to the next line at
@@ -973,8 +883,8 @@ impl Editor {
     fn next_char(&self, offset: usize) -> usize {
         let line = self.buffer.line_of_offset(offset);
         let layout = self.layout(line);
-        match layout.cell_at(offset - layout.start) {
-            Some(i) => layout.start + layout.cells[i].range.end,
+        match layout.line.cell_at(offset - layout.start) {
+            Some(i) => layout.start + layout.line.cells()[i].range.end,
             None if line + 1 < self.buffer.line_count() => self.buffer.offset_of_line(line + 1),
             None => offset,
         }
@@ -994,8 +904,9 @@ impl Editor {
             };
         }
         // The character ending at (or containing) rel.
-        let i = layout.cells.partition_point(|c| c.range.end < rel);
-        layout.start + layout.cells[i.min(layout.cells.len() - 1)].range.start
+        let cells = layout.line.cells();
+        let i = cells.partition_point(|c| c.range.end < rel);
+        layout.start + cells[i.min(cells.len() - 1)].range.start
     }
 
     /// The bytes of the line containing `offset`, with the offset of the

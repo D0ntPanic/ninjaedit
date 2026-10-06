@@ -41,19 +41,19 @@
 //! was left.
 //!
 //! The keyboard is in one pane at a time; Tab and Shift+Tab move it
-//! round, and clicking a pane moves it there. In the sidebar ↑ and ↓
-//! move between branches, ← and → fold and unfold a remote (Space too),
-//! and Enter goes to the branch's commit in the log. In the log ↑ and ↓
-//! move between commits (Page Up and Page Down by a screenful, Home and
-//! End to the ends), ← and → scroll the messages sideways (← at the
-//! left edge goes back to the sidebar), Enter moves on to the
-//! files, and Space (or a double-click) checks the commit out. In the
-//! files ↑ and ↓ choose what the right pane shows,
-//! Enter, → or a double-click on a file moves into it, ← on a file
-//! goes to its directory, and ← at the top of the tree goes back to
-//! the log. In the diff the arrows scroll, Page Up and Page Down by a
-//! screenful, and ← goes back to the files when nothing is scrolled
-//! sideways. The wheel scrolls whichever pane it is over, sideways too.
+//! round, and clicking a pane moves it there. The arrows never leave a
+//! pane: they act within it. In the sidebar ↑ and ↓ move between
+//! branches, ← and → fold and unfold a remote (Space too), and Enter
+//! goes to the branch's commit in the log. In the log ↑ and ↓ move
+//! between commits (Page Up and Page Down by a screenful, Home and End
+//! to the ends), ← and → scroll the messages sideways, Enter moves on
+//! to the files, and Space (or a double-click) checks the commit out.
+//! In the files ↑ and ↓ choose what the right pane shows, Enter or a
+//! double-click on a file moves into it, and ← on a file goes to its
+//! directory. In the diff the arrows scroll, Page Up and Page Down by a
+//! screenful, with a scrollbar down the side saying where in the diff
+//! the pane is and how much of it shows. The wheel scrolls whichever
+//! pane it is over, sideways too.
 //! In the files and the diff, `o` opens the selected file in the editor
 //! as it is in the working directory now (one that isn't there any
 //! more has nothing to open, and the status bar says so).
@@ -201,9 +201,8 @@ use crate::clipboard::Clipboard;
 use crate::commit_row::{CommitLine, Highlight, commit_extent, draw_commit_line, lane_cap};
 use crate::confirm_box::{ConfirmBox, ConfirmOutcome};
 use crate::diff_pane::{
-    ARROW_COLUMNS, Button, HScroll, Piece, clamp_between, content_background, diff_extent,
-    display_width, draw_cells, fit_end, layout_cells, render_diff, share_for, share_of,
-    text_extent,
+    ARROW_COLUMNS, Button, ContentPane, HScroll, Piece, Shown, clamp_between, display_width,
+    fit_end, share_for, share_of,
 };
 use crate::git_layout::{GitLogLayout, MAIN_REPOSITORY, PaneSizes};
 use crate::palette::palette_background;
@@ -386,6 +385,18 @@ enum Content {
     Directory(usize),
     Diff(Box<FileDiff>),
     Failed(String),
+}
+
+/// What the content pane is to draw for `content`, with the lines of
+/// text it shows when it isn't a diff (see
+/// [`GitLogView::content_lines`]).
+fn shown<'a>(content: Option<&'a Content>, lines: Option<&'a [Piece]>) -> Shown<'a> {
+    match (content, lines) {
+        (Some(Content::Diff(diff)), _) => Shown::Diff(diff),
+        (Some(Content::Failed(why)), _) => Shown::Note(why),
+        (Some(_), Some(lines)) => Shown::Lines(lines),
+        _ => Shown::Nothing,
+    }
 }
 
 /// Which version of the selected files a restore puts in the working
@@ -939,12 +950,7 @@ pub struct GitLogView {
     /// What the content pane shows, for `file_selected`; built when
     /// first drawn.
     content: Option<Content>,
-    content_scroll: usize,
-    content_h: HScroll,
-    /// How many rows the content had when last drawn, and how many of
-    /// them were shown.
-    content_rows: usize,
-    content_shown: usize,
+    content_pane: ContentPane,
     /// Sizes set by dragging the rules between panes, or kept from
     /// last time, as shares of the space each divides; the layout
     /// picks defaults where these are unset, and clamps them to what
@@ -964,8 +970,6 @@ pub struct GitLogView {
     sidebar_rule: Rect,
     log_rule: Rect,
     files_rule: Rect,
-    /// The expand buttons drawn in the content pane, to hit-test clicks.
-    buttons: Vec<(Rect, Button)>,
     /// Presses in the log and the file list, to notice a double-click.
     clicks: ClickTracker,
     /// A commit of a submodule to show on the submodule's tab, asked
@@ -1048,10 +1052,7 @@ impl GitLogView {
             files_scroll: 0,
             reveal_files: false,
             content: None,
-            content_scroll: 0,
-            content_h: HScroll::default(),
-            content_rows: 0,
-            content_shown: 0,
+            content_pane: ContentPane::default(),
             sidebar_share: None,
             log_share: None,
             files_share: None,
@@ -1064,7 +1065,6 @@ impl GitLogView {
             sidebar_rule: Rect::default(),
             log_rule: Rect::default(),
             files_rule: Rect::default(),
-            buttons: Vec::new(),
             clicks: ClickTracker::default(),
             submodule_jump: None,
             branch_prompt: None,
@@ -1122,8 +1122,7 @@ impl GitLogView {
         self.file_selected = 0;
         self.files_scroll = 0;
         self.content = None;
-        self.content_scroll = 0;
-        self.content_h.col = 0;
+        self.content_pane.reset();
     }
 
     /// Read the repository again, without disturbing what the page
@@ -1511,8 +1510,7 @@ impl GitLogView {
             self.file_selected = 0;
             self.files_scroll = 0;
             self.content = None;
-            self.content_scroll = 0;
-            self.content_h.col = 0;
+            self.content_pane.reset();
         }
         self.reveal_log = true;
     }
@@ -1536,8 +1534,7 @@ impl GitLogView {
         if index != self.file_selected {
             self.file_selected = index;
             self.content = None;
-            self.content_scroll = 0;
-            self.content_h.col = 0;
+            self.content_pane.reset();
         }
         self.reveal_files = true;
     }
@@ -2076,8 +2073,7 @@ impl GitLogView {
         self.file_selected = 0;
         self.files_scroll = 0;
         self.content = None;
-        self.content_scroll = 0;
-        self.content_h.col = 0;
+        self.content_pane.reset();
     }
 
     /// Build what the content pane shows for the selected file, if it
@@ -2231,14 +2227,13 @@ impl GitLogView {
             .unwrap_or(0)
     }
 
-    /// The columns the content pane's visible lines reach: `rows` rows
-    /// from `scroll`.
-    fn content_extent(&self, scroll: usize, rows: usize) -> usize {
+    /// The lines of text the content pane shows, when it shows text
+    /// rather than a diff; see [`shown`].
+    fn content_lines(&self) -> Option<Vec<Piece>> {
         match &self.content {
-            Some(Content::Description) => text_extent(&self.description_lines(), scroll, rows),
-            Some(Content::Directory(dir)) => text_extent(&self.directory_lines(*dir), scroll, rows),
-            Some(Content::Diff(diff)) => diff_extent(diff, &diff.rows(), scroll, rows),
-            _ => 0,
+            Some(Content::Description) => Some(self.description_lines()),
+            Some(Content::Directory(dir)) => Some(self.directory_lines(*dir)),
+            _ => None,
         }
     }
 
@@ -2246,12 +2241,6 @@ impl GitLogView {
     fn scroll_log_sideways(&mut self, columns: isize) {
         let extent = self.log_extent(self.log_scroll, self.log_rows);
         self.log_h.scroll_by(columns, extent);
-    }
-
-    /// Scroll the content pane sideways by `columns`.
-    fn scroll_content_sideways(&mut self, columns: isize) {
-        let extent = self.content_extent(self.content_scroll, self.content_shown);
-        self.content_h.scroll_by(columns, extent);
     }
 
     // ----- Input ----------------------------------------------------------
@@ -2785,11 +2774,11 @@ impl GitLogView {
                 Some(SideRow::RemoteBranch(r, _)) => self.set_collapsed(r, true),
                 _ => {}
             },
-            KeyCode::Right => match selected {
-                Some(SideRow::Remote(r)) => self.set_collapsed(r, false),
-                Some(SideRow::Branch(_) | SideRow::RemoteBranch(..)) => self.pane = Pane::Log,
-                _ => {}
-            },
+            KeyCode::Right => {
+                if let Some(SideRow::Remote(r)) = selected {
+                    self.set_collapsed(r, false);
+                }
+            }
             _ => {}
         }
     }
@@ -2815,14 +2804,8 @@ impl GitLogView {
                 self.scroll_log_sideways(ARROW_COLUMNS as isize);
                 None
             }
-            KeyCode::Left if self.log_h.col > 0 => {
-                self.scroll_log_sideways(-(ARROW_COLUMNS as isize));
-                None
-            }
             KeyCode::Left => {
-                if self.sidebar_area.width > 0 {
-                    self.pane = Pane::Sidebar;
-                }
+                self.scroll_log_sideways(-(ARROW_COLUMNS as isize));
                 None
             }
             _ => None,
@@ -2862,7 +2845,7 @@ impl GitLogView {
                 }) => self.set_dir_collapsed(dir, false),
                 // An open directory: on to its first entry.
                 Some(TreeRow::Dir { .. }) => self.select_file(self.file_selected + 1),
-                _ => self.pane = Pane::Content,
+                _ => {}
             },
             KeyCode::Left => match row {
                 Some(TreeRow::Dir {
@@ -2870,36 +2853,25 @@ impl GitLogView {
                     collapsed: false,
                     ..
                 }) => self.set_dir_collapsed(dir, true),
-                Some(TreeRow::Dir { dir, .. }) => match self.file_tree.dirs()[dir].parent {
-                    Some(parent) => self.select_dir(parent),
-                    None => self.pane = Pane::Log,
-                },
+                Some(TreeRow::Dir { dir, .. }) => {
+                    if let Some(parent) = self.file_tree.dirs()[dir].parent {
+                        self.select_dir(parent);
+                    }
+                }
                 Some(TreeRow::File {
                     parent: Some(parent),
                     ..
                 }) => self.select_dir(parent),
-                _ => self.pane = Pane::Log,
+                _ => {}
             },
             _ => {}
         }
     }
 
     fn handle_content_key(&mut self, key: KeyEvent) {
-        let page = (self.content_area.height as usize).saturating_sub(1).max(1);
-        match key.code {
-            KeyCode::Up => self.content_scroll = self.content_scroll.saturating_sub(1),
-            KeyCode::Down => self.content_scroll += 1,
-            KeyCode::PageUp => self.content_scroll = self.content_scroll.saturating_sub(page),
-            KeyCode::PageDown => self.content_scroll += page,
-            KeyCode::Home => self.content_scroll = 0,
-            KeyCode::End => self.content_scroll = usize::MAX,
-            KeyCode::Right => self.scroll_content_sideways(ARROW_COLUMNS as isize),
-            KeyCode::Left if self.content_h.col > 0 => {
-                self.scroll_content_sideways(-(ARROW_COLUMNS as isize));
-            }
-            KeyCode::Left => self.pane = Pane::Files,
-            _ => {}
-        }
+        let lines = self.content_lines();
+        let content = shown(self.content.as_ref(), lines.as_deref());
+        self.content_pane.handle_key(key, content);
     }
 
     /// Whether the screen position is over the page.
@@ -2911,7 +2883,7 @@ impl GitLogView {
     /// in which case the page wants drag and release events wherever
     /// they happen.
     pub fn is_dragging(&self) -> bool {
-        self.log_h.dragging || self.content_h.dragging || self.divider_drag.is_some()
+        self.log_h.dragging || self.content_pane.is_dragging() || self.divider_drag.is_some()
     }
 
     // ----- Resizing the panes -----------------------------------------------
@@ -3061,18 +3033,15 @@ impl GitLogView {
         // A scrollbar drag owns the mouse likewise.
         if self.is_dragging() {
             match mouse.kind {
-                MouseEventKind::Drag(_) => {
-                    if self.log_h.dragging {
-                        let extent = self.log_extent(self.log_scroll, self.log_rows);
-                        self.log_h.scroll_to(mouse.column, extent);
-                    } else {
-                        let extent = self.content_extent(self.content_scroll, self.content_shown);
-                        self.content_h.scroll_to(mouse.column, extent);
-                    }
+                MouseEventKind::Drag(_) if self.log_h.dragging => {
+                    let extent = self.log_extent(self.log_scroll, self.log_rows);
+                    self.log_h.scroll_to(mouse.column, extent);
                 }
-                MouseEventKind::Up(_) => {
-                    self.log_h.dragging = false;
-                    self.content_h.dragging = false;
+                MouseEventKind::Up(_) if self.log_h.dragging => self.log_h.dragging = false,
+                MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
+                    let lines = self.content_lines();
+                    let content = shown(self.content.as_ref(), lines.as_deref());
+                    self.content_pane.handle_mouse(mouse, wheel, content);
                 }
                 _ => {}
             }
@@ -3092,6 +3061,19 @@ impl GitLogView {
         let Some(pane) = pane else {
             return outcome;
         };
+        // The content pane scrolls itself, and says which of a diff's
+        // expand buttons was pressed.
+        if pane == Pane::Content {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.pane = Pane::Content;
+            }
+            let lines = self.content_lines();
+            let content = shown(self.content.as_ref(), lines.as_deref());
+            if let Some(button) = self.content_pane.handle_mouse(mouse, wheel, content) {
+                self.press(button);
+            }
+            return outcome;
+        }
         match mouse.kind {
             // A right press on a commit in the log selects it, and asks
             // for the menu of what can be done with it.
@@ -3138,10 +3120,8 @@ impl GitLogView {
                 } else {
                     -(wheel as isize)
                 };
-                match pane {
-                    Pane::Log => self.scroll_log_sideways(columns),
-                    Pane::Content => self.scroll_content_sideways(columns),
-                    _ => {}
+                if pane == Pane::Log {
+                    self.scroll_log_sideways(columns);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if self.log_h.bar.contains(at) => {
@@ -3149,12 +3129,6 @@ impl GitLogView {
                 self.log_h.dragging = true;
                 let extent = self.log_extent(self.log_scroll, self.log_rows);
                 self.log_h.scroll_to(mouse.column, extent);
-            }
-            MouseEventKind::Down(MouseButton::Left) if self.content_h.bar.contains(at) => {
-                self.pane = Pane::Content;
-                self.content_h.dragging = true;
-                let extent = self.content_extent(self.content_scroll, self.content_shown);
-                self.content_h.scroll_to(mouse.column, extent);
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.pane = pane;
@@ -3198,13 +3172,7 @@ impl GitLogView {
                             }
                         }
                     }
-                    Pane::Content => {
-                        if let Some((_, button)) =
-                            self.buttons.iter().find(|(area, _)| area.contains(at))
-                        {
-                            self.press(*button);
-                        }
-                    }
+                    Pane::Content => {}
                 }
             }
             _ => {}
@@ -3219,7 +3187,7 @@ impl GitLogView {
             Pane::Sidebar => self.side_scroll = step(self.side_scroll),
             Pane::Log => self.log_scroll = step(self.log_scroll),
             Pane::Files => self.files_scroll = step(self.files_scroll),
-            Pane::Content => self.content_scroll = step(self.content_scroll),
+            Pane::Content => self.content_pane.scroll_by(rows),
         }
     }
 
@@ -3261,7 +3229,6 @@ impl GitLogView {
         self.area = area;
         let background = palette_background(theme);
         buf.set_style(area, background);
-        self.buttons.clear();
         if area.height == 0 || area.width < 8 {
             self.sidebar_area = Rect::default();
             self.log_area = Rect::default();
@@ -3657,90 +3624,10 @@ impl GitLogView {
     }
 
     fn render_content(&mut self, buf: &mut Buffer, theme: &Theme) {
-        let area = self.content_area;
-        if area.width < 4 || area.height == 0 {
-            return;
-        }
-        let background = content_background(theme);
-        buf.set_style(area, background);
-        let dim = background.fg(theme.command_palette_result_context_text);
-        let height = area.height as usize;
-        let content = match &self.content {
-            Some(content) => content,
-            None => return,
-        };
-        let text = match content {
-            Content::Description => Some(self.description_lines()),
-            Content::Directory(dir) => Some(self.directory_lines(*dir)),
-            _ => None,
-        };
-        match content {
-            Content::Description | Content::Directory(_) => {
-                let lines = text.unwrap_or_default();
-                self.content_rows = lines.len();
-                let capacity = area.width as usize - 1;
-                // The scrollbar takes the last row; see `render_log`.
-                // Clamp the scroll asked for afresh on each pass, as
-                // `render_diff` does, so the last row is reachable once
-                // the bar takes a row.
-                let wanted = self.content_scroll;
-                let mut show_bar = false;
-                let mut shown;
-                let mut extent;
-                loop {
-                    shown = height - usize::from(show_bar);
-                    self.content_scroll = wanted.min(lines.len().saturating_sub(shown));
-                    extent = text_extent(&lines, self.content_scroll, shown);
-                    let needed = self.content_h.needs_bar(extent, capacity) && height > 1;
-                    if needed && !show_bar {
-                        show_bar = true;
-                        continue;
-                    }
-                    break;
-                }
-                self.content_shown = shown;
-                for (row, (line, style)) in lines
-                    .iter()
-                    .skip(self.content_scroll)
-                    .take(shown)
-                    .enumerate()
-                {
-                    let y = area.y + row as u16;
-                    let cells = layout_cells(line, &[]);
-                    let row_area = Rect::new(area.x + 1, y, area.width - 1, 1);
-                    draw_cells(buf, row_area, &cells, self.content_h.col, |_| {
-                        background.patch(*style)
-                    });
-                }
-                let bar = if show_bar {
-                    Rect::new(area.x + 1, area.bottom() - 1, area.width - 1, 1)
-                } else {
-                    Rect::default()
-                };
-                self.content_h.render(extent, capacity, bar, buf, theme);
-            }
-            Content::Failed(message) => {
-                buf.set_stringn(area.x + 1, area.y, message, area.width as usize - 1, dim);
-                self.content_h
-                    .render(0, area.width as usize, Rect::default(), buf, theme);
-            }
-            Content::Diff(diff) => {
-                let mut buttons = Vec::new();
-                let drawn = render_diff(
-                    diff,
-                    area,
-                    buf,
-                    theme,
-                    self.content_scroll,
-                    &mut self.content_h,
-                    &mut buttons,
-                );
-                self.content_rows = drawn.rows;
-                self.content_shown = drawn.shown;
-                self.content_scroll = drawn.scroll;
-                self.buttons = buttons;
-            }
-        }
+        let lines = self.content_lines();
+        let content = shown(self.content.as_ref(), lines.as_deref());
+        self.content_pane
+            .render(self.content_area, buf, theme, content);
     }
 }
 
@@ -4128,7 +4015,14 @@ mod tests {
         // from the new one down to the old, the new one drawn as HEAD.
         let content_x = view.content_area.x as usize;
         let content_y = view.content_area.y as usize;
-        let content = move |row: &str| row.chars().skip(content_x).collect::<String>();
+        // Short of the vertical scrollbar down the right edge.
+        let content_width = view.content_area.width as usize - 1;
+        let content = move |row: &str| {
+            row.chars()
+                .skip(content_x)
+                .take(content_width)
+                .collect::<String>()
+        };
         let heading = content(row_with(&screen, "Submodule sub: "));
         assert_eq!(
             heading.trim(),
@@ -4220,7 +4114,7 @@ mod tests {
         view.jump_to(added);
         // Back from the content pane to the files pane, and down past
         // .gitmodules to it.
-        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::BackTab), &mut Clipboard::new());
         view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 30);
@@ -4283,7 +4177,7 @@ mod tests {
         // (and `.gitmodules` with it): a double-click on `sub` goes to
         // the commit it was added at.
         tabs.set_active(0);
-        tabs.handle_key(key(KeyCode::Left), &mut Clipboard::new());
+        tabs.handle_key(key(KeyCode::BackTab), &mut Clipboard::new());
         assert_eq!(tabs.active().pane, Pane::Log);
         tabs.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         let view = tabs.active();
@@ -4326,7 +4220,7 @@ mod tests {
         // A double-click on an ordinary file moves into its diff, as
         // Enter does.
         tabs.set_active(0);
-        tabs.handle_key(key(KeyCode::Left), &mut Clipboard::new());
+        tabs.handle_key(key(KeyCode::BackTab), &mut Clipboard::new());
         tabs.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         let view = tabs.active();
         assert_eq!(
@@ -4464,9 +4358,11 @@ mod tests {
         view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
         assert_eq!(view.selected_commit(), Some(s));
         assert_eq!(view.pane, Pane::Log);
-        // Back in the sidebar, the remote unfolds with → and its branch
-        // goes to the merge.
-        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
+        // Back in the sidebar, → on a branch stays there; the remote
+        // unfolds with → and its branch goes to the merge.
+        view.handle_key(key(KeyCode::BackTab), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
+        assert_eq!(view.pane, Pane::Sidebar);
         view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         assert_eq!(view.side_rows[view.side_selected], SideRow::Remote(0));
         view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
@@ -4832,7 +4728,7 @@ mod tests {
         let screen = draw(&mut view, 90, 30);
         assert!(screen[log_bottom].contains('█'), "{screen:#?}");
         view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
-        assert_eq!(view.pane, Pane::Sidebar);
+        assert_eq!(view.pane, Pane::Log, "← at the left edge stays in the log");
     }
 
     #[test]
@@ -4850,13 +4746,15 @@ mod tests {
             .position(|r| r.contains("+ let long"))
             .unwrap();
         assert!(!screen[line].contains("TAIL"), "{screen:#?}");
-        let content_bottom = view.content_area.bottom() as usize - 1;
-        assert!(screen[content_bottom].contains('█'), "{screen:#?}");
+        assert!(
+            sideways_bar_row(&view, &screen).contains('█'),
+            "{screen:#?}"
+        );
         let number_column = column_of(&screen[line], "1 +");
         for _ in 0..50 {
             view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
         }
-        let col = view.content_h.col;
+        let col = view.content_pane.h().col;
         let screen = draw(&mut view, 100, 30);
         assert!(screen[line].contains("TAIL"), "{screen:#?}");
         assert_eq!(
@@ -4864,27 +4762,29 @@ mod tests {
             number_column,
             "{screen:#?}"
         );
-        let extent = view.content_extent(view.content_scroll, view.content_shown);
-        assert_eq!(col, extent + HSCROLL_SLACK - view.content_h.capacity);
-        // ← scrolls back to the edge and then leaves for the files.
-        // Coming back to the file starts at the left again, and the
-        // description, with nothing out of view, has no scrollbar.
+        let Some(Content::Diff(diff)) = &view.content else {
+            panic!("the file's diff is shown");
+        };
+        let extent = view.content_pane.extent(Shown::Diff(diff));
+        assert_eq!(col, extent + HSCROLL_SLACK - view.content_pane.h().capacity);
+        // ← scrolls back to the edge, and stays in the diff there.
         for _ in 0..100 {
-            if view.pane == Pane::Files {
-                break;
-            }
             view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
         }
-        assert_eq!(view.pane, Pane::Files);
-        assert_eq!(view.content_h.col, 0);
-        view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Content);
+        assert_eq!(view.content_pane.h().col, 0);
         view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
-        assert_eq!(view.content_h.col, ARROW_COLUMNS);
+        assert_eq!(view.content_pane.h().col, ARROW_COLUMNS);
         view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
-        assert_eq!(view.content_h.col, 0);
+        assert_eq!(view.content_pane.h().col, 0);
         view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
+        assert_eq!(view.pane, Pane::Content);
+        // Coming back to the file starts at the left again, and the
+        // description, with nothing out of view, has no scrollbar.
+        view.handle_key(key(KeyCode::BackTab), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Files);
+        view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
+        assert_eq!(view.pane, Pane::Files, "→ on a file stays in the files");
         view.handle_key(key(KeyCode::Up), &mut Clipboard::new());
         view.handle_key(key(KeyCode::Up), &mut Clipboard::new());
         view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
@@ -4894,19 +4794,102 @@ mod tests {
             screen.iter().any(|r| r.contains("+ let long")),
             "{screen:#?}"
         );
-        assert_eq!(view.content_h.col, 0);
+        assert_eq!(view.content_pane.h().col, 0);
         // The description scrolls too: this commit's long message needs
         // the bar, the short commit's doesn't.
         view.handle_key(key(KeyCode::Up), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 30);
         assert!(screen.iter().any(|r| r.contains("Parents:")), "{screen:#?}");
-        assert!(screen[content_bottom].contains('█'), "{screen:#?}");
+        assert!(
+            sideways_bar_row(&view, &screen).contains('█'),
+            "{screen:#?}"
+        );
         view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
+        assert_eq!(view.pane, Pane::Files, "← on the description stays");
+        view.handle_key(key(KeyCode::BackTab), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Log);
         view.handle_key(key(KeyCode::Home), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 30);
         assert!(screen.iter().any(|r| r.contains("Parents:")), "{screen:#?}");
-        assert!(!screen[content_bottom].contains('█'), "{screen:#?}");
+        assert!(
+            !sideways_bar_row(&view, &screen).contains('█'),
+            "{screen:#?}"
+        );
+    }
+
+    /// The content pane's bottom row, short of the vertical
+    /// scrollbar's column: where the sideways scrollbar shows.
+    fn sideways_bar_row(view: &GitLogView, screen: &[String]) -> String {
+        let area = view.content_area;
+        screen[area.bottom() as usize - 1]
+            .chars()
+            .skip(area.x as usize)
+            .take(area.width as usize - 1)
+            .collect()
+    }
+
+    #[test]
+    fn a_diff_has_a_scrollbar_down_its_side_that_scrolls_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let sig = Signature::now("T", "t@example.com").unwrap();
+        let body: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        fs::write(dir.path().join("t.rs"), body).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("t.rs")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Tall", &tree, &[])
+            .unwrap();
+        let mut view = view(&dir);
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        assert_eq!(view.pane, Pane::Content);
+        // The bar runs down the pane's right edge: at the top of the
+        // diff the thumb is at the top, a short one, since a hundred
+        // lines don't fit.
+        let screen = draw(&mut view, 100, 30);
+        let bar = view.content_pane.v().bar;
+        assert_eq!(bar.x, view.content_area.right() - 1);
+        assert_eq!(bar.height, view.content_area.height);
+        let column = |screen: &[String]| -> String {
+            (bar.y..bar.bottom())
+                .map(|y| screen[y as usize].chars().nth(bar.x as usize).unwrap())
+                .collect()
+        };
+        let track = column(&screen);
+        assert!(track.starts_with('█') && track.ends_with('│'), "{track:?}");
+        let thumb = track.chars().filter(|c| *c == '█').count();
+        assert!(thumb < bar.height as usize / 2, "{track:?}");
+        // At the end of the diff it is at the bottom.
+        view.handle_key(key(KeyCode::End), &mut Clipboard::new());
+        let track = column(&draw(&mut view, 100, 30));
+        assert!(track.starts_with('│') && track.ends_with('█'), "{track:?}");
+        // A click halfway down the bar scrolls halfway through the
+        // diff, and dragging to its top scrolls back to the start.
+        click(&mut view, bar.x, bar.y + bar.height / 2);
+        assert!(view.is_dragging());
+        let (rows, shown) = view.content_pane.rows();
+        let max = rows - shown;
+        let halfway = view.content_pane.scroll();
+        assert!(
+            halfway > max / 3 && halfway < max * 2 / 3,
+            "{halfway} of {max}"
+        );
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: bar.x,
+            row: bar.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        view.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left)), WHEEL);
+        assert_eq!(view.content_pane.scroll(), 0);
+        view.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left)), WHEEL);
+        assert!(!view.is_dragging());
+        let screen = draw(&mut view, 100, 30);
+        assert!(column(&screen).starts_with('█'), "{screen:#?}");
+        assert!(screen[bar.y as usize].contains("line 0"), "{screen:#?}");
     }
 
     #[test]
@@ -4934,12 +4917,16 @@ mod tests {
         view.handle_key(key(KeyCode::End), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 30);
         let content_bottom = view.content_area.bottom() as usize - 1;
-        assert!(screen[content_bottom].contains('█'), "{screen:#?}");
+        assert!(
+            sideways_bar_row(&view, &screen).contains('█'),
+            "{screen:#?}"
+        );
         assert!(
             screen[content_bottom - 1].contains("+ let last"),
             "{screen:#?}"
         );
-        assert_eq!(view.content_scroll + view.content_shown, view.content_rows);
+        let (rows, shown) = view.content_pane.rows();
+        assert_eq!(view.content_pane.scroll() + shown, rows);
         // Scrolling down a line at a time gets there too.
         view.handle_key(key(KeyCode::Home), &mut Clipboard::new());
         for _ in 0..100 {
@@ -5146,7 +5133,7 @@ mod tests {
         assert!(row_with(&screen, "a.rs").contains("+1"), "{screen:#?}");
         assert!(screen.iter().any(|r| r.contains("two();")), "{screen:#?}");
         // The new commit is at the top of the log.
-        view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::BackTab), &mut Clipboard::new());
         view.handle_key(key(KeyCode::Home), &mut Clipboard::new());
         let screen = draw(&mut view, 110, 24);
         assert!(

@@ -7,6 +7,7 @@
 pub mod auto_indent;
 pub mod buffer;
 pub mod build;
+pub mod caret;
 pub mod completion;
 pub mod diagnostics;
 pub mod editor;
@@ -32,12 +33,13 @@ pub use build::{
     BuildConfig, BuildRoot, BuildSystem, ConfigurationKey, DEFAULT_CMAKE_GENERATOR, Directories,
     Discovery, DiscoveryResult, Job, Selection, Step, TargetKey, Variable,
 };
+pub use caret::Movement;
 pub use completion::{
     Completer, CompletionOutcome, CompletionRequest, ConfidenceThresholds, LineConfidence,
     TokenConfidence,
 };
 pub use diagnostics::{SourceLink, SourceLocation, find_source_links};
-pub use editor::{Cell, ConflictStep, Editor, ExternalChange, Movement, Position};
+pub use editor::{Cell, ConflictStep, Editor, ExternalChange, Position};
 pub use highlight_cache::HighlightCache;
 pub use indent::Indentation;
 pub use index::{FileIndex, FileList, IndexEntry};

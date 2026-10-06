@@ -141,6 +141,94 @@ pub fn prev_word_boundary(bytes: &[u8], offset: usize) -> usize {
     cells.get(i).map_or(bytes.len(), |(range, _)| range.start)
 }
 
+/// One line of text laid out for display: its characters with their byte
+/// ranges and the display columns they occupy, for turning byte offsets
+/// into columns and back. Offsets are relative to the start of the bytes
+/// laid out, which shouldn't include the line's terminator.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LineLayout {
+    cells: Vec<LayoutCell>,
+    /// The display column after the last character.
+    end_column: usize,
+}
+
+/// One character of a [`LineLayout`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutCell {
+    /// The character's byte range in the line.
+    pub range: Range<usize>,
+    /// The display column the character starts at.
+    pub column: usize,
+    /// The number of cells the character occupies (may be zero).
+    pub width: usize,
+}
+
+impl LineLayout {
+    /// Lay out a line's bytes, with tab stops every `tab_width` columns.
+    pub fn new(bytes: &[u8], tab_width: usize) -> LineLayout {
+        let mut column = 0;
+        let cells = graphemes(bytes)
+            .map(|Grapheme { range, text }| {
+                let width = width(text, column, tab_width);
+                let cell = LayoutCell {
+                    range,
+                    column,
+                    width,
+                };
+                column += width;
+                cell
+            })
+            .collect();
+        LineLayout {
+            cells,
+            end_column: column,
+        }
+    }
+
+    /// The line's characters, in order.
+    pub fn cells(&self) -> &[LayoutCell] {
+        &self.cells
+    }
+
+    /// The byte length of the line laid out.
+    pub fn len(&self) -> usize {
+        self.cells.last().map_or(0, |c| c.range.end)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    /// The display column after the last character: the line's width.
+    pub fn end_column(&self) -> usize {
+        self.end_column
+    }
+
+    /// The index of the character containing the offset, or `None` at
+    /// (or past) the end of the line.
+    pub fn cell_at(&self, offset: usize) -> Option<usize> {
+        let i = self.cells.partition_point(|c| c.range.end <= offset);
+        (i < self.cells.len()).then_some(i)
+    }
+
+    /// The display column of an offset, which is snapped back to the start
+    /// of the character containing it.
+    pub fn column_of(&self, offset: usize) -> usize {
+        match self.cell_at(offset) {
+            Some(i) => self.cells[i].column,
+            None => self.end_column,
+        }
+    }
+
+    /// The offset of the character covering a display column, or the end
+    /// of the line if the column is past its content. A column in the
+    /// middle of a wide character maps to that character's start.
+    pub fn offset_at_column(&self, column: usize) -> usize {
+        let i = self.cells.partition_point(|c| c.column + c.width <= column);
+        self.cells.get(i).map_or(self.len(), |c| c.range.start)
+    }
+}
+
 /// Split bytes into graphemes, tolerating invalid UTF-8.
 pub fn graphemes(bytes: &[u8]) -> Graphemes<'_> {
     Graphemes {
@@ -263,5 +351,34 @@ mod tests {
         assert_eq!(width("\t", 4, 4), 4);
         assert_eq!(width("\t", 5, 0), 1, "a zero tab width behaves as one");
         assert_eq!(width("\u{FFFD}", 0, 4), 1);
+    }
+
+    #[test]
+    fn line_layout_maps_offsets_and_columns() {
+        // A tab to the stop, a wide character, a combining mark.
+        let line = "\tx한e\u{301}".as_bytes();
+        let layout = LineLayout::new(line, 4);
+        let cells: Vec<_> = layout
+            .cells()
+            .iter()
+            .map(|c| (c.range.clone(), c.column, c.width))
+            .collect();
+        assert_eq!(
+            cells,
+            [(0..1, 0, 4), (1..2, 4, 1), (2..5, 5, 2), (5..8, 7, 1)]
+        );
+        assert_eq!(layout.len(), line.len());
+        assert_eq!(layout.end_column(), 8);
+        assert_eq!(layout.cell_at(3), Some(2), "inside a character");
+        assert_eq!(layout.cell_at(8), None, "at the end");
+        assert_eq!(layout.column_of(3), 5, "snapped back to the start");
+        assert_eq!(layout.column_of(8), 8);
+        assert_eq!(layout.offset_at_column(2), 0, "inside the tab");
+        assert_eq!(layout.offset_at_column(6), 2, "inside the wide character");
+        assert_eq!(layout.offset_at_column(99), line.len());
+        let empty = LineLayout::new(b"", 4);
+        assert!(empty.is_empty());
+        assert_eq!(empty.offset_at_column(3), 0);
+        assert_eq!(empty.column_of(0), 0);
     }
 }

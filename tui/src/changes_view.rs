@@ -7,6 +7,14 @@
 //! they are resolved. The git log page brings it up when one of its
 //! merges or rebases stops so.
 //!
+//! The page is kept when it is left (for the editor, or another mode)
+//! and comes back as it was, as the git log page does, so that a review
+//! can go to the editor to look something up and carry on where it
+//! was: the same file selected in the same list, the diff scrolled to
+//! the same place, and the commit message as far as it was written.
+//! Coming back scans the working tree again, keeping the selection by
+//! path.
+//!
 //! The left of the page is the file lists: `Unstaged changes` above
 //! (the working directory against the index: modified, deleted, and
 //! untracked files, and any in conflict, marked `U`) and `Staged
@@ -36,22 +44,23 @@
 //! the box goes under the lists.
 //!
 //! The keyboard is in one pane at a time; Tab and Shift+Tab move it
-//! round (the lists, the diff, the commit box), and clicking a pane
-//! moves it there. In a list ↑ and ↓ move
-//! between rows, running on from the end of the unstaged list into
-//! the staged one and from there into the commit box; ← and → fold and
-//! unfold a directory (← on a file goes to its directory); Space
-//! stages what is selected, a file or a whole directory (or unstages
-//! it, in the staged list), and `a` stages or unstages everything;
-//! Enter or → on a file moves into its diff, and Enter on a directory
-//! folds or unfolds it; `o` opens the file in the editor, at its first
-//! conflict if it has one; and `m` toggles amending. Ctrl+S, from any
-//! pane, makes the commit with the message in the box, as the person
-//! the repository's configuration names; a merge in progress starts
-//! with the message git prepared for it. In the diff the arrows scroll,
-//! Page Up and Page Down by a screenful, and ← goes back to the list
-//! when nothing is scrolled sideways. The wheel scrolls whichever pane
-//! it is over.
+//! round (the lists, the diff, the commit box; Shift+Tab from the diff
+//! goes back to the list it shows a file of), and clicking a pane
+//! moves it there. The arrows never leave a pane, as in a graphical
+//! program: in a list ↑ and ↓ move between its rows and stop at its
+//! ends; ← and → fold and unfold a directory (← on a file goes to its
+//! directory); Space stages what is selected, a file
+//! or a whole directory (or unstages it, in the staged list), and `a`
+//! stages or unstages everything; Enter on a file moves into its diff,
+//! and Enter on a directory folds or unfolds it; `o` opens the file in
+//! the editor, at its first conflict if it has one; and `m` toggles
+//! amending. Ctrl+S, from any pane, makes the commit with the message
+//! in the box, as the person the repository's configuration names; a
+//! merge in progress starts with the message git prepared for it. In
+//! the diff the arrows scroll, Page Up and Page Down by a screenful,
+//! with a scrollbar down the side saying where in the diff the pane is
+//! and how much of it shows. The wheel scrolls whichever pane it is
+//! over.
 //!
 //! A right click on a file or directory in a list selects it and opens
 //! a menu of what can be done to it (the application draws the menu;
@@ -131,9 +140,7 @@
 use crate::clipboard::Clipboard;
 use crate::confirm_box::{ConfirmBox, ConfirmOutcome};
 use crate::diff_pane::{
-    ARROW_COLUMNS, Button, HScroll, Piece, clamp_between, content_background, diff_extent,
-    display_width, draw_cells, fit_end, layout_cells, render_diff, share_for, share_of,
-    text_extent,
+    ContentPane, Piece, Shown, clamp_between, display_width, fit_end, share_for, share_of,
 };
 use crate::editor_view::EditorView;
 use crate::git_layout::{ChangesSizes, GitChangesLayout, MAIN_REPOSITORY};
@@ -304,6 +311,16 @@ enum Content {
     Directory(Vec<Piece>),
     Diff(Box<FileDiff>),
     Failed(String),
+}
+
+/// What the diff pane is to draw for `content`.
+fn shown(content: Option<&Content>) -> Shown<'_> {
+    match content {
+        None => Shown::Nothing,
+        Some(Content::Message(message) | Content::Failed(message)) => Shown::Note(message),
+        Some(Content::Directory(lines)) => Shown::Lines(lines),
+        Some(Content::Diff(diff)) => Shown::Diff(diff),
+    }
 }
 
 /// What a row of a list stands for, by path, for telling whether the
@@ -848,12 +865,7 @@ pub struct ChangesView {
     /// What the diff pane shows, and what it was built for.
     shown: Option<(List, RowKey)>,
     content: Option<Content>,
-    content_scroll: usize,
-    content_h: HScroll,
-    /// How many rows the content had when last drawn, and how many of
-    /// them were shown.
-    content_rows: usize,
-    content_shown: usize,
+    content_pane: ContentPane,
     /// The commit message, in an editor of its own.
     message: EditorView,
     /// Text the page put in the message itself (a merge's prepared
@@ -892,8 +904,6 @@ pub struct ChangesView {
     files_rule: Rect,
     lists_rule: Rect,
     commit_rule: Rect,
-    /// The expand buttons drawn in the diff, to hit-test clicks.
-    buttons: Vec<(Rect, Button)>,
 }
 
 impl ChangesView {
@@ -925,10 +935,7 @@ impl ChangesView {
             staged: FileList::default(),
             shown: None,
             content: None,
-            content_scroll: 0,
-            content_h: HScroll::default(),
-            content_rows: 0,
-            content_shown: 0,
+            content_pane: ContentPane::default(),
             message: message_editor(""),
             auto_message: None,
             files_share: None,
@@ -948,7 +955,6 @@ impl ChangesView {
             files_rule: Rect::default(),
             lists_rule: Rect::default(),
             commit_rule: Rect::default(),
-            buttons: Vec::new(),
         }
     }
 
@@ -1150,8 +1156,7 @@ impl ChangesView {
             return;
         }
         if self.shown != wanted {
-            self.content_scroll = 0;
-            self.content_h.col = 0;
+            self.content_pane.reset();
         }
         self.shown = wanted;
         let Some(changes) = &self.changes else {
@@ -1228,22 +1233,6 @@ impl ChangesView {
             ));
         }
         lines
-    }
-
-    /// The columns the diff pane's visible lines reach: `rows` rows from
-    /// `scroll`.
-    fn content_extent(&self, scroll: usize, rows: usize) -> usize {
-        match &self.content {
-            Some(Content::Diff(diff)) => diff_extent(diff, &diff.rows(), scroll, rows),
-            Some(Content::Directory(lines)) => text_extent(lines, scroll, rows),
-            _ => 0,
-        }
-    }
-
-    /// Scroll the diff sideways by `columns`.
-    fn scroll_content_sideways(&mut self, columns: isize) {
-        let extent = self.content_extent(self.content_scroll, self.content_shown);
-        self.content_h.scroll_by(columns, extent);
     }
 
     // ----- Actions ---------------------------------------------------------
@@ -1754,6 +1743,11 @@ impl ChangesView {
                 }
                 return ChangesOutcome::Continue;
             }
+            // From the diff, back to the list it shows a file of.
+            KeyCode::BackTab | KeyCode::Tab if self.pane == Pane::Content => {
+                self.pane = self.list.pane();
+                return ChangesOutcome::Continue;
+            }
             KeyCode::BackTab | KeyCode::Tab => {
                 self.pane = self.pane.previous();
                 if self.pane == Pane::Commit && !self.has_commit_box() {
@@ -1786,26 +1780,15 @@ impl ChangesView {
             List::Staged => self.staged_area,
         };
         let page = (area.height as usize).saturating_sub(2).max(1);
-        let count = self.file_list(list).rows.len();
         let selected = self.file_list(list).selected;
         let row = self.file_list(list).selected_row();
         // Moving in a list makes it the one the diff follows, even at
         // its ends.
         self.list = list;
         match key.code {
-            KeyCode::Up if selected == 0 || count == 0 => {
-                if list == List::Staged && !self.unstaged.rows.is_empty() {
-                    self.enter_list(List::Unstaged, usize::MAX);
-                }
-            }
-            KeyCode::Up => self.select(list, selected - 1),
-            KeyCode::Down if selected + 1 >= count => {
-                if list == List::Unstaged && !self.staged.rows.is_empty() {
-                    self.enter_list(List::Staged, 0);
-                } else if self.has_commit_box() {
-                    self.pane = Pane::Commit;
-                }
-            }
+            // The ends of a list are as far as the arrows go: Tab moves
+            // on to the other panes.
+            KeyCode::Up => self.select(list, selected.saturating_sub(1)),
             KeyCode::Down => self.select(list, selected + 1),
             KeyCode::PageUp => self.select(list, selected.saturating_sub(page)),
             KeyCode::PageDown => self.select(list, selected + page),
@@ -1828,9 +1811,6 @@ impl ChangesView {
                 }) => self.file_list_mut(list).set_dir_collapsed(dir, false),
                 // An open directory: on to its first entry.
                 Some(TreeRow::Dir { .. }) => self.select(list, selected + 1),
-                Some(TreeRow::File { .. }) if self.content_area.width > 0 => {
-                    self.pane = Pane::Content;
-                }
                 _ => {}
             },
             KeyCode::Left => match row {
@@ -1860,21 +1840,8 @@ impl ChangesView {
     }
 
     fn handle_content_key(&mut self, key: KeyEvent) {
-        let page = (self.content_area.height as usize).saturating_sub(1).max(1);
-        match key.code {
-            KeyCode::Up => self.content_scroll = self.content_scroll.saturating_sub(1),
-            KeyCode::Down => self.content_scroll += 1,
-            KeyCode::PageUp => self.content_scroll = self.content_scroll.saturating_sub(page),
-            KeyCode::PageDown => self.content_scroll += page,
-            KeyCode::Home => self.content_scroll = 0,
-            KeyCode::End => self.content_scroll = usize::MAX,
-            KeyCode::Right => self.scroll_content_sideways(ARROW_COLUMNS as isize),
-            KeyCode::Left if self.content_h.col > 0 => {
-                self.scroll_content_sideways(-(ARROW_COLUMNS as isize));
-            }
-            KeyCode::Left => self.pane = self.list.pane(),
-            _ => {}
-        }
+        self.content_pane
+            .handle_key(key, shown(self.content.as_ref()));
     }
 
     /// Add pasted text to the commit message, if that is where the
@@ -1894,7 +1861,7 @@ impl ChangesView {
     /// message is being dragged, in which case the page wants drag and
     /// release events wherever they happen.
     pub fn is_dragging(&self) -> bool {
-        self.content_h.dragging || self.divider_drag.is_some() || self.message.is_dragging()
+        self.content_pane.is_dragging() || self.divider_drag.is_some() || self.message.is_dragging()
     }
 
     // ----- Resizing the panes -----------------------------------------------
@@ -2079,15 +2046,11 @@ impl ChangesView {
         if self.is_dragging()
             && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
         {
-            match mouse.kind {
-                MouseEventKind::Drag(_) if self.content_h.dragging => {
-                    let extent = self.content_extent(self.content_scroll, self.content_shown);
-                    self.content_h.scroll_to(mouse.column, extent);
-                }
-                MouseEventKind::Up(_) if self.content_h.dragging => {
-                    self.content_h.dragging = false;
-                }
-                _ => self.message.handle_mouse(mouse, wheel),
+            if self.content_pane.is_dragging() {
+                self.content_pane
+                    .handle_mouse(mouse, wheel, shown(self.content.as_ref()));
+            } else {
+                self.message.handle_mouse(mouse, wheel);
             }
             return outcome;
         }
@@ -2105,26 +2068,28 @@ impl ChangesView {
         let Some(pane) = pane else {
             return outcome;
         };
+        // The diff pane scrolls itself, and says which of the diff's
+        // expand buttons was pressed.
+        if pane == Pane::Content {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.pane = Pane::Content;
+            }
+            let button = self
+                .content_pane
+                .handle_mouse(mouse, wheel, shown(self.content.as_ref()));
+            if let Some(button) = button
+                && let Some(Content::Diff(diff)) = &mut self.content
+            {
+                button.press(diff);
+            }
+            return outcome;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if pane == Pane::Commit => {
                 self.message.handle_mouse(mouse, wheel);
             }
             MouseEventKind::ScrollUp => self.scroll_pane(pane, -(wheel as isize)),
             MouseEventKind::ScrollDown => self.scroll_pane(pane, wheel as isize),
-            MouseEventKind::ScrollRight | MouseEventKind::ScrollLeft if pane == Pane::Content => {
-                let columns = if mouse.kind == MouseEventKind::ScrollRight {
-                    wheel as isize
-                } else {
-                    -(wheel as isize)
-                };
-                self.scroll_content_sideways(columns);
-            }
-            MouseEventKind::Down(MouseButton::Left) if self.content_h.bar.contains(at) => {
-                self.pane = Pane::Content;
-                self.content_h.dragging = true;
-                let extent = self.content_extent(self.content_scroll, self.content_shown);
-                self.content_h.scroll_to(mouse.column, extent);
-            }
             MouseEventKind::Down(MouseButton::Left) if self.amend_area.contains(at) => {
                 if let ChangesOutcome::Notice(notice) = self.toggle_amend() {
                     outcome.notice = Some(notice);
@@ -2172,14 +2137,7 @@ impl ChangesView {
                             self.message.handle_mouse(mouse, wheel);
                         }
                     }
-                    Pane::Content => {
-                        if let Some((_, button)) =
-                            self.buttons.iter().find(|(area, _)| area.contains(at))
-                            && let Some(Content::Diff(diff)) = &mut self.content
-                        {
-                            button.press(diff);
-                        }
-                    }
+                    Pane::Content => {}
                 }
             }
             _ => {}
@@ -2194,7 +2152,7 @@ impl ChangesView {
             Pane::Unstaged => self.unstaged.scroll = step(self.unstaged.scroll),
             Pane::Staged => self.staged.scroll = step(self.staged.scroll),
             Pane::Commit => {}
-            Pane::Content => self.content_scroll = step(self.content_scroll),
+            Pane::Content => self.content_pane.scroll_by(rows),
         }
     }
 
@@ -2211,7 +2169,6 @@ impl ChangesView {
         self.area = area;
         let background = palette_background(theme);
         buf.set_style(area, background);
-        self.buttons.clear();
         self.unstaged_area = Rect::default();
         self.staged_area = Rect::default();
         self.commit_area = Rect::default();
@@ -2559,86 +2516,8 @@ impl ChangesView {
     }
 
     fn render_content(&mut self, buf: &mut Buffer, theme: &Theme) {
-        let area = self.content_area;
-        if area.width < 4 || area.height == 0 {
-            return;
-        }
-        let background = content_background(theme);
-        buf.set_style(area, background);
-        let dim = background.fg(theme.command_palette_result_context_text);
-        let height = area.height as usize;
-        let Some(content) = &self.content else {
-            return;
-        };
-        match content {
-            Content::Message(message) | Content::Failed(message) => {
-                buf.set_stringn(area.x + 1, area.y, message, area.width as usize - 1, dim);
-                self.content_h
-                    .render(0, area.width as usize, Rect::default(), buf, theme);
-                self.content_rows = 1;
-                self.content_shown = 1;
-                self.content_scroll = 0;
-            }
-            Content::Directory(lines) => {
-                self.content_rows = lines.len();
-                let capacity = area.width as usize - 1;
-                // The scrollbar takes the last row; see `render_diff`.
-                // Clamp the scroll asked for afresh on each pass, as
-                // `render_diff` does, so the last row is reachable once
-                // the bar takes a row.
-                let wanted = self.content_scroll;
-                let mut show_bar = false;
-                let mut shown;
-                let mut extent;
-                loop {
-                    shown = height - usize::from(show_bar);
-                    self.content_scroll = wanted.min(lines.len().saturating_sub(shown));
-                    extent = text_extent(lines, self.content_scroll, shown);
-                    let needed = self.content_h.needs_bar(extent, capacity) && height > 1;
-                    if needed && !show_bar {
-                        show_bar = true;
-                        continue;
-                    }
-                    break;
-                }
-                self.content_shown = shown;
-                for (row, (line, style)) in lines
-                    .iter()
-                    .skip(self.content_scroll)
-                    .take(shown)
-                    .enumerate()
-                {
-                    let y = area.y + row as u16;
-                    let cells = layout_cells(line, &[]);
-                    let row_area = Rect::new(area.x + 1, y, area.width - 1, 1);
-                    draw_cells(buf, row_area, &cells, self.content_h.col, |_| {
-                        background.patch(*style)
-                    });
-                }
-                let bar = if show_bar {
-                    Rect::new(area.x + 1, area.bottom() - 1, area.width - 1, 1)
-                } else {
-                    Rect::default()
-                };
-                self.content_h.render(extent, capacity, bar, buf, theme);
-            }
-            Content::Diff(diff) => {
-                let mut buttons = Vec::new();
-                let drawn = render_diff(
-                    diff,
-                    area,
-                    buf,
-                    theme,
-                    self.content_scroll,
-                    &mut self.content_h,
-                    &mut buttons,
-                );
-                self.content_rows = drawn.rows;
-                self.content_shown = drawn.shown;
-                self.content_scroll = drawn.scroll;
-                self.buttons = buttons;
-            }
-        }
+        self.content_pane
+            .render(self.content_area, buf, theme, shown(self.content.as_ref()));
     }
 }
 
@@ -3025,10 +2904,15 @@ mod tests {
             .unwrap_or_else(|| panic!("{left:#?}"));
         assert!(left[staged + 1].starts_with(" A c.txt"), "{left:#?}");
         assert_eq!(view.unstaged.selected, 1);
-        // Down past the end of the unstaged list goes on into the
-        // staged one, whose diff is against HEAD.
+        // Down at the end of the unstaged list stays there; Tab goes
+        // on to the staged one, whose diff, against HEAD, shows once
+        // its selection moves.
         press(&mut view, KeyCode::Down);
+        assert_eq!(view.pane, Pane::Unstaged);
+        assert_eq!(view.unstaged.selected, 1);
+        press(&mut view, KeyCode::Tab);
         assert_eq!(view.pane, Pane::Staged);
+        press(&mut view, KeyCode::Home);
         assert_eq!(view.list, List::Staged);
         let screen = draw(&mut view, 100, 30);
         assert!(screen.iter().any(|r| r.contains("+ c")), "{screen:#?}");
@@ -3045,6 +2929,8 @@ mod tests {
         assert!(view.files(List::Staged).is_empty());
         assert_eq!(view.files(List::Unstaged).len(), 3);
         press(&mut view, KeyCode::Up);
+        assert_eq!(view.pane, Pane::Staged, "↑ stays in the emptied list");
+        press(&mut view, KeyCode::BackTab);
         assert_eq!(view.pane, Pane::Unstaged);
         press(&mut view, KeyCode::Char('a'));
         assert!(view.files(List::Unstaged).is_empty());
@@ -3058,13 +2944,18 @@ mod tests {
         let screen = draw(&mut view, 100, 30);
         assert!(row_with(&screen, NO_UNSTAGED).len() > width);
 
-        // Down from the empty unstaged list goes to the staged one, and
-        // from its end to the commit box; a two-paragraph message and
-        // Ctrl+S commit.
+        // Down in the empty unstaged list stays there; Tab goes to the
+        // staged one, and on past the diff to the commit box, where a
+        // two-paragraph message and Ctrl+S commit.
         press(&mut view, KeyCode::Down);
+        assert_eq!(view.pane, Pane::Unstaged);
+        press(&mut view, KeyCode::Tab);
         assert_eq!(view.pane, Pane::Staged);
         press(&mut view, KeyCode::End);
         press(&mut view, KeyCode::Down);
+        assert_eq!(view.pane, Pane::Staged);
+        press(&mut view, KeyCode::Tab);
+        press(&mut view, KeyCode::Tab);
         assert_eq!(view.pane, Pane::Commit);
         let outcome = ctrl(&mut view, 's');
         assert!(
@@ -3250,11 +3141,12 @@ mod tests {
         view.refresh();
         settle(&mut view);
 
-        // Staged, the same range shows against HEAD; Down from the
-        // now empty unstaged list goes to it.
+        // Staged, the same range shows against HEAD, in the staged
+        // list.
         press(&mut view, KeyCode::Char(' '));
         settle(&mut view);
-        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Tab);
+        press(&mut view, KeyCode::Home);
         let screen = draw(&mut view, 100, 30);
         assert!(
             row_with(&screen, "Submodule sub: ").contains(&short_id(s2)),
@@ -3368,6 +3260,9 @@ mod tests {
             view.staged.selected_row(),
             Some(TreeRow::File { .. })
         ));
+        // → on a file stays in the list: Enter or Tab goes to the diff.
+        press(&mut view, KeyCode::Right);
+        assert_eq!(view.pane, Pane::Staged);
         press(&mut view, KeyCode::Left);
         assert!(matches!(
             view.staged.selected_row(),
@@ -4014,8 +3909,11 @@ mod tests {
         assert_eq!(view.pane, Pane::Content);
         let mut buf = Buffer::empty(area);
         assert_eq!(view.render(area, &mut buf, &Theme::default()), None);
-        // ← in the diff goes back to the list the diff follows.
+        // ← stays in the diff; Shift+Tab goes back to the list the
+        // diff follows, which needn't be the pane before it.
         press(&mut view, KeyCode::Left);
+        assert_eq!(view.pane, Pane::Content);
+        press(&mut view, KeyCode::BackTab);
         assert_eq!(view.pane, Pane::Unstaged);
     }
 
@@ -4243,7 +4141,8 @@ mod tests {
 
         // Nothing to discard in the staged list: the command does
         // nothing there.
-        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Tab);
+        press(&mut view, KeyCode::Home);
         press(&mut view, KeyCode::Down);
         assert_eq!(view.list, List::Staged);
         assert!(!view.can_discard_selected());

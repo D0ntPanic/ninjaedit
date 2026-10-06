@@ -21,6 +21,14 @@
 //! its status letter as the file lists have them, and where to go to
 //! commit them.
 //!
+//! Both pages show the diff in a [`ContentPane`], which shows lines of
+//! text (a commit's description, a directory's files) and notes in
+//! place of content as well, and keeps the pane's scrolling: the keys
+//! and the wheel scroll it, a scrollbar down its right edge ([`VScroll`],
+//! always shown, as the editor's is) says where in the content it is
+//! and how much of it fits, and a click on an expand button is handed
+//! back to the page, which holds the diff, to press.
+//!
 //! [`HScroll`] is the sideways scrolling of a pane, with the editor's
 //! rules (see `EditorView`): the limit is set by the longest line
 //! visible now plus a little slack, not by the longest line there is,
@@ -33,13 +41,14 @@
 use crate::commit_row::{CommitLine, Highlight, commit_extent, draw_commit_line, lane_cap};
 use crate::palette::palette_background;
 use crate::theme::Theme;
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
     ChangeKind, Commit, DiffRow, FileDiff, LineKind, RANGE_LIMIT, SubmoduleRange,
     UncommittedChange, Unshown, short_id,
 };
 use ninjaedit_core::{Token, TokenKind, text};
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position as ScreenPosition, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget};
 
@@ -167,6 +176,320 @@ impl HScroll {
             .track_style(base.fg(theme.scroll_bar_track))
             .thumb_style(base.fg(theme.scroll_bar_color))
             .render(bar, buf, &mut state);
+    }
+}
+
+/// The vertical scrollbar of a pane, which is always shown, as the
+/// editor's is: the thumb's place says where in the content the pane
+/// is, and its length how much of the content fits.
+#[derive(Default)]
+pub(crate) struct VScroll {
+    /// Where the scrollbar was drawn, empty while there is none.
+    pub(crate) bar: Rect,
+    pub(crate) dragging: bool,
+    /// The furthest down the content could scroll at the last render.
+    max: usize,
+}
+
+impl VScroll {
+    /// The scroll position that a click or drag at screen row `y` puts
+    /// the thumb at.
+    pub(crate) fn scroll_at(&self, y: u16) -> usize {
+        let track = self.bar.height.max(1) as usize;
+        let row = y.saturating_sub(self.bar.y) as usize;
+        (row * (self.max + 1) / track).min(self.max)
+    }
+
+    /// Draw the scrollbar in `bar` for content of `rows` rows, `shown`
+    /// of them from `scroll`; an empty `bar` draws none.
+    pub(crate) fn render(
+        &mut self,
+        rows: usize,
+        shown: usize,
+        scroll: usize,
+        bar: Rect,
+        buf: &mut Buffer,
+        theme: &Theme,
+    ) {
+        self.bar = bar;
+        self.max = rows.saturating_sub(shown);
+        if bar.width == 0 || bar.height == 0 {
+            self.bar = Rect::default();
+            return;
+        }
+        let base = content_background(theme);
+        let mut state = ScrollbarState::new(self.max + 1)
+            .position(scroll)
+            .viewport_content_length(shown);
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("█")
+            .track_style(base.fg(theme.scroll_bar_track))
+            .thumb_style(base.fg(theme.scroll_bar_color))
+            .render(bar, buf, &mut state);
+    }
+}
+
+/// What a page's content pane shows, for drawing and measuring it.
+#[derive(Clone, Copy)]
+pub(crate) enum Shown<'a> {
+    Nothing,
+    /// Lines of text, each in a style of its own.
+    Lines(&'a [Piece]),
+    Diff(&'a FileDiff),
+    /// A note in place of content, such as why there is none.
+    Note(&'a str),
+}
+
+/// The pane the git pages show the selection's content in, a diff or
+/// lines of text: how it is scrolled, both ways, with a scrollbar for
+/// each, and the expand buttons a diff's gaps drew. The page keeps what
+/// is shown and hands it over for each render and input, as a
+/// [`Shown`]; the pane keeps the rest.
+#[derive(Default)]
+pub(crate) struct ContentPane {
+    /// The rows scrolled off the top.
+    scroll: usize,
+    h: HScroll,
+    v: VScroll,
+    /// How many rows the content had at the last render, and how many
+    /// of them were shown.
+    rows: usize,
+    shown: usize,
+    /// Where the pane was drawn.
+    area: Rect,
+    /// The expand buttons drawn in a diff, to hit-test clicks.
+    buttons: Vec<(Rect, Button)>,
+}
+
+impl ContentPane {
+    /// Back to the top and the left edge, for new content.
+    pub(crate) fn reset(&mut self) {
+        self.scroll = 0;
+        self.h.col = 0;
+    }
+
+    /// Whether a scrollbar is being dragged, in which case the pane
+    /// wants drag and release events wherever they happen.
+    pub(crate) fn is_dragging(&self) -> bool {
+        self.h.dragging || self.v.dragging
+    }
+
+    /// The columns the visible rows of the content reach.
+    pub(crate) fn extent(&self, content: Shown<'_>) -> usize {
+        match content {
+            Shown::Lines(lines) => text_extent(lines, self.scroll, self.shown),
+            Shown::Diff(diff) => diff_extent(diff, &diff.rows(), self.scroll, self.shown),
+            Shown::Nothing | Shown::Note(_) => 0,
+        }
+    }
+
+    /// Scroll by some rows, down for positive. The render clamps the
+    /// position to the content.
+    pub(crate) fn scroll_by(&mut self, rows: isize) {
+        self.scroll = self.scroll.saturating_add_signed(rows);
+    }
+
+    /// Scroll sideways by some columns, right for positive, with the
+    /// editor's limits (see [`HScroll`]).
+    pub(crate) fn scroll_sideways(&mut self, columns: isize, content: Shown<'_>) {
+        let extent = self.extent(content);
+        self.h.scroll_by(columns, extent);
+    }
+
+    /// Handle a key while the pane has the keyboard: the arrows scroll
+    /// it, Page Up and Page Down by a page, Home and End to either end.
+    /// Returns whether the key meant something to the pane.
+    pub(crate) fn handle_key(&mut self, key: KeyEvent, content: Shown<'_>) -> bool {
+        let page = (self.area.height as usize).saturating_sub(1).max(1);
+        match key.code {
+            KeyCode::Up => self.scroll_by(-1),
+            KeyCode::Down => self.scroll_by(1),
+            KeyCode::PageUp => self.scroll_by(-(page as isize)),
+            KeyCode::PageDown => self.scroll_by(page as isize),
+            KeyCode::Home => self.scroll = 0,
+            KeyCode::End => self.scroll = usize::MAX,
+            KeyCode::Right => self.scroll_sideways(ARROW_COLUMNS as isize, content),
+            KeyCode::Left => self.scroll_sideways(-(ARROW_COLUMNS as isize), content),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Handle a mouse event over the pane, or any drag or release while
+    /// a scrollbar is being dragged. `wheel` is how many rows (or
+    /// columns, sideways) the wheel scrolls. Returns the expand button
+    /// pressed, if any, for the page to press: it holds the diff.
+    pub(crate) fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        wheel: usize,
+        content: Shown<'_>,
+    ) -> Option<Button> {
+        let at = ScreenPosition::new(mouse.column, mouse.row);
+        let wheel = wheel as isize;
+        match mouse.kind {
+            MouseEventKind::Drag(_) if self.h.dragging => {
+                let extent = self.extent(content);
+                self.h.scroll_to(mouse.column, extent);
+            }
+            MouseEventKind::Drag(_) if self.v.dragging => self.scroll = self.v.scroll_at(mouse.row),
+            MouseEventKind::Up(_) => {
+                self.h.dragging = false;
+                self.v.dragging = false;
+            }
+            MouseEventKind::ScrollUp => self.scroll_by(-wheel),
+            MouseEventKind::ScrollDown => self.scroll_by(wheel),
+            MouseEventKind::ScrollRight => self.scroll_sideways(wheel, content),
+            MouseEventKind::ScrollLeft => self.scroll_sideways(-wheel, content),
+            MouseEventKind::Down(MouseButton::Left) if self.h.bar.contains(at) => {
+                self.h.dragging = true;
+                let extent = self.extent(content);
+                self.h.scroll_to(mouse.column, extent);
+            }
+            MouseEventKind::Down(MouseButton::Left) if self.v.bar.contains(at) => {
+                self.v.dragging = true;
+                self.scroll = self.v.scroll_at(mouse.row);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                return self
+                    .buttons
+                    .iter()
+                    .find(|(area, _)| area.contains(at))
+                    .map(|(_, button)| *button);
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Draw the content into `area`, with the vertical scrollbar down
+    /// its right edge, and the horizontal one along the bottom of the
+    /// rest when anything is out of view sideways.
+    pub(crate) fn render(
+        &mut self,
+        area: Rect,
+        buf: &mut Buffer,
+        theme: &Theme,
+        content: Shown<'_>,
+    ) {
+        self.area = area;
+        self.buttons.clear();
+        let background = content_background(theme);
+        buf.set_style(area, background);
+        if area.width < 4 || area.height == 0 {
+            self.h.bar = Rect::default();
+            self.v.bar = Rect::default();
+            return;
+        }
+        let dim = background.fg(theme.command_palette_result_context_text);
+        let inner = Rect::new(area.x, area.y, area.width - 1, area.height);
+        match content {
+            Shown::Nothing => {
+                self.h.render(0, 0, Rect::default(), buf, theme);
+                self.v.bar = Rect::default();
+                return;
+            }
+            Shown::Note(note) => {
+                buf.set_stringn(inner.x + 1, inner.y, note, inner.width as usize - 1, dim);
+                self.h
+                    .render(0, inner.width as usize, Rect::default(), buf, theme);
+                self.rows = 1;
+                self.shown = 1;
+                self.scroll = 0;
+            }
+            Shown::Lines(lines) => self.render_lines(inner, buf, theme, lines),
+            Shown::Diff(diff) => {
+                let drawn = render_diff(
+                    diff,
+                    inner,
+                    buf,
+                    theme,
+                    self.scroll,
+                    &mut self.h,
+                    &mut self.buttons,
+                );
+                self.rows = drawn.rows;
+                self.shown = drawn.shown;
+                self.scroll = drawn.scroll;
+            }
+        }
+        // The bar runs down beside the rows shown, leaving the corner
+        // by the horizontal scrollbar empty, as in the editor.
+        let bar = Rect::new(
+            area.right() - 1,
+            area.y,
+            1,
+            self.shown.min(area.height as usize) as u16,
+        );
+        self.v
+            .render(self.rows, self.shown, self.scroll, bar, buf, theme);
+    }
+
+    /// Draw lines of text, each in its own style over the pane's
+    /// background, scrolled both ways.
+    fn render_lines(&mut self, area: Rect, buf: &mut Buffer, theme: &Theme, lines: &[Piece]) {
+        let background = content_background(theme);
+        let height = area.height as usize;
+        self.rows = lines.len();
+        let capacity = area.width as usize - 1;
+        // The scrollbar takes the last row; see `render_diff`. Clamp the
+        // scroll asked for afresh on each pass, as `render_diff` does,
+        // so the last row is reachable once the bar takes a row.
+        let wanted = self.scroll;
+        let mut show_bar = false;
+        let mut shown;
+        let mut extent;
+        loop {
+            shown = height - usize::from(show_bar);
+            self.scroll = wanted.min(lines.len().saturating_sub(shown));
+            extent = text_extent(lines, self.scroll, shown);
+            let needed = self.h.needs_bar(extent, capacity) && height > 1;
+            if needed && !show_bar {
+                show_bar = true;
+                continue;
+            }
+            break;
+        }
+        self.shown = shown;
+        for (row, (line, style)) in lines.iter().skip(self.scroll).take(shown).enumerate() {
+            let y = area.y + row as u16;
+            let cells = layout_cells(line, &[]);
+            let row_area = Rect::new(area.x + 1, y, area.width - 1, 1);
+            draw_cells(buf, row_area, &cells, self.h.col, |_| {
+                background.patch(*style)
+            });
+        }
+        let bar = if show_bar {
+            Rect::new(area.x + 1, area.bottom() - 1, area.width - 1, 1)
+        } else {
+            Rect::default()
+        };
+        self.h.render(extent, capacity, bar, buf, theme);
+    }
+}
+
+/// What tests look at.
+#[cfg(test)]
+impl ContentPane {
+    pub(crate) fn h(&self) -> &HScroll {
+        &self.h
+    }
+
+    pub(crate) fn v(&self) -> &VScroll {
+        &self.v
+    }
+
+    pub(crate) fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    /// How many rows the content had at the last render, and how many
+    /// of them were shown.
+    pub(crate) fn rows(&self) -> (usize, usize) {
+        (self.rows, self.shown)
     }
 }
 

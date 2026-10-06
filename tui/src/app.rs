@@ -623,6 +623,9 @@ pub struct App {
     /// kept as it was left so that Ctrl+L brings it back to the same
     /// place; see [`open_git_log`](Self::open_git_log).
     git_log: Option<Box<GitLogTabs>>,
+    /// The changes page likewise, so that Ctrl+U brings it back as it
+    /// was left; see [`open_changes`](Self::open_changes).
+    changes: Option<Box<ChangesTabs>>,
     /// The tab bar drawn in place of the editor's while a mode is up,
     /// with the mode's one tab.
     mode_tab_bar: TabBar,
@@ -765,6 +768,7 @@ impl App {
             theme: Theme::default(),
             mode: Mode::Editor,
             git_log: None,
+            changes: None,
             mode_tab_bar: TabBar::default(),
             view_history: Vec::new(),
             last_view: View::Editor,
@@ -1860,7 +1864,7 @@ impl App {
                 self.handle_build_outcome(outcome);
             }
             Mode::GitLog(tabs) => self.git_log = Some(tabs),
-            Mode::Changes(_) => {}
+            Mode::Changes(tabs) => self.changes = Some(tabs),
             Mode::Agent(previous, _) => {
                 self.mode = *previous;
                 self.leave_mode();
@@ -2146,25 +2150,37 @@ impl App {
     // ----- Changes --------------------------------------------------------
 
     /// Ctrl+U: show the changes page in the editor's place and give it
-    /// the keyboard. With the page already up, scan the working tree
-    /// again: the user may have saved a file, or run git in a shell.
+    /// the keyboard. The page is kept when it is left, and comes back as
+    /// it was, as the git log page does: a review can go to the editor
+    /// to look something up and come back to where it was. Coming back,
+    /// or Ctrl+U with the page already up, scans the working tree again:
+    /// the user may have saved a file, or run git in a shell.
     fn open_changes(&mut self) {
         self.close_editor_overlays();
         match &mut self.mode {
             Mode::Changes(tabs) => tabs.refresh(),
             _ => {
                 self.leave_mode();
-                let layout = match git_layout::load(
-                    &self.project_storage,
-                    git_layout::CHANGES_LAYOUT_FILE,
-                ) {
-                    Ok(layout) => layout,
-                    Err(err) => {
-                        self.status = Some(StatusLine::error(err.to_string()));
-                        Default::default()
+                let tabs = match self.changes.take() {
+                    Some(mut tabs) => {
+                        tabs.refresh();
+                        tabs
+                    }
+                    None => {
+                        let layout = match git_layout::load(
+                            &self.project_storage,
+                            git_layout::CHANGES_LAYOUT_FILE,
+                        ) {
+                            Ok(layout) => layout,
+                            Err(err) => {
+                                self.status = Some(StatusLine::error(err.to_string()));
+                                Default::default()
+                            }
+                        };
+                        Box::new(ChangesTabs::new(self.project.root(), layout))
                     }
                 };
-                self.mode = Mode::Changes(Box::new(ChangesTabs::new(self.project.root(), layout)));
+                self.mode = Mode::Changes(tabs);
             }
         }
         self.focus = Focus::Editor;
@@ -5655,6 +5671,74 @@ mod tests {
         assert_eq!(selected(&app), Some(first));
         wait(&mut app);
         assert_eq!(selected(&app), Some(first));
+    }
+
+    #[test]
+    fn the_changes_page_comes_back_as_it_was_left_and_scans_again() {
+        let (dir, mut app) = app_with_files(&[]);
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".storage/\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+        let mut index = repo.index().unwrap();
+        for path in [".gitignore", "a.txt", "b.txt"] {
+            index.add_path(Path::new(path)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Base", &tree, &[])
+            .unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a edited\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "b edited\n").unwrap();
+        let settle = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Mode::Changes(tabs) = &app.mode
+                && tabs.is_loading()
+                && Instant::now() < deadline
+            {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(matches!(&app.mode, Mode::Changes(tabs) if !tabs.is_loading()));
+        };
+        ctrl(&mut app, 'u');
+        settle(&mut app);
+        // Down to b.txt, and round to the commit box to start a message.
+        press(&mut app, KeyCode::Down);
+        let screen = draw(&mut app, 100, 24);
+        assert!(screen.iter().any(|r| r.contains("b edited")), "{screen:#?}");
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Tab);
+        }
+        type_str(&mut app, "Half a message");
+        let screen = draw(&mut app, 100, 24);
+        assert!(
+            screen.iter().any(|r| r.contains("Half a message")),
+            "{screen:#?}"
+        );
+        // Leave for the editor; a file is added meanwhile; come back.
+        ctrl(&mut app, 'e');
+        type_str(&mut app, EDITOR_MODE_LABEL);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Editor));
+        std::fs::write(dir.path().join("c.txt"), "new\n").unwrap();
+        ctrl(&mut app, 'u');
+        assert!(matches!(&app.mode, Mode::Changes(tabs) if tabs.is_loading()));
+        // The page is as it was left, the scan taking in the new file
+        // around the selection, which stays on b.txt; and the keyboard
+        // is still in the message, which goes on where it was.
+        settle(&mut app);
+        type_str(&mut app, ", finished");
+        let screen = draw(&mut app, 100, 24);
+        assert!(screen.iter().any(|r| r.contains("c.txt")), "{screen:#?}");
+        assert!(screen.iter().any(|r| r.contains("b edited")), "{screen:#?}");
+        assert!(
+            screen
+                .iter()
+                .any(|r| r.contains("Half a message, finished")),
+            "{screen:#?}"
+        );
     }
 
     #[test]
