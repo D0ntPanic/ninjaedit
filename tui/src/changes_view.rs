@@ -67,7 +67,8 @@
 //! diff: the core crate's `Changes::apply_lines` writes what the diff
 //! works out for them, and refuses if the file changed since the diff
 //! was made. A right click in the diff opens a menu of all of that, with
-//! copying the selection, selecting it all, and, set apart since it
+//! copying the selection (as shown, as a patch, or as the new side has
+//! it), selecting it all, and, set apart since it
 //! loses work, reverting the selected lines of an unstaged file to what
 //! is staged, after asking. A
 //! scan builds the diff again, since the file may have changed, and the
@@ -155,8 +156,8 @@
 use crate::clipboard::Clipboard;
 use crate::confirm_box::{ConfirmBox, ConfirmOutcome};
 use crate::diff_pane::{
-    self, ContentPane, Piece, Shown, ShownMut, TAB_WIDTH, clamp_between, display_width, fit_end,
-    share_for, share_of,
+    self, ContentPane, CopyAs, Piece, Shown, ShownMut, TAB_WIDTH, clamp_between, display_width,
+    fit_end, share_for, share_of,
 };
 use crate::editor_view::EditorView;
 use crate::git_layout::{ChangesSizes, GitChangesLayout, MAIN_REPOSITORY};
@@ -2060,10 +2061,23 @@ impl ChangesView {
         matches!(&self.content, Some(Content::Diff(model)) if model.selection().is_some())
     }
 
-    /// "Copy": put the diff's selection on the clipboard. Returns what
-    /// to say about it, nothing without a selection.
-    pub fn copy_diff_selection(&self, clipboard: &mut Clipboard) -> Option<StatusLine> {
-        diff_pane::copy(shown(self.content.as_ref()), clipboard)
+    /// "Copy", "Copy as patch", and "Copy new side": put the diff's
+    /// selection on the clipboard, copied `how`. Returns what to say
+    /// about it, nothing without a selection.
+    pub fn copy_diff_selection(
+        &self,
+        clipboard: &mut Clipboard,
+        how: CopyAs,
+    ) -> Option<StatusLine> {
+        diff_pane::copy(shown(self.content.as_ref()), clipboard, how)
+    }
+
+    /// Whether the diff's selection has changes in it, to copy as a
+    /// patch.
+    pub fn has_diff_selection_changes(&self) -> bool {
+        matches!(&self.content, Some(Content::Diff(model))
+            if model.selection().is_some()
+                && model.diff().has_changes_among(&model.selected_lines()))
     }
 
     /// "Select all": select the whole diff shown, and give the keyboard
@@ -4329,7 +4343,10 @@ mod tests {
         view.select_all_in_diff();
         assert!(view.has_diff_selection());
         let mut clipboard = Clipboard::local_only();
-        assert!(view.copy_diff_selection(&mut clipboard).is_some());
+        assert!(
+            view.copy_diff_selection(&mut clipboard, CopyAs::Text)
+                .is_some()
+        );
         assert_eq!(
             clipboard.get().as_deref(),
             Some("line 7\nline 8\nline 9\nline 10\nline ten\nline 11\nline 12\nline 13\n")

@@ -56,6 +56,10 @@ pub enum Command {
     Redo,
     Cut,
     Copy,
+    /// Copying a git page's diff selection as a patch.
+    CopyAsPatch,
+    /// Copying a git page's diff selection as the new side has it.
+    CopyNewSide,
     Paste,
     SelectAll,
     Build,
@@ -300,13 +304,16 @@ pub struct Context {
     /// On the git pages, whether anything is selected in the diff shown,
     /// to copy.
     pub diff_has_selection: bool,
+    /// On the git pages, whether the diff's selection takes in changed
+    /// lines, to copy as a patch.
+    pub diff_selection_has_changes: bool,
 }
 
 impl Command {
     /// Every command, in the order the palette lists them before
     /// anything is typed: files, searching, editing, building, the
     /// pages, views, and quitting last.
-    pub const ALL: [Command; 63] = [
+    pub const ALL: [Command; 65] = [
         Command::OpenFile,
         Command::SwitchTab,
         Command::Save,
@@ -322,6 +329,8 @@ impl Command {
         Command::Redo,
         Command::Cut,
         Command::Copy,
+        Command::CopyAsPatch,
+        Command::CopyNewSide,
         Command::Paste,
         Command::SelectAll,
         Command::Build,
@@ -402,6 +411,8 @@ impl Command {
             Command::Redo => file.is_some_and(|f| f.can_redo),
             Command::Cut => file.is_some_and(|f| f.has_selection),
             Command::Copy => file.is_some_and(|f| f.has_selection) || context.diff_has_selection,
+            Command::CopyNewSide => context.diff_has_selection,
+            Command::CopyAsPatch => context.diff_selection_has_changes,
             Command::Build | Command::Run | Command::DeleteBuildDir => build.has_current,
             Command::StopJob => context.job_running,
             Command::SelectConfiguration => build.has_configurations,
@@ -470,6 +481,8 @@ impl Command {
             Command::Redo => "Redo",
             Command::Cut => "Cut",
             Command::Copy => "Copy",
+            Command::CopyAsPatch => "Copy as patch",
+            Command::CopyNewSide => "Copy new side",
             Command::Paste => "Paste",
             Command::SelectAll => "Select all",
             Command::Build => "Build",
@@ -546,6 +559,12 @@ impl Command {
             Command::Redo => "Redo the last undone edit",
             Command::Cut => "Cut the selection to the clipboard",
             Command::Copy => "Copy the selection to the clipboard",
+            Command::CopyAsPatch => {
+                "On a git page, copy the changes on the lines selected in the diff as a patch in git's format, to apply with git apply to the file as it was before them"
+            }
+            Command::CopyNewSide => {
+                "On a git page, copy the text selected in the diff as it is after the change: the added and unchanged lines, without the removed ones"
+            }
             Command::Paste => "Paste from the clipboard",
             Command::SelectAll => "Select the whole file, or the whole diff on a git page",
             Command::Build => "Build the current target with the current configuration",
@@ -732,6 +751,8 @@ impl Command {
             | Command::RestoreParentVersion
             | Command::StageSelected
             | Command::UnstageSelected
+            | Command::CopyAsPatch
+            | Command::CopyNewSide
             | Command::StageLines
             | Command::UnstageLines
             | Command::RevertLines
@@ -1027,6 +1048,14 @@ mod tests {
             };
             let listed = available(&selected);
             assert!(listed.contains(&Command::Copy), "{listed:?}");
+            assert!(listed.contains(&Command::CopyNewSide), "{listed:?}");
+            // A patch needs changes among what is selected.
+            assert!(!listed.contains(&Command::CopyAsPatch), "{listed:?}");
+            let changed = Context {
+                diff_selection_has_changes: true,
+                ..selected
+            };
+            assert!(available(&changed).contains(&Command::CopyAsPatch));
             // The editor's other edits stay the editor's.
             assert!(!listed.contains(&Command::Cut), "{listed:?}");
             assert!(!listed.contains(&Command::Paste), "{listed:?}");

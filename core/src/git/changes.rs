@@ -1964,6 +1964,91 @@ mod tests {
         assert_eq!(read(&repo, "a.txt"), "edited since\n");
     }
 
+    /// Apply a patch to the working directory as `git apply` does,
+    /// with libgit2's reader of git's patches.
+    fn apply_patch(repo: &TestRepo, patch: &str) {
+        let diff = git2::Diff::from_buffer(patch.as_bytes())
+            .unwrap_or_else(|err| panic!("{err}: {patch}"));
+        repo.repo
+            .apply(&diff, git2::ApplyLocation::WorkDir, None)
+            .unwrap_or_else(|err| panic!("{err}: {patch}"));
+    }
+
+    #[test]
+    fn selected_lines_make_a_patch_git_applies() {
+        let mut repo = TestRepo::new();
+        let base: String = (1..=10).map(|n| format!("{n}\n")).collect();
+        repo.commit(
+            &[("a.txt", &base), ("gone.txt", "x\ny\n"), ("end.txt", "e")],
+            "Base",
+            &[],
+        );
+        let edited = base.replace("3\n", "three\n").replace("8\n", "eight\n");
+        fs::write(repo.path().join("a.txt"), &edited).unwrap();
+        fs::write(repo.path().join("new.txt"), "n1\nn2\n").unwrap();
+        fs::remove_file(repo.path().join("gone.txt")).unwrap();
+        fs::write(repo.path().join("end.txt"), "e\nf").unwrap();
+        let changes = open(&repo);
+        let diff_of = |path: &str| {
+            let change = changes
+                .unstaged()
+                .iter()
+                .find(|change| change.path == path)
+                .unwrap()
+                .clone();
+            changes.unstaged_diff(&change).unwrap()
+        };
+
+        // The change of line 3 alone, against the file as committed.
+        let diff = diff_of("a.txt");
+        let patch = diff
+            .patch_of_lines(&pick(&diff, &["-3", "+three"]))
+            .unwrap();
+        assert!(
+            patch.starts_with("diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ "),
+            "{patch}"
+        );
+        assert!(!patch.contains("eight"), "{patch}");
+        fs::write(repo.path().join("a.txt"), &base).unwrap();
+        apply_patch(&repo, &patch);
+        assert_eq!(read(&repo, "a.txt"), base.replace("3\n", "three\n"));
+        assert_eq!(diff.patch_of_lines(&pick(&diff, &[" 4"])), None);
+
+        // A new file is created, with the lines chosen.
+        let diff = diff_of("new.txt");
+        let patch = diff.patch_of_lines(&pick(&diff, &["+n2"])).unwrap();
+        assert!(
+            patch.contains("new file mode 100644\n--- /dev/null\n"),
+            "{patch}"
+        );
+        fs::remove_file(repo.path().join("new.txt")).unwrap();
+        apply_patch(&repo, &patch);
+        assert_eq!(read(&repo, "new.txt"), "n2\n");
+
+        // A file with all its lines removed is deleted; with some, kept.
+        let diff = diff_of("gone.txt");
+        let all = diff.patch_of_lines(&pick(&diff, &["-x", "-y"])).unwrap();
+        assert!(all.contains("deleted file mode 100644\n"), "{all}");
+        assert!(all.contains("+++ /dev/null\n"), "{all}");
+        let some = diff.patch_of_lines(&pick(&diff, &["-x"])).unwrap();
+        fs::write(repo.path().join("gone.txt"), "x\ny\n").unwrap();
+        apply_patch(&repo, &some);
+        assert_eq!(read(&repo, "gone.txt"), "y\n");
+        fs::write(repo.path().join("gone.txt"), "x\ny\n").unwrap();
+        apply_patch(&repo, &all);
+        assert!(!repo.path().join("gone.txt").exists());
+
+        // A last line without a line break says so, and keeps it so.
+        let diff = diff_of("end.txt");
+        let patch = diff
+            .patch_of_lines(&pick(&diff, &["-e", "+e", "+f"]))
+            .unwrap();
+        assert!(patch.contains("\\ No newline at end of file"), "{patch}");
+        fs::write(repo.path().join("end.txt"), "e").unwrap();
+        apply_patch(&repo, &patch);
+        assert_eq!(read(&repo, "end.txt"), "e\nf");
+    }
+
     #[test]
     fn lines_of_an_untracked_file_are_staged_into_a_new_entry() {
         let mut repo = TestRepo::new();

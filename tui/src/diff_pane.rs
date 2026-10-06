@@ -37,7 +37,9 @@
 //! or drag in the line numbers selects whole lines. The view follows
 //! the cursor; the wheel and the scrollbars scroll without moving it.
 //! The selection is drawn in the theme's selection colors over the
-//! text, and Ctrl+C copies it as shown, without the hidden lines. On a
+//! text, and Ctrl+C copies it as shown, without the hidden lines; the
+//! menu copies it as a patch in git's format, or as the new side has it,
+//! too (see [`CopyAs`]). On a
 //! row of hidden lines the cursor stops on each of its buttons, and
 //! Enter presses the one it is on. Lines of text only scroll.
 //!
@@ -91,14 +93,46 @@ impl Button {
     }
 }
 
-/// Put a diff's selection on the clipboard, saying so; nothing without
-/// one.
-pub(crate) fn copy(content: Shown<'_>, clipboard: &mut Clipboard) -> Option<StatusLine> {
+/// How a diff's selection is copied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyAs {
+    /// The text as shown, removed and added lines alike: Ctrl+C.
+    Text,
+    /// The changes on the selected lines, as a patch in git's format to
+    /// apply to the file as the diff's old side has it.
+    Patch,
+    /// The text as the new side has it, without the removed lines.
+    NewSide,
+}
+
+/// Put a diff's selection on the clipboard, copied `how`, saying so;
+/// nothing without one, or for a patch, without changes in it.
+pub(crate) fn copy(
+    content: Shown<'_>,
+    clipboard: &mut Clipboard,
+    how: CopyAs,
+) -> Option<StatusLine> {
     let Shown::Diff(model) = content else {
         return None;
     };
-    let text = model.selected_text()?;
-    let notice = StatusLine::copied(&text);
+    let (text, notice) = match how {
+        CopyAs::Text | CopyAs::NewSide => {
+            let text = match how {
+                CopyAs::Text => model.selected_text()?,
+                _ => model.selected_new_text()?,
+            };
+            let notice = StatusLine::copied(&text);
+            (text, notice)
+        }
+        CopyAs::Patch => {
+            let patch = model.selected_patch()?;
+            let notice = StatusLine::info(format!(
+                "Copied a patch of {} to the clipboard",
+                model.diff().path
+            ));
+            (patch, notice)
+        }
+    };
     clipboard.set(text);
     Some(notice)
 }
@@ -456,7 +490,7 @@ impl ContentPane {
             KeyCode::Char(c) if ctrl => {
                 match c.to_ascii_lowercase() {
                     'a' => model.select_all(),
-                    'c' => return copy(Shown::Diff(model), clipboard),
+                    'c' => return copy(Shown::Diff(model), clipboard, CopyAs::Text),
                     _ => {}
                 }
                 return None;

@@ -842,6 +842,56 @@ impl FileDiff {
         })
     }
 
+    /// The changes on some of the lines as a patch in git's format, to
+    /// apply with `git apply` (or `patch -p1`) to the file as the old
+    /// side has it: what [`stage_lines`] would stage, as a diff. A file
+    /// the old side doesn't have is created by it, and one the changes
+    /// empty that the new side doesn't have is deleted; a renamed or
+    /// copied file says so. See [`stage_lines`] for which lines count;
+    /// `None` when none do.
+    ///
+    /// [`stage_lines`]: Self::stage_lines
+    pub fn patch_of_lines(&self, lines: &[DiffLine]) -> Option<String> {
+        let (chosen, _) = self.chosen(lines)?;
+        let new = self.with_changes(&chosen);
+        let mut options = DiffOptions::new();
+        options.context_lines(CONTEXT_LINES);
+        let mut patch =
+            Patch::from_buffers(&self.old_bytes, None, &new, None, Some(&mut options)).ok()?;
+        let text = patch.to_buf().ok()?;
+        let text = String::from_utf8_lossy(&text);
+        // libgit2's header names no file and knows nothing of files that
+        // come or go: the hunks are all that is wanted of it.
+        let hunks = &text[text.find("\n@@ ")? + 1..];
+        let new_path = &self.path;
+        let old_path = self.old_path.as_deref().unwrap_or(new_path);
+        let created = matches!(self.kind, ChangeKind::Added | ChangeKind::Untracked);
+        let deleted = self.kind == ChangeKind::Deleted && new.is_empty();
+        let mut header = format!("diff --git a/{old_path} b/{new_path}\n");
+        match self.kind {
+            _ if created => header.push_str("new file mode 100644\n"),
+            _ if deleted => header.push_str("deleted file mode 100644\n"),
+            ChangeKind::Renamed => {
+                header.push_str(&format!("rename from {old_path}\nrename to {new_path}\n"))
+            }
+            ChangeKind::Copied => {
+                header.push_str(&format!("copy from {old_path}\ncopy to {new_path}\n"))
+            }
+            _ => {}
+        }
+        let from = if created {
+            "/dev/null".to_owned()
+        } else {
+            format!("a/{old_path}")
+        };
+        let to = if deleted {
+            "/dev/null".to_owned()
+        } else {
+            format!("b/{new_path}")
+        };
+        Some(format!("{header}--- {from}\n+++ {to}\n{hunks}"))
+    }
+
     /// Whether any of `lines` is a change [`stage_lines`] and the two
     /// after it would take, without working out what they make.
     ///

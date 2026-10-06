@@ -58,7 +58,8 @@
 //! in the editor as it is in the working directory now, from the diff
 //! at the line its cursor is on (one that isn't there any more has
 //! nothing to open, and the status bar says so). A right click in the
-//! diff opens a menu to copy the selection or select it all.
+//! diff opens a menu to open the file there, copy the selection (as
+//! shown, as a patch, or as the new side has it), or select it all.
 //!
 //! A right click on a file or directory of the selected commit selects
 //! it and opens a menu of what can be done to it (the application
@@ -203,8 +204,8 @@ use crate::clipboard::Clipboard;
 use crate::commit_row::{CommitLine, Highlight, commit_extent, draw_commit_line, lane_cap};
 use crate::confirm_box::{ConfirmBox, ConfirmOutcome};
 use crate::diff_pane::{
-    self, ARROW_COLUMNS, ContentPane, HScroll, Piece, Shown, ShownMut, TAB_WIDTH, clamp_between,
-    display_width, fit_end, share_for, share_of,
+    self, ARROW_COLUMNS, ContentPane, CopyAs, HScroll, Piece, Shown, ShownMut, TAB_WIDTH,
+    clamp_between, display_width, fit_end, share_for, share_of,
 };
 use crate::git_layout::{GitLogLayout, MAIN_REPOSITORY, PaneSizes};
 use crate::palette::palette_background;
@@ -2950,11 +2951,28 @@ impl GitLogView {
         matches!(&self.content, Some(Content::Diff(model)) if model.selection().is_some())
     }
 
-    /// "Copy": put the diff's selection on the clipboard. Returns what
-    /// to say about it, nothing without a selection.
-    pub fn copy_diff_selection(&self, clipboard: &mut Clipboard) -> Option<StatusLine> {
+    /// "Copy", "Copy as patch", and "Copy new side": put the diff's
+    /// selection on the clipboard, copied `how`. Returns what to say
+    /// about it, nothing without a selection.
+    pub fn copy_diff_selection(
+        &self,
+        clipboard: &mut Clipboard,
+        how: CopyAs,
+    ) -> Option<StatusLine> {
         let lines = self.content_lines();
-        diff_pane::copy(shown(self.content.as_ref(), lines.as_deref()), clipboard)
+        diff_pane::copy(
+            shown(self.content.as_ref(), lines.as_deref()),
+            clipboard,
+            how,
+        )
+    }
+
+    /// Whether the diff's selection has changes in it, to copy as a
+    /// patch.
+    pub fn has_diff_selection_changes(&self) -> bool {
+        matches!(&self.content, Some(Content::Diff(model))
+            if model.selection().is_some()
+                && model.diff().has_changes_among(&model.selected_lines()))
     }
 
     /// "Select all": select the whole diff shown, and give the keyboard
@@ -4523,6 +4541,47 @@ mod tests {
     }
 
     #[test]
+    fn the_diffs_selection_copies_as_a_patch_or_the_new_side() {
+        let (_dir, mut view) = diff_of_a_changed_line();
+        draw(&mut view, 90, 30);
+        let mut clipboard = Clipboard::local_only();
+        // Nothing selected: nothing to copy, in any form.
+        assert!(!view.has_diff_selection_changes());
+        assert_eq!(
+            view.copy_diff_selection(&mut clipboard, CopyAs::Patch),
+            None
+        );
+        // Down to line 19, and over the change below it.
+        for _ in 0..3 {
+            view.handle_key(key(KeyCode::Down), &mut clipboard);
+        }
+        for _ in 0..3 {
+            view.handle_key(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+                &mut clipboard,
+            );
+        }
+        assert!(view.has_diff_selection_changes());
+        let notice = view.copy_diff_selection(&mut clipboard, CopyAs::NewSide);
+        assert_eq!(clipboard.get().as_deref(), Some("line 19\nline twenty\n"));
+        assert_eq!(
+            notice.map(|n| n.text()).as_deref(),
+            Some("Copied 2 lines to the clipboard")
+        );
+        let notice = view.copy_diff_selection(&mut clipboard, CopyAs::Patch);
+        assert_eq!(
+            notice.map(|n| n.text()).as_deref(),
+            Some("Copied a patch of f.txt to the clipboard")
+        );
+        let patch = clipboard.get().unwrap();
+        assert!(
+            patch.starts_with("diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n"),
+            "{patch}"
+        );
+        assert!(patch.contains("\n-line 20\n+line twenty\n"), "{patch}");
+    }
+
+    #[test]
     fn the_mouse_puts_the_cursor_in_the_diff_and_selects() {
         let (_dir, mut view) = diff_of_a_changed_line();
         let screen = draw(&mut view, 90, 30);
@@ -4609,7 +4668,10 @@ mod tests {
         assert_eq!(selected(&view).as_deref(), Some("line 18\n"));
         assert!(view.has_diff_selection());
         let mut clipboard = Clipboard::local_only();
-        assert!(view.copy_diff_selection(&mut clipboard).is_some());
+        assert!(
+            view.copy_diff_selection(&mut clipboard, CopyAs::Text)
+                .is_some()
+        );
         assert_eq!(clipboard.get().as_deref(), Some("line 18\n"));
         // Outside it, the press moves the cursor there first.
         mouse(

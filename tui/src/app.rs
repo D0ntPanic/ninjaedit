@@ -205,7 +205,7 @@ use crate::changes_view::{self, ChangesOutcome, ChangesTabs};
 use crate::clipboard::Clipboard;
 use crate::command::{BuildContext, Command, Context as CommandContext, FileContext, Page};
 use crate::context_menu::{ContextMenu, MenuEntry, MenuOutcome};
-use crate::diff_pane::draw_pieces;
+use crate::diff_pane::{CopyAs, draw_pieces};
 use crate::editor_view::EditorView;
 use crate::git_layout;
 use crate::git_view::{self, GitLogMenu, GitLogTabs, Version};
@@ -405,8 +405,8 @@ const EDITOR_MENU: &[MenuEntry] = &[
 ];
 /// What a right click in a diff on the git pages offers: opening the
 /// file at the cursor first; on the changes page staging or unstaging
-/// the selected lines (or the cursor's); copying the selection and
-/// selecting it all; and, set apart below since it loses work, reverting
+/// the selected lines (or the cursor's); copying the selection, as shown,
+/// as a patch, or as the new side has it, and selecting it all; and, set apart below since it loses work, reverting
 /// the selected lines of an unstaged file, which asks first. Only the
 /// ones that apply are listed.
 const DIFF_MENU: &[MenuEntry] = &[
@@ -416,6 +416,8 @@ const DIFF_MENU: &[MenuEntry] = &[
     MenuEntry::Command(Command::UnstageLines),
     MenuEntry::Separator,
     MenuEntry::Command(Command::Copy),
+    MenuEntry::Command(Command::CopyAsPatch),
+    MenuEntry::Command(Command::CopyNewSide),
     MenuEntry::Command(Command::SelectAll),
     MenuEntry::Separator,
     MenuEntry::Command(Command::RevertLines),
@@ -1574,6 +1576,9 @@ impl App {
                 || log.is_some_and(|view| view.shows_diff_lines()),
             diff_has_selection: changes.is_some_and(|view| view.has_diff_selection())
                 || log.is_some_and(|view| view.has_diff_selection()),
+            diff_selection_has_changes: changes
+                .is_some_and(|view| view.has_diff_selection_changes())
+                || log.is_some_and(|view| view.has_diff_selection_changes()),
         }
     }
 
@@ -1596,7 +1601,9 @@ impl App {
             Command::Undo => self.press_editor_key('z'),
             Command::Redo => self.press_editor_key('y'),
             Command::Cut => self.press_editor_key('x'),
-            Command::Copy => self.copy(),
+            Command::Copy => self.copy(CopyAs::Text),
+            Command::CopyAsPatch => self.copy(CopyAs::Patch),
+            Command::CopyNewSide => self.copy(CopyAs::NewSide),
             Command::Paste => self.press_editor_key('v'),
             Command::SelectAll => self.select_all(),
             Command::Build => self.build(),
@@ -1787,12 +1794,14 @@ impl App {
     /// source of what it does. With a mode in the editor's place there
     /// is no editor to press it in. An edit made this way from a tool
     /// brings the editor into focus, so it can be seen.
-    /// "Copy": the selection in the editor, or in a git page's diff.
-    fn copy(&mut self) {
+    /// "Copy": the selection in the editor, or in a git page's diff,
+    /// which "Copy as patch" and "Copy new side" copy `how` they say.
+    fn copy(&mut self, how: CopyAs) {
         let notice = match &mut self.mode {
-            Mode::GitLog(tabs) => tabs.active().copy_diff_selection(&mut self.clipboard),
-            Mode::Changes(tabs) => tabs.active().copy_diff_selection(&mut self.clipboard),
-            _ => return self.press_editor_key('c'),
+            Mode::GitLog(tabs) => tabs.active().copy_diff_selection(&mut self.clipboard, how),
+            Mode::Changes(tabs) => tabs.active().copy_diff_selection(&mut self.clipboard, how),
+            _ if how == CopyAs::Text => return self.press_editor_key('c'),
+            _ => return,
         };
         if let Some(notice) = notice {
             self.status = Some(notice);

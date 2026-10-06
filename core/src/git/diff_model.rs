@@ -315,6 +315,37 @@ impl DiffModel {
         Some(text)
     }
 
+    /// The selected text as the new side has it, or `None` when nothing
+    /// is selected: [`selected_text`](Self::selected_text) without the
+    /// removed lines, so the lines as they are after the change.
+    pub fn selected_new_text(&self) -> Option<String> {
+        let range = self.selection()?;
+        let mut text = String::new();
+        for row in range.start.line..=range.end.line {
+            let Some(DiffRow::Line(line)) = self.rows.get(row) else {
+                continue;
+            };
+            if line.new.is_none() {
+                continue;
+            }
+            if let Some(selected) = self.selection_on(row) {
+                text.push_str(&self.diff.text(line)[selected.bytes]);
+                if selected.past_end {
+                    text.push('\n');
+                }
+            }
+        }
+        Some(text)
+    }
+
+    /// The changes on the selected lines as a patch in git's format, or
+    /// `None` when nothing is selected or the selection has no changes:
+    /// see [`FileDiff::patch_of_lines`].
+    pub fn selected_patch(&self) -> Option<String> {
+        self.selection()?;
+        self.diff.patch_of_lines(&self.selected_lines())
+    }
+
     /// The lines of the diff the selection takes in, in the order shown,
     /// for commands that work on whole lines; with nothing selected, the
     /// cursor's line. A line counts when any of its text is selected (or,
@@ -686,6 +717,27 @@ mod tests {
         model.clear_selection();
         assert_eq!(model.selected_text(), None);
         assert_eq!(model.selected_columns(16), None);
+    }
+
+    #[test]
+    fn a_selection_copies_as_the_new_side_or_as_a_patch() {
+        let mut model = model();
+        assert_eq!(model.selected_new_text(), None);
+        assert_eq!(model.selected_patch(), None);
+        // From inside l4 to inside L5: the removed l5 left out of the new
+        // side, and in the patch, just that change.
+        model.set_cursor_at(3, 1);
+        model.extend_to(5, 2);
+        assert_eq!(model.selected_text().as_deref(), Some("4\nl5\nL5"));
+        assert_eq!(model.selected_new_text().as_deref(), Some("4\nL5"));
+        let patch = model.selected_patch().unwrap();
+        assert!(patch.starts_with("diff --git a/t.txt b/t.txt\n"), "{patch}");
+        assert!(patch.contains("\n-l5\n+L5\n"), "{patch}");
+        assert!(!patch.contains("L25"), "{patch}");
+        // Context alone makes no patch, but has a new side.
+        model.select_rows(1, 2);
+        assert_eq!(model.selected_patch(), None);
+        assert_eq!(model.selected_new_text().as_deref(), Some("l2\nl3\n"));
     }
 
     #[test]
