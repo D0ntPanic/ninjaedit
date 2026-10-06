@@ -64,8 +64,8 @@ pub use branch::{BranchError, DeleteBranchError, create_branch, create_branch_in
 pub use changes::{Changes, ConflictSide};
 pub use checkout::{Checkout, CheckoutError, CheckoutJob, CheckoutOutcome, CheckoutPlan};
 pub use diff::{
-    ChangeKind, CommitDetail, DiffLine, DiffRow, FileChange, FileDiff, LineKind, Person, Side,
-    Unshown,
+    ChangeKind, CommitDetail, DiffLine, DiffRow, FileChange, FileDiff, LineKind, LinesChange,
+    LinesTarget, Person, Side, Unshown,
 };
 pub use diff_model::{DiffModel, EXPAND_LINES, GapAction};
 pub use fetch::{Fetch, FetchReport};

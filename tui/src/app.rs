@@ -403,12 +403,22 @@ const EDITOR_MENU: &[MenuEntry] = &[
     MenuEntry::Separator,
     MenuEntry::Command(Command::SelectAll),
 ];
-/// What a right click in a diff on the git pages offers: copying what is
-/// selected, and selecting it all.
+/// What a right click in a diff on the git pages offers: opening the
+/// file at the cursor first; on the changes page staging or unstaging
+/// the selected lines (or the cursor's); copying the selection and
+/// selecting it all; and, set apart below since it loses work, reverting
+/// the selected lines of an unstaged file, which asks first. Only the
+/// ones that apply are listed.
 const DIFF_MENU: &[MenuEntry] = &[
-    MenuEntry::Command(Command::Copy),
+    MenuEntry::Command(Command::OpenAtCursor),
     MenuEntry::Separator,
+    MenuEntry::Command(Command::StageLines),
+    MenuEntry::Command(Command::UnstageLines),
+    MenuEntry::Separator,
+    MenuEntry::Command(Command::Copy),
     MenuEntry::Command(Command::SelectAll),
+    MenuEntry::Separator,
+    MenuEntry::Command(Command::RevertLines),
 ];
 /// What a right click on a file or directory of the changes page's
 /// lists offers: opening it and moving it between the lists first;
@@ -1546,6 +1556,11 @@ impl App {
             can_unstage_selected: changes.is_some_and(|view| view.can_unstage_selected()),
             can_discard_selected: changes.is_some_and(|view| view.can_discard_selected()),
             can_resolve_selected: changes.is_some_and(|view| view.can_resolve_selected()),
+            can_stage_lines: changes.is_some_and(|view| view.can_stage_lines()),
+            can_unstage_lines: changes.is_some_and(|view| view.can_unstage_lines()),
+            can_revert_lines: changes.is_some_and(|view| view.can_revert_lines()),
+            can_open_at_cursor: changes.is_some_and(|view| view.can_open_at_cursor())
+                || log.is_some_and(|view| view.can_open_at_cursor()),
             can_restore_selected: log.is_some_and(|view| view.can_restore_selected()),
             can_checkout_branch: log.is_some_and(|view| view.can_checkout_branch()),
             can_delete_branch: log.is_some_and(|view| view.can_delete_branch()),
@@ -1653,6 +1668,9 @@ impl App {
             Command::StageSelected => self.on_changes_page(ChangesTabs::stage_selected),
             Command::UnstageSelected => self.on_changes_page(ChangesTabs::unstage_selected),
             Command::DiscardSelected => self.on_changes_page(ChangesTabs::discard_selected),
+            Command::StageLines => self.on_changes_page(ChangesTabs::stage_lines),
+            Command::UnstageLines => self.on_changes_page(ChangesTabs::unstage_lines),
+            Command::RevertLines => self.on_changes_page(ChangesTabs::revert_lines),
             Command::ResolveOurs => {
                 self.on_changes_page(|tabs| tabs.resolve_selected(ConflictSide::Ours))
             }
@@ -1665,6 +1683,13 @@ impl App {
                     self.follow_git_log();
                 }
                 _ => self.on_changes_page(ChangesTabs::open_selected),
+            },
+            Command::OpenAtCursor => match &mut self.mode {
+                Mode::GitLog(tabs) => {
+                    tabs.open_change_at_cursor();
+                    self.follow_git_log();
+                }
+                _ => self.on_changes_page(ChangesTabs::open_at_cursor),
             },
             Command::RestoreCommitVersion => self.restore_on_git_log(Version::Commit),
             Command::RestoreParentVersion => self.restore_on_git_log(Version::Parent),
@@ -9558,6 +9583,77 @@ mod tests {
     /// The commands the open menu lists, with `None` for a separator.
     fn menu_commands(app: &App) -> Vec<Option<Command>> {
         app.context_menu.as_ref().unwrap().commands()
+    }
+
+    #[test]
+    fn right_click_in_a_changes_diff_offers_opening_and_the_lines_actions() {
+        let (dir, mut app) = app_with_files(&[]);
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".storage/\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "1\n2\n3\n").unwrap();
+        let mut index = repo.index().unwrap();
+        for path in [".gitignore", "a.txt"] {
+            index.add_path(Path::new(path)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Base", &tree, &[])
+            .unwrap();
+        std::fs::write(dir.path().join("a.txt"), "1\ntwo\n3\n").unwrap();
+        let settle = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Mode::Changes(tabs) = &app.mode
+                && tabs.is_loading()
+                && Instant::now() < deadline
+            {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        ctrl(&mut app, 'u');
+        settle(&mut app);
+        draw(&mut app, 100, 24);
+        press(&mut app, KeyCode::Enter);
+        let screen = draw(&mut app, 100, 24);
+        let two = screen.iter().position(|r| r.contains("two")).unwrap();
+        let x = column_of(&screen[two], "two");
+        // On the added line: open the file there, stage or revert the
+        // line, and select all; nothing is selected to copy.
+        right_click(&mut app, x, two as u16);
+        assert_eq!(
+            menu_commands(&app),
+            [
+                Some(Command::OpenAtCursor),
+                None,
+                Some(Command::StageLines),
+                None,
+                Some(Command::SelectAll),
+                None,
+                Some(Command::RevertLines)
+            ]
+        );
+        // "Stage lines" stages it: the addition alone, the removal of 2
+        // being a change of its own.
+        let screen = draw(&mut app, 100, 24);
+        let stage = screen
+            .iter()
+            .position(|r| r.contains("Stage lines"))
+            .unwrap();
+        click(
+            &mut app,
+            column_of(&screen[stage], "Stage lines"),
+            stage as u16,
+        );
+        assert!(app.context_menu.is_none());
+        assert_eq!(status_text(&app).as_deref(), Some("Staged 1 line of a.txt"));
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        let entry = index.get_path(Path::new("a.txt"), 0).unwrap();
+        assert_eq!(
+            repo.find_blob(entry.id).unwrap().content(),
+            b"1\n2\ntwo\n3\n"
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@ use super::history::CommitTime;
 use super::submodules::{SubmoduleRange, submodule_range};
 use crate::syntax::{Language, Token, lex_text};
 use git2::{Delta, DiffFindOptions, DiffLineType, DiffOptions, FileMode, Oid, Patch, Repository};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Files bigger than this aren't shown line by line.
@@ -336,7 +337,7 @@ pub enum Side {
     New,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LineKind {
     Context,
     Added,
@@ -345,7 +346,7 @@ pub enum LineKind {
 
 /// One line of a diff: which side(s) it is on, by line index (from
 /// zero) into the old and new contents. A context line is on both.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DiffLine {
     pub kind: LineKind,
     pub old: Option<usize>,
@@ -369,6 +370,33 @@ pub enum DiffRow {
         /// Whether lines can be revealed downward from the hunk above.
         down: bool,
     },
+}
+
+/// Where a [`LinesChange`] is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinesTarget {
+    /// The file's entry in the index: staging or unstaging lines.
+    Index,
+    /// The file in the working directory: reverting lines.
+    WorkingTree,
+}
+
+/// Some of a file's changed lines staged, unstaged, or reverted, worked
+/// out from its diff (see [`FileDiff::stage_lines`] and the two after
+/// it): what the index or the working directory is to hold for the
+/// file, and what it holds now as far as the diff knows, so that
+/// writing it can refuse when the file has changed since the diff was
+/// made (see the [`changes`](super::changes) module).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinesChange {
+    pub path: String,
+    pub target: LinesTarget,
+    /// How many changed lines it takes in.
+    pub lines: usize,
+    /// What the target holds for the file now, as the diff saw it.
+    pub(super) expected: Vec<u8>,
+    /// What the target is to hold.
+    pub(super) contents: Vec<u8>,
 }
 
 /// Why a file's lines aren't shown.
@@ -416,6 +444,11 @@ pub struct FileDiff {
     new_lines: Vec<String>,
     old_tokens: Vec<Vec<Token>>,
     new_tokens: Vec<Vec<Token>>,
+    /// Both sides as they were read, for working out what staging,
+    /// unstaging, or reverting some of the lines makes of them: see
+    /// [`FileDiff::stage_lines`].
+    old_bytes: Vec<u8>,
+    new_bytes: Vec<u8>,
     hunks: Vec<Hunk>,
     /// One more than the hunks: before the first, between each pair,
     /// after the last.
@@ -465,6 +498,8 @@ impl FileDiff {
             new_lines: Vec::new(),
             old_tokens: Vec::new(),
             new_tokens: Vec::new(),
+            old_bytes: Vec::new(),
+            new_bytes: Vec::new(),
             hunks: Vec::new(),
             gaps: vec![Gap::default()],
         }
@@ -499,6 +534,8 @@ impl FileDiff {
             new_lines: Vec::new(),
             old_tokens: Vec::new(),
             new_tokens: Vec::new(),
+            old_bytes: Vec::new(),
+            new_bytes: Vec::new(),
             hunks: Vec::new(),
             gaps: vec![Gap::default()],
         };
@@ -507,6 +544,8 @@ impl FileDiff {
         }
         let old_text = String::from_utf8_lossy(&old.bytes);
         let new_text = String::from_utf8_lossy(&new.bytes);
+        file.old_bytes = old.bytes.clone();
+        file.new_bytes = new.bytes.clone();
         file.old_lines = split_lines(&old_text);
         file.new_lines = split_lines(&new_text);
         if language != Language::Plain {
@@ -553,6 +592,54 @@ impl FileDiff {
         }
         Ok(file)
     }
+}
+
+/// The lines of a side's bytes, each with its terminator (the last may
+/// have none): the same lines, one for one, as [`split_lines`] makes of
+/// its text.
+fn line_bytes(bytes: &[u8]) -> Vec<&[u8]> {
+    bytes.split_inclusive(|&b| b == b'\n').collect()
+}
+
+/// One side's lines being copied into a file being put together, in
+/// order, up to where the changes are.
+struct Lines<'a> {
+    lines: Vec<&'a [u8]>,
+    /// The first line not yet copied or skipped.
+    next: usize,
+}
+
+impl<'a> Lines<'a> {
+    fn of(bytes: &'a [u8]) -> Lines<'a> {
+        Lines {
+            lines: line_bytes(bytes),
+            next: 0,
+        }
+    }
+
+    /// Copy the lines up to (not including) `end`.
+    fn copy_to(&mut self, out: &mut Vec<u8>, end: usize) {
+        let end = end.min(self.lines.len());
+        for line in self.lines.get(self.next..end).unwrap_or_default() {
+            push_line(out, line);
+        }
+        self.next = self.next.max(end);
+    }
+
+    /// Leave a line out.
+    fn skip(&mut self, line: usize) {
+        self.next = self.next.max(line + 1);
+    }
+}
+
+/// Put a line on the end of a file being put together, starting it on
+/// a line of its own if the line before had no terminator (it was the
+/// last of its side).
+fn push_line(out: &mut Vec<u8>, line: &[u8]) {
+    if out.last().is_some_and(|&b| b != b'\n') {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(line);
 }
 
 /// The lines of a text, without their terminators; a final terminator
@@ -699,6 +786,137 @@ impl FileDiff {
         };
         entry.top = (entry.top + top).min(size);
         entry.bottom = (entry.bottom + bottom).min(size - entry.top);
+    }
+
+    // ----- Staging, unstaging, and reverting lines ------------------------
+
+    /// Stage the changes on some of the lines of a diff of the working
+    /// directory against the index: the index's version of the file
+    /// with those removed lines dropped and those added lines put in,
+    /// the rest of the changes left out of it. Lines in `lines` that
+    /// aren't changes, or aren't this diff's, are no part of it. `None`
+    /// when none of the lines is one of the diff's changes, or the diff
+    /// has no lines to take (a binary file, a submodule, a conflict).
+    pub fn stage_lines(&self, lines: &[DiffLine]) -> Option<LinesChange> {
+        let (chosen, count) = self.chosen(lines)?;
+        Some(LinesChange {
+            path: self.path.clone(),
+            target: LinesTarget::Index,
+            lines: count,
+            expected: self.old_bytes.clone(),
+            contents: self.with_changes(&chosen),
+        })
+    }
+
+    /// Unstage the changes on some of the lines of a diff of the index
+    /// against HEAD: the index's version of the file with those changes
+    /// undone, the rest staged as they were. See [`stage_lines`] for
+    /// which lines count.
+    ///
+    /// [`stage_lines`]: Self::stage_lines
+    pub fn unstage_lines(&self, lines: &[DiffLine]) -> Option<LinesChange> {
+        let (chosen, count) = self.chosen(lines)?;
+        Some(LinesChange {
+            path: self.path.clone(),
+            target: LinesTarget::Index,
+            lines: count,
+            expected: self.new_bytes.clone(),
+            contents: self.without_changes(&chosen),
+        })
+    }
+
+    /// Revert the changes on some of the lines of a diff of the working
+    /// directory against the index: the working directory's version of
+    /// the file with those changes undone, put back as the index has
+    /// them. See [`stage_lines`] for which lines count.
+    ///
+    /// [`stage_lines`]: Self::stage_lines
+    pub fn revert_lines(&self, lines: &[DiffLine]) -> Option<LinesChange> {
+        let (chosen, count) = self.chosen(lines)?;
+        Some(LinesChange {
+            path: self.path.clone(),
+            target: LinesTarget::WorkingTree,
+            lines: count,
+            expected: self.new_bytes.clone(),
+            contents: self.without_changes(&chosen),
+        })
+    }
+
+    /// Whether any of `lines` is a change [`stage_lines`] and the two
+    /// after it would take, without working out what they make.
+    ///
+    /// [`stage_lines`]: Self::stage_lines
+    pub fn has_changes_among(&self, lines: &[DiffLine]) -> bool {
+        self.chosen(lines).is_some()
+    }
+
+    /// The changes among `lines` that this diff has, and how many there
+    /// are: `None` with none, or with no lines to take.
+    fn chosen(&self, lines: &[DiffLine]) -> Option<(HashSet<DiffLine>, usize)> {
+        if self.unshown.is_some() || self.kind == ChangeKind::Conflicted {
+            return None;
+        }
+        let chosen: HashSet<DiffLine> = self
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .filter(|line| line.kind != LineKind::Context && lines.contains(line))
+            .copied()
+            .collect();
+        let count = chosen.len();
+        (count > 0).then_some((chosen, count))
+    }
+
+    /// The old side with the `chosen` changes made to it.
+    fn with_changes(&self, chosen: &HashSet<DiffLine>) -> Vec<u8> {
+        let new = line_bytes(&self.new_bytes);
+        let mut old = Lines::of(&self.old_bytes);
+        let mut out = Vec::with_capacity(self.old_bytes.len());
+        for hunk in &self.hunks {
+            old.copy_to(&mut out, hunk.old_first);
+            for line in &hunk.lines {
+                match (line.kind, line.old, line.new) {
+                    (LineKind::Context, Some(o), _) => old.copy_to(&mut out, o + 1),
+                    (LineKind::Removed, Some(o), _) if chosen.contains(line) => {
+                        old.copy_to(&mut out, o);
+                        old.skip(o);
+                    }
+                    (LineKind::Removed, Some(o), _) => old.copy_to(&mut out, o + 1),
+                    (LineKind::Added, _, Some(n)) if chosen.contains(line) => {
+                        push_line(&mut out, new[n]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        old.copy_to(&mut out, usize::MAX);
+        out
+    }
+
+    /// The new side with the `chosen` changes undone.
+    fn without_changes(&self, chosen: &HashSet<DiffLine>) -> Vec<u8> {
+        let old = line_bytes(&self.old_bytes);
+        let mut new = Lines::of(&self.new_bytes);
+        let mut out = Vec::with_capacity(self.new_bytes.len());
+        for hunk in &self.hunks {
+            new.copy_to(&mut out, hunk.new_first);
+            for line in &hunk.lines {
+                match (line.kind, line.old, line.new) {
+                    (LineKind::Context, _, Some(n)) => new.copy_to(&mut out, n + 1),
+                    (LineKind::Added, _, Some(n)) if chosen.contains(line) => {
+                        new.copy_to(&mut out, n);
+                        new.skip(n);
+                    }
+                    (LineKind::Added, _, Some(n)) => new.copy_to(&mut out, n + 1),
+                    (LineKind::Removed, Some(o), _) if chosen.contains(line) => {
+                        push_line(&mut out, old[o]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        new.copy_to(&mut out, usize::MAX);
+        out
     }
 
     /// Reveal the hidden lines that `shown` says were shown before, by

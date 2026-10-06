@@ -116,6 +116,13 @@ pub enum Command {
     /// The changes page's discarding of the selected unstaged changes,
     /// once confirmed.
     DiscardSelected,
+    /// The changes page's Space in the diff of an unstaged file.
+    StageLines,
+    /// The changes page's Space in the diff of a staged file.
+    UnstageLines,
+    /// The changes page's reverting of the selected lines of an
+    /// unstaged file, once confirmed.
+    RevertLines,
     /// The changes page's resolving of the selected conflicts by taking
     /// our side, once confirmed.
     ResolveOurs,
@@ -125,6 +132,8 @@ pub enum Command {
     /// The changes page's `o`, and the git log page's among a commit's
     /// files.
     OpenChange,
+    /// `o` in the diff on either git page.
+    OpenAtCursor,
     /// The git log page's restoring of the selected files as the
     /// selected commit left them.
     RestoreCommitVersion,
@@ -244,6 +253,16 @@ pub struct Context {
     /// On the changes page, whether what is selected in the unstaged
     /// list has files in conflict, to resolve by taking a side.
     pub can_resolve_selected: bool,
+    /// On the changes page, whether changed lines are selected (or under
+    /// the cursor) in the diff of an unstaged file, to stage or revert.
+    pub can_stage_lines: bool,
+    pub can_revert_lines: bool,
+    /// On the changes page, whether changed lines are selected (or under
+    /// the cursor) in the diff of a staged file, to unstage.
+    pub can_unstage_lines: bool,
+    /// On either git page, whether the diff of a file to open is shown,
+    /// for its cursor to say where.
+    pub can_open_at_cursor: bool,
     /// On the git log page, whether a file or directory is selected
     /// among the selected commit's files, with files to restore: not
     /// only submodules.
@@ -287,7 +306,7 @@ impl Command {
     /// Every command, in the order the palette lists them before
     /// anything is typed: files, searching, editing, building, the
     /// pages, views, and quitting last.
-    pub const ALL: [Command; 59] = [
+    pub const ALL: [Command; 63] = [
         Command::OpenFile,
         Command::SwitchTab,
         Command::Save,
@@ -332,12 +351,16 @@ impl Command {
         Command::Commit,
         Command::StageSelected,
         Command::UnstageSelected,
+        Command::StageLines,
+        Command::UnstageLines,
         Command::StageAll,
         Command::UnstageAll,
         Command::DiscardSelected,
+        Command::RevertLines,
         Command::ResolveOurs,
         Command::ResolveTheirs,
         Command::OpenChange,
+        Command::OpenAtCursor,
         Command::ToggleAmend,
         Command::ContinueRebase,
         Command::AbortMerge,
@@ -414,6 +437,12 @@ impl Command {
             }
             Command::StageSelected => on(Page::Changes) && context.can_stage_selected,
             Command::UnstageSelected => on(Page::Changes) && context.can_unstage_selected,
+            Command::StageLines => on(Page::Changes) && context.can_stage_lines,
+            Command::UnstageLines => on(Page::Changes) && context.can_unstage_lines,
+            Command::RevertLines => on(Page::Changes) && context.can_revert_lines,
+            Command::OpenAtCursor => {
+                (on(Page::Changes) || on(Page::GitLog)) && context.can_open_at_cursor
+            }
             Command::DiscardSelected => on(Page::Changes) && context.can_discard_selected,
             Command::ResolveOurs | Command::ResolveTheirs => {
                 on(Page::Changes) && context.can_resolve_selected
@@ -473,6 +502,10 @@ impl Command {
             Command::RestoreParentVersion => "Restore previous version",
             Command::StageSelected => "Stage changes",
             Command::UnstageSelected => "Unstage changes",
+            Command::StageLines => "Stage lines",
+            Command::UnstageLines => "Unstage lines",
+            Command::RevertLines => "Revert lines",
+            Command::OpenAtCursor => "Open file at cursor",
             Command::DiscardSelected => "Discard changes",
             Command::ResolveOurs => "Resolve using ours",
             Command::ResolveTheirs => "Resolve using theirs",
@@ -594,6 +627,18 @@ impl Command {
             Command::StageSelected => {
                 "On the changes page, stage the selected file, or every file under the selected directory (Space in the unstaged list)"
             }
+            Command::StageLines => {
+                "On the changes page, stage the changes on the lines selected in an unstaged file's diff, or on the line under the cursor (Space in the diff)"
+            }
+            Command::UnstageLines => {
+                "On the changes page, unstage the changes on the lines selected in a staged file's diff, or on the line under the cursor (Space in the diff)"
+            }
+            Command::RevertLines => {
+                "On the changes page, throw away the working directory's changes on the lines selected in an unstaged file's diff, or on the line under the cursor, after asking: they go back to what is staged, or else committed"
+            }
+            Command::OpenAtCursor => {
+                "Open the file of the diff shown in the editor, at the line the diff's cursor is on (o in the diff)"
+            }
             Command::UnstageSelected => {
                 "On the changes page, unstage the selected file, or every file under the selected directory (Space in the staged list)"
             }
@@ -687,6 +732,10 @@ impl Command {
             | Command::RestoreParentVersion
             | Command::StageSelected
             | Command::UnstageSelected
+            | Command::StageLines
+            | Command::UnstageLines
+            | Command::RevertLines
+            | Command::OpenAtCursor
             | Command::DiscardSelected
             | Command::ResolveOurs
             | Command::ResolveTheirs
@@ -903,6 +952,55 @@ mod tests {
         let listed = available(&changes);
         assert!(listed.contains(&Command::OpenChange));
         assert!(restore.iter().all(|c| !listed.contains(c)), "{listed:?}");
+    }
+
+    #[test]
+    fn a_changes_diff_offers_its_lines_and_either_page_opening_at_the_cursor() {
+        let lines = [
+            Command::StageLines,
+            Command::UnstageLines,
+            Command::RevertLines,
+        ];
+        let changes = Context {
+            page: Page::Changes,
+            ..Context::default()
+        };
+        let listed = available(&changes);
+        assert!(lines.iter().all(|c| !listed.contains(c)), "{listed:?}");
+        assert!(!listed.contains(&Command::OpenAtCursor));
+        // An unstaged file's lines: stage or revert them.
+        let unstaged = Context {
+            can_stage_lines: true,
+            can_revert_lines: true,
+            can_open_at_cursor: true,
+            ..changes
+        };
+        let listed = available(&unstaged);
+        assert!(listed.contains(&Command::StageLines), "{listed:?}");
+        assert!(listed.contains(&Command::RevertLines), "{listed:?}");
+        assert!(!listed.contains(&Command::UnstageLines), "{listed:?}");
+        assert!(listed.contains(&Command::OpenAtCursor), "{listed:?}");
+        // A staged file's lines: unstage them.
+        let staged = Context {
+            can_unstage_lines: true,
+            ..changes
+        };
+        let listed = available(&staged);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|c| listed.contains(c))
+                .collect::<Vec<_>>(),
+            [&Command::UnstageLines]
+        );
+        // The git log opens at the cursor, and has no lines to stage.
+        let log = Context {
+            page: Page::GitLog,
+            ..unstaged
+        };
+        let listed = available(&log);
+        assert!(listed.contains(&Command::OpenAtCursor), "{listed:?}");
+        assert!(lines.iter().all(|c| !listed.contains(c)), "{listed:?}");
     }
 
     #[test]

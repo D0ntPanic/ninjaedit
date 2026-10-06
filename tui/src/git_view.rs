@@ -758,6 +758,12 @@ impl GitLogTabs {
         self.active().open_selected_change();
     }
 
+    /// Open the file of the shown page's diff in the editor at the line
+    /// its cursor is on, as `o` in the diff does.
+    pub fn open_change_at_cursor(&mut self) {
+        self.active().open_change_at_cursor();
+    }
+
     /// Restore the selected files of the shown page's commit in the
     /// working directory, as the commit left them or as they were
     /// before it, asking first if that would overwrite changes that
@@ -1661,13 +1667,28 @@ impl GitLogView {
             .is_some_and(|change| !change.submodule)
     }
 
-    /// `o`, or "Open changed file": ask for the selected file to be
-    /// opened in the editor as it is in the working directory now (see
-    /// [`GitLogTabs::take_file_to_open`]); from the diff, at the line
-    /// its cursor is on, as near as the commit's lines say. A file that
-    /// isn't there (the commit deleted it, or a later one did) has
-    /// nothing to open, and the status bar says so.
+    /// `o` in the files, or "Open changed file": ask for the selected
+    /// file to be opened in the editor as it is in the working directory
+    /// now (see [`GitLogTabs::take_file_to_open`]). A file that isn't
+    /// there (the commit deleted it, or a later one did) has nothing to
+    /// open, and the status bar says so.
     pub fn open_selected_change(&mut self) {
+        self.open_change(false);
+    }
+
+    /// `o` in the diff, or "Open file at cursor": the same, at the line
+    /// the diff's cursor is on, as near as the commit's lines say.
+    pub fn open_change_at_cursor(&mut self) {
+        self.open_change(true);
+    }
+
+    /// Whether the selected file's diff is shown, with lines for its
+    /// cursor to say where to open the file.
+    pub fn can_open_at_cursor(&self) -> bool {
+        self.shows_diff_lines() && self.can_open_selected_change()
+    }
+
+    fn open_change(&mut self, at_cursor: bool) {
         self.ensure_detail();
         let Some(change) = self.selected_change() else {
             return;
@@ -1686,9 +1707,7 @@ impl GitLogView {
         if path.is_file() {
             self.ensure_content();
             let line = match &self.content {
-                Some(Content::Diff(model)) if self.pane == Pane::Content => {
-                    model.new_line_at_cursor()
-                }
+                Some(Content::Diff(model)) if at_cursor => model.new_line_at_cursor(),
                 _ => None,
             };
             self.file_to_open = Some((path, line));
@@ -2769,8 +2788,12 @@ impl GitLogView {
                 self.fetch();
                 return;
             }
-            KeyCode::Char('o') if matches!(self.pane, Pane::Files | Pane::Content) => {
+            KeyCode::Char('o') if self.pane == Pane::Files => {
                 self.open_selected_change();
+                return;
+            }
+            KeyCode::Char('o') if self.pane == Pane::Content => {
+                self.open_change_at_cursor();
                 return;
             }
             _ => {}

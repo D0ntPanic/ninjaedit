@@ -41,12 +41,20 @@
 //! file, ours or theirs (see [`ConflictSide`]), as `git checkout
 //! --ours` and then `git add` do.
 //!
+//! Some of a file's changed lines, rather than the whole file, are
+//! staged, unstaged, or reverted by [`apply_lines`](Changes::apply_lines),
+//! with what the file's diff works out for them (see
+//! [`FileDiff::stage_lines`] and the two after it), as `git add -p`,
+//! `git reset -p`, and `git checkout -p` do. The diff may be out of date
+//! by then (the file edited since, say), so nothing is written unless
+//! the index or the working directory still holds what the diff saw.
+//!
 //! [`discard`](Changes::discard) throws away unstaged changes, putting
 //! files back to the index's version (or deleting them, when untracked):
 //! it touches the working directory and nothing else, and can't be
-//! undone. It and [`resolve`](Changes::resolve), which writes over what
-//! the working directory has for a conflicted file, are the actions
-//! here that lose work.
+//! undone. It, reverting lines, and [`resolve`](Changes::resolve), which
+//! writes over what the working directory has for a conflicted file,
+//! are the actions here that lose work.
 //!
 //! Every action ([`stage`](Changes::stage), [`unstage`](Changes::unstage),
 //! [`discard`](Changes::discard), [`resolve`](Changes::resolve), and
@@ -71,7 +79,8 @@
 
 use super::checkout::follow_gitlink;
 use super::diff::{
-    self, CONTEXT_LINES, ChangeKind, Contents, FileChange, FileDiff, STATS_LIMIT, Unshown,
+    self, CONTEXT_LINES, ChangeKind, Contents, FileChange, FileDiff, LinesChange, LinesTarget,
+    STATS_LIMIT, Unshown,
 };
 use super::operation::{InProgress, OperationError, Outcome};
 use super::rebase::{RebaseStatus, rebase_status};
@@ -740,6 +749,105 @@ impl Changes {
         result
     }
 
+    /// Stage, unstage, or revert some of a file's changed lines, as its
+    /// diff worked out (see [`FileDiff::stage_lines`] and the two after
+    /// it): write what the change holds for the file to the index, or to
+    /// the working directory, and update the lists as staging does.
+    ///
+    /// Refused, with nothing changed, when the index or the working
+    /// directory no longer holds what the diff saw: the file was edited,
+    /// staged, or unstaged since. A file the index doesn't have (an
+    /// untracked one being staged, or one whose deletion is staged
+    /// being unstaged) gets an entry, executable or not as the working
+    /// directory's file is, or as HEAD has it. Reverting can't be
+    /// undone: a frontend should confirm it.
+    pub fn apply_lines(&mut self, change: &LinesChange) -> Result<(), git2::Error> {
+        let path = change.path.as_str();
+        let stale = || {
+            git2::Error::from_str(&format!(
+                "{path} changed since its diff was shown: look again"
+            ))
+        };
+        match change.target {
+            LinesTarget::Index => {
+                // As the index is on disk now, which the diff may be older
+                // than.
+                let mut index = self.repo.index()?;
+                index.read(false)?;
+                let entry = index.get_path(Path::new(path), 0);
+                let now = match &entry {
+                    Some(entry) => self.repo.find_blob(entry.id)?.content().to_vec(),
+                    None => Vec::new(),
+                };
+                if now != change.expected {
+                    return Err(stale());
+                }
+                let entry = match entry {
+                    Some(entry) => entry,
+                    None => self.new_index_entry(&mut index, path)?,
+                };
+                index.add_frombuffer(&entry, &change.contents)?;
+                index.write()?;
+            }
+            LinesTarget::WorkingTree => {
+                let file = self.workdir.join(path);
+                let now = match fs::read(&file) {
+                    Ok(bytes) => bytes,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                    Err(err) => {
+                        return Err(git2::Error::from_str(&format!(
+                            "could not read {path}: {err}"
+                        )));
+                    }
+                };
+                if now != change.expected {
+                    return Err(stale());
+                }
+                if let Some(parent) = file.parent() {
+                    fs::create_dir_all(parent).ok();
+                }
+                fs::write(&file, &change.contents).map_err(|err| {
+                    git2::Error::from_str(&format!("could not write {path}: {err}"))
+                })?;
+            }
+        }
+        self.rescan(&[path]);
+        self.confirm();
+        Ok(())
+    }
+
+    /// An index entry for a file the index doesn't have, to put lines
+    /// of it in: as staging the working directory's file would make it,
+    /// or else as HEAD (or the commit amended) has the file.
+    fn new_index_entry(&self, index: &mut Index, path: &str) -> Result<IndexEntry, git2::Error> {
+        if self.workdir.join(path).is_file() {
+            index.add_path(Path::new(path))?;
+            if let Some(entry) = index.get_path(Path::new(path), 0) {
+                return Ok(entry);
+            }
+        }
+        let mode = self
+            .base_commit()
+            .and_then(|commit| commit.tree().ok())
+            .and_then(|tree| tree.get_path(Path::new(path)).ok())
+            .map_or(0o100644, |entry| entry.filemode() as u32);
+        let time = git2::IndexTime::new(0, 0);
+        Ok(IndexEntry {
+            ctime: time,
+            mtime: time,
+            dev: 0,
+            ino: 0,
+            mode,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id: Oid::ZERO_SHA1,
+            flags: path.len().min(0xfff) as u16,
+            flags_extended: 0,
+            path: path.as_bytes().to_vec(),
+        })
+    }
+
     /// The work of a discard: check `restore` out of the index over
     /// what the working directory has, and delete `remove`.
     fn restore_and_remove(&self, restore: &[String], remove: &[String]) -> Result<(), git2::Error> {
@@ -1176,7 +1284,7 @@ fn list_changes(
 mod tests {
     use super::super::history::tests::TestRepo;
     use super::*;
-    use crate::git::{DiffRow, LineKind};
+    use crate::git::{DiffLine, DiffRow, LineKind};
 
     fn open(repo: &TestRepo) -> Changes {
         let mut changes = Changes::open(repo.path()).unwrap();
@@ -1754,6 +1862,123 @@ mod tests {
 
     fn read(repo: &TestRepo, path: &str) -> String {
         fs::read_to_string(repo.path().join(path)).unwrap()
+    }
+
+    /// The lines of a diff with these texts as `lines` writes them
+    /// (`-3`, `+three`), in the order asked for.
+    fn pick(file: &FileDiff, texts: &[&str]) -> Vec<DiffLine> {
+        texts
+            .iter()
+            .map(|text| {
+                file.rows()
+                    .into_iter()
+                    .find_map(|row| match row {
+                        DiffRow::Line(line) => {
+                            let marker = match line.kind {
+                                LineKind::Context => ' ',
+                                LineKind::Added => '+',
+                                LineKind::Removed => '-',
+                            };
+                            (format!("{marker}{}", file.text(&line)) == *text).then_some(line)
+                        }
+                        DiffRow::Gap { .. } => None,
+                    })
+                    .unwrap_or_else(|| panic!("no {text:?} in {:?}", lines(file)))
+            })
+            .collect()
+    }
+
+    /// What the index holds for a file.
+    fn index_text(repo: &TestRepo, path: &str) -> String {
+        let mut index = repo.repo.index().unwrap();
+        index.read(true).unwrap();
+        let entry = index.get_path(Path::new(path), 0).unwrap();
+        let blob = repo.repo.find_blob(entry.id).unwrap();
+        String::from_utf8(blob.content().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn lines_are_staged_unstaged_and_reverted() {
+        let mut repo = TestRepo::new();
+        let base: String = (1..=10).map(|n| format!("{n}\n")).collect();
+        repo.commit(&[("a.txt", &base)], "Base", &[]);
+        let edited = base
+            .replace("3\n", "three\n")
+            .replace("5\n", "5\nnew\n")
+            .replace("8\n", "eight\n");
+        fs::write(repo.path().join("a.txt"), &edited).unwrap();
+        let mut changes = open(&repo);
+        let unstaged = |changes: &Changes| {
+            let change = changes.unstaged()[0].clone();
+            changes.unstaged_diff(&change).unwrap()
+        };
+        let staged = |changes: &Changes| {
+            let change = changes.staged()[0].clone();
+            changes.staged_diff(&change).unwrap()
+        };
+
+        // Stage the change of line 3 alone: the index has it, and the
+        // rest are still unstaged.
+        let diff = unstaged(&changes);
+        let stage = diff.stage_lines(&pick(&diff, &["-3", "+three"])).unwrap();
+        assert_eq!((stage.lines, stage.target), (2, LinesTarget::Index));
+        changes.apply_lines(&stage).unwrap();
+        confirmed(&mut changes);
+        assert_eq!(index_text(&repo, "a.txt"), base.replace("3\n", "three\n"));
+        assert_eq!(listed(changes.staged()), [('M', "a.txt", 1, 1)]);
+        assert_eq!(listed(changes.unstaged()), [('M', "a.txt", 2, 1)]);
+        // Context lines, and lines that aren't the diff's, take nothing.
+        let diff = unstaged(&changes);
+        assert_eq!(diff.stage_lines(&pick(&diff, &[" 4"])), None);
+        assert_eq!(diff.stage_lines(&[]), None);
+
+        // Stage the added line alone, then unstage the change of line 3
+        // again: the index has the base with just the new line.
+        let stage = diff.stage_lines(&pick(&diff, &["+new"])).unwrap();
+        changes.apply_lines(&stage).unwrap();
+        confirmed(&mut changes);
+        let diff = staged(&changes);
+        let unstage = diff.unstage_lines(&pick(&diff, &["-3", "+three"])).unwrap();
+        changes.apply_lines(&unstage).unwrap();
+        confirmed(&mut changes);
+        assert_eq!(index_text(&repo, "a.txt"), base.replace("5\n", "5\nnew\n"));
+
+        // Revert the change of line 8 in the working directory: the rest
+        // of the edits stay.
+        let diff = unstaged(&changes);
+        let revert = diff.revert_lines(&pick(&diff, &["-8", "+eight"])).unwrap();
+        assert_eq!(revert.target, LinesTarget::WorkingTree);
+        changes.apply_lines(&revert).unwrap();
+        confirmed(&mut changes);
+        assert_eq!(
+            read(&repo, "a.txt"),
+            base.replace("3\n", "three\n").replace("5\n", "5\nnew\n")
+        );
+
+        // A diff the file has moved on from writes nothing.
+        let diff = unstaged(&changes);
+        let revert = diff.revert_lines(&pick(&diff, &["+three"])).unwrap();
+        fs::write(repo.path().join("a.txt"), "edited since\n").unwrap();
+        let err = changes.apply_lines(&revert).unwrap_err();
+        assert!(err.message().contains("changed since"), "{}", err.message());
+        assert_eq!(read(&repo, "a.txt"), "edited since\n");
+    }
+
+    #[test]
+    fn lines_of_an_untracked_file_are_staged_into_a_new_entry() {
+        let mut repo = TestRepo::new();
+        repo.commit(&[("a.txt", "a\n")], "Base", &[]);
+        fs::write(repo.path().join("b.txt"), "x\ny\n").unwrap();
+        let mut changes = open(&repo);
+        let change = changes.unstaged()[0].clone();
+        assert_eq!(change.kind, ChangeKind::Untracked);
+        let diff = changes.unstaged_diff(&change).unwrap();
+        let stage = diff.stage_lines(&pick(&diff, &["+x"])).unwrap();
+        changes.apply_lines(&stage).unwrap();
+        confirmed(&mut changes);
+        assert_eq!(index_text(&repo, "b.txt"), "x\n");
+        assert_eq!(listed(changes.staged()), [('A', "b.txt", 1, 0)]);
+        assert_eq!(listed(changes.unstaged()), [('M', "b.txt", 1, 0)]);
     }
 
     #[test]

@@ -60,8 +60,16 @@
 //! diff has a cursor and a selection, as the editor has, to read it by
 //! and copy from it (see the `diff_pane` module), with a scrollbar down
 //! the side saying where in the diff the pane is and how much of it
-//! shows; `o` there opens the file at the line the cursor is on, and a
-//! right click opens a menu to copy the selection or select it all. A
+//! shows; `o` there opens the file at the line the cursor is on.
+//! Space in the diff stages the changes on the selected lines (or on
+//! the line under the cursor, with nothing selected), as Space on a file
+//! in its list stages the file, or unstages them in a staged file's
+//! diff: the core crate's `Changes::apply_lines` writes what the diff
+//! works out for them, and refuses if the file changed since the diff
+//! was made. A right click in the diff opens a menu of all of that, with
+//! copying the selection, selecting it all, and, set apart since it
+//! loses work, reverting the selected lines of an unstaged file to what
+//! is staged, after asking. A
 //! scan builds the diff again, since the file may have changed, and the
 //! new diff keeps the reader's place in the old one (see the core
 //! crate's `git::diff_model` module): the context revealed, and the
@@ -157,8 +165,8 @@ use crate::status::StatusLine;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
-    ChangeKind, Changes, ConflictSide, DiffModel, FileChange, FileTree, InProgress, TreeRow,
-    short_id,
+    ChangeKind, Changes, ConflictSide, DiffLine, DiffModel, FileChange, FileDiff, FileTree,
+    InProgress, LinesChange, LinesTarget, TreeRow, short_id,
 };
 use ninjaedit_core::{Editor, FileBuffer};
 use ratatui::buffer::Buffer;
@@ -194,6 +202,8 @@ const NO_STAGED: &str = "No staged changes";
 const SCANNING: &str = "scanning…";
 /// The discard box's button.
 const DISCARD: &str = "Discard";
+/// The revert box's button.
+const REVERT: &str = "Revert";
 /// The resolve box's button.
 const RESOLVE: &str = "Resolve";
 /// The abort box's button.
@@ -245,9 +255,27 @@ const ABORT_HELP: &[(&str, &str)] = &[
     ("←→", "button"),
     ("Enter", "press"),
 ];
+const REVERT_HELP: &[(&str, &str)] = &[
+    ("y", "revert"),
+    ("n/Esc", "cancel"),
+    ("←→", "button"),
+    ("Enter", "press"),
+];
+/// The diff of an unstaged file, and of a staged one.
 const CONTENT_HELP: &[(&str, &str)] = &[
     ("↑↓←→", "move"),
     ("Shift", "select"),
+    ("Space", "stage lines"),
+    ("Ctrl+C", "copy"),
+    ("Enter", "expand"),
+    ("o", "open"),
+    ("Tab", "pane"),
+    ("Ctrl+E", "leave"),
+];
+const STAGED_CONTENT_HELP: &[(&str, &str)] = &[
+    ("↑↓←→", "move"),
+    ("Shift", "select"),
+    ("Space", "unstage lines"),
     ("Ctrl+C", "copy"),
     ("Enter", "expand"),
     ("o", "open"),
@@ -333,6 +361,28 @@ fn shown(content: Option<&Content>) -> Shown<'_> {
     }
 }
 
+/// How the status bar and the revert box name a file's lines: `3 lines
+/// of src/a.rs`.
+fn lines_of(change: &LinesChange) -> String {
+    format!(
+        "{} of {}",
+        count_of(change.lines, "line", "lines"),
+        change.path
+    )
+}
+
+/// What staging, unstaging, or reverting lines says when there are none
+/// to act on: in the diff of a file of the right list, that the
+/// selection (or the cursor's line) has no changes; elsewhere, nothing.
+fn nothing_to(in_diff: bool, verb: &str) -> ChangesOutcome {
+    if !in_diff {
+        return ChangesOutcome::Continue;
+    }
+    ChangesOutcome::Notice(StatusLine::info(format!(
+        "Nothing to {verb}: select changed lines, or put the cursor on one"
+    )))
+}
+
 /// Drop what the diff pane shows, for it to be built again on the next
 /// draw, keeping a diff as `stale`, to put the new one's cursor where
 /// its was.
@@ -403,6 +453,8 @@ enum FilesAction {
     Discard,
     /// Resolve their conflicts by taking a side.
     Resolve(ConflictSide),
+    /// Revert some of a file's lines.
+    RevertLines,
 }
 
 /// Unstaged files the discard or resolve box is asking about: what the
@@ -412,8 +464,10 @@ struct PendingFiles {
     action: FilesAction,
     paths: Vec<String>,
     /// What is being acted on, for the status bar: a file's path, or a
-    /// directory's with a slash.
+    /// directory's with a slash, or a file's lines.
     what: String,
+    /// The lines to revert, worked out when the box was opened.
+    lines: Option<LinesChange>,
 }
 
 /// One of the file lists: its files as a tree, which directories are
@@ -836,6 +890,34 @@ impl ChangesTabs {
         self.follow_submodule(outcome)
     }
 
+    /// Open the file of the shown page's diff at the line its cursor is
+    /// on, as `o` in the diff does.
+    pub fn open_at_cursor(&mut self) -> ChangesOutcome {
+        self.active().open_at_cursor()
+    }
+
+    /// Stage the lines selected in the shown page's diff of an unstaged
+    /// file, as Space there does.
+    pub fn stage_lines(&mut self) -> ChangesOutcome {
+        let outcome = self.active().stage_lines();
+        self.refresh_others();
+        outcome
+    }
+
+    /// Unstage the lines selected in the shown page's diff of a staged
+    /// file, as Space there does.
+    pub fn unstage_lines(&mut self) -> ChangesOutcome {
+        let outcome = self.active().unstage_lines();
+        self.refresh_others();
+        outcome
+    }
+
+    /// Ask whether to revert the lines selected in the shown page's diff
+    /// of an unstaged file; the page reverts them once answered yes.
+    pub fn revert_lines(&mut self) -> ChangesOutcome {
+        self.active().revert_lines()
+    }
+
     /// Give the shown page a mouse event. A change to its pane sizes (a
     /// drag of a rule ended) goes into the layout, which is then worth
     /// keeping. `wheel` is how many rows (or columns, sideways) a wheel
@@ -1097,6 +1179,7 @@ impl ChangesView {
             return StatusLine::help(match pending.action {
                 FilesAction::Discard => DISCARD_HELP,
                 FilesAction::Resolve(_) => RESOLVE_HELP,
+                FilesAction::RevertLines => REVERT_HELP,
             });
         }
         if self.abort.is_some() {
@@ -1106,6 +1189,7 @@ impl ChangesView {
             Pane::Unstaged => UNSTAGED_HELP,
             Pane::Staged => STAGED_HELP,
             Pane::Commit => COMMIT_HELP,
+            Pane::Content if self.shown_list() == Some(List::Staged) => STAGED_CONTENT_HELP,
             Pane::Content => CONTENT_HELP,
         })
     }
@@ -1408,6 +1492,7 @@ impl ChangesView {
             action: FilesAction::Discard,
             paths: files.into_iter().map(|change| change.path).collect(),
             what,
+            lines: None,
         });
         ChangesOutcome::Continue
     }
@@ -1469,6 +1554,7 @@ impl ChangesView {
             action: FilesAction::Resolve(side),
             paths: files.into_iter().map(|change| change.path).collect(),
             what,
+            lines: None,
         });
         ChangesOutcome::Continue
     }
@@ -1479,6 +1565,9 @@ impl ChangesView {
         let Some(pending) = self.pending.take() else {
             return ChangesOutcome::Continue;
         };
+        if let Some(change) = &pending.lines {
+            return self.apply_lines(change);
+        }
         let Some(changes) = &mut self.changes else {
             return ChangesOutcome::Continue;
         };
@@ -1486,6 +1575,9 @@ impl ChangesView {
         let result = match pending.action {
             FilesAction::Discard => changes.discard(paths),
             FilesAction::Resolve(side) => changes.resolve(paths, side),
+            // Its lines were worked out when the box opened, and are
+            // written above.
+            FilesAction::RevertLines => return ChangesOutcome::Continue,
         };
         self.acted = true;
         drop_content(&mut self.content, &mut self.stale);
@@ -1512,6 +1604,7 @@ impl ChangesView {
             (FilesAction::Resolve(_), Err(err)) => ChangesOutcome::Notice(StatusLine::error(
                 format!("Could not resolve {what}: {}", err.message()),
             )),
+            (FilesAction::RevertLines, _) => ChangesOutcome::Continue,
         }
     }
 
@@ -1743,10 +1836,30 @@ impl ChangesView {
         self.abort.as_ref()
     }
 
-    /// Open the selected file in the editor. A submodule isn't a file
-    /// to open: its changes are on its own tab, which the page asks to
-    /// have shown (see [`ChangesTabs::follow_submodule`]).
+    /// Open the selected file in the editor, at its first conflict if it
+    /// has one. A submodule isn't a file to open: its changes are on its
+    /// own tab, which the page asks to have shown (see
+    /// [`ChangesTabs::follow_submodule`]).
     pub fn open_selected(&mut self) -> ChangesOutcome {
+        self.open(false)
+    }
+
+    /// Open the file of the diff shown in the editor, at the line the
+    /// diff's cursor is on: `o` in the diff.
+    pub fn open_at_cursor(&mut self) -> ChangesOutcome {
+        self.open(true)
+    }
+
+    /// Whether the diff of a file to open is shown, for its cursor to say
+    /// where to open it.
+    pub fn can_open_at_cursor(&self) -> bool {
+        self.shows_diff_lines()
+            && self
+                .selected_change()
+                .is_some_and(|(_, change)| !change.submodule && change.kind != ChangeKind::Deleted)
+    }
+
+    fn open(&mut self, at_cursor: bool) -> ChangesOutcome {
         let Some((_, change)) = self.selected_change() else {
             return ChangesOutcome::Continue;
         };
@@ -1760,14 +1873,13 @@ impl ChangesView {
         if change.kind == ChangeKind::Deleted {
             return ChangesOutcome::Notice(StatusLine::info(format!("{} is deleted", change.path)));
         }
-        // From the diff, at the line its cursor is on.
         let line = match &self.content {
-            Some(Content::Diff(model)) if self.pane == Pane::Content => model.new_line_at_cursor(),
+            Some(Content::Diff(model)) if at_cursor => model.new_line_at_cursor(),
             _ => None,
         };
         ChangesOutcome::OpenFile {
             path: changes.workdir().join(&change.path),
-            conflicted: change.kind == ChangeKind::Conflicted,
+            conflicted: change.kind == ChangeKind::Conflicted && line.is_none(),
             line,
         }
     }
@@ -1901,8 +2013,19 @@ impl ChangesView {
     }
 
     fn handle_content_key(&mut self, key: KeyEvent, clipboard: &mut Clipboard) -> ChangesOutcome {
-        if key.code == KeyCode::Char('o') && key.modifiers.is_empty() {
-            return self.open_selected();
+        if key.modifiers.is_empty() {
+            match key.code {
+                KeyCode::Char('o') => return self.open_at_cursor(),
+                // As Space on a file in its list.
+                KeyCode::Char(' ') => {
+                    return match self.shown_list() {
+                        Some(List::Unstaged) => self.stage_lines(),
+                        Some(List::Staged) => self.unstage_lines(),
+                        None => ChangesOutcome::Continue,
+                    };
+                }
+                _ => {}
+            }
         }
         let content = shown_mut(self.content.as_mut());
         match self.content_pane.handle_key(key, content, clipboard) {
@@ -1952,6 +2075,124 @@ impl ChangesView {
             model.select_all();
             self.pane = Pane::Content;
         }
+    }
+
+    // ----- Staging, unstaging, and reverting lines --------------------------
+
+    /// The list whose file the diff shows.
+    fn shown_list(&self) -> Option<List> {
+        self.shown.as_ref().map(|(list, _)| *list)
+    }
+
+    /// Whether the diff shown is of a file of `list` with changed lines
+    /// selected (or under the cursor, with nothing selected), to stage,
+    /// unstage, or revert.
+    fn has_lines_in(&self, list: List) -> bool {
+        self.shown_list() == Some(list)
+            && matches!(&self.content, Some(Content::Diff(model))
+                if model.diff().has_changes_among(&model.selected_lines()))
+    }
+
+    /// Whether lines of an unstaged file's diff are selected to stage.
+    pub fn can_stage_lines(&self) -> bool {
+        self.has_lines_in(List::Unstaged)
+    }
+
+    /// Whether lines of a staged file's diff are selected to unstage.
+    pub fn can_unstage_lines(&self) -> bool {
+        self.has_lines_in(List::Staged)
+    }
+
+    /// Whether lines of an unstaged file's diff are selected to revert.
+    pub fn can_revert_lines(&self) -> bool {
+        self.has_lines_in(List::Unstaged)
+    }
+
+    /// What staging, unstaging, or reverting the selected lines of the
+    /// diff of a file of `list` makes of the file, as `make` works it out.
+    fn lines_change(
+        &self,
+        list: List,
+        make: fn(&FileDiff, &[DiffLine]) -> Option<LinesChange>,
+    ) -> Option<LinesChange> {
+        if self.shown_list() != Some(list) {
+            return None;
+        }
+        match &self.content {
+            Some(Content::Diff(model)) => make(model.diff(), &model.selected_lines()),
+            _ => None,
+        }
+    }
+
+    /// The command palette's and the menu's "Stage lines", and Space in
+    /// the diff of an unstaged file: stage the changes on the selected
+    /// lines, or the line under the cursor with nothing selected.
+    pub fn stage_lines(&mut self) -> ChangesOutcome {
+        match self.lines_change(List::Unstaged, FileDiff::stage_lines) {
+            Some(change) => self.apply_lines(&change),
+            None => nothing_to(self.shown_list() == Some(List::Unstaged), "stage"),
+        }
+    }
+
+    /// The command palette's and the menu's "Unstage lines", and Space in
+    /// the diff of a staged file: unstage the changes on the selected
+    /// lines, or the line under the cursor with nothing selected.
+    pub fn unstage_lines(&mut self) -> ChangesOutcome {
+        match self.lines_change(List::Staged, FileDiff::unstage_lines) {
+            Some(change) => self.apply_lines(&change),
+            None => nothing_to(self.shown_list() == Some(List::Staged), "unstage"),
+        }
+    }
+
+    /// The command palette's and the menu's "Revert lines": ask, in the
+    /// revert box, whether to put the selected lines of an unstaged
+    /// file's diff (or the line under the cursor) back as the index has
+    /// them, throwing away the working directory's changes to them. The
+    /// box's yes reverts them (see [`finish_pending`](Self::finish_pending)).
+    pub fn revert_lines(&mut self) -> ChangesOutcome {
+        let Some(change) = self.lines_change(List::Unstaged, FileDiff::revert_lines) else {
+            return nothing_to(self.shown_list() == Some(List::Unstaged), "revert");
+        };
+        let what = lines_of(&change);
+        let dialog = ConfirmBox::new(
+            format!("Revert {what}?"),
+            "The working directory's changes to them are lost: they go back to what is staged, or else what was last committed. This can't be undone.",
+            REVERT,
+        );
+        self.pending = Some(PendingFiles {
+            dialog,
+            action: FilesAction::RevertLines,
+            paths: vec![change.path.clone()],
+            what,
+            lines: Some(change),
+        });
+        ChangesOutcome::Continue
+    }
+
+    /// Write lines staged, unstaged, or reverted, and show the outcome:
+    /// the lists and the diff built again, the diff's place kept but its
+    /// selection gone with the lines it was on.
+    fn apply_lines(&mut self, change: &LinesChange) -> ChangesOutcome {
+        let Some(changes) = &mut self.changes else {
+            return ChangesOutcome::Continue;
+        };
+        let result = changes.apply_lines(change);
+        if let Some(Content::Diff(model)) = &mut self.content {
+            model.clear_selection();
+        }
+        self.acted = true;
+        drop_content(&mut self.content, &mut self.stale);
+        self.follow_lists();
+        let what = lines_of(change);
+        let (done, verb) = match (change.target, self.shown_list()) {
+            (LinesTarget::WorkingTree, _) => ("Reverted", "revert"),
+            (LinesTarget::Index, Some(List::Staged)) => ("Unstaged", "unstage"),
+            (LinesTarget::Index, _) => ("Staged", "stage"),
+        };
+        ChangesOutcome::Notice(match result {
+            Ok(()) => StatusLine::info(format!("{done} {what}")),
+            Err(err) => StatusLine::error(format!("Could not {verb} {what}: {}", err.message())),
+        })
     }
 
     /// Add pasted text to the commit message, if that is where the
@@ -4149,6 +4390,108 @@ mod tests {
         assert_eq!(cursor_text(&view), "line 62");
         assert_eq!(hidden(&view), 0);
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn lines_of_a_diff_are_staged_unstaged_and_reverted() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        configure_user(&repo);
+        let base: String = (1..=10).map(|n| format!("{n}\n")).collect();
+        commit_files(&repo, &[("a.txt", &base)], "Base");
+        let edited = base.replace("3\n", "three\n").replace("8\n", "eight\n");
+        fs::write(dir.path().join("a.txt"), &edited).unwrap();
+        let mut view = view(&dir);
+        draw(&mut view, 100, 30);
+        press(&mut view, KeyCode::Enter);
+        assert_eq!(view.pane, Pane::Content);
+        let index = |dir: &tempfile::TempDir| {
+            let repo = Repository::open(dir.path()).unwrap();
+            let index = repo.index().unwrap();
+            let entry = index.get_path(Path::new("a.txt"), 0).unwrap();
+            String::from_utf8(repo.find_blob(entry.id).unwrap().content().to_vec()).unwrap()
+        };
+        // The rows: 1, 2, -3, +three, 4, 5, 6, 7, -8, +eight, 9, 10. On
+        // a context line there is nothing to stage, and Space says so.
+        assert!(!view.can_stage_lines());
+        assert!(matches!(
+            press(&mut view, KeyCode::Char(' ')),
+            ChangesOutcome::Notice(notice) if notice.text().contains("Nothing to stage")
+        ));
+        // Down to -3, and Shift+Down, Shift+End over +three: Space
+        // stages that change.
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Down);
+        for code in [KeyCode::Down, KeyCode::End] {
+            view.handle_key(key(code, KeyModifiers::SHIFT), &mut Clipboard::local_only());
+        }
+        assert!(view.can_stage_lines() && view.can_revert_lines());
+        assert!(!view.can_unstage_lines());
+        let outcome = press(&mut view, KeyCode::Char(' '));
+        assert!(
+            matches!(&outcome, ChangesOutcome::Notice(notice) if notice.text() == "Staged 2 lines of a.txt"),
+            "{outcome:?}"
+        );
+        settle(&mut view);
+        assert_eq!(index(&dir), base.replace("3\n", "three\n"));
+        assert!(
+            !view.has_diff_selection(),
+            "the selection goes with the lines"
+        );
+        // Revert the line under the cursor, +eight, after asking: it goes
+        // from the working directory, while the removal of 8, a change of
+        // its own, stays, as does three.
+        draw(&mut view, 100, 30);
+        let row = |view: &ChangesView, text: &str| match &view.content {
+            Some(Content::Diff(model)) => model
+                .rows()
+                .iter()
+                .position(
+                    |row| matches!(row, DiffRow::Line(line) if model.diff().text(line) == text),
+                )
+                .unwrap(),
+            _ => panic!("no diff"),
+        };
+        let eight = row(&view, "eight");
+        if let Some(Content::Diff(model)) = &mut view.content {
+            model.set_cursor_at(eight, 0);
+        }
+        assert_eq!(view.revert_lines(), ChangesOutcome::Continue);
+        let dialog = view.files_box().expect("the revert box asks");
+        assert!(
+            dialog.title().contains("Revert 1 line of a.txt"),
+            "{}",
+            dialog.title()
+        );
+        assert!(matches!(
+            press(&mut view, KeyCode::Char('y')),
+            ChangesOutcome::Notice(notice) if notice.text() == "Reverted 1 line of a.txt"
+        ));
+        settle(&mut view);
+        assert_eq!(
+            read(&dir, "a.txt"),
+            base.replace("3\n", "three\n").replace("8\n", "")
+        );
+        // In the staged list's diff, Space on -3 unstages it, and the
+        // +three left staged alone.
+        press(&mut view, KeyCode::BackTab);
+        press(&mut view, KeyCode::Tab);
+        assert_eq!(view.pane, Pane::Staged);
+        press(&mut view, KeyCode::Home);
+        press(&mut view, KeyCode::Enter);
+        draw(&mut view, 100, 30);
+        assert_eq!(view.pane, Pane::Content);
+        let removed = row(&view, "3");
+        if let Some(Content::Diff(model)) = &mut view.content {
+            model.set_cursor_at(removed, 0);
+        }
+        assert!(view.can_unstage_lines() && !view.can_stage_lines());
+        assert!(matches!(
+            press(&mut view, KeyCode::Char(' ')),
+            ChangesOutcome::Notice(notice) if notice.text() == "Unstaged 1 line of a.txt"
+        ));
+        settle(&mut view);
+        assert_eq!(index(&dir), base.replace("3\n", "3\nthree\n"));
     }
 
     fn right_click(view: &mut ChangesView, column: u16, row: u16) -> ChangesMouseOutcome {
