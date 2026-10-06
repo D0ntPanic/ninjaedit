@@ -14,7 +14,10 @@
 //! [`Position`] converts to and from line/column pairs for display, where a
 //! column is a terminal cell: wide characters take two, tabs extend to the
 //! next tab stop. Vertical movement remembers the column it started from, so
-//! moving across a short line and back returns to the original column.
+//! moving across a short line and back returns to the original column. The
+//! moves themselves are made by a [`Caret`] (see the [`caret`](crate::caret)
+//! module), which the views that show text without editing it move their
+//! cursors with too.
 //!
 //! Undo: cursor and selection changes are not undoable on their own, but each
 //! undo entry records the cursor and selection from before and after its
@@ -140,7 +143,7 @@
 
 use crate::auto_indent::{self, CodeLine, CodeStyle, Indenter, Rules};
 use crate::buffer::{BufferSnapshot, DiskChange, FileBuffer};
-use crate::caret::Movement;
+use crate::caret::{Caret, Movement, TextPos};
 use crate::completion::CompletionRequest;
 use crate::indent::{self, Indentation};
 use crate::merge;
@@ -651,106 +654,64 @@ impl Editor {
     /// [`text::word_at`]. The cursor ends up at the end of the word. On
     /// an empty line nothing is selected and the cursor moves there.
     pub fn select_word_at(&mut self, offset: usize) {
-        let offset = self.snap(offset);
-        let (start, bytes) = self.line_bytes_at(offset);
-        let word = text::word_at(&bytes, offset - start);
-        self.set_selection(start + word.start, start + word.end);
+        let mut caret = self.caret();
+        caret.select_word_at(&self.buffer, self.text_pos(self.snap(offset)));
+        self.take_caret(&caret);
     }
 
     /// Move the cursor, clearing any selection. Moving left or right out of
     /// a selection collapses it to its start or end.
     pub fn move_cursor(&mut self, movement: Movement) {
-        if let Some(range) = self.selection() {
-            let collapsed = match movement {
-                Movement::Left => Some(range.start),
-                Movement::Right => Some(range.end),
-                _ => None,
-            };
-            if let Some(offset) = collapsed {
-                self.cursor = offset;
-                self.anchor = None;
-                self.end_movement();
-                return;
-            }
-        }
-        self.apply_movement(movement, false);
+        let mut caret = self.caret();
+        caret.move_cursor(&self.buffer, movement);
+        self.take_caret(&caret);
     }
 
     /// Move the cursor while keeping (or starting) a selection from where
     /// the cursor was.
     pub fn extend_selection(&mut self, movement: Movement) {
-        self.apply_movement(movement, true);
+        let mut caret = self.caret();
+        caret.extend_selection(&self.buffer, movement);
+        self.take_caret(&caret);
     }
 
-    fn apply_movement(&mut self, movement: Movement, extend: bool) {
-        let vertical = matches!(
-            movement,
-            Movement::Up | Movement::Down | Movement::PageUp(_) | Movement::PageDown(_)
-        );
-        let line = self.buffer.line_of_offset(self.cursor);
-        let mut column = if vertical {
-            Some(
-                self.desired_column
-                    .unwrap_or_else(|| self.cursor_position().column),
-            )
-        } else {
-            None
-        };
-        let mut vertical_target =
-            |delta: isize| match self.vertical_target(line, column.unwrap(), delta) {
-                Some(offset) => offset,
-                // Ran off the first or last line: jump to that end of the buffer,
-                // which is a horizontal move, so forget the column.
-                None => {
-                    column = None;
-                    if delta < 0 { 0 } else { self.buffer.len() }
-                }
-            };
-        let target = match movement {
-            Movement::Left => self.prev_char(self.cursor),
-            Movement::Right => self.next_char(self.cursor),
-            Movement::Up => vertical_target(-1),
-            Movement::Down => vertical_target(1),
-            Movement::PageUp(height) => vertical_target(-(height.max(1) as isize)),
-            Movement::PageDown(height) => vertical_target(height.max(1) as isize),
-            Movement::WordLeft => self.word_left(self.cursor),
-            Movement::WordRight => self.word_right(self.cursor),
-            Movement::LineStart => self.line_start_target(line),
-            Movement::LineEnd => self.buffer.line_content_range(line).end,
-            Movement::DocumentStart => 0,
-            Movement::DocumentEnd => self.buffer.len(),
-        };
-        if extend {
-            if self.anchor.is_none() {
-                self.anchor = Some(self.cursor);
-            }
-        } else {
-            self.anchor = None;
-        }
-        self.cursor = target;
-        self.grouping = false;
-        self.desired_column = column;
-        self.pending = None;
-        self.search = None;
-        self.drop_suggestion();
+    /// A [`Caret`] where the cursor and selection are, to move them by
+    /// its rules, which are the editor's (see the [`caret`](crate::caret)
+    /// module). Vertical movement aims for the column remembered, or else
+    /// the column the cursor shows at, which pending indentation puts
+    /// past its offset's.
+    fn caret(&self) -> Caret {
+        let column = self.desired_column.or_else(|| {
+            self.pending
+                .is_some()
+                .then(|| self.cursor_position().column)
+        });
+        Caret::with_state(
+            self.tab_width,
+            self.text_pos(self.cursor),
+            self.anchor.map(|anchor| self.text_pos(anchor)),
+            column,
+        )
     }
 
-    /// Where [`Movement::LineStart`] goes from the cursor's line: the end of
-    /// the line's leading whitespace, unless the cursor is already at or
-    /// before it (but not at the very start of the line), in which case the
-    /// start of the line. A line that is all whitespace has no first
-    /// character to go to, so its start is the only target.
-    fn line_start_target(&self, line: usize) -> usize {
-        let indent = self.leading_whitespace(line);
-        let content = self.buffer.line_content_range(line);
-        if indent.end == content.end {
-            return indent.start;
-        }
-        if self.cursor > indent.start && self.cursor <= indent.end {
-            indent.start
-        } else {
-            indent.end
-        }
+    /// Take the cursor and selection a caret moved, with the bookkeeping
+    /// of any movement (see [`end_movement`](Self::end_movement)), but
+    /// keeping the column the caret remembers for vertical movement.
+    fn take_caret(&mut self, caret: &Caret) {
+        self.cursor = self.offset_of_text_pos(caret.cursor());
+        self.anchor = caret.anchor().map(|anchor| self.offset_of_text_pos(anchor));
+        self.end_movement();
+        self.desired_column = caret.desired_column();
+    }
+
+    /// A byte offset as a line and a byte within it.
+    fn text_pos(&self, offset: usize) -> TextPos {
+        let line = self.buffer.line_of_offset(offset);
+        TextPos::new(line, offset - self.buffer.offset_of_line(line))
+    }
+
+    fn offset_of_text_pos(&self, pos: TextPos) -> usize {
+        self.buffer.offset_of_line(pos.line) + pos.byte
     }
 
     /// Bookkeeping shared by all explicit cursor changes: they break undo
@@ -881,76 +842,20 @@ impl Editor {
     /// The offset one character to the right, crossing to the next line at
     /// the end of a line. Returns `offset` itself at the end of the buffer.
     fn next_char(&self, offset: usize) -> usize {
-        let line = self.buffer.line_of_offset(offset);
-        let layout = self.layout(line);
-        match layout.line.cell_at(offset - layout.start) {
-            Some(i) => layout.start + layout.line.cells()[i].range.end,
-            None if line + 1 < self.buffer.line_count() => self.buffer.offset_of_line(line + 1),
-            None => offset,
-        }
+        self.moved_from(offset, Movement::Right)
     }
 
     /// The offset one character to the left, crossing to the previous line
     /// at the start of a line. Returns 0 at the start of the buffer.
     fn prev_char(&self, offset: usize) -> usize {
-        let line = self.buffer.line_of_offset(offset);
-        let layout = self.layout(line);
-        let rel = offset - layout.start;
-        if rel == 0 {
-            return if line > 0 {
-                self.buffer.line_content_range(line - 1).end
-            } else {
-                0
-            };
-        }
-        // The character ending at (or containing) rel.
-        let cells = layout.line.cells();
-        let i = cells.partition_point(|c| c.range.end < rel);
-        layout.start + cells[i.min(cells.len() - 1)].range.start
+        self.moved_from(offset, Movement::Left)
     }
 
-    /// The bytes of the line containing `offset`, with the offset of the
-    /// line's start.
-    fn line_bytes_at(&self, offset: usize) -> (usize, Vec<u8>) {
-        let content = self
-            .buffer
-            .line_content_range(self.buffer.line_of_offset(offset));
-        (content.start, self.buffer.bytes_in_range(content))
-    }
-
-    /// The next word boundary, crossing to the next line from the end of
-    /// a line.
-    fn word_right(&self, offset: usize) -> usize {
-        let (start, bytes) = self.line_bytes_at(offset);
-        if offset >= start + bytes.len() {
-            return self.next_char(offset);
-        }
-        start + text::next_word_boundary(&bytes, offset - start)
-    }
-
-    /// The previous word boundary, crossing to the previous line from
-    /// the start of a line.
-    fn word_left(&self, offset: usize) -> usize {
-        let (start, bytes) = self.line_bytes_at(offset);
-        if offset <= start {
-            return self.prev_char(offset);
-        }
-        start + text::prev_word_boundary(&bytes, offset - start)
-    }
-
-    /// The target of moving `delta` lines from `line` aiming for `column`,
-    /// or `None` if `line` is already the first (or last) line.
-    fn vertical_target(&self, line: usize, column: usize, delta: isize) -> Option<usize> {
-        let last = self.buffer.line_count() - 1;
-        let target = if delta < 0 {
-            line.saturating_sub(delta.unsigned_abs())
-        } else {
-            (line + delta as usize).min(last)
-        };
-        if target == line {
-            return None;
-        }
-        Some(self.offset_at_column(target, column))
+    /// Where a movement from an offset goes, as the cursor would.
+    fn moved_from(&self, offset: usize, movement: Movement) -> usize {
+        let mut caret = Caret::with_state(self.tab_width, self.text_pos(offset), None, None);
+        caret.move_cursor(&self.buffer, movement);
+        self.offset_of_text_pos(caret.cursor())
     }
 
     // ----- Editing --------------------------------------------------------
@@ -1685,18 +1590,6 @@ impl Editor {
     fn shrink_indent(&self, indent: &mut String) {
         let len = indent.len() - self.outdent_len(indent.as_bytes());
         indent.truncate(len);
-    }
-
-    /// The range of spaces and tabs at the start of a line's content.
-    fn leading_whitespace(&self, line: usize) -> Range<usize> {
-        let content = self.buffer.line_content_range(line);
-        let len = self
-            .buffer
-            .bytes_in_range(content.clone())
-            .iter()
-            .take_while(|&&b| b == b' ' || b == b'\t')
-            .count();
-        content.start..content.start + len
     }
 
     /// In a space-indented buffer, when only spaces precede the cursor on

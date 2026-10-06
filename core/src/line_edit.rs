@@ -5,13 +5,15 @@
 //! a frontend-agnostic way: it holds the text, a cursor, and a selection
 //! (an anchor at the fixed end, the cursor at the moving end, as in the
 //! [`Editor`](crate::Editor)), and moves, selects, inserts, and deletes by
-//! character and by word. The frontend maps keys and mouse positions onto
+//! character and by word, its moves made by a [`Caret`] as the editor's
+//! are, on the text as one line. The frontend maps keys and mouse positions onto
 //! these actions and draws the result; the [`cells`](LineEdit::cells)
 //! layout gives it the display column of every character for both.
 //!
 //! Line breaks can't be part of the text: inserting text drops them, so a
 //! pasted paragraph becomes one line.
 
+use crate::caret::{self, Caret, TextPos};
 use crate::text::{self, Grapheme};
 use std::ops::Range;
 
@@ -135,8 +137,9 @@ impl LineEdit {
     /// Select the word at a byte offset, as a double-click does; see
     /// [`text::word_at`]. The cursor ends up at the end of the word.
     pub fn select_word_at(&mut self, offset: usize) {
-        let word = text::word_at(self.text.as_bytes(), self.snap(offset));
-        self.set_selection(word.start, word.end);
+        let mut caret = self.caret();
+        caret.select_word_at(&[self.text.as_str()][..], TextPos::new(0, offset));
+        self.take_caret(&caret);
     }
 
     /// Move the cursor. With `extend` the selection grows (or starts) from
@@ -144,34 +147,40 @@ impl LineEdit {
     /// moving left or right out of one only collapses it to its start or
     /// end.
     pub fn move_cursor(&mut self, movement: Movement, extend: bool) {
-        if !extend && let Some(range) = self.selection() {
-            let collapsed = match movement {
-                Movement::Left => Some(range.start),
-                Movement::Right => Some(range.end),
-                _ => None,
-            };
-            if let Some(offset) = collapsed {
-                self.set_cursor(offset);
-                return;
-            }
-        }
-        let bytes = self.text.as_bytes();
-        let target = match movement {
-            Movement::Left => self.prev_char(self.cursor),
-            Movement::Right => self.next_char(self.cursor),
-            Movement::WordLeft => text::prev_word_boundary(bytes, self.cursor),
-            Movement::WordRight => text::next_word_boundary(bytes, self.cursor),
-            Movement::Start => 0,
-            Movement::End => self.text.len(),
+        let movement = match movement {
+            Movement::Left => caret::Movement::Left,
+            Movement::Right => caret::Movement::Right,
+            Movement::WordLeft => caret::Movement::WordLeft,
+            Movement::WordRight => caret::Movement::WordRight,
+            Movement::Start => caret::Movement::DocumentStart,
+            Movement::End => caret::Movement::DocumentEnd,
         };
+        let mut caret = self.caret();
+        let lines = [self.text.as_str()];
         if extend {
-            if self.anchor.is_none() {
-                self.anchor = Some(self.cursor);
-            }
+            caret.extend_selection(&lines[..], movement);
         } else {
-            self.anchor = None;
+            caret.move_cursor(&lines[..], movement);
         }
-        self.cursor = target;
+        self.take_caret(&caret);
+    }
+
+    /// A [`Caret`] at the cursor and selection, to move them by its rules,
+    /// which are the editor's (see the [`caret`] module), on the text as
+    /// the one line it is.
+    fn caret(&self) -> Caret {
+        Caret::with_state(
+            TAB_WIDTH,
+            TextPos::new(0, self.cursor),
+            self.anchor.map(|anchor| TextPos::new(0, anchor)),
+            None,
+        )
+    }
+
+    /// Take the cursor and selection a caret moved.
+    fn take_caret(&mut self, caret: &Caret) {
+        self.cursor = caret.cursor().byte;
+        self.anchor = caret.anchor().map(|anchor| anchor.byte);
     }
 
     // ----- Editing --------------------------------------------------------
@@ -326,25 +335,26 @@ impl LineEdit {
     /// Clamp an offset to the text and move it back to a character
     /// boundary.
     fn snap(&self, offset: usize) -> usize {
-        let offset = offset.min(self.text.len());
-        text::graphemes(self.text.as_bytes())
-            .find(|g| g.range.end > offset)
-            .map_or(self.text.len(), |g| g.range.start)
+        let mut caret = self.caret();
+        caret.set_cursor(&[self.text.as_str()][..], TextPos::new(0, offset));
+        caret.cursor().byte
     }
 
     /// The offset one character right of `offset`, or the end of the text.
     fn next_char(&self, offset: usize) -> usize {
-        text::graphemes(self.text.as_bytes())
-            .find(|g| g.range.end > offset)
-            .map_or(self.text.len(), |g| g.range.end)
+        self.moved_from(offset, caret::Movement::Right)
     }
 
     /// The offset one character left of `offset`, or 0.
     fn prev_char(&self, offset: usize) -> usize {
-        text::graphemes(self.text.as_bytes())
-            .take_while(|g| g.range.start < offset)
-            .last()
-            .map_or(0, |g| g.range.start)
+        self.moved_from(offset, caret::Movement::Left)
+    }
+
+    /// Where a movement from an offset goes, as the cursor would.
+    fn moved_from(&self, offset: usize, movement: caret::Movement) -> usize {
+        let mut caret = Caret::with_state(TAB_WIDTH, TextPos::new(0, offset), None, None);
+        caret.move_cursor(&[self.text.as_str()][..], movement);
+        caret.cursor().byte
     }
 }
 

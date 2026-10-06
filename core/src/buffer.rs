@@ -17,6 +17,8 @@
 //! directory, synced, and renamed over the target, so a crash mid-save can
 //! never leave a half-written file in place of the original.
 
+use crate::caret::LineSource;
+use std::borrow::Cow;
 use std::fs;
 use std::io::{self, Write};
 use std::ops::Range;
@@ -736,6 +738,23 @@ impl FileBuffer {
             return Ok(DiskChange::Unchanged);
         }
         Ok(DiskChange::Changed { previous, contents })
+    }
+}
+
+/// The buffer's lines, without their terminators, for a [`Caret`] to move
+/// through.
+///
+/// [`Caret`]: crate::caret::Caret
+impl LineSource for FileBuffer {
+    fn line_count(&self) -> usize {
+        FileBuffer::line_count(self)
+    }
+
+    fn line(&self, index: usize) -> Cow<'_, [u8]> {
+        if index >= FileBuffer::line_count(self) {
+            return Cow::Borrowed(&[]);
+        }
+        Cow::Owned(self.bytes_in_range(self.line_content_range(index)))
     }
 }
 

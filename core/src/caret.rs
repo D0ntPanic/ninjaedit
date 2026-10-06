@@ -1,7 +1,10 @@
 //! Moving a cursor through lines of text, and selecting with it.
 //!
-//! The editor, and the views that show text without editing it, move a
-//! cursor the same way: by character (a grapheme cluster; see the
+//! The editor, the one-line inputs (see the
+//! [`line_edit`](crate::line_edit) module), and the views that show text
+//! without editing it, such as a diff (see the
+//! [`git::diff_model`](crate::git::diff_model) module), move a cursor the
+//! same way: by character (a grapheme cluster; see the
 //! [`text`] module), by word, by line keeping the column, by
 //! page, and to either end of a line or of the text. [`Movement`] names
 //! those moves for every model that has a cursor to move, and a [`Caret`]
@@ -135,8 +138,31 @@ impl Caret {
         }
     }
 
+    /// A caret with the cursor, selection anchor, and remembered column
+    /// of a model that keeps its own, for moving them by the caret's
+    /// rules; see the editor. The positions are taken as given.
+    pub fn with_state(
+        tab_width: usize,
+        cursor: TextPos,
+        anchor: Option<TextPos>,
+        desired_column: Option<usize>,
+    ) -> Caret {
+        Caret {
+            cursor,
+            anchor,
+            desired_column,
+            tab_width,
+        }
+    }
+
     pub fn cursor(&self) -> TextPos {
         self.cursor
+    }
+
+    /// The column vertical movement aims for, while one is remembered:
+    /// after a vertical move, until anything else moves the cursor.
+    pub fn desired_column(&self) -> Option<usize> {
+        self.desired_column
     }
 
     /// The selection anchor: the end of the selection that doesn't move.
@@ -402,7 +428,8 @@ impl Caret {
         let layout = self.layout(lines, pos.line);
         let cells = layout.cells();
         let i = cells.partition_point(|c| c.range.end < pos.byte);
-        TextPos::new(pos.line, cells[i.min(cells.len() - 1)].range.start)
+        let start = cells.get(i.min(cells.len().saturating_sub(1)));
+        TextPos::new(pos.line, start.map_or(0, |cell| cell.range.start))
     }
 
     /// The next word boundary, crossing to the next line from the end of
