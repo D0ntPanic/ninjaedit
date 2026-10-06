@@ -43,10 +43,8 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget};
 
-/// Rows scrolled per mouse wheel notch.
-pub(crate) const WHEEL_LINES: usize = 3;
-/// Columns scrolled per horizontal wheel notch, or by ← and →.
-pub(crate) const WHEEL_COLUMNS: usize = 4;
+/// Columns scrolled sideways by ← and →.
+pub(crate) const ARROW_COLUMNS: usize = 4;
 /// Columns a pane may scroll past the longest visible line, as in the
 /// editor.
 pub(crate) const HSCROLL_SLACK: usize = 2;

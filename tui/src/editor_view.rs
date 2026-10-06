@@ -58,10 +58,6 @@ use ratatui::style::Style;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget};
 use std::ops::Range;
 
-/// Lines scrolled per mouse wheel notch.
-const WHEEL_LINES: usize = 3;
-/// Columns scrolled per horizontal wheel notch.
-const WHEEL_COLUMNS: usize = 4;
 /// Columns the view may scroll past the longest visible line: one for the
 /// cursor at the end of the line, one for padding.
 const HSCROLL_SLACK: usize = 2;
@@ -913,14 +909,17 @@ impl EditorView {
         self.drag != Drag::None
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+    /// Handle a mouse event. `wheel` is how many lines (or columns,
+    /// sideways) a wheel event scrolls.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, wheel: usize) {
         let (x, y) = (mouse.column, mouse.row);
         let at = ScreenPosition::new(x, y);
+        let wheel = wheel as isize;
         match mouse.kind {
-            MouseEventKind::ScrollDown => self.scroll_by(WHEEL_LINES as isize),
-            MouseEventKind::ScrollUp => self.scroll_by(-(WHEEL_LINES as isize)),
-            MouseEventKind::ScrollRight => self.scroll_horizontally_by(WHEEL_COLUMNS as isize),
-            MouseEventKind::ScrollLeft => self.scroll_horizontally_by(-(WHEEL_COLUMNS as isize)),
+            MouseEventKind::ScrollDown => self.scroll_by(wheel),
+            MouseEventKind::ScrollUp => self.scroll_by(-wheel),
+            MouseEventKind::ScrollRight => self.scroll_horizontally_by(wheel),
+            MouseEventKind::ScrollLeft => self.scroll_horizontally_by(-wheel),
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.vscroll.contains(at) {
                     self.drag = Drag::VerticalScrollbar;
@@ -1069,6 +1068,9 @@ mod tests {
     use super::*;
     use ninjaedit_core::FileBuffer;
 
+    /// Rows a wheel event scrolls in these tests.
+    const WHEEL: usize = 3;
+
     fn draw(
         view: &mut EditorView,
         width: u16,
@@ -1102,12 +1104,15 @@ mod tests {
         assert!(rows[0].starts_with("one "), "{rows:#?}");
         assert!(rows[1].starts_with("two "), "{rows:#?}");
         assert_eq!(cursor, Some(ScreenPosition::new(0, 0)));
-        view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 2,
-            row: 1,
-            modifiers: KeyModifiers::NONE,
-        });
+        view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
         assert_eq!(
             view.editor.cursor_position(),
             Position { line: 1, column: 2 }
@@ -1137,18 +1142,24 @@ mod tests {
     }
 
     fn click(view: &mut EditorView, column: u16, row: u16) {
-        view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column,
-            row,
-            modifiers: KeyModifiers::NONE,
-        });
-        view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Up(MouseButton::Left),
-            column,
-            row,
-            modifiers: KeyModifiers::NONE,
-        });
+        view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
+        view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
     }
 
     /// Type `l` on the blank line and answer the request that makes

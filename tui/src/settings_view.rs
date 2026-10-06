@@ -53,8 +53,6 @@ const MAX_FIELD_WIDTH: u16 = 76;
 /// How far the category headers and the settings are indented.
 const HEADER_INDENT: u16 = 1;
 const INDENT: u16 = 3;
-/// Rows scrolled per mouse wheel notch.
-const WHEEL_LINES: usize = 3;
 /// Columns between a table's row labels and its first column, and
 /// between one column and the next.
 const TABLE_GAP: u16 = 2;
@@ -699,11 +697,11 @@ impl SettingsView {
     pub fn handle_mouse(&mut self, mouse: MouseEvent, settings: &mut Settings) -> SettingsOutcome {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.scroll = self.scroll.saturating_sub(WHEEL_LINES);
+                self.scroll = self.scroll.saturating_sub(settings.wheel_lines());
                 SettingsOutcome::Continue
             }
             MouseEventKind::ScrollDown => {
-                self.scroll += WHEEL_LINES;
+                self.scroll += settings.wheel_lines();
                 SettingsOutcome::Continue
             }
             _ => {
@@ -1081,10 +1079,10 @@ mod tests {
     fn enter_applies_a_value_and_moving_on_applies_the_field_left() {
         let mut settings = Settings::default();
         let mut view = SettingsView::new(&settings);
-        // Down past the continuation indent, shell, and agent fields to
-        // the scrollback field; the fields left as they were are applied
-        // without changing anything.
-        for _ in 0..3 {
+        // Down past the continuation indent, wheel, shell, and agent
+        // fields to the scrollback field; the fields left as they were
+        // are applied without changing anything.
+        for _ in 0..4 {
             assert_eq!(
                 press(&mut view, &mut settings, KeyCode::Down),
                 SettingsOutcome::Continue
@@ -1277,7 +1275,7 @@ mod tests {
             .unwrap();
         let mut view = SettingsView::new(&settings);
         assert_eq!(view.text(SettingKey::Shell), "fish");
-        press(&mut view, &mut settings, KeyCode::Down);
+        focus_key(&mut view, &mut settings, SettingKey::Shell);
         assert_eq!(
             ctrl(&mut view, &mut settings, 'd'),
             SettingsOutcome::Changed
@@ -1307,7 +1305,7 @@ mod tests {
     fn clicking_a_field_focuses_it_and_applies_the_one_left() {
         let mut settings = Settings::default();
         let mut view = SettingsView::new(&settings);
-        press(&mut view, &mut settings, KeyCode::Down);
+        focus_key(&mut view, &mut settings, SettingKey::Shell);
         type_str(&mut view, &mut settings, "/bin/sh");
         let screen = draw(&mut view, &settings, 80, 60);
         let row = screen
@@ -1411,7 +1409,7 @@ mod tests {
             "the note is shown with the field: {screen:#?}"
         );
         // The wheel scrolls back up without moving the focus.
-        for _ in 0..30 {
+        for _ in 0..100 {
             view.handle_mouse(
                 MouseEvent {
                     kind: MouseEventKind::ScrollUp,

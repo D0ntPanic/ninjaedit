@@ -75,8 +75,6 @@ const MIN_TREE_WIDTH: u16 = 22;
 const MAX_TREE_WIDTH: u16 = 40;
 /// How far the options pane's content is indented from its edge.
 const INDENT: u16 = 2;
-/// Rows scrolled per mouse wheel notch.
-const WHEEL_LINES: usize = 3;
 const NO_ROOTS: &str = "No build roots";
 const NO_ROOTS_HINT: &str = "Ctrl+N adds a Cargo.toml or CMakeLists.txt";
 
@@ -841,23 +839,30 @@ impl BuildView {
         self.fields.is_dragging()
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent, config: &mut BuildConfig) -> BuildOutcome {
+    /// Handle a mouse event. `wheel` is how many rows a wheel event
+    /// scrolls.
+    pub fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        config: &mut BuildConfig,
+        wheel: usize,
+    ) -> BuildOutcome {
         let at = ScreenPosition::new(mouse.column, mouse.row);
         let in_tree = self.tree_area.contains(at);
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 if in_tree {
-                    self.tree_scroll = self.tree_scroll.saturating_sub(WHEEL_LINES);
+                    self.tree_scroll = self.tree_scroll.saturating_sub(wheel);
                 } else {
-                    self.options_scroll = self.options_scroll.saturating_sub(WHEEL_LINES);
+                    self.options_scroll = self.options_scroll.saturating_sub(wheel);
                 }
                 BuildOutcome::Continue
             }
             MouseEventKind::ScrollDown => {
                 if in_tree {
-                    self.tree_scroll += WHEEL_LINES;
+                    self.tree_scroll += wheel;
                 } else {
-                    self.options_scroll += WHEEL_LINES;
+                    self.options_scroll += wheel;
                 }
                 BuildOutcome::Continue
             }
@@ -1151,6 +1156,9 @@ mod tests {
     use crossterm::event::{KeyEventKind, KeyEventState};
     use ninjaedit_core::BuildRoot;
     use std::path::Path;
+
+    /// Rows a wheel event scrolls in these tests.
+    const WHEEL: usize = 3;
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {
@@ -1629,6 +1637,7 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             },
             &mut config,
+            WHEEL,
         );
         assert_eq!(outcome, BuildOutcome::Continue);
         assert_eq!(view.selected_node(), Some(Node::Target(0, 1)));
@@ -1649,6 +1658,7 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             },
             &mut config,
+            WHEEL,
         );
         assert!(!view.in_tree());
         assert!(view.contains(40, field_row));
@@ -1663,6 +1673,7 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             },
             &mut config,
+            WHEEL,
         );
         assert_eq!(outcome, BuildOutcome::Changed);
         assert_eq!(config.roots()[0].targets()[1].package, "lib2");
@@ -1687,6 +1698,7 @@ mod tests {
                     modifiers: KeyModifiers::NONE,
                 },
                 config,
+                WHEEL,
             )
         };
         wheel(&mut view, &mut config, MouseEventKind::ScrollDown);

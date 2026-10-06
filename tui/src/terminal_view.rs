@@ -62,10 +62,6 @@ use ratatui::layout::{Position as ScreenPosition, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use std::ops::Range;
 
-/// Lines scrolled per mouse wheel notch when the view, not the program,
-/// is scrolling.
-const WHEEL_LINES: usize = 3;
-
 /// The part of a source link drawn on one screen row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LinkSpan {
@@ -230,8 +226,12 @@ impl TerminalView {
     /// scrollback unless the program is reading the mouse itself, and a
     /// left drag selects text to copy (see the module notes). `escaped`
     /// says the user has pressed the prefix to reach the editor's keys,
-    /// which keeps the mouse from a program reading it too.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent, escaped: bool) -> Vec<u8> {
+    /// which keeps the mouse from a program reading it too. `wheel` is
+    /// how many lines a wheel event scrolls the scrollback; a program
+    /// reading the mouse gets the wheel events as they came, to scroll
+    /// by however much it scrolls for one.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, escaped: bool, wheel: usize) -> Vec<u8> {
+        let wheel = wheel as isize;
         // A selection in progress takes the drag and the release that
         // ends it, wherever the pointer has gone; another button
         // meanwhile does nothing.
@@ -251,11 +251,11 @@ impl TerminalView {
                 // The wheel moves the view under the selection, whoever
                 // has the mouse otherwise.
                 MouseEventKind::ScrollUp => {
-                    self.scroll_by(WHEEL_LINES as isize);
+                    self.scroll_by(wheel);
                     return Vec::new();
                 }
                 MouseEventKind::ScrollDown => {
-                    self.scroll_by(-(WHEEL_LINES as isize));
+                    self.scroll_by(-wheel);
                     return Vec::new();
                 }
                 _ => {}
@@ -275,8 +275,8 @@ impl TerminalView {
         // The mouse is the view's: the wheel scrolls the scrollback, a
         // left press starts selecting, and the rest is nothing to it.
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_by(WHEEL_LINES as isize),
-            MouseEventKind::ScrollDown => self.scroll_by(-(WHEEL_LINES as isize)),
+            MouseEventKind::ScrollUp => self.scroll_by(wheel),
+            MouseEventKind::ScrollDown => self.scroll_by(-wheel),
             MouseEventKind::Down(MouseButton::Left) => {
                 self.selection = Some(Selection::new(self.point_at(mouse.column, mouse.row)));
                 self.autoscroll = 0;
@@ -736,6 +736,9 @@ mod tests {
     use ratatui::Terminal as RatTerminal;
     use ratatui::backend::TestBackend;
 
+    /// Rows a wheel event scrolls in these tests.
+    const WHEEL: usize = 3;
+
     fn view() -> TerminalView {
         TerminalView::new(20, 5)
     }
@@ -825,8 +828,8 @@ mod tests {
             row: 1,
             modifiers: KeyModifiers::NONE,
         };
-        assert!(v.handle_mouse(wheel, false).is_empty());
-        assert_eq!(v.scrollback_offset(), WHEEL_LINES);
+        assert!(v.handle_mouse(wheel, false, WHEEL).is_empty());
+        assert_eq!(v.scrollback_offset(), WHEEL);
         // A key jumps back to the bottom.
         v.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
         assert_eq!(v.scrollback_offset(), 0);
@@ -847,7 +850,7 @@ mod tests {
             row: 2,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(v.handle_mouse(down, false), b"\x1b[<0;5;3M");
+        assert_eq!(v.handle_mouse(down, false, WHEEL), b"\x1b[<0;5;3M");
         assert!(v.is_dragging());
         let up = MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Left),
@@ -855,7 +858,7 @@ mod tests {
             row: 2,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(v.handle_mouse(up, false), b"\x1b[<0;5;3m");
+        assert_eq!(v.handle_mouse(up, false, WHEEL), b"\x1b[<0;5;3m");
         assert!(!v.is_dragging());
         // The wheel now goes to the program too, not the scrollback.
         let wheel = MouseEvent {
@@ -864,7 +867,7 @@ mod tests {
             row: 2,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(v.handle_mouse(wheel, false), b"\x1b[<64;5;3M");
+        assert_eq!(v.handle_mouse(wheel, false, WHEEL), b"\x1b[<64;5;3M");
     }
 
     #[test]
@@ -967,11 +970,11 @@ mod tests {
         let drag = MouseEventKind::Drag(MouseButton::Left);
         let up = MouseEventKind::Up(MouseButton::Left);
         // Press on "two" and drag to just after the "r" of "four".
-        assert!(v.handle_mouse(mouse(down, 4, 0), false).is_empty());
+        assert!(v.handle_mouse(mouse(down, 4, 0), false, WHEEL).is_empty());
         assert!(v.is_selecting());
         assert!(v.is_dragging());
         assert_eq!(v.take_copied(), None);
-        v.handle_mouse(mouse(drag, 4, 2), false);
+        v.handle_mouse(mouse(drag, 4, 2), false, WHEEL);
         // The selection is highlighted: the tail of the first row, all of
         // the middle one, and the head of the last.
         let buf = render_in(&mut v, 20, 5, area);
@@ -988,7 +991,7 @@ mod tests {
         // Text keeps its color over the highlight.
         assert_eq!(buf[(4, 0)].fg, theme.terminal_text);
         // The release copies and deselects.
-        v.handle_mouse(mouse(up, 4, 2), false);
+        v.handle_mouse(mouse(up, 4, 2), false, WHEEL);
         assert!(!v.is_selecting());
         assert!(!v.is_dragging());
         assert_eq!(v.take_copied().as_deref(), Some("two\nthree\nfour"));
@@ -996,29 +999,29 @@ mod tests {
         let buf = render_in(&mut v, 20, 5, area);
         assert_eq!(buf[(0, 1)].bg, theme.terminal_background);
         // Dragging backwards selects the same text.
-        v.handle_mouse(mouse(down, 4, 2), false);
-        v.handle_mouse(mouse(drag, 4, 0), false);
-        v.handle_mouse(mouse(up, 4, 0), false);
+        v.handle_mouse(mouse(down, 4, 2), false, WHEEL);
+        v.handle_mouse(mouse(drag, 4, 0), false, WHEEL);
+        v.handle_mouse(mouse(up, 4, 0), false, WHEEL);
         assert_eq!(v.take_copied().as_deref(), Some("two\nthree\nfour"));
         // From the start of a line to the start of a later one takes
         // whole lines, line breaks included.
-        v.handle_mouse(mouse(down, 0, 0), false);
-        v.handle_mouse(mouse(drag, 0, 2), false);
+        v.handle_mouse(mouse(down, 0, 0), false, WHEEL);
+        v.handle_mouse(mouse(drag, 0, 2), false, WHEEL);
         let buf = render_in(&mut v, 20, 5, area);
         assert_eq!(buf[(19, 1)].bg, theme.selection_background);
         assert_eq!(buf[(0, 2)].bg, theme.terminal_background);
-        v.handle_mouse(mouse(up, 0, 2), false);
+        v.handle_mouse(mouse(up, 0, 2), false, WHEEL);
         assert_eq!(v.take_copied().as_deref(), Some("one two\nthree\n"));
         // Past the right edge takes the last column too.
-        v.handle_mouse(mouse(down, 18, 2), false);
-        v.handle_mouse(mouse(drag, 25, 2), false);
-        v.handle_mouse(mouse(up, 25, 2), false);
+        v.handle_mouse(mouse(down, 18, 2), false, WHEEL);
+        v.handle_mouse(mouse(drag, 25, 2), false, WHEEL);
+        v.handle_mouse(mouse(up, 25, 2), false, WHEEL);
         // ...which is blank here, so the trailing blanks go.
         assert_eq!(v.take_copied(), None);
         v.process(b"\x1b[3;19Hab");
-        v.handle_mouse(mouse(down, 18, 2), false);
-        v.handle_mouse(mouse(drag, 25, 2), false);
-        v.handle_mouse(mouse(up, 25, 2), false);
+        v.handle_mouse(mouse(down, 18, 2), false, WHEEL);
+        v.handle_mouse(mouse(drag, 25, 2), false, WHEEL);
+        v.handle_mouse(mouse(up, 25, 2), false, WHEEL);
         assert_eq!(v.take_copied().as_deref(), Some("ab"));
     }
 
@@ -1031,28 +1034,32 @@ mod tests {
         let drag = MouseEventKind::Drag(MouseButton::Left);
         let up = MouseEventKind::Up(MouseButton::Left);
         // A press and release in place is a click.
-        v.handle_mouse(mouse(down, 1, 0), false);
-        v.handle_mouse(mouse(up, 1, 0), false);
+        v.handle_mouse(mouse(down, 1, 0), false, WHEEL);
+        v.handle_mouse(mouse(up, 1, 0), false, WHEEL);
         assert_eq!(v.take_copied(), None);
         // So is a drag that comes back to where it started.
-        v.handle_mouse(mouse(down, 1, 0), false);
-        v.handle_mouse(mouse(drag, 2, 0), false);
-        v.handle_mouse(mouse(drag, 1, 0), false);
-        v.handle_mouse(mouse(up, 1, 0), false);
+        v.handle_mouse(mouse(down, 1, 0), false, WHEEL);
+        v.handle_mouse(mouse(drag, 2, 0), false, WHEEL);
+        v.handle_mouse(mouse(drag, 1, 0), false, WHEEL);
+        v.handle_mouse(mouse(up, 1, 0), false, WHEEL);
         assert_eq!(v.take_copied(), None);
         // Across one cell is one character.
-        v.handle_mouse(mouse(down, 1, 0), false);
-        v.handle_mouse(mouse(drag, 2, 0), false);
-        v.handle_mouse(mouse(up, 2, 0), false);
+        v.handle_mouse(mouse(down, 1, 0), false, WHEEL);
+        v.handle_mouse(mouse(drag, 2, 0), false, WHEEL);
+        v.handle_mouse(mouse(up, 2, 0), false, WHEEL);
         assert_eq!(v.take_copied().as_deref(), Some("n"));
         // Nothing but blanks isn't worth the clipboard.
-        v.handle_mouse(mouse(down, 2, 2), false);
-        v.handle_mouse(mouse(drag, 8, 3), false);
-        v.handle_mouse(mouse(up, 8, 3), false);
+        v.handle_mouse(mouse(down, 2, 2), false, WHEEL);
+        v.handle_mouse(mouse(drag, 8, 3), false, WHEEL);
+        v.handle_mouse(mouse(up, 8, 3), false, WHEEL);
         assert_eq!(v.take_copied(), None);
         assert!(!v.is_selecting());
         // The right button selects nothing.
-        v.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 1, 0), false);
+        v.handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Right), 1, 0),
+            false,
+            WHEEL,
+        );
         assert!(!v.is_selecting());
     }
 
@@ -1071,34 +1078,34 @@ mod tests {
         let drag = MouseEventKind::Drag(MouseButton::Left);
         let up = MouseEventKind::Up(MouseButton::Left);
         // Press on "line19", the fourth row of the view.
-        v.handle_mouse(mouse(down, 2, 5), false);
+        v.handle_mouse(mouse(down, 2, 5), false, WHEEL);
         // One row above the view: one line up, and the selection reaches
         // the start of the new top row.
-        v.handle_mouse(mouse(drag, 7, 1), false);
+        v.handle_mouse(mouse(drag, 7, 1), false, WHEEL);
         assert_eq!(v.scrollback_offset(), 1);
         // Holding there keeps scrolling a line a tick.
         assert!(v.tick());
         assert_eq!(v.scrollback_offset(), 2);
         // Two rows above: two lines a step.
-        v.handle_mouse(mouse(drag, 7, 0), false);
+        v.handle_mouse(mouse(drag, 7, 0), false, WHEEL);
         assert_eq!(v.scrollback_offset(), 4);
         assert!(v.tick());
         assert_eq!(v.scrollback_offset(), 6);
         // Back inside: the scrolling stops and the head follows the
         // pointer.
-        v.handle_mouse(mouse(drag, 3, 2), false);
+        v.handle_mouse(mouse(drag, 3, 2), false, WHEEL);
         assert!(!v.tick());
         assert_eq!(v.scrollback_offset(), 6);
         // Below the view, scrolling back down toward the bottom.
-        v.handle_mouse(mouse(drag, 0, 7), false);
+        v.handle_mouse(mouse(drag, 0, 7), false, WHEEL);
         assert_eq!(v.scrollback_offset(), 5);
         assert!(v.tick());
         assert_eq!(v.scrollback_offset(), 4);
         // Back up past the top and release there: the text runs from the
         // top row down to the "li" before the anchor.
-        v.handle_mouse(mouse(drag, 0, 1), false);
+        v.handle_mouse(mouse(drag, 0, 1), false, WHEEL);
         assert_eq!(v.scrollback_offset(), 5);
-        v.handle_mouse(mouse(up, 0, 1), false);
+        v.handle_mouse(mouse(up, 0, 1), false, WHEEL);
         assert!(!v.tick());
         let copied = v.take_copied().expect("copied");
         assert_eq!(
@@ -1107,19 +1114,19 @@ mod tests {
         );
         // From "line14" on the fourth row, below the bottom scrolls one
         // line down and takes the new bottom row whole.
-        v.handle_mouse(mouse(down, 0, 5), false);
-        v.handle_mouse(mouse(drag, 0, 7), false);
-        v.handle_mouse(mouse(up, 0, 7), false);
+        v.handle_mouse(mouse(down, 0, 5), false, WHEEL);
+        v.handle_mouse(mouse(drag, 0, 7), false, WHEEL);
+        v.handle_mouse(mouse(up, 0, 7), false, WHEEL);
         assert_eq!(v.scrollback_offset(), 4);
         assert_eq!(v.take_copied().as_deref(), Some("line14\nline15\nline16\n"));
         // Scrolling past the start stops there.
-        v.handle_mouse(mouse(down, 0, 6), false);
+        v.handle_mouse(mouse(down, 0, 6), false, WHEEL);
         for _ in 0..30 {
-            v.handle_mouse(mouse(drag, 0, 0), false);
+            v.handle_mouse(mouse(drag, 0, 0), false, WHEEL);
         }
         assert_eq!(v.scrollback_offset(), 16);
         assert!(!v.tick());
-        v.handle_mouse(mouse(up, 0, 0), false);
+        v.handle_mouse(mouse(up, 0, 0), false, WHEEL);
         assert!(v.take_copied().unwrap().starts_with("line0\nline1\n"));
     }
 
@@ -1136,30 +1143,42 @@ mod tests {
         let drag = MouseEventKind::Drag(MouseButton::Left);
         let up = MouseEventKind::Up(MouseButton::Left);
         // Without the prefix the drag is reported to the program.
-        assert_eq!(v.handle_mouse(mouse(down, 0, 0), false), b"\x1b[<0;1;1M");
+        assert_eq!(
+            v.handle_mouse(mouse(down, 0, 0), false, WHEEL),
+            b"\x1b[<0;1;1M"
+        );
         assert!(!v.is_selecting());
-        assert_eq!(v.handle_mouse(mouse(drag, 3, 0), false), b"\x1b[<32;4;1M");
-        assert_eq!(v.handle_mouse(mouse(up, 3, 0), false), b"\x1b[<0;4;1m");
+        assert_eq!(
+            v.handle_mouse(mouse(drag, 3, 0), false, WHEEL),
+            b"\x1b[<32;4;1M"
+        );
+        assert_eq!(
+            v.handle_mouse(mouse(up, 3, 0), false, WHEEL),
+            b"\x1b[<0;4;1m"
+        );
         assert_eq!(v.take_copied(), None);
         // A drag the program is following finishes there even if the
         // prefix is pressed partway.
-        v.handle_mouse(mouse(down, 0, 0), false);
-        assert_eq!(v.handle_mouse(mouse(up, 3, 0), true), b"\x1b[<0;4;1m");
+        v.handle_mouse(mouse(down, 0, 0), false, WHEEL);
+        assert_eq!(
+            v.handle_mouse(mouse(up, 3, 0), true, WHEEL),
+            b"\x1b[<0;4;1m"
+        );
         // Escaped, the press selects and nothing reaches the program;
         // the selection carries on after the prefix is spent.
-        assert!(v.handle_mouse(mouse(down, 0, 0), true).is_empty());
+        assert!(v.handle_mouse(mouse(down, 0, 0), true, WHEEL).is_empty());
         assert!(v.is_selecting());
-        assert!(v.handle_mouse(mouse(drag, 3, 0), false).is_empty());
-        assert!(v.handle_mouse(mouse(up, 3, 0), false).is_empty());
+        assert!(v.handle_mouse(mouse(drag, 3, 0), false, WHEEL).is_empty());
+        assert!(v.handle_mouse(mouse(up, 3, 0), false, WHEEL).is_empty());
         assert_eq!(v.take_copied().as_deref(), Some("lin"));
         // Escaped, the wheel is the view's too.
         assert!(
-            v.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0), true)
+            v.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0), true, WHEEL)
                 .is_empty()
         );
-        assert_eq!(v.scrollback_offset(), WHEEL_LINES);
+        assert_eq!(v.scrollback_offset(), WHEEL);
         assert_eq!(
-            v.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0), false),
+            v.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0), false, WHEEL),
             b"\x1b[<64;1;1M"
         );
     }

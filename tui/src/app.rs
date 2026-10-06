@@ -3674,6 +3674,7 @@ impl App {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         let (x, y) = (mouse.column, mouse.row);
+        let wheel = self.settings.wheel_lines();
         // A click with the prefix waiting is the gesture it was held for:
         // in the tool's terminal it takes the mouse from a program
         // reading it, so a drag selects text, and anywhere else it
@@ -3739,7 +3740,7 @@ impl App {
             && let Some(dialog) = &mut self.project_search
         {
             if dialog.contains(x, y) || dialog.is_dragging() {
-                let outcome = dialog.handle_mouse(mouse);
+                let outcome = dialog.handle_mouse(mouse, wheel);
                 self.handle_project_search_outcome(outcome);
             } else if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.hide_project_search();
@@ -3924,7 +3925,7 @@ impl App {
                     if pressed {
                         self.focus = Focus::Editor;
                     }
-                    let outcome = view.handle_mouse(mouse, &mut self.build);
+                    let outcome = view.handle_mouse(mouse, &mut self.build, wheel);
                     self.handle_build_outcome(outcome);
                 }
                 Mode::GitLog(tabs)
@@ -3936,7 +3937,7 @@ impl App {
                         self.focus = Focus::Editor;
                     }
                     // A resize is kept in the project's storage.
-                    let outcome = tabs.handle_mouse(mouse);
+                    let outcome = tabs.handle_mouse(mouse, wheel);
                     if outcome.resized
                         && let Err(err) = git_layout::save(
                             &self.project_storage,
@@ -3962,7 +3963,7 @@ impl App {
                     if pressed {
                         self.focus = Focus::Editor;
                     }
-                    let outcome = tabs.handle_mouse(mouse);
+                    let outcome = tabs.handle_mouse(mouse, wheel);
                     if let Some(notice) = outcome.notice {
                         self.status = Some(notice);
                     }
@@ -3995,7 +3996,7 @@ impl App {
             && tab.view.is_dragging()
             && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
         {
-            tab.view.handle_mouse(mouse);
+            tab.view.handle_mouse(mouse, wheel);
             return;
         }
 
@@ -4017,7 +4018,7 @@ impl App {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.focus = Focus::Editor;
             }
-            tab.view.handle_mouse(mouse);
+            tab.view.handle_mouse(mouse, wheel);
             if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
                 self.open_editor_menu(x, y);
             }
@@ -4029,10 +4030,11 @@ impl App {
     /// `escaped` says the prefix was waiting when the event came, which
     /// takes the mouse from a program reading it.
     fn route_tool_mouse(&mut self, console: Console, mouse: MouseEvent, escaped: bool) {
+        let wheel = self.settings.wheel_lines();
         let Some(tool) = self.console_mut(console) else {
             return;
         };
-        let bytes = tool.view_mut().handle_mouse(mouse, escaped);
+        let bytes = tool.view_mut().handle_mouse(mouse, escaped, wheel);
         let copied = tool.view_mut().take_copied();
         tool.write(bytes);
         if let Some(text) = copied {
@@ -5091,7 +5093,7 @@ mod tests {
         // Down to the scrollback field, a new value, Enter: applied and
         // saved to the storage, where nothing was before.
         assert_eq!(settings_file(&app), None);
-        for _ in 0..3 {
+        for _ in 0..4 {
             press(&mut app, KeyCode::Down);
         }
         ctrl(&mut app, 'a');
@@ -5164,6 +5166,8 @@ mod tests {
     fn ctrl_d_resets_and_ctrl_o_or_ctrl_t_leave_the_settings_page() {
         let (dir, mut app) = app_with_files(&[("a.txt", "hi\n"), ("b.txt", "yo\n")]);
         app.open_settings();
+        // Down past the wheel lines to the shell.
+        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         type_str(&mut app, "/bin/dash");
         press(&mut app, KeyCode::Enter);
@@ -5672,10 +5676,11 @@ mod tests {
         let screen = draw(&mut app, 200, 10);
         assert!(screen[9].contains("search.max-results"), "{screen:#?}");
 
-        // Down past the continuation indent, the shell, the agent, the
-        // scrollback, and the terminal keys' rows to the results.
+        // Down past the continuation indent, the wheel lines, the shell,
+        // the agent, the scrollback, and the terminal keys' rows to the
+        // results.
         app.open_settings();
-        for _ in 0..7 {
+        for _ in 0..8 {
             press(&mut app, KeyCode::Down);
         }
         ctrl(&mut app, 'a');
@@ -6455,7 +6460,7 @@ mod tests {
         assert!(matches!(app.mode, Mode::Settings(_)));
         assert_eq!(app.focus, Focus::Editor);
         assert!(app.tool_pane.is_visible());
-        for _ in 0..3 {
+        for _ in 0..4 {
             press(&mut app, KeyCode::Down);
         }
         ctrl(&mut app, 'a');
@@ -6925,6 +6930,8 @@ mod tests {
 
         // From a page, back to the page as it was.
         app.open_settings();
+        // Down past the wheel lines to the shell.
+        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         type_str(&mut app, "fish");
         ctrl(&mut app, 'i');
@@ -7241,7 +7248,8 @@ mod tests {
             .collect();
         assert_eq!(bar, "││││││││██", "{screen:#?}");
         assert!(screen[10].starts_with(" 41 "), "{screen:#?}");
-        // Wheel scrolling moves the view without moving the cursor.
+        // Wheel scrolling moves the view without moving the cursor, a
+        // row for each event by default.
         app.handle_event(Event::Mouse(MouseEvent {
             kind: MouseEventKind::ScrollUp,
             column: 5,
@@ -7249,7 +7257,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }));
         let screen = draw(&mut app, 20, 12);
-        assert!(screen[1].starts_with(" 29 "), "{screen:#?}");
+        assert!(screen[1].starts_with(" 31 "), "{screen:#?}");
         assert!(screen[11].contains("Ln 41"), "{screen:#?}");
     }
 
@@ -7312,6 +7320,8 @@ mod tests {
         let long = "x".repeat(50);
         let short: String = "short\n".repeat(30);
         let (_dir, mut app) = app_with_files(&[("a.txt", &format!("short\n{long}\n{short}"))]);
+        // Three rows or columns an event, as the setting asks.
+        app.settings.set_text(SettingKey::WheelLines, "3").unwrap();
         draw(&mut app, 20, 6);
         let wheel = |app: &mut App, kind| {
             app.handle_event(Event::Mouse(MouseEvent {
@@ -7338,9 +7348,9 @@ mod tests {
         wheel(&mut app, MouseEventKind::ScrollRight);
         assert_eq!(app.tabs[0].view.scroll_col(), 38);
         wheel(&mut app, MouseEventKind::ScrollLeft);
-        assert_eq!(app.tabs[0].view.scroll_col(), 34);
+        assert_eq!(app.tabs[0].view.scroll_col(), 35);
         wheel(&mut app, MouseEventKind::ScrollRight);
-        assert_eq!(app.tabs[0].view.scroll_col(), 34);
+        assert_eq!(app.tabs[0].view.scroll_col(), 35);
         // Back at the top, the short first line doesn't limit anything
         // until the long line scrolls out of view, and even a burst of
         // vertical and horizontal motion between redraws respects the
@@ -7364,7 +7374,7 @@ mod tests {
         let col = app.tabs[0].view.scroll_col();
         assert!(col > 30 && col <= 38, "scroll_col {col}");
         // Short lines only: no limit to scroll into from the left edge.
-        for _ in 0..10 {
+        for _ in 0..20 {
             wheel(&mut app, MouseEventKind::ScrollLeft);
         }
         wheel(&mut app, MouseEventKind::ScrollDown);
@@ -7391,7 +7401,7 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             }));
         };
-        for _ in 0..30 {
+        for _ in 0..50 {
             wheel(&mut app, MouseEventKind::ScrollDown);
         }
         let screen = draw(&mut app, 30, 12);
@@ -8733,10 +8743,11 @@ mod tests {
         app.handle_event(key(KeyCode::PageUp, KeyModifiers::CONTROL));
         let screen = draw(&mut app, 60, 20);
         assert!(screen[11].contains("11 │line 11"), "{screen:#?}");
-        // The wheel over the pane scrolls it too, and stops at the ends.
+        // The wheel over the pane scrolls it too, a line an event, and
+        // stops at the ends.
         mouse(&mut app, MouseEventKind::ScrollDown, 20, 14);
         let screen = draw(&mut app, 60, 20);
-        assert!(screen[11].contains("14 │line 14"), "{screen:#?}");
+        assert!(screen[11].contains("12 │line 12"), "{screen:#?}");
         for _ in 0..20 {
             mouse(&mut app, MouseEventKind::ScrollDown, 20, 14);
         }
@@ -8801,7 +8812,7 @@ mod tests {
         assert!(screen[14].contains("4 │}"), "{screen:#?}");
         // ...and right, as far as the longest visible line and two spare
         // columns: 104 + 2 - 51.
-        for _ in 0..40 {
+        for _ in 0..60 {
             mouse(&mut app, MouseEventKind::ScrollRight, 20, 12);
         }
         assert_eq!(app.project_search.as_ref().unwrap().context_col(), 55);

@@ -131,9 +131,9 @@
 use crate::clipboard::Clipboard;
 use crate::confirm_box::{ConfirmBox, ConfirmOutcome};
 use crate::diff_pane::{
-    Button, HScroll, Piece, WHEEL_COLUMNS, WHEEL_LINES, clamp_between, content_background,
-    diff_extent, display_width, draw_cells, fit_end, layout_cells, render_diff, share_for,
-    share_of, text_extent,
+    ARROW_COLUMNS, Button, HScroll, Piece, clamp_between, content_background, diff_extent,
+    display_width, draw_cells, fit_end, layout_cells, render_diff, share_for, share_of,
+    text_extent,
 };
 use crate::editor_view::EditorView;
 use crate::git_layout::{ChangesSizes, GitChangesLayout, MAIN_REPOSITORY};
@@ -787,10 +787,11 @@ impl ChangesTabs {
 
     /// Give the shown page a mouse event. A change to its pane sizes (a
     /// drag of a rule ended) goes into the layout, which is then worth
-    /// keeping.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ChangesMouseOutcome {
+    /// keeping. `wheel` is how many rows (or columns, sideways) a wheel
+    /// event scrolls.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, wheel: usize) -> ChangesMouseOutcome {
         let active = self.active;
-        let outcome = self.active().handle_mouse(mouse);
+        let outcome = self.active().handle_mouse(mouse, wheel);
         if outcome.resized {
             let sizes = self.tabs[active].view.as_ref().map(ChangesView::sizes);
             if let Some(sizes) = sizes {
@@ -1867,9 +1868,9 @@ impl ChangesView {
             KeyCode::PageDown => self.content_scroll += page,
             KeyCode::Home => self.content_scroll = 0,
             KeyCode::End => self.content_scroll = usize::MAX,
-            KeyCode::Right => self.scroll_content_sideways(WHEEL_COLUMNS as isize),
+            KeyCode::Right => self.scroll_content_sideways(ARROW_COLUMNS as isize),
             KeyCode::Left if self.content_h.col > 0 => {
-                self.scroll_content_sideways(-(WHEEL_COLUMNS as isize));
+                self.scroll_content_sideways(-(ARROW_COLUMNS as isize));
             }
             KeyCode::Left => self.pane = self.list.pane(),
             _ => {}
@@ -2014,8 +2015,9 @@ impl ChangesView {
         (row < file_list.rows.len()).then_some(row)
     }
 
-    /// Handle a mouse event.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ChangesMouseOutcome {
+    /// Handle a mouse event. `wheel` is how many rows (or columns,
+    /// sideways) a wheel event scrolls.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, wheel: usize) -> ChangesMouseOutcome {
         let mut outcome = ChangesMouseOutcome::default();
         // The discard or resolve box, while it asks, has the mouse; a
         // press outside it is no.
@@ -2085,7 +2087,7 @@ impl ChangesView {
                 MouseEventKind::Up(_) if self.content_h.dragging => {
                     self.content_h.dragging = false;
                 }
-                _ => self.message.handle_mouse(mouse),
+                _ => self.message.handle_mouse(mouse, wheel),
             }
             return outcome;
         }
@@ -2105,15 +2107,15 @@ impl ChangesView {
         };
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if pane == Pane::Commit => {
-                self.message.handle_mouse(mouse);
+                self.message.handle_mouse(mouse, wheel);
             }
-            MouseEventKind::ScrollUp => self.scroll_pane(pane, false),
-            MouseEventKind::ScrollDown => self.scroll_pane(pane, true),
+            MouseEventKind::ScrollUp => self.scroll_pane(pane, -(wheel as isize)),
+            MouseEventKind::ScrollDown => self.scroll_pane(pane, wheel as isize),
             MouseEventKind::ScrollRight | MouseEventKind::ScrollLeft if pane == Pane::Content => {
                 let columns = if mouse.kind == MouseEventKind::ScrollRight {
-                    WHEEL_COLUMNS as isize
+                    wheel as isize
                 } else {
-                    -(WHEEL_COLUMNS as isize)
+                    -(wheel as isize)
                 };
                 self.scroll_content_sideways(columns);
             }
@@ -2167,7 +2169,7 @@ impl ChangesView {
                     }
                     Pane::Commit => {
                         if mouse.row > self.commit_area.y {
-                            self.message.handle_mouse(mouse);
+                            self.message.handle_mouse(mouse, wheel);
                         }
                     }
                     Pane::Content => {
@@ -2185,14 +2187,9 @@ impl ChangesView {
         outcome
     }
 
-    fn scroll_pane(&mut self, pane: Pane, down: bool) {
-        let step = |value: usize| {
-            if down {
-                value + WHEEL_LINES
-            } else {
-                value.saturating_sub(WHEEL_LINES)
-            }
-        };
+    /// Scroll a pane by some rows, down for positive.
+    fn scroll_pane(&mut self, pane: Pane, rows: isize) {
+        let step = |value: usize| value.saturating_add_signed(rows);
         match pane {
             Pane::Unstaged => self.unstaged.scroll = step(self.unstaged.scroll),
             Pane::Staged => self.staged.scroll = step(self.staged.scroll),
@@ -2803,6 +2800,9 @@ mod tests {
     use std::fs;
     use std::time::Duration;
 
+    /// Rows a wheel event scrolls in these tests.
+    const WHEEL: usize = 3;
+
     fn configure_user(repo: &Repository) {
         let mut config = repo.config().unwrap();
         config.set_str("user.name", "Ann Author").unwrap();
@@ -2911,18 +2911,24 @@ mod tests {
     }
 
     fn click(view: &mut ChangesView, column: u16, row: u16) {
-        view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column,
-            row,
-            modifiers: KeyModifiers::NONE,
-        });
-        view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Up(MouseButton::Left),
-            column,
-            row,
-            modifiers: KeyModifiers::NONE,
-        });
+        view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
+        view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
     }
 
     fn row_with<'a>(screen: &'a [String], text: &str) -> &'a str {
@@ -3890,25 +3896,34 @@ mod tests {
         let mut view = view(&dir);
         draw(&mut view, 120, 40);
         let drag = |view: &mut ChangesView, from: (u16, u16), to: (u16, u16)| {
-            view.handle_mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: from.0,
-                row: from.1,
-                modifiers: KeyModifiers::NONE,
-            });
+            view.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: from.0,
+                    row: from.1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                WHEEL,
+            );
             assert!(view.is_dragging());
-            view.handle_mouse(MouseEvent {
-                kind: MouseEventKind::Drag(MouseButton::Left),
-                column: to.0,
-                row: to.1,
-                modifiers: KeyModifiers::NONE,
-            });
-            let released = view.handle_mouse(MouseEvent {
-                kind: MouseEventKind::Up(MouseButton::Left),
-                column: to.0,
-                row: to.1,
-                modifiers: KeyModifiers::NONE,
-            });
+            view.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Drag(MouseButton::Left),
+                    column: to.0,
+                    row: to.1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                WHEEL,
+            );
+            let released = view.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    column: to.0,
+                    row: to.1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                WHEEL,
+            );
             assert!(released.resized);
             assert!(!view.is_dragging());
         };
@@ -4014,18 +4029,24 @@ mod tests {
     }
 
     fn right_click(view: &mut ChangesView, column: u16, row: u16) -> ChangesMouseOutcome {
-        let outcome = view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Right),
-            column,
-            row,
-            modifiers: KeyModifiers::NONE,
-        });
-        view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Up(MouseButton::Right),
-            column,
-            row,
-            modifiers: KeyModifiers::NONE,
-        });
+        let outcome = view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
+        view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Right),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
         outcome
     }
 
@@ -4108,12 +4129,15 @@ mod tests {
         let x = (0..x.len())
             .find(|&i| x[i..].iter().collect::<String>().starts_with(" Discard "))
             .unwrap();
-        let outcome = view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: x as u16 + 1,
-            row: y as u16,
-            modifiers: KeyModifiers::NONE,
-        });
+        let outcome = view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x as u16 + 1,
+                row: y as u16,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
         assert_eq!(
             outcome.notice,
             Some(StatusLine::info("Discarded changes to b.txt"))
@@ -4129,12 +4153,15 @@ mod tests {
             "It isn't tracked by git, so it is deleted. This can't be undone."
         );
         draw(&mut view, 100, 30);
-        let outcome = view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 0,
-            row: 29,
-            modifiers: KeyModifiers::NONE,
-        });
+        let outcome = view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 29,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
         assert_eq!(outcome, ChangesMouseOutcome::default());
         assert!(view.files_box().is_none());
         assert!(dir.path().join("c.txt").exists());

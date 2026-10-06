@@ -201,9 +201,9 @@ use crate::clipboard::Clipboard;
 use crate::commit_row::{CommitLine, Highlight, commit_extent, draw_commit_line, lane_cap};
 use crate::confirm_box::{ConfirmBox, ConfirmOutcome};
 use crate::diff_pane::{
-    Button, HScroll, Piece, WHEEL_COLUMNS, WHEEL_LINES, clamp_between, content_background,
-    diff_extent, display_width, draw_cells, fit_end, layout_cells, render_diff, share_for,
-    share_of, text_extent,
+    ARROW_COLUMNS, Button, HScroll, Piece, clamp_between, content_background, diff_extent,
+    display_width, draw_cells, fit_end, layout_cells, render_diff, share_for, share_of,
+    text_extent,
 };
 use crate::git_layout::{GitLogLayout, MAIN_REPOSITORY, PaneSizes};
 use crate::palette::palette_background;
@@ -751,10 +751,11 @@ impl GitLogTabs {
     /// Give the shown page a mouse event, and go where it asks (see
     /// [`follow_submodule`](Self::follow_submodule)). A change to its
     /// pane sizes (a drag of a rule ended) goes into the layout, which
-    /// is then worth keeping.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> GitLogMouseOutcome {
+    /// is then worth keeping. `wheel` is how many rows (or columns,
+    /// sideways) a wheel event scrolls.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, wheel: usize) -> GitLogMouseOutcome {
         let active = self.active;
-        let outcome = self.active().handle_mouse(mouse);
+        let outcome = self.active().handle_mouse(mouse, wheel);
         if outcome.resized {
             let sizes = self.tabs[active].view.as_ref().map(GitLogView::sizes);
             if let Some(sizes) = sizes {
@@ -910,8 +911,9 @@ pub struct GitLogView {
     reveal_side: bool,
     /// The selected commit, an index into the history's commits.
     selected: usize,
-    /// How many commits are scrolled off the top of the log, and how
-    /// many rows of it were shown at the last render.
+    /// How many rows of the log are scrolled off its top, two a commit
+    /// (an odd count leaves the top commit's second line showing), and
+    /// how many rows of it were shown at the last render.
     log_scroll: usize,
     log_rows: usize,
     log_h: HScroll,
@@ -1312,7 +1314,7 @@ impl GitLogView {
     /// to the first branch.
     fn replace_history(&mut self, fresh: History) {
         let selected = self.selected_id();
-        let offset = self.selected.saturating_sub(self.log_scroll);
+        let offset = (self.selected * 2).saturating_sub(self.log_scroll);
         let side_selected = self.side_key(self.side_selected);
         let unfolded: Vec<String> = self
             .history
@@ -1346,7 +1348,7 @@ impl GitLogView {
         match position {
             Some(position) => {
                 self.selected = position;
-                self.log_scroll = position.saturating_sub(offset);
+                self.log_scroll = (position * 2).saturating_sub(offset);
                 self.head_shown = true;
             }
             None => {
@@ -2208,8 +2210,8 @@ impl GitLogView {
 
     /// The columns the log's visible commits reach, from the first
     /// column after its left edge to the end of the longest of their
-    /// lines: `rows` rows from `scroll`, two a commit, an odd last row
-    /// showing the first line of one more.
+    /// lines: `rows` rows from row `scroll`, two a commit, counting a
+    /// commit with one line showing at either end.
     fn log_extent(&self, scroll: usize, rows: usize) -> usize {
         let Some(history) = &self.history else {
             return 0;
@@ -2219,8 +2221,8 @@ impl GitLogView {
         history
             .commits()
             .iter()
-            .skip(scroll)
-            .take(rows.div_ceil(2))
+            .skip(scroll / 2)
+            .take((scroll + rows).div_ceil(2) - scroll / 2)
             .map(|commit| {
                 let lanes = commit.graph.width().clamp(1, cap);
                 commit_extent(commit, Highlight::head_if(head == Some(commit.id)), lanes)
@@ -2810,11 +2812,11 @@ impl GitLogView {
                 None
             }
             KeyCode::Right => {
-                self.scroll_log_sideways(WHEEL_COLUMNS as isize);
+                self.scroll_log_sideways(ARROW_COLUMNS as isize);
                 None
             }
             KeyCode::Left if self.log_h.col > 0 => {
-                self.scroll_log_sideways(-(WHEEL_COLUMNS as isize));
+                self.scroll_log_sideways(-(ARROW_COLUMNS as isize));
                 None
             }
             KeyCode::Left => {
@@ -2891,9 +2893,9 @@ impl GitLogView {
             KeyCode::PageDown => self.content_scroll += page,
             KeyCode::Home => self.content_scroll = 0,
             KeyCode::End => self.content_scroll = usize::MAX,
-            KeyCode::Right => self.scroll_content_sideways(WHEEL_COLUMNS as isize),
+            KeyCode::Right => self.scroll_content_sideways(ARROW_COLUMNS as isize),
             KeyCode::Left if self.content_h.col > 0 => {
-                self.scroll_content_sideways(-(WHEEL_COLUMNS as isize));
+                self.scroll_content_sideways(-(ARROW_COLUMNS as isize));
             }
             KeyCode::Left => self.pane = Pane::Files,
             _ => {}
@@ -2995,8 +2997,9 @@ impl GitLogView {
         }
     }
 
-    /// Handle a mouse event.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> GitLogMouseOutcome {
+    /// Handle a mouse event. `wheel` is how many rows (or columns,
+    /// sideways) a wheel event scrolls.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, wheel: usize) -> GitLogMouseOutcome {
         let mut outcome = GitLogMouseOutcome::default();
         // The branch name box, while open, takes the mouse over it, and
         // a press anywhere else closes it, as the go to line box does.
@@ -3093,7 +3096,7 @@ impl GitLogView {
             // A right press on a commit in the log selects it, and asks
             // for the menu of what can be done with it.
             MouseEventKind::Down(MouseButton::Right) if pane == Pane::Log => {
-                let index = self.log_scroll + (mouse.row - self.log_area.y) as usize / 2;
+                let index = (self.log_scroll + (mouse.row - self.log_area.y) as usize) / 2;
                 if index < self.commit_count() {
                     self.pane = Pane::Log;
                     self.head_shown = true;
@@ -3127,13 +3130,13 @@ impl GitLogView {
                     outcome.menu = Some(GitLogMenu::Branch);
                 }
             }
-            MouseEventKind::ScrollUp => self.scroll_pane(pane, false),
-            MouseEventKind::ScrollDown => self.scroll_pane(pane, true),
+            MouseEventKind::ScrollUp => self.scroll_pane(pane, -(wheel as isize)),
+            MouseEventKind::ScrollDown => self.scroll_pane(pane, wheel as isize),
             MouseEventKind::ScrollRight | MouseEventKind::ScrollLeft => {
                 let columns = if mouse.kind == MouseEventKind::ScrollRight {
-                    WHEEL_COLUMNS as isize
+                    wheel as isize
                 } else {
-                    -(WHEEL_COLUMNS as isize)
+                    -(wheel as isize)
                 };
                 match pane {
                     Pane::Log => self.scroll_log_sideways(columns),
@@ -3164,7 +3167,7 @@ impl GitLogView {
                         }
                     }
                     Pane::Log => {
-                        let index = self.log_scroll + (mouse.row - self.log_area.y) as usize / 2;
+                        let index = (self.log_scroll + (mouse.row - self.log_area.y) as usize) / 2;
                         let presses = self.clicks.press(mouse.column, mouse.row);
                         if index < self.commit_count() {
                             self.head_shown = true;
@@ -3209,25 +3212,12 @@ impl GitLogView {
         outcome
     }
 
-    fn scroll_pane(&mut self, pane: Pane, down: bool) {
-        let step = |value: usize| {
-            if down {
-                value + WHEEL_LINES
-            } else {
-                value.saturating_sub(WHEEL_LINES)
-            }
-        };
+    /// Scroll a pane by some rows, down for positive.
+    fn scroll_pane(&mut self, pane: Pane, rows: isize) {
+        let step = |value: usize| value.saturating_add_signed(rows);
         match pane {
             Pane::Sidebar => self.side_scroll = step(self.side_scroll),
-            Pane::Log => {
-                // Two rows a commit: a notch moves fewer commits.
-                let commits = WHEEL_LINES.div_ceil(2);
-                self.log_scroll = if down {
-                    self.log_scroll + commits
-                } else {
-                    self.log_scroll.saturating_sub(commits)
-                };
-            }
+            Pane::Log => self.log_scroll = step(self.log_scroll),
             Pane::Files => self.files_scroll = step(self.files_scroll),
             Pane::Content => self.content_scroll = step(self.content_scroll),
         }
@@ -3464,10 +3454,12 @@ impl GitLogView {
             buf.set_stringn(area.x + 1, area.y, message, area.width as usize, dim);
             return;
         }
-        // Two rows a commit. An odd last row shows the first line of
-        // the next commit, as a scroll area would, but only whole
-        // commits count for scrolling: at the end of the log the last
-        // commit is shown whole and the odd row stays blank. The
+        // Two rows a commit, scrolled a row at a time, so either end
+        // of the log can show one line of a commit, as a scroll area
+        // would. Revealing the selected commit puts the top back on a
+        // commit, so the keys move whole commits, and the end of the
+        // log is reached the same way: the last commit whole at the
+        // top of its pair of rows, an odd last row left blank. The
         // sideways scrollbar, when needed, takes the last row, which
         // can change which commits are visible and so whether it is
         // needed: lay out again with the row taken, and settle there.
@@ -3480,12 +3472,14 @@ impl GitLogView {
         loop {
             rows = full_height - usize::from(show_bar);
             visible = (rows / 2).max(1);
-            self.log_scroll = self.log_scroll.min(commits.len().saturating_sub(visible));
+            let last = commits.len().saturating_sub(visible);
+            self.log_scroll = self.log_scroll.min(last * 2);
             if self.reveal_log {
-                if self.selected < self.log_scroll {
-                    self.log_scroll = self.selected;
-                } else if self.selected >= self.log_scroll + visible {
-                    self.log_scroll = self.selected + 1 - visible;
+                let top = self.selected * 2;
+                if top < self.log_scroll {
+                    self.log_scroll = top;
+                } else if top + 2 > self.log_scroll + rows {
+                    self.log_scroll = (self.selected + 1 - visible) * 2;
                 }
             }
             extent = self.log_extent(self.log_scroll, rows);
@@ -3517,41 +3511,35 @@ impl GitLogView {
         let head = history.head();
         let selected_style = background.bg(self.selection_background(Pane::Log, theme));
 
-        for (index, commit) in commits
-            .iter()
-            .enumerate()
-            .skip(self.log_scroll)
-            .take(rows.div_ceil(2))
-        {
-            let row = index - self.log_scroll;
-            let y0 = area.y + (row * 2) as u16;
-            // The commit past the last whole one shows only its first
-            // line, and no line goes under the scrollbar.
-            let bottom = area.bottom() - u16::from(show_bar);
-            if y0 >= bottom {
+        // Row by row, none under the scrollbar: each is a line of a
+        // commit, the graph in the lanes' colors over the row's
+        // background, then line one: the references and the message,
+        // or line two: the author, the id, and the time. Both scroll
+        // sideways together, the graph staying put.
+        for offset in 0..rows {
+            let row = self.log_scroll + offset;
+            let index = row / 2;
+            let Some(commit) = commits.get(index) else {
                 break;
-            }
-            let height = 2.min(bottom - y0);
-            let highlight = Highlight::head_if(head == Some(commit.id));
-            let is_selected = index == self.selected;
-            let row_style = if is_selected {
-                buf.set_style(Rect::new(area.x, y0, area.width, height), selected_style);
+            };
+            let line = if row.is_multiple_of(2) {
+                CommitLine::Node
+            } else {
+                CommitLine::Transition
+            };
+            let y = area.y + offset as u16;
+            let row_style = if index == self.selected {
+                buf.set_style(Rect::new(area.x, y, area.width, 1), selected_style);
                 selected_style
             } else {
                 background
             };
-            // The graph, in the lanes' colors over the row's background,
-            // then line one: the references and the message, and line
-            // two: the author, the id, and the time. Both scroll
-            // sideways together, the graph staying put.
+            let highlight = Highlight::head_if(head == Some(commit.id));
             let lanes = commit.graph.width().clamp(1, max_lanes);
-            let lines = [CommitLine::Node, CommitLine::Transition];
-            for (y, line) in (y0..y0 + height).zip(lines) {
-                let row = Rect::new(area.x + 1, y, area.width - 1, 1);
-                draw_commit_line(
-                    buf, row, commit, line, highlight, lanes, row_style, theme, scroll_col,
-                );
-            }
+            let rect = Rect::new(area.x + 1, y, area.width - 1, 1);
+            draw_commit_line(
+                buf, rect, commit, line, highlight, lanes, row_style, theme, scroll_col,
+            );
         }
     }
 
@@ -3841,6 +3829,9 @@ mod tests {
     use std::fs;
     use std::time::Duration;
 
+    /// Rows a wheel event scrolls in these tests.
+    const WHEEL: usize = 3;
+
     /// A repository with a merge in it: `main` has Base and On main,
     /// `side` has On side, and `main` has merged `side`; plus a tag on
     /// Base and a remote branch on the merge.
@@ -3928,12 +3919,15 @@ mod tests {
     }
 
     fn click(view: &mut GitLogView, column: u16, row: u16) {
-        view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column,
-            row,
-            modifiers: KeyModifiers::NONE,
-        });
+        view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
     }
 
     /// The screen column `needle` starts at in `row`, which may hold
@@ -4207,7 +4201,7 @@ mod tests {
         let scrolled = screen[small_y].chars().skip(small_x).collect::<String>();
         assert_eq!(column_of(&scrolled, HEAD_NODE), column_of(&top, HEAD_NODE));
         assert_eq!(
-            column_of(&scrolled, "Inner three") + WHEEL_COLUMNS as u16,
+            column_of(&scrolled, "Inner three") + ARROW_COLUMNS as u16,
             column_of(&top, "Inner three"),
             "{screen:#?}"
         );
@@ -4300,24 +4294,30 @@ mod tests {
         draw(view, 100, 24);
         let files = view.files_area;
         let (x, y) = (files.x + 2, files.y + file_row_of(view, "sub") as u16);
-        tabs.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: x,
-            row: y,
-            modifiers: KeyModifiers::NONE,
-        });
+        tabs.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
         // One click only selects it.
         assert_eq!(tabs.active_index(), 0);
         assert_eq!(
             file_row_of(tabs.active(), "sub"),
             tabs.active().file_selected
         );
-        tabs.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: x,
-            row: y,
-            modifiers: KeyModifiers::NONE,
-        });
+        tabs.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
         assert_eq!(tabs.active_index(), 1);
         wait_tabs(&mut tabs);
         assert_eq!(tabs.active().selected_commit(), Some(subs[0]));
@@ -4337,12 +4337,15 @@ mod tests {
         let files = view.files_area;
         let y = files.y + file_row_of(view, "a.rs") as u16;
         for _ in 0..2 {
-            tabs.handle_mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: files.x + 2,
-                row: y,
-                modifiers: KeyModifiers::NONE,
-            });
+            tabs.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: files.x + 2,
+                    row: y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                WHEEL,
+            );
         }
         assert_eq!(tabs.active_index(), 0);
         assert_eq!(tabs.active().pane, Pane::Content);
@@ -4678,10 +4681,10 @@ mod tests {
             "{screen:#?}"
         );
         // Scrolling to the end shows the last commit whole, the odd
-        // row blank below it, since only whole commits scroll.
+        // row blank below it, as the keys leave the top on a commit.
         view.handle_key(key(KeyCode::End), &mut Clipboard::new());
         let screen = draw(&mut view, 100, 40);
-        assert_eq!(view.log_scroll, 2, "{screen:#?}");
+        assert_eq!(view.log_scroll, 4, "{screen:#?}");
         assert!(screen[2].contains("Base commit"), "{screen:#?}");
         assert!(screen[3].contains("Ann Author"), "{screen:#?}");
         let log_x = view.log_area.x as usize;
@@ -4694,9 +4697,62 @@ mod tests {
         click(&mut view, log.x + 5, log.y + 4);
         let screen = draw(&mut view, 100, 40);
         assert_eq!(view.selected, 2, "{screen:#?}");
-        assert_eq!(view.log_scroll, 1, "{screen:#?}");
+        assert_eq!(view.log_scroll, 2, "{screen:#?}");
         assert!(screen[2].contains("On "), "{screen:#?}");
         assert!(screen[4].contains("Base commit"), "{screen:#?}");
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_log_a_row_at_a_time() {
+        // Five rows of a four-commit log, scrolled a row an event.
+        let (dir, _) = repo_with_history();
+        let mut view = view(&dir);
+        view.log_share = Some(share_for(5, 40));
+        draw(&mut view, 100, 40);
+        let log = view.log_area;
+        let wheel = |view: &mut GitLogView, kind| {
+            view.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column: log.x + 5,
+                    row: log.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                1,
+            );
+            draw(view, 100, 40)
+        };
+        // One row down leaves the second line of the first commit at
+        // the top, the next commit whole below it.
+        let screen = wheel(&mut view, MouseEventKind::ScrollDown);
+        assert_eq!(view.log_scroll, 1);
+        let top = log.y as usize;
+        assert!(screen[top].contains("Ann Author"), "{screen:#?}");
+        assert!(!screen[top].contains("Merge"), "{screen:#?}");
+        assert!(screen[top + 1].contains("On "), "{screen:#?}");
+        // The wheel stops where the keys would end up: the last commit
+        // whole, the odd row blank.
+        for _ in 0..10 {
+            wheel(&mut view, MouseEventKind::ScrollDown);
+        }
+        assert_eq!(view.log_scroll, 4);
+        let screen = wheel(&mut view, MouseEventKind::ScrollUp);
+        assert_eq!(view.log_scroll, 3);
+        assert!(screen[top + 3].contains("Base commit"), "{screen:#?}");
+        // A click on the commit half shown at the top selects it and
+        // shows it whole.
+        click(&mut view, log.x + 5, log.y);
+        let screen = draw(&mut view, 100, 40);
+        assert_eq!(view.selected, 1, "{screen:#?}");
+        assert_eq!(view.log_scroll, 2, "{screen:#?}");
+        // A key moving the selection off screen puts the top back on a
+        // commit too.
+        wheel(&mut view, MouseEventKind::ScrollDown);
+        assert_eq!(view.log_scroll, 3);
+        view.handle_key(key(KeyCode::Up), &mut Clipboard::new());
+        draw(&mut view, 100, 40);
+        assert_eq!(view.selected, 0);
+        assert_eq!(view.log_scroll, 0);
     }
 
     #[test]
@@ -4730,13 +4786,16 @@ mod tests {
         // one is still on screen; the horizontal wheel scrolls back.
         view.handle_key(key(KeyCode::Down), &mut Clipboard::new());
         assert_eq!(view.log_h.col, col);
-        view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::ScrollLeft,
-            column: 40,
-            row: 2,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(view.log_h.col, col - WHEEL_COLUMNS);
+        view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollLeft,
+                column: 40,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
+        assert_eq!(view.log_h.col, col - WHEEL);
         // Dragging the scrollbar's thumb to the left edge scrolls back to
         // the start; then ← at the edge goes to the sidebar.
         let bar = view.log_h.bar;
@@ -4749,19 +4808,25 @@ mod tests {
             view.log_h.col
         );
         assert!(view.is_dragging());
-        view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Drag(MouseButton::Left),
-            column: bar.x,
-            row: bar.y,
-            modifiers: KeyModifiers::NONE,
-        });
+        view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: bar.x,
+                row: bar.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
         assert_eq!(view.log_h.col, 0);
-        view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Up(MouseButton::Left),
-            column: bar.x,
-            row: bar.y,
-            modifiers: KeyModifiers::NONE,
-        });
+        view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: bar.x,
+                row: bar.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
         assert!(!view.is_dragging());
         // The long message is still cut off, so the bar stays.
         let screen = draw(&mut view, 90, 30);
@@ -4815,7 +4880,7 @@ mod tests {
         view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
         assert_eq!(view.pane, Pane::Content);
         view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
-        assert_eq!(view.content_h.col, WHEEL_COLUMNS);
+        assert_eq!(view.content_h.col, ARROW_COLUMNS);
         view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
         assert_eq!(view.content_h.col, 0);
         view.handle_key(key(KeyCode::Left), &mut Clipboard::new());
@@ -4895,18 +4960,24 @@ mod tests {
         let drag = |view: &mut GitLogView, from: (u16, u16), to: (u16, u16)| {
             click(view, from.0, from.1);
             assert!(view.is_dragging());
-            view.handle_mouse(MouseEvent {
-                kind: MouseEventKind::Drag(MouseButton::Left),
-                column: to.0,
-                row: to.1,
-                modifiers: KeyModifiers::NONE,
-            });
-            view.handle_mouse(MouseEvent {
-                kind: MouseEventKind::Up(MouseButton::Left),
-                column: to.0,
-                row: to.1,
-                modifiers: KeyModifiers::NONE,
-            });
+            view.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Drag(MouseButton::Left),
+                    column: to.0,
+                    row: to.1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                WHEEL,
+            );
+            view.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Left),
+                    column: to.0,
+                    row: to.1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                WHEEL,
+            );
             assert!(!view.is_dragging());
         };
         // The sidebar's edge moves right, and no further left than the
@@ -4963,12 +5034,15 @@ mod tests {
         assert_eq!(again.log_area, view.log_area);
         assert_eq!(again.files_area, view.files_area);
         click(&mut view, at.0, at.1);
-        let released = view.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Up(MouseButton::Left),
-            column: at.0,
-            row: at.1,
-            modifiers: KeyModifiers::NONE,
-        });
+        let released = view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: at.0,
+                row: at.1,
+                modifiers: KeyModifiers::NONE,
+            },
+            WHEEL,
+        );
         assert!(released.resized);
     }
 
@@ -6045,12 +6119,15 @@ mod tests {
         select_file_of(&mut view, change, 0);
         let screen = draw(&mut view, 120, 40);
         let right_press = |view: &mut GitLogView, column: u16, row: u16| {
-            view.handle_mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Right),
-                column,
-                row,
-                modifiers: KeyModifiers::NONE,
-            })
+            view.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Right),
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                WHEEL,
+            )
         };
         let x = view.files_area.x + 2;
         let y_of = |text: &str| {
@@ -6235,12 +6312,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("no {name} in {screen:#?}")) as u16
         };
         let right_press = |view: &mut GitLogView, row: u16| {
-            view.handle_mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Right),
-                column: 4,
-                row,
-                modifiers: KeyModifiers::NONE,
-            })
+            view.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Right),
+                    column: 4,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                WHEEL,
+            )
         };
         // HEAD's branch is nothing to rebase onto; side is.
         right_press(&mut view, row_of(&screen, &head));
@@ -6296,12 +6376,15 @@ mod tests {
         let mut view = view(&dir);
         let screen = draw(&mut view, 110, 24);
         let right_press = |view: &mut GitLogView, row: u16| {
-            view.handle_mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Right),
-                column: 4,
-                row,
-                modifiers: KeyModifiers::NONE,
-            })
+            view.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Right),
+                    column: 4,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+                WHEEL,
+            )
         };
         let side_row = |screen: &[String], name: &str| {
             screen

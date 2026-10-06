@@ -62,10 +62,6 @@ const KEYS_HINT: &str = "Enter opens the match; Ctrl+Up and Ctrl+Down scroll the
 /// small project's matches show up in the same frame as the keystroke.
 const SEARCH_GRACE: Duration = Duration::from_millis(15);
 const TAB_WIDTH: usize = 4;
-/// Lines the context pane scrolls per mouse wheel notch.
-const WHEEL_LINES: usize = 3;
-/// Columns the context pane scrolls per horizontal wheel notch.
-const WHEEL_COLUMNS: usize = 4;
 /// Columns the context pane may scroll past its longest visible line.
 const HSCROLL_SLACK: usize = 2;
 const ELLIPSIS: &str = "…";
@@ -401,7 +397,10 @@ impl ProjectSearchDialog {
         self.input.is_dragging()
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> ProjectSearchOutcome {
+    /// Handle a mouse event. `wheel` is how many lines (or columns,
+    /// sideways) a wheel event scrolls the context pane; over the list
+    /// of matches, each wheel event moves the selection by one.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, wheel: usize) -> ProjectSearchOutcome {
         let (x, y) = (mouse.column, mouse.row);
         let at = ScreenPosition::new(x, y);
         if self.input.is_dragging() || self.input.contains(x, y) {
@@ -409,18 +408,19 @@ impl ProjectSearchDialog {
             return ProjectSearchOutcome::Continue;
         }
         let in_context = self.context_area.contains(at);
+        let wheel = wheel as isize;
         match mouse.kind {
             MouseEventKind::ScrollUp if in_context => {
-                self.scroll_context(-(WHEEL_LINES as isize));
+                self.scroll_context(-wheel);
             }
             MouseEventKind::ScrollDown if in_context => {
-                self.scroll_context(WHEEL_LINES as isize);
+                self.scroll_context(wheel);
             }
             MouseEventKind::ScrollLeft if in_context => {
-                self.scroll_context_horizontally(-(WHEEL_COLUMNS as isize));
+                self.scroll_context_horizontally(-wheel);
             }
             MouseEventKind::ScrollRight if in_context => {
-                self.scroll_context_horizontally(WHEEL_COLUMNS as isize);
+                self.scroll_context_horizontally(wheel);
             }
             MouseEventKind::ScrollUp => self.select(self.selected.saturating_sub(1)),
             MouseEventKind::ScrollDown => self.select(self.selected + 1),

@@ -9,6 +9,7 @@
 //! ```toml
 //! [editor]
 //! continuation-indent = "indent"
+//! wheel-lines = 3
 //!
 //! [terminal]
 //! shell = "/opt/homebrew/bin/fish"
@@ -321,6 +322,12 @@ pub enum SettingKey {
     /// How lines continuing inside brackets are indented as code is
     /// typed; see [`ContinuationIndent`].
     ContinuationIndent,
+    /// How many lines a view scrolls for each mouse wheel event the
+    /// terminal sends. Terminals such as Ghostty send several events for
+    /// a notch of a mouse wheel and one for a small movement on a
+    /// touchpad, so one line an event follows both; a terminal that
+    /// sends one event a notch wants more.
+    WheelLines,
     /// The program the shell tool runs; blank to detect the user's shell.
     Shell,
     /// The command agent mode runs: the program and its arguments.
@@ -357,30 +364,31 @@ impl SettingKey {
     /// Every setting, in the order a settings page lists them (grouped by
     /// category, in [`Category::ALL`]'s order). A table's toggles follow
     /// one another, row by row.
-    pub const ALL: [SettingKey; 27] = {
+    pub const ALL: [SettingKey; 28] = {
         const KEYS: usize = EditorKey::ALL.len();
         const TERMINAL_KEYS: usize = TerminalKind::ALL.len() * KEYS;
-        let mut all = [SettingKey::ContinuationIndent; 9 + TERMINAL_KEYS];
-        all[1] = SettingKey::Shell;
-        all[2] = SettingKey::AgentCommand;
-        all[3] = SettingKey::TerminalScrollback;
+        let mut all = [SettingKey::ContinuationIndent; 10 + TERMINAL_KEYS];
+        all[1] = SettingKey::WheelLines;
+        all[2] = SettingKey::Shell;
+        all[3] = SettingKey::AgentCommand;
+        all[4] = SettingKey::TerminalScrollback;
         let mut i = 0;
         while i < TERMINAL_KEYS {
-            all[4 + i] =
+            all[5 + i] =
                 SettingKey::TerminalKey(TerminalKind::ALL[i / KEYS], EditorKey::ALL[i % KEYS]);
             i += 1;
         }
-        all[4 + TERMINAL_KEYS] = SettingKey::SearchMaxResults;
-        all[5 + TERMINAL_KEYS] = SettingKey::CMakeGenerator;
-        all[6 + TERMINAL_KEYS] = SettingKey::CompletionModels;
-        all[7 + TERMINAL_KEYS] = SettingKey::CompletionLineConfidence;
-        all[8 + TERMINAL_KEYS] = SettingKey::CompletionTokenConfidence;
+        all[5 + TERMINAL_KEYS] = SettingKey::SearchMaxResults;
+        all[6 + TERMINAL_KEYS] = SettingKey::CMakeGenerator;
+        all[7 + TERMINAL_KEYS] = SettingKey::CompletionModels;
+        all[8 + TERMINAL_KEYS] = SettingKey::CompletionLineConfidence;
+        all[9 + TERMINAL_KEYS] = SettingKey::CompletionTokenConfidence;
         all
     };
 
     pub fn category(self) -> Category {
         match self {
-            SettingKey::ContinuationIndent => Category::Editor,
+            SettingKey::ContinuationIndent | SettingKey::WheelLines => Category::Editor,
             SettingKey::Shell
             | SettingKey::AgentCommand
             | SettingKey::TerminalScrollback
@@ -399,7 +407,8 @@ impl SettingKey {
             SettingKey::ContinuationIndent => SettingKind::Choice(&CONTINUATION_CHOICES),
             SettingKey::CompletionModels => SettingKind::List,
             SettingKey::TerminalKey(..) => SettingKind::Toggle,
-            SettingKey::Shell
+            SettingKey::WheelLines
+            | SettingKey::Shell
             | SettingKey::AgentCommand
             | SettingKey::TerminalScrollback
             | SettingKey::SearchMaxResults
@@ -428,6 +437,7 @@ impl SettingKey {
     pub fn name(self) -> &'static str {
         match self {
             SettingKey::ContinuationIndent => "Continuation indent",
+            SettingKey::WheelLines => "Mouse wheel lines",
             SettingKey::Shell => "Shell executable",
             SettingKey::AgentCommand => "Coding agent",
             SettingKey::TerminalScrollback => "Scrollback lines",
@@ -444,6 +454,9 @@ impl SettingKey {
     pub fn description(self) -> String {
         let text = match self {
             SettingKey::ContinuationIndent => "How a line continuing inside brackets is indented",
+            SettingKey::WheelLines => {
+                "Lines scrolled for each mouse wheel event, or columns sideways: 1 for a terminal that sends several events for a notch of the wheel (most terminals), more for one that sends just one"
+            }
             SettingKey::Shell => "The program the shell tool runs; blank to use your login shell",
             SettingKey::AgentCommand => {
                 "The command agent mode (Ctrl+I) runs in the project's directory, with any arguments, quoted as in a shell"
@@ -481,6 +494,7 @@ impl SettingKey {
     fn key(self) -> String {
         let key = match self {
             SettingKey::ContinuationIndent => "continuation-indent",
+            SettingKey::WheelLines => "wheel-lines",
             SettingKey::Shell => "shell",
             SettingKey::AgentCommand => "agent",
             SettingKey::TerminalScrollback => "scrollback",
@@ -509,6 +523,7 @@ impl SettingKey {
             SettingKey::ContinuationIndent => {
                 continuation_name(ContinuationIndent::default()).to_owned()
             }
+            SettingKey::WheelLines => DEFAULT_WHEEL_LINES.to_string(),
             SettingKey::Shell => String::new(),
             SettingKey::AgentCommand => DEFAULT_AGENT_COMMAND.to_owned(),
             SettingKey::TerminalScrollback => DEFAULT_SCROLLBACK.to_string(),
@@ -558,11 +573,16 @@ impl std::error::Error for SettingsError {}
 /// The command agent mode runs unless the settings name another.
 pub const DEFAULT_AGENT_COMMAND: &str = "claude";
 
+/// Lines scrolled per mouse wheel event unless the settings say
+/// otherwise; see [`SettingKey::WheelLines`].
+pub const DEFAULT_WHEEL_LINES: usize = 1;
+
 /// The user's settings; see the [module documentation](self). Each field
 /// is `None` at its default.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     continuation_indent: Option<ContinuationIndent>,
+    wheel_lines: Option<usize>,
     shell: Option<String>,
     agent_command: Option<String>,
     terminal_scrollback: Option<usize>,
@@ -595,6 +615,12 @@ impl Settings {
         CodeStyle {
             continuation: self.continuation_indent(),
         }
+    }
+
+    /// How many lines a view scrolls for each mouse wheel event, and
+    /// how many columns for each sideways one.
+    pub fn wheel_lines(&self) -> usize {
+        self.wheel_lines.unwrap_or(DEFAULT_WHEEL_LINES)
     }
 
     /// The program the shell tool runs, or `None` to detect the user's
@@ -722,6 +748,7 @@ impl Settings {
             SettingKey::ContinuationIndent => {
                 continuation_name(self.continuation_indent()).to_owned()
             }
+            SettingKey::WheelLines => self.wheel_lines().to_string(),
             SettingKey::Shell => self.shell().unwrap_or_default().to_owned(),
             SettingKey::AgentCommand => self.agent_command().to_owned(),
             SettingKey::TerminalScrollback => self.terminal_scrollback().to_string(),
@@ -748,6 +775,10 @@ impl Settings {
                 let continuation = parse_continuation(text)?;
                 self.continuation_indent =
                     (continuation != ContinuationIndent::default()).then_some(continuation);
+            }
+            SettingKey::WheelLines => {
+                let lines = parse_count(text, 1)?;
+                self.wheel_lines = (lines != DEFAULT_WHEEL_LINES).then_some(lines);
             }
             SettingKey::Shell => {
                 self.shell = (!text.is_empty()).then(|| text.to_owned());
@@ -796,6 +827,7 @@ impl Settings {
             SettingKey::ContinuationIndent => {
                 self.continuation_indent() == ContinuationIndent::default()
             }
+            SettingKey::WheelLines => self.wheel_lines() == DEFAULT_WHEEL_LINES,
             SettingKey::Shell => self.shell.is_none(),
             SettingKey::AgentCommand => self.agent_command.is_none(),
             SettingKey::TerminalScrollback => self.terminal_scrollback() == DEFAULT_SCROLLBACK,
@@ -818,6 +850,7 @@ impl Settings {
         let was_default = self.is_default(key);
         match key {
             SettingKey::ContinuationIndent => self.continuation_indent = None,
+            SettingKey::WheelLines => self.wheel_lines = None,
             SettingKey::Shell => self.shell = None,
             SettingKey::AgentCommand => self.agent_command = None,
             SettingKey::TerminalScrollback => self.terminal_scrollback = None,
@@ -895,6 +928,10 @@ impl Settings {
                 self.continuation_indent =
                     (continuation != ContinuationIndent::default()).then_some(continuation);
             }
+            SettingKey::WheelLines => {
+                let lines = read_count(key, value, 1)?;
+                self.wheel_lines = (lines != DEFAULT_WHEEL_LINES).then_some(lines);
+            }
             SettingKey::Shell => {
                 let shell = value
                     .as_str()
@@ -964,6 +1001,7 @@ impl Settings {
                 SettingKey::ContinuationIndent | SettingKey::Shell | SettingKey::AgentCommand => {
                     Value::String(self.text(key))
                 }
+                SettingKey::WheelLines => Value::Integer(self.wheel_lines() as i64),
                 SettingKey::TerminalScrollback => Value::Integer(self.terminal_scrollback() as i64),
                 SettingKey::TerminalKey(terminal, key) => {
                     Value::Boolean(self.editor_takes_key(terminal, key))
@@ -1373,6 +1411,37 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "`editor.continuation-indent` must be \"align\" or \"indent\""
+        );
+    }
+
+    #[test]
+    fn wheel_lines_are_a_count_of_at_least_one() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.wheel_lines(), 1);
+        assert_eq!(SettingKey::WheelLines.category(), Category::Editor);
+        assert_eq!(settings.set_text(SettingKey::WheelLines, " 3 "), Ok(true));
+        assert_eq!(settings.wheel_lines(), 3);
+        assert_eq!(settings.text(SettingKey::WheelLines), "3");
+        assert_eq!(
+            settings.set_text(SettingKey::WheelLines, "0"),
+            Err("must be at least 1".to_owned())
+        );
+        assert_eq!(settings.wheel_lines(), 3);
+
+        let text = settings.to_toml();
+        assert!(text.contains("[editor]"), "{text}");
+        assert!(text.contains("wheel-lines = 3"), "{text}");
+        assert_eq!(Settings::parse(&text).unwrap(), settings);
+
+        assert!(settings.reset(SettingKey::WheelLines));
+        assert!(!settings.to_toml().contains("[editor]"));
+        let settings = Settings::parse("[editor]\nwheel-lines = 1\n").unwrap();
+        assert!(settings.is_default(SettingKey::WheelLines));
+        assert_eq!(
+            Settings::parse("[editor]\nwheel-lines = 0\n")
+                .unwrap_err()
+                .to_string(),
+            "`editor.wheel-lines` must be a whole number of at least 1"
         );
     }
 
