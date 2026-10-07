@@ -101,6 +101,12 @@ pub enum Command {
     /// The git log page's editing of the selected commit of HEAD's
     /// branch, by an interactive rebase.
     EditCommit,
+    /// The git log page's interactive rebase of HEAD's branch onto the
+    /// selected commit, planned in a dialog.
+    InteractiveRebaseOntoCommit,
+    /// The git log page's interactive rebase of HEAD's branch onto the
+    /// selected commit's parent, the commit replayed first.
+    InteractiveRebaseOntoParent,
     /// The git log page's merging of the branch selected in the sidebar
     /// into HEAD's.
     MergeBranch,
@@ -289,6 +295,12 @@ pub struct Context {
     /// On the git log page, whether the selected commit is one of
     /// HEAD's branch that an interactive rebase can edit.
     pub can_edit_commit: bool,
+    /// On the git log page, whether an interactive rebase onto the
+    /// selected commit has commits to replay.
+    pub can_rebase_onto_commit: bool,
+    /// On the git log page, whether the selected commit is one of
+    /// HEAD's that an interactive rebase onto its parent can begin with.
+    pub can_rebase_onto_parent: bool,
     /// On the git log page, with the keyboard in the sidebar, whether a
     /// branch (local or a remote's) HEAD isn't on is selected there, to
     /// merge, rebase onto, or reset to.
@@ -319,7 +331,7 @@ impl Command {
     /// Every command, in the order the palette lists them before
     /// anything is typed: files, searching, editing, building, the
     /// pages, views, and quitting last.
-    pub const ALL: [Command; 66] = [
+    pub const ALL: [Command; 68] = [
         Command::OpenFile,
         Command::SwitchTab,
         Command::Save,
@@ -357,6 +369,8 @@ impl Command {
         Command::DeleteBranch,
         Command::MergeCommit,
         Command::RebaseOntoCommit,
+        Command::InteractiveRebaseOntoCommit,
+        Command::InteractiveRebaseOntoParent,
         Command::EditCommit,
         Command::ResetToCommit,
         Command::MergeBranch,
@@ -436,6 +450,12 @@ impl Command {
             Command::DeleteBranch => on(Page::GitLog) && context.can_delete_branch,
             Command::MergeCommit => on(Page::GitLog) && context.can_merge_commit,
             Command::EditCommit => on(Page::GitLog) && context.can_edit_commit,
+            Command::InteractiveRebaseOntoCommit => {
+                on(Page::GitLog) && context.can_rebase_onto_commit
+            }
+            Command::InteractiveRebaseOntoParent => {
+                on(Page::GitLog) && context.can_rebase_onto_parent
+            }
             Command::RebaseOntoCommit | Command::ResetToCommit => {
                 on(Page::GitLog) && context.other_commit_selected
             }
@@ -513,6 +533,8 @@ impl Command {
             Command::RebaseOntoCommit => "Rebase current branch onto commit",
             Command::ResetToCommit => "Reset current branch to commit",
             Command::EditCommit => "Edit commit",
+            Command::InteractiveRebaseOntoCommit => "Interactive rebase onto commit",
+            Command::InteractiveRebaseOntoParent => "Interactive rebase onto parent",
             Command::MergeBranch => "Merge branch into current branch",
             Command::RebaseOntoBranch => "Rebase current branch onto branch",
             Command::ResetToBranch => "Reset current branch to branch",
@@ -621,6 +643,12 @@ impl Command {
             }
             Command::RebaseOntoCommit => {
                 "On the git log page, replay the commits of the branch HEAD is on onto the selected commit (git rebase); conflicts stop it on the changes page, to resolve and continue"
+            }
+            Command::InteractiveRebaseOntoCommit => {
+                "On the git log page, rewrite the commits of the branch HEAD is on that the selected commit hasn't, replayed onto it (git rebase -i): a dialog plans the rebase, each commit picked, dropped, edited, squashed, or fixed up, and reordered"
+            }
+            Command::InteractiveRebaseOntoParent => {
+                "On the git log page, rewrite the branch HEAD is on from the selected commit, replayed onto its parent so that the commit comes first (git rebase -i): for folding a later commit into it, say, without looking for its parent"
             }
             Command::EditCommit => {
                 "On the git log page, rewrite the selected commit of the branch HEAD is on (git rebase -i, edit): the changes page opens with its changes staged, to reword, change, or split it into several commits; the commits after it are replayed once nothing is left unstaged"
@@ -751,6 +779,8 @@ impl Command {
             | Command::MergeCommit
             | Command::RebaseOntoCommit
             | Command::EditCommit
+            | Command::InteractiveRebaseOntoCommit
+            | Command::InteractiveRebaseOntoParent
             | Command::ResetToCommit
             | Command::MergeBranch
             | Command::RebaseOntoBranch
@@ -1138,6 +1168,41 @@ mod tests {
             commit_commands.iter().all(|c| !listed.contains(c)),
             "{listed:?}"
         );
+    }
+
+    #[test]
+    fn the_git_log_offers_interactive_rebases_as_the_selection_allows() {
+        let log = Context {
+            page: Page::GitLog,
+            commit_selected: true,
+            ..Context::default()
+        };
+        let listed = available(&log);
+        assert!(!listed.contains(&Command::InteractiveRebaseOntoCommit));
+        assert!(!listed.contains(&Command::InteractiveRebaseOntoParent));
+        let onto = Context {
+            can_rebase_onto_commit: true,
+            ..log
+        };
+        let listed = available(&onto);
+        assert!(listed.contains(&Command::InteractiveRebaseOntoCommit));
+        assert!(!listed.contains(&Command::InteractiveRebaseOntoParent));
+        let parent = Context {
+            can_rebase_onto_parent: true,
+            ..log
+        };
+        let listed = available(&parent);
+        assert!(!listed.contains(&Command::InteractiveRebaseOntoCommit));
+        assert!(listed.contains(&Command::InteractiveRebaseOntoParent));
+        let elsewhere = Context {
+            page: Page::Changes,
+            can_rebase_onto_commit: true,
+            can_rebase_onto_parent: true,
+            ..log
+        };
+        let listed = available(&elsewhere);
+        assert!(!listed.contains(&Command::InteractiveRebaseOntoCommit));
+        assert!(!listed.contains(&Command::InteractiveRebaseOntoParent));
     }
 
     #[test]

@@ -103,7 +103,16 @@
 //! rebase, in the background as a rebase is, stops at it with its
 //! changes staged and brings up the changes page, where it is reworded,
 //! changed, or split, and the commits after it replayed once that is
-//! committed (see the core crate's `git::interactive` module). Only a commit HEAD isn't at offers
+//! committed (see the core crate's `git::interactive` module).
+//! "Interactive rebase onto commit" and "Interactive rebase onto
+//! parent" rewrite HEAD's branch by a plan: the commits HEAD has that
+//! the selected commit hasn't, or the selected commit and those after
+//! it, replayed onto its parent (so that it comes first, for folding a
+//! later commit into it without finding its parent first). The plan is
+//! made in a dialog over the page (see the `rebase_dialog` module),
+//! where each commit is picked, dropped, edited, squashed, or fixed up,
+//! and reordered, and the rebase started; it then runs as an edit
+//! does. Only a commit HEAD isn't at offers
 //! more than checking out, and merging needs a branch there other than
 //! HEAD's: a local one, or failing that a remote's (see the core
 //! crate's `git::merge` and `git::rebase` modules). A merge or rebase
@@ -215,6 +224,7 @@ use crate::diff_pane::{
 };
 use crate::git_layout::{GitLogLayout, MAIN_REPOSITORY, PaneSizes};
 use crate::palette::palette_background;
+use crate::rebase_dialog::{PlanCommit, RebaseDialog, RebaseDialogOutcome};
 use crate::status::StatusLine;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -273,6 +283,15 @@ const PROMPT_HELP: &[(&str, &str)] = &[("Enter", "create branch and check out"),
 const CONFIRM_HELP: &[(&str, &str)] = &[("y", "restore"), ("n/Esc", "cancel")];
 const DELETE_HELP: &[(&str, &str)] = &[("y", "delete"), ("n/Esc", "cancel")];
 const RESET_HELP: &[(&str, &str)] = &[("y", "reset"), ("n/Esc", "cancel")];
+/// What the status bar shows while the interactive rebase dialog plans.
+const REBASE_HELP: &[(&str, &str)] = &[
+    ("↑↓", "select"),
+    ("Alt+↑↓", "move"),
+    ("Enter", "action"),
+    ("p/d/e/s/f", "pick…fixup"),
+    ("Ctrl+S", "start"),
+    ("Esc", "cancel"),
+];
 /// The restore box's button.
 const RESTORE: &str = "Restore";
 /// The delete branch box's button.
@@ -703,6 +722,18 @@ impl GitLogTabs {
         self.active().edit_selected_commit();
     }
 
+    /// The command palette's "Interactive rebase onto commit": the shown
+    /// page's selected commit, planned in the rebase dialog.
+    pub fn rebase_interactively_onto_commit(&mut self) {
+        self.active().rebase_interactively_onto_commit();
+    }
+
+    /// The command palette's "Interactive rebase onto parent": the shown
+    /// page's selected commit's parent, planned in the rebase dialog.
+    pub fn rebase_interactively_onto_parent(&mut self) {
+        self.active().rebase_interactively_onto_parent();
+    }
+
     /// The command palette's "Reset current branch to commit": the
     /// shown page's selected commit, asking first if commits would be
     /// left on no branch.
@@ -1005,6 +1036,8 @@ pub struct GitLogView {
     branch_delete: Option<PendingDelete>,
     /// The reset box, while it asks whether to go ahead.
     reset_box: Option<PendingReset>,
+    /// The interactive rebase dialog, while it plans one.
+    rebase_dialog: Option<RebaseDialog>,
     /// Whether a merge or rebase stopped at conflicts and the changes
     /// page, where they are resolved, is to be shown, and that hasn't
     /// been asked since (see [`take_show_changes`](Self::take_show_changes)).
@@ -1087,6 +1120,7 @@ impl GitLogView {
             restore: None,
             branch_delete: None,
             reset_box: None,
+            rebase_dialog: None,
             show_changes: false,
         };
         view.install(GitLogView::open_history(root, exact));
@@ -1450,6 +1484,9 @@ impl GitLogView {
         }
         if self.reset_box.is_some() {
             return StatusLine::help(RESET_HELP);
+        }
+        if self.rebase_dialog.is_some() {
+            return StatusLine::help(REBASE_HELP);
         }
         StatusLine::help(match self.pane {
             Pane::Sidebar => SIDEBAR_HELP,
@@ -2411,6 +2448,92 @@ impl GitLogView {
         }
     }
 
+    /// Whether an interactive rebase onto the selected commit has
+    /// commits to replay, for "Interactive rebase onto commit".
+    pub fn can_rebase_onto_commit(&self) -> bool {
+        self.selected_id()
+            .zip(self.history.as_ref())
+            .is_some_and(|(id, history)| history.can_rebase_onto(id))
+    }
+
+    /// Whether an interactive rebase onto the selected commit's parent
+    /// can begin with the commit, for "Interactive rebase onto parent".
+    pub fn can_rebase_onto_parent(&self) -> bool {
+        self.selected_id()
+            .zip(self.history.as_ref())
+            .is_some_and(|(id, history)| history.can_rebase_onto_parent(id))
+    }
+
+    /// "Interactive rebase onto commit": plan, in the rebase dialog, an
+    /// interactive rebase of HEAD's branch onto the selected commit.
+    pub fn rebase_interactively_onto_commit(&mut self) {
+        self.open_rebase_dialog(false);
+    }
+
+    /// "Interactive rebase onto parent": plan, in the rebase dialog, an
+    /// interactive rebase of HEAD's branch onto the selected commit's
+    /// parent, the commit the first replayed.
+    pub fn rebase_interactively_onto_parent(&mut self) {
+        self.open_rebase_dialog(true);
+    }
+
+    /// Open the rebase dialog with the plan for the selected commit, or
+    /// say why there is none. The dialog shows the plan's commits as the
+    /// log does, by their author and time.
+    fn open_rebase_dialog(&mut self, onto_parent: bool) {
+        if self.busy() {
+            return;
+        }
+        let (Some(id), Some(history)) = (self.selected_id(), &self.history) else {
+            return;
+        };
+        let plan = if onto_parent {
+            history.rebase_plan_onto_parent(id)
+        } else {
+            history.rebase_plan_onto(id)
+        };
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(err) => {
+                self.notice = Some(StatusLine::error(format!(
+                    "Could not rebase onto {}: {err}",
+                    short_id(id)
+                )));
+                return;
+            }
+        };
+        let walked = |id: Oid| history.position(id).map(|at| &history.commits()[at]);
+        let commits = plan
+            .steps
+            .iter()
+            .map(|step| {
+                let commit = walked(step.commit);
+                PlanCommit {
+                    step: step.clone(),
+                    author: commit.map(|c| c.author.clone()).unwrap_or_default(),
+                    time: commit.map(|c| c.time.to_string()).unwrap_or_default(),
+                }
+            })
+            .collect();
+        let onto = walked(plan.onto)
+            .map(|commit| commit.summary.clone())
+            .unwrap_or_default();
+        self.rebase_dialog = Some(RebaseDialog::new(plan, commits, onto));
+    }
+
+    /// The rebase dialog was answered: start the rebase it planned, in
+    /// the background, or close it.
+    fn handle_rebase_dialog_outcome(&mut self, outcome: RebaseDialogOutcome) {
+        match outcome {
+            RebaseDialogOutcome::Continue => {}
+            RebaseDialogOutcome::Cancel => self.rebase_dialog = None,
+            RebaseDialogOutcome::Start(plan) => {
+                self.rebase_dialog = None;
+                self.start_integration(Integration::Interactive(plan));
+            }
+        }
+    }
+
     /// "Reset current branch to commit": reset HEAD's branch to the
     /// selected commit (see [`request_reset`](Self::request_reset)).
     pub fn reset_to_selected_commit(&mut self) {
@@ -2791,6 +2914,12 @@ impl GitLogView {
             self.handle_reset_outcome(outcome);
             return;
         }
+        // The rebase dialog, while it plans, has every key too.
+        if let Some(dialog) = &mut self.rebase_dialog {
+            let outcome = dialog.handle_key(key);
+            self.handle_rebase_dialog_outcome(outcome);
+            return;
+        }
         // The file list follows the selected commit's detail, which is
         // read on the first draw after the selection moves; a key that
         // comes first (from a test, or a burst of input) needs it too.
@@ -3136,6 +3265,11 @@ impl GitLogView {
             self.handle_reset_outcome(answer);
             return outcome;
         }
+        if let Some(dialog) = &mut self.rebase_dialog {
+            let answer = dialog.handle_mouse(mouse);
+            self.handle_rebase_dialog_outcome(answer);
+            return outcome;
+        }
         self.ensure_detail();
         let at = ScreenPosition::new(mouse.column, mouse.row);
         // A rule being dragged owns the mouse until the button comes up.
@@ -3352,6 +3486,10 @@ impl GitLogView {
         }
         if let Some(pending) = &mut self.reset_box {
             pending.dialog.render(area, buf, theme);
+            cursor = None;
+        }
+        if let Some(dialog) = &mut self.rebase_dialog {
+            dialog.render(area, buf, theme);
             cursor = None;
         }
         match &mut self.branch_prompt {
@@ -6857,6 +6995,61 @@ mod tests {
         let repo = Repository::open(dir.path()).unwrap();
         assert_eq!(repo.state(), git2::RepositoryState::RebaseInteractive);
         assert_eq!(repo.head().unwrap().target(), Some(base));
+    }
+
+    #[test]
+    fn an_interactive_rebase_is_planned_in_the_dialog_and_started_from_it() {
+        let (dir, [base, main, side]) = diverged_repo(false);
+        let head = head_of(&dir).0.unwrap();
+        let mut view = view(&dir);
+        wait(&mut view);
+        let select = |view: &mut GitLogView, id: Oid| {
+            let position = view.history.as_ref().unwrap().position(id).unwrap();
+            view.select_commit(position);
+        };
+        // Onto another branch's commit, but not onto HEAD's own parent.
+        select(&mut view, side);
+        assert!(view.can_rebase_onto_commit());
+        assert!(!view.can_rebase_onto_parent());
+        // HEAD's commit: onto its parent, but nothing to replay onto it.
+        select(&mut view, main);
+        assert!(view.can_rebase_onto_parent());
+        assert!(!view.can_rebase_onto_commit());
+        select(&mut view, base);
+        assert!(!view.can_rebase_onto_parent(), "the first commit");
+
+        select(&mut view, side);
+        view.rebase_interactively_onto_commit();
+        assert!(view.rebase_dialog.is_some());
+        assert_eq!(view.hint(), StatusLine::help(REBASE_HELP));
+        let screen = draw(&mut view, 110, 30);
+        let heading = format!("Interactive rebase of {head} onto {}", short_id(side));
+        assert!(
+            screen.iter().any(|row| row.contains(&heading)),
+            "{screen:#?}"
+        );
+        assert!(
+            screen.iter().any(|row| row.contains("[pick   ▾]")),
+            "{screen:#?}"
+        );
+        // Escape closes it; opened again, Ctrl+S starts the rebase.
+        view.handle_key(key(KeyCode::Esc), &mut Clipboard::local_only());
+        assert!(view.rebase_dialog.is_none());
+        view.rebase_interactively_onto_commit();
+        view.handle_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &mut Clipboard::local_only(),
+        );
+        assert!(view.rebase_dialog.is_none());
+        wait(&mut view);
+        assert_eq!(
+            notice_of(&mut view),
+            Some(format!("Rebased {head}: 1 commit"))
+        );
+        let repo = Repository::open(dir.path()).unwrap();
+        let rebased = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(rebased.parent_ids().collect::<Vec<_>>(), [side]);
+        assert_eq!(rebased.message().unwrap(), "Main");
     }
 
     #[test]

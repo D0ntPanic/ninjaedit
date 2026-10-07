@@ -119,8 +119,9 @@
 //! the branch and its files back as they were before it began; that
 //! loses whatever was resolved, so a box asks first.
 //!
-//! An interactive rebase (the git log's "Edit commit"; see the core
-//! crate's `git::interactive` module) stops here to edit a commit, with
+//! An interactive rebase (the git log's "Edit commit", or one planned
+//! in its rebase dialog; see the core crate's `git::interactive`
+//! module) stops here to edit a commit, with
 //! HEAD at what it is replayed onto and the commit's changes staged,
 //! the heading saying so (`Edit 1a2b3c4d on main: 1 of 3`) and the box
 //! starting with its message. Ctrl+S commits what is staged, keeping
@@ -130,9 +131,12 @@
 //! committing what is left staged and the rest after. With nothing
 //! staged Ctrl+S commits nothing, never an empty commit, and goes on if
 //! nothing is unstaged either (the commit's changes all discarded,
-//! say), or says what is left to stage or discard. An untracked file
-//! holds it up only when the commit added it (unstaged from it, to
-//! split it off); others are left alone, as git leaves them. A step
+//! say), or says what is left to stage or discard. A squash stops the
+//! same way (`Squash 1a2b3c4d on main: 3 of 5`), with the commits it
+//! folds together staged and their messages in the box, to be made
+//! one. An untracked file holds it up only when the commit added it
+//! (unstaged from it, to split it off); others are left alone, as git
+//! leaves them. A step
 //! that conflicts stops as a plain rebase's does, and its resolution is
 //! committed the same way.
 //!
@@ -2915,6 +2919,9 @@ impl ChangesView {
                         RebaseAction::Pick => "Pick",
                         RebaseAction::Edit => "Edit",
                         RebaseAction::Reword => "Reword",
+                        RebaseAction::Drop => "Drop",
+                        RebaseAction::Squash => "Squash",
+                        RebaseAction::Fixup => "Fixup",
                     };
                     format!(
                         "{action} {} on {branch}: {} of {}",

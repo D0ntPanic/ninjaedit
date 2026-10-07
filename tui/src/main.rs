@@ -26,6 +26,7 @@ mod input;
 mod new_branch;
 mod palette;
 mod project_search;
+mod rebase_dialog;
 mod search_box;
 mod settings_view;
 mod status;

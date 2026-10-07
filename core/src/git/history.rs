@@ -393,6 +393,61 @@ impl History {
         RebasePlan::edit(&self.repo, id)
     }
 
+    /// Whether an interactive rebase onto a commit has anything to
+    /// replay, as far as the commits walked so far tell: HEAD has commits
+    /// the commit hasn't, so it isn't HEAD's, or one after it.
+    pub fn can_rebase_onto(&self, id: Oid) -> bool {
+        self.head.is_some_and(|head| {
+            head != id && self.position(id).is_some() && !self.reaches(id, head)
+        })
+    }
+
+    /// Whether an interactive rebase onto a commit's parent can begin
+    /// with the commit, as far as the commits walked so far tell: it is
+    /// HEAD's or one before it, with one parent (not the first commit of
+    /// the history, nor a merge).
+    pub fn can_rebase_onto_parent(&self, id: Oid) -> bool {
+        let Some(commit) = self.position(id).map(|at| &self.commits[at]) else {
+            return false;
+        };
+        commit.parents.len() == 1 && self.head.is_some_and(|head| self.reaches(head, id))
+    }
+
+    /// The interactive rebase onto a commit; see [`RebasePlan::onto`].
+    pub fn rebase_plan_onto(&self, id: Oid) -> Result<RebasePlan, PlanError> {
+        RebasePlan::onto(&self.repo, id)
+    }
+
+    /// The interactive rebase onto a commit's parent, beginning with the
+    /// commit; see [`RebasePlan::onto_parent`].
+    pub fn rebase_plan_onto_parent(&self, id: Oid) -> Result<RebasePlan, PlanError> {
+        RebasePlan::onto_parent(&self.repo, id)
+    }
+
+    /// Whether `from` is `to` or a commit after it, as far as the
+    /// commits walked so far tell. The walk puts each commit before its
+    /// parents, so only the commits from `from` down the log as far as
+    /// `to` need looking at.
+    fn reaches(&self, from: Oid, to: Oid) -> bool {
+        let Some(limit) = self.position(to) else {
+            return false;
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![from];
+        while let Some(id) = stack.pop() {
+            if id == to {
+                return true;
+            }
+            let Some(at) = self.position(id).filter(|&at| at < limit) else {
+                continue;
+            };
+            if seen.insert(id) {
+                stack.extend(self.commits[at].parents.iter().copied());
+            }
+        }
+        false
+    }
+
     /// What checking out a commit calls for, or why it can't be done
     /// now; see [`Checkout::plan`].
     pub fn checkout_plan(&self, id: Oid) -> Result<CheckoutPlan, CheckoutError> {
@@ -835,6 +890,33 @@ pub(crate) mod tests {
         let history = open(&t);
         assert!(history.can_edit(side));
         assert!(!history.can_edit(after));
+    }
+
+    #[test]
+    fn interactive_rebases_are_offered_where_they_replay_something() {
+        let mut t = TestRepo::new();
+        let base = t.commit(&[("a.txt", "a\n")], "Base", &[]);
+        let two = t.commit(&[("a.txt", "two\n")], "Two", &[base]);
+        t.branch("side", base);
+        t.checkout("side");
+        let side = t.commit(&[("s.txt", "s\n")], "Side", &[base]);
+        let ahead = t.commit(&[("s.txt", "s2\n")], "Ahead", &[side]);
+        t.checkout("master");
+        let merge = t.commit(&[("m.txt", "m\n")], "Merge", &[two, side]);
+        let head = t.commit(&[("n.txt", "n\n")], "After", &[merge]);
+        let history = open(&t);
+        // Onto: anything but HEAD and what comes after it.
+        assert!(history.can_rebase_onto(base));
+        assert!(history.can_rebase_onto(merge));
+        assert!(history.can_rebase_onto(ahead));
+        assert!(!history.can_rebase_onto(head));
+        // Onto the parent: HEAD's own commits, but a merge or the first.
+        assert!(history.can_rebase_onto_parent(head));
+        assert!(history.can_rebase_onto_parent(two));
+        assert!(history.can_rebase_onto_parent(side), "merged in");
+        assert!(!history.can_rebase_onto_parent(merge));
+        assert!(!history.can_rebase_onto_parent(base));
+        assert!(!history.can_rebase_onto_parent(ahead));
     }
 
     #[test]

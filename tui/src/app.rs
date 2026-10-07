@@ -453,16 +453,19 @@ const GIT_LOG_MENU: &[MenuEntry] = &[
 ];
 /// What a right click on a commit in the git log offers: checking it
 /// out first; then bringing it into the branch HEAD is on, by merging
-/// the branch there or rebasing onto it; editing it, when it is one of
-/// that branch's own; and, set apart below since it moves the branch
-/// off its commits, resetting the branch to it. Only a commit HEAD
-/// isn't at is merged, rebased onto, or reset to, and merging is for
-/// one with another branch there.
+/// the branch there or rebasing onto it, plainly or interactively (onto
+/// it, or onto its parent, so that it is replayed first); editing it,
+/// when it is one of that branch's own; and, set apart below since it
+/// moves the branch off its commits, resetting the branch to it. Only a
+/// commit HEAD isn't at is merged, rebased onto, or reset to, and
+/// merging is for one with another branch there.
 const GIT_LOG_COMMIT_MENU: &[MenuEntry] = &[
     MenuEntry::Command(Command::CheckoutCommit),
     MenuEntry::Separator,
     MenuEntry::Command(Command::MergeCommit),
     MenuEntry::Command(Command::RebaseOntoCommit),
+    MenuEntry::Command(Command::InteractiveRebaseOntoCommit),
+    MenuEntry::Command(Command::InteractiveRebaseOntoParent),
     MenuEntry::Command(Command::EditCommit),
     MenuEntry::Separator,
     MenuEntry::Command(Command::ResetToCommit),
@@ -1571,6 +1574,8 @@ impl App {
             other_commit_selected: log.is_some_and(|view| view.other_commit_selected()),
             can_merge_commit: log.is_some_and(|view| view.can_merge_commit()),
             can_edit_commit: log.is_some_and(|view| view.can_edit_commit()),
+            can_rebase_onto_commit: log.is_some_and(|view| view.can_rebase_onto_commit()),
+            can_rebase_onto_parent: log.is_some_and(|view| view.can_rebase_onto_parent()),
             other_branch_selected: log.is_some_and(|view| view.other_branch_selected()),
             merging: changes.is_some_and(|view| view.is_merging()),
             rebasing: changes.is_some_and(|view| view.is_rebasing()),
@@ -1668,6 +1673,12 @@ impl App {
             }
             Command::ResetToCommit => self.on_git_log_page(GitLogTabs::reset_to_selected_commit),
             Command::EditCommit => self.on_git_log_page(GitLogTabs::edit_selected_commit),
+            Command::InteractiveRebaseOntoCommit => {
+                self.on_git_log_page(GitLogTabs::rebase_interactively_onto_commit)
+            }
+            Command::InteractiveRebaseOntoParent => {
+                self.on_git_log_page(GitLogTabs::rebase_interactively_onto_parent)
+            }
             Command::MergeBranch => self.on_git_log_page(GitLogTabs::merge_selected_branch),
             Command::RebaseOntoBranch => {
                 self.on_git_log_page(GitLogTabs::rebase_onto_selected_branch)
@@ -10326,19 +10337,21 @@ mod tests {
         let (topic, head_row) = (row_of("On topic"), row_of("On main"));
         let column = screen[topic as usize].find("On topic").unwrap() as u16;
 
-        // HEAD's own commit can only be checked out, or edited.
+        // HEAD's own commit can only be checked out, or rewritten:
+        // rebased interactively from it, or edited.
         right_click(&mut app, column, head_row);
         assert_eq!(
             menu_commands(&app),
             [
                 Some(Command::CheckoutCommit),
                 None,
+                Some(Command::InteractiveRebaseOntoParent),
                 Some(Command::EditCommit)
             ]
         );
         press(&mut app, KeyCode::Esc);
-        // Another branch's commit can be merged, rebased onto, and reset
-        // to, the reset set apart.
+        // Another branch's commit can be merged, rebased onto (plainly
+        // or interactively), and reset to, the reset set apart.
         right_click(&mut app, column, topic);
         assert_eq!(
             menu_commands(&app),
@@ -10347,6 +10360,7 @@ mod tests {
                 None,
                 Some(Command::MergeCommit),
                 Some(Command::RebaseOntoCommit),
+                Some(Command::InteractiveRebaseOntoCommit),
                 None,
                 Some(Command::ResetToCommit),
             ]

@@ -1,12 +1,15 @@
 //! Interactive rebasing, as `git rebase -i` does it: the commits of
 //! HEAD's branch from some point on are replayed onto a commit as a
-//! plan, a [`RebasePlan`], says, step by step. For now a step picks its
-//! commit (replays it as it is), edits it (stops with its changes
+//! plan, a [`RebasePlan`], says, step by step. A step picks its commit
+//! (replays it as it is), drops it, edits it (stops with its changes
 //! staged, for the user to change, split, or reword before going on),
-//! or rewords it (stops the same way, for a new message), and the one
-//! plan made here is [`RebasePlan::edit`]'s: edit one commit of HEAD's
-//! branch, and pick each one after it. A frontend that lets the user
-//! write the plan builds on the same steps.
+//! rewords it (stops the same way, for a new message), or folds it into
+//! the commit before it, as a squash (the two messages combined) or a
+//! fixup (its message dropped). [`RebasePlan::onto`] and
+//! [`RebasePlan::onto_parent`] make the plan that picks every commit,
+//! for a frontend to let the user change and reorder the steps;
+//! [`RebasePlan::edit`]'s edits one commit of HEAD's branch and picks
+//! each one after it.
 //!
 //! libgit2's rebase does no interactive steps, so the replaying is the
 //! editor's own, by libgit2's three-way merge as a cherry-pick does it;
@@ -19,8 +22,9 @@
 //! the editor stopped. One that git's command line began is carried on
 //! here too, as long as its remaining steps are ones the editor knows.
 //! Git stops to edit a commit differently, though: with the commit
-//! made, HEAD on it, and nothing staged, for `git commit --amend`;
-//! [`adopt_stop`] makes such a stop the editor's kind.
+//! made, HEAD on it, and nothing staged, for `git commit --amend`; and
+//! likewise at a conflict among folds; [`adopt_stop`] makes such a stop
+//! the editor's kind.
 //!
 //! A pick replays its commit onto HEAD, keeping its author and message:
 //! as the very commit when HEAD is its parent already (a fast-forward,
@@ -34,6 +38,17 @@
 //! reword stops just as an edit does, git's own reword being an edit
 //! that only changes the message: the message box is where it is
 //! changed, and the commit then made goes on as an edit's does.
+//!
+//! A fold merges its commit's change into the commit HEAD is on (the
+//! last one kept) and stages the result on that commit's parent, so
+//! that the commit made of it takes the folded-into commit's place,
+//! with that one's author and message (a squash's own message after
+//! it). A run of fixups is committed without stopping; a run with a
+//! squash among them stops at its end, as git opens an editor there,
+//! with the combined message for the user to write, and a fold that
+//! conflicts stops there, either one committed as an edit's stop is. A
+//! fold needs a commit kept before it in the plan to go into, which
+//! [`RebasePlan::check`] makes sure of before the rebase starts.
 //!
 //! At a stop, [`proceed`] commits what is staged, with the message
 //! given, as the stopped commit's author, and goes on with the rest of
@@ -73,6 +88,8 @@ const DETACHED: &str = "detached HEAD";
 /// Where git notes the commit it stopped on to be amended, at a stop
 /// of its own to edit a commit.
 const AMEND: &str = "amend";
+/// Where git notes the folds of the run it is in, at a stop in one.
+const FIXUPS: &str = "current-fixups";
 
 /// What a step of an interactive rebase does with its commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +102,15 @@ pub enum RebaseAction {
     /// Stop as for an edit, for the user to give the commit a new
     /// message.
     Reword,
+    /// Leave the commit out.
+    Drop,
+    /// Fold the commit's changes into the commit before it in the
+    /// rebase, and its message after that commit's, stopping at the end
+    /// of a run of folds for the user to write the combined message.
+    Squash,
+    /// Fold the commit's changes into the commit before it in the
+    /// rebase, keeping that commit's message and dropping this one's.
+    Fixup,
 }
 
 impl RebaseAction {
@@ -94,15 +120,32 @@ impl RebaseAction {
             RebaseAction::Pick => "pick",
             RebaseAction::Edit => "edit",
             RebaseAction::Reword => "reword",
+            RebaseAction::Drop => "drop",
+            RebaseAction::Squash => "squash",
+            RebaseAction::Fixup => "fixup",
         }
     }
 
-    /// Whether the rebase stops at a step that does this, for the user.
+    /// Whether the rebase always stops at a step that does this, for the
+    /// user. (A squash stops for the combined message only at the end
+    /// of a run of folds.)
     pub fn stops(self) -> bool {
-        match self {
-            RebaseAction::Pick => false,
-            RebaseAction::Edit | RebaseAction::Reword => true,
-        }
+        matches!(self, RebaseAction::Edit | RebaseAction::Reword)
+    }
+
+    /// Whether a step that does this folds its commit into the one
+    /// before it.
+    pub fn folds(self) -> bool {
+        matches!(self, RebaseAction::Squash | RebaseAction::Fixup)
+    }
+
+    /// Whether the commit is in the result as a commit of its own,
+    /// which the folds after it go into.
+    pub fn keeps(self) -> bool {
+        matches!(
+            self,
+            RebaseAction::Pick | RebaseAction::Edit | RebaseAction::Reword
+        )
     }
 
     /// The action a word of git's list of steps names, in full or
@@ -112,6 +155,9 @@ impl RebaseAction {
             "pick" | "p" => Some(RebaseAction::Pick),
             "edit" | "e" => Some(RebaseAction::Edit),
             "reword" | "r" => Some(RebaseAction::Reword),
+            "drop" | "d" => Some(RebaseAction::Drop),
+            "squash" | "s" => Some(RebaseAction::Squash),
+            "fixup" | "f" => Some(RebaseAction::Fixup),
             _ => None,
         }
     }
@@ -147,6 +193,10 @@ pub struct RebasePlan {
     pub onto: Oid,
     /// The steps, oldest commit first.
     pub steps: Vec<RebaseStep>,
+    /// The merge commits among those replayed, which the plan leaves
+    /// out, as `git rebase -i` does: their changes come with the
+    /// commits merged, replayed one by one.
+    pub merges: Vec<Oid>,
 }
 
 /// Why a commit can't be edited on HEAD's branch.
@@ -163,6 +213,11 @@ pub enum PlanError {
     /// The commit is the first of the history, with no parent to
     /// replay it onto.
     Root,
+    /// HEAD has no commit that the commit to rebase onto hasn't.
+    NothingToReplay,
+    /// A step folds its commit (named) into the one before it, but no
+    /// commit before it in the plan is kept to fold it into.
+    NothingToFold(Oid),
     Git(git2::Error),
 }
 
@@ -183,6 +238,14 @@ impl fmt::Display for PlanError {
                 short_id(*id)
             ),
             PlanError::Root => f.write_str("the first commit has no parent to replay it onto"),
+            PlanError::NothingToReplay => {
+                f.write_str("HEAD has no commits to replay that the commit hasn't already")
+            }
+            PlanError::NothingToFold(id) => write!(
+                f,
+                "{} has no commit kept before it to fold into",
+                short_id(*id)
+            ),
             PlanError::Git(err) => f.write_str(err.message()),
         }
     }
@@ -254,18 +317,91 @@ impl RebasePlan {
                 })
             })
             .collect::<Result<_, git2::Error>>()?;
-        let branch = if repo.head_detached()? {
-            None
-        } else {
-            repo.head()?.name().ok().map(str::to_owned)
-        };
         Ok(RebasePlan {
-            branch,
+            branch: head_branch(repo)?,
             head,
             onto,
             steps,
+            merges: Vec::new(),
         })
     }
+
+    /// The plan that replays HEAD's commits that `onto` hasn't onto it,
+    /// as `git rebase -i <onto>` does, each picked to begin with, oldest
+    /// first; the merges among them are left out. `onto` may be a
+    /// commit of HEAD's branch, rewriting the commits after it, or one
+    /// elsewhere, moving them there.
+    pub fn onto(repo: &Repository, onto: Oid) -> Result<RebasePlan, PlanError> {
+        let head = head_commit(repo).map_err(|_| PlanError::Unborn)?;
+        let mut walk = repo.revwalk()?;
+        walk.push(head)?;
+        walk.hide(onto)?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+        let mut steps = Vec::new();
+        let mut merges = Vec::new();
+        for id in walk {
+            let commit = repo.find_commit(id?)?;
+            if commit.parent_count() > 1 {
+                merges.push(commit.id());
+                continue;
+            }
+            steps.push(RebaseStep {
+                action: RebaseAction::Pick,
+                commit: commit.id(),
+                summary: summary_of(&commit),
+            });
+        }
+        if steps.is_empty() {
+            return Err(PlanError::NothingToReplay);
+        }
+        Ok(RebasePlan {
+            branch: head_branch(repo)?,
+            head,
+            onto,
+            steps,
+            merges,
+        })
+    }
+
+    /// The plan that replays `commit` and HEAD's commits after it onto
+    /// `commit`'s parent (see [`onto`](Self::onto)), so that `commit`
+    /// is the first one replayed: for folding a later commit into it,
+    /// say, without looking for its parent first. Only a commit of
+    /// HEAD's, not a merge, and with a parent, can be.
+    pub fn onto_parent(repo: &Repository, commit: Oid) -> Result<RebasePlan, PlanError> {
+        let head = head_commit(repo).map_err(|_| PlanError::Unborn)?;
+        if head != commit && !repo.graph_descendant_of(head, commit)? {
+            return Err(PlanError::NotOnBranch);
+        }
+        let found = repo.find_commit(commit)?;
+        match found.parent_count() {
+            0 => Err(PlanError::Root),
+            1 => RebasePlan::onto(repo, found.parent_id(0)?),
+            _ => Err(PlanError::Merge(commit)),
+        }
+    }
+
+    /// Whether the plan can be carried out as it stands: every step
+    /// that folds its commit has a commit kept before it to fold into.
+    pub fn check(&self) -> Result<(), PlanError> {
+        let mut kept = false;
+        for step in &self.steps {
+            if step.action.folds() && !kept {
+                return Err(PlanError::NothingToFold(step.commit));
+            }
+            kept |= step.action.keeps();
+        }
+        Ok(())
+    }
+}
+
+/// The branch HEAD is on, by its full reference name, or `None` when
+/// HEAD is detached.
+fn head_branch(repo: &Repository) -> Result<Option<String>, git2::Error> {
+    if repo.head_detached()? {
+        return Ok(None);
+    }
+    Ok(repo.head()?.name().ok().map(str::to_owned))
 }
 
 /// A commit's summary line, for a step.
@@ -285,7 +421,7 @@ pub struct Continued {
 }
 
 /// An interactive rebase under way, as kept in the repository.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct State {
     branch: Option<String>,
     orig_head: Oid,
@@ -294,8 +430,34 @@ struct State {
     /// is the one stopped at, while stopped.
     done: Vec<String>,
     todo: Vec<RebaseStep>,
-    /// The commit of the step stopped at, while stopped.
-    stop: Option<Oid>,
+    /// Where it stopped, while stopped.
+    stop: Option<Stop>,
+}
+
+/// Where a rebase stopped: at which step's commit, and what the commit
+/// made there (of what is staged) is to have.
+#[derive(Clone)]
+struct Stop {
+    commit: Oid,
+    /// The message to start from: the stopped commit's, or for a fold,
+    /// that of the commit folded into (and for a squash, this one's
+    /// after it).
+    message: String,
+    /// Whom the commit is by: the stopped commit's author, or for a
+    /// fold, the author of the commit folded into.
+    author: Signature<'static>,
+}
+
+impl Stop {
+    /// A stop at `commit`, the commit made there keeping its message
+    /// and author.
+    fn at(commit: &Commit<'_>) -> Stop {
+        Stop {
+            commit: commit.id(),
+            message: message_of(commit),
+            author: commit.author().to_owned(),
+        }
+    }
 }
 
 impl State {
@@ -305,7 +467,7 @@ impl State {
 
     /// What the step stopped at does, as its line in `done` says.
     fn stopped_action(&self) -> Option<RebaseAction> {
-        self.stop?;
+        self.stop.as_ref()?;
         let line = self.done.last()?;
         RebaseAction::parse(line.split_whitespace().next()?)
     }
@@ -350,10 +512,9 @@ fn write_state(repo: &Repository, state: &State) -> Result<(), OperationError> {
     write("end", format!("{}\n", state.total()))?;
     match &state.stop {
         Some(stop) => {
-            let commit = repo.find_commit(*stop)?;
-            write("stopped-sha", format!("{stop}\n"))?;
-            write("message", commit.message_raw().unwrap_or("").to_owned())?;
-            write("author-script", author_script(&commit.author()))?;
+            write("stopped-sha", format!("{}\n", stop.commit))?;
+            write("message", stop.message.clone())?;
+            write("author-script", author_script(&stop.author))?;
         }
         None => {
             for name in ["stopped-sha", "message", "author-script", AMEND] {
@@ -408,6 +569,50 @@ fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
+/// The author an `author-script` names, as git writes one (see
+/// [`author_script`]), or `None` if it can't be read so.
+fn parse_author_script(text: &str) -> Option<Signature<'static>> {
+    let (mut name, mut email, mut date) = (None, None, None);
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let (key, value) = line.split_once('=')?;
+        let value = unquote(value)?;
+        match key {
+            "GIT_AUTHOR_NAME" => name = Some(value),
+            "GIT_AUTHOR_EMAIL" => email = Some(value),
+            "GIT_AUTHOR_DATE" => date = Some(value),
+            _ => {}
+        }
+    }
+    let date = date?;
+    let (seconds, offset) = date.strip_prefix('@')?.split_once(' ')?;
+    let seconds: i64 = seconds.parse().ok()?;
+    let sign = if offset.starts_with('-') { -1 } else { 1 };
+    let digits = offset.trim_start_matches(['+', '-']);
+    if digits.len() != 4 {
+        return None;
+    }
+    let hours: i32 = digits[..2].parse().ok()?;
+    let minutes: i32 = digits[2..].parse().ok()?;
+    let when = git2::Time::new(seconds, sign * (hours * 60 + minutes));
+    Signature::new(&name?, &email?, &when).ok()
+}
+
+/// Text quoted for a shell as [`quote`] quotes it, unquoted.
+fn unquote(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    let mut quoted = false;
+    while let Some(c) = chars.next() {
+        match (quoted, c) {
+            (_, '\'') => quoted = !quoted,
+            (false, '\\') => out.push(chars.next()?),
+            (true, c) => out.push(c),
+            (false, _) => return None,
+        }
+    }
+    (!quoted).then_some(out)
+}
+
 /// The interactive rebase in progress, as kept in the repository.
 fn read_state(repo: &Repository) -> Result<State, OperationError> {
     if repo.state() != RepositoryState::RebaseInteractive {
@@ -446,7 +651,24 @@ fn read_state(repo: &Repository) -> Result<State, OperationError> {
     let done = fs::read_to_string(dir.join("done")).unwrap_or_default();
     let done: Vec<String> = steps(&done).map(str::to_owned).collect();
     let stop = match fs::read_to_string(dir.join("stopped-sha")) {
-        Ok(text) => Some(commit(&text)?),
+        Ok(text) => {
+            let mut stop = Stop::at(&repo.find_commit(commit(&text)?)?);
+            // The message and author written for the commit to be made
+            // at the stop, where they can be read: a fold's are those of
+            // the commit folded into.
+            if let Ok(message) = fs::read_to_string(dir.join("message"))
+                && !message.trim().is_empty()
+            {
+                stop.message = message;
+            }
+            if let Some(author) = fs::read_to_string(dir.join("author-script"))
+                .ok()
+                .and_then(|text| parse_author_script(&text))
+            {
+                stop.author = author;
+            }
+            Some(stop)
+        }
         Err(_) => None,
     };
     Ok(State {
@@ -484,13 +706,9 @@ pub(super) fn start(
     plan: &RebasePlan,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<Outcome, OperationError> {
+    plan.check().map_err(OperationError::Plan)?;
     let head = ensure_ready(repo)?;
-    let branch = if repo.head_detached()? {
-        None
-    } else {
-        repo.head()?.name().ok().map(str::to_owned)
-    };
-    if head != plan.head || branch != plan.branch {
+    if head != plan.head || head_branch(repo)? != plan.branch {
         return Err(OperationError::Git(git2::Error::from_str(
             "HEAD has moved since the rebase was planned",
         )));
@@ -543,8 +761,7 @@ pub fn proceed(repo: &Repository, message: &str) -> Result<Continued, OperationE
         }
     }
     let mut committed = None;
-    if let Some(stop) = state.stop {
-        let stopped = repo.find_commit(stop)?;
+    if let Some(stop) = state.stop.clone() {
         if has_staged(repo)? {
             let message = message.trim();
             if message.is_empty() {
@@ -553,10 +770,10 @@ pub fn proceed(repo: &Repository, message: &str) -> Result<Continued, OperationE
                 )));
             }
             let signature = repo.signature()?;
-            committed = commit_index(repo, &stopped.author(), &signature, message)?;
+            committed = commit_index(repo, &stop.author, &signature, message)?;
             tally.commits += usize::from(committed.is_some());
         }
-        if let Some(untracked_only) = unstaged(repo, &stopped)? {
+        if let Some(untracked_only) = unstaged(repo, &repo.find_commit(stop.commit)?)? {
             if committed.is_some() {
                 return Ok(Continued {
                     committed,
@@ -584,9 +801,11 @@ pub fn proceed(repo: &Repository, message: &str) -> Result<Continued, OperationE
 /// they are, as `git reset --soft HEAD~` does, and `amend` goes, after
 /// which `git rebase --continue` commits what is staged, as the editor
 /// does. Nothing is lost: the commit's changes are all staged, and
-/// `stopped-sha` still names it. A stop where HEAD has moved on since
-/// is left as it is, the commits made there being the user's. Returns
-/// whether it made the stop over.
+/// `stopped-sha` still names it. A stop at a conflict in a run of folds
+/// (squashes and fixups) is git's same kind, HEAD on the commit folded
+/// into, which the commit made there replaces. A stop where HEAD has
+/// moved on since is left as it is, the commits made there being the
+/// user's. Returns whether it made the stop over.
 pub fn adopt_stop(repo: &Repository) -> Result<bool, OperationError> {
     if repo.state() != RepositoryState::RebaseInteractive {
         return Ok(false);
@@ -606,6 +825,21 @@ pub fn adopt_stop(repo: &Repository) -> Result<bool, OperationError> {
     let Some(parent) = head.parent_ids().next() else {
         return Ok(false);
     };
+    let dir = state_dir(repo);
+    if dir.join(FIXUPS).exists() {
+        // Git stopped in a run of folds, at a conflict, to amend the
+        // commit folded into: the commit made here replaces that one,
+        // keeping its author, and the message git prepared for it is
+        // without the comments git would strip. Git's note of the run
+        // goes, as git would amend HEAD by it.
+        let message = fs::read_to_string(dir.join("message")).unwrap_or_default();
+        let message = git2::message_prettify(message, Some(b'#'))?;
+        fs::write(dir.join("message"), message).map_err(io_error)?;
+        fs::write(dir.join("author-script"), author_script(&head.author())).map_err(io_error)?;
+        for name in [FIXUPS, "message-squash", "message-fixup"] {
+            remove_file(&dir.join(name))?;
+        }
+    }
     repo.set_head_detached(parent)?;
     remove_file(&path)?;
     Ok(true)
@@ -649,11 +883,14 @@ pub(super) fn status(repo: &Repository) -> Option<RebaseStatus> {
         .map(|name| name.strip_prefix("refs/heads/").unwrap_or(name).to_owned());
     let message = state
         .stop
-        .and_then(|stop| repo.find_commit(stop).ok())
-        .and_then(|commit| commit.message().ok().map(|text| text.trim_end().to_owned()));
-    let stop = state
-        .stop
-        .map(|stop| (state.stopped_action().unwrap_or(RebaseAction::Pick), stop));
+        .as_ref()
+        .map(|stop| stop.message.trim_end().to_owned());
+    let stop = state.stop.as_ref().map(|stop| {
+        (
+            state.stopped_action().unwrap_or(RebaseAction::Pick),
+            stop.commit,
+        )
+    });
     Some(RebaseStatus {
         branch,
         onto: short_id(state.onto),
@@ -689,6 +926,9 @@ pub(super) fn summary(head: &str, outcome: &Outcome) -> String {
         } => {
             let then = match action {
                 RebaseAction::Reword => "change its message and commit it",
+                RebaseAction::Squash | RebaseAction::Fixup => {
+                    "write the message of the commits folded together and commit them"
+                }
                 _ => "change, stage, and commit it",
             };
             format!(
@@ -750,9 +990,18 @@ fn replay(
     let signature = repo.signature()?;
     while !state.todo.is_empty() {
         let step = state.todo.remove(0);
+        if step.action == RebaseAction::Drop {
+            state.done.push(step.line());
+            write_state(repo, state)?;
+            continue;
+        }
         let commit = repo.find_commit(step.commit)?;
         let head = repo.find_commit(head_commit(repo)?)?;
-        let fast_forward = commit.parent_ids().next() == Some(head.id());
+        // A fold goes into the commit HEAD is on: the one kept before
+        // it. With none kept yet (all of them dropped at an edit), it is
+        // picked instead.
+        let fold = step.action.folds() && head.id() != state.onto;
+        let fast_forward = !fold && commit.parent_ids().next() == Some(head.id());
         let written = if fast_forward {
             let mut options = checkout_options(progress);
             repo.checkout_tree(commit.as_object(), Some(&mut options))
@@ -765,9 +1014,18 @@ fn replay(
             return Err(err.into());
         }
         state.done.push(step.line());
-        state.stop = Some(commit.id());
+        let stop = if fold {
+            folded_stop(&head, &commit, step.action)
+        } else {
+            Stop::at(&commit)
+        };
+        state.stop = Some(stop.clone());
         write_state(repo, state)?;
-        if fast_forward && step.action == RebaseAction::Pick {
+        if fold {
+            // Staged on what the commit folded into was made on, so that
+            // the commit made of it takes that one's place.
+            repo.set_head_detached(head.parent_id(0)?)?;
+        } else if fast_forward && step.action == RebaseAction::Pick {
             // The very commit: HEAD moves on to it.
             repo.set_head_detached(commit.id())?;
         }
@@ -791,18 +1049,65 @@ fn replay(
                     action,
                 });
             }
-            RebaseAction::Pick if fast_forward => tally.commits += 1,
-            RebaseAction::Pick => {
-                match commit_index(repo, &commit.author(), &signature, &message_of(&commit))? {
-                    Some(_) => tally.commits += 1,
-                    None => tally.skipped += 1,
+            // The end of a run of folds with a squash among them stops
+            // for the combined message, as git opens an editor for it.
+            action if fold && ends_fold_run(state) && squashed_in_run(state) => {
+                return Ok(Outcome::Editing {
+                    step: at,
+                    commit: commit.id(),
+                    action,
+                });
+            }
+            _ if fold => {
+                // One that leaves the commit folded into with no change
+                // of its own drops it.
+                if commit_index(repo, &stop.author, &signature, &stop.message)?.is_none() {
+                    tally.skipped += 1;
                 }
             }
+            _ if fast_forward => tally.commits += 1,
+            _ => match commit_index(repo, &commit.author(), &signature, &message_of(&commit))? {
+                Some(_) => tally.commits += 1,
+                None => tally.skipped += 1,
+            },
         }
         state.stop = None;
         write_state(repo, state)?;
     }
     finish(repo, state, tally, progress)
+}
+
+/// The stop for folding `commit` into `into` (HEAD's commit): what is
+/// committed there replaces `into`, by its author and with its message,
+/// followed by `commit`'s for a squash.
+fn folded_stop(into: &Commit<'_>, commit: &Commit<'_>, action: RebaseAction) -> Stop {
+    let mut message = message_of(into);
+    if action == RebaseAction::Squash {
+        message = format!("{}\n\n{}", message.trim_end(), message_of(commit));
+    }
+    Stop {
+        commit: commit.id(),
+        message,
+        author: into.author().to_owned(),
+    }
+}
+
+/// Whether the step just taken is the last of a run of folds: the next
+/// one doesn't fold.
+fn ends_fold_run(state: &State) -> bool {
+    !state.todo.first().is_some_and(|step| step.action.folds())
+}
+
+/// Whether the run of folds ending with the step just taken has a
+/// squash among them, whose message is to be written.
+fn squashed_in_run(state: &State) -> bool {
+    state
+        .done
+        .iter()
+        .rev()
+        .map(|line| line.split_whitespace().next().and_then(RebaseAction::parse))
+        .take_while(|action| action.is_some_and(RebaseAction::folds))
+        .any(|action| action == Some(RebaseAction::Squash))
 }
 
 /// A commit's message, whole, to replay it with.
@@ -1487,6 +1792,301 @@ mod tests {
         // It can still be given up.
         abort(&t.repo).unwrap();
         assert_eq!(t.repo.state(), RepositoryState::Clean);
+    }
+
+    /// The plan that replays two, three, and four onto base, with the
+    /// steps set as given, oldest first, by commit and action.
+    fn plan_of(t: &TestRepo, two: Oid, steps: &[(Oid, RebaseAction)]) -> RebasePlan {
+        let mut plan = RebasePlan::onto_parent(&t.repo, two).unwrap();
+        plan.steps = steps
+            .iter()
+            .map(|&(commit, action)| {
+                let found = plan.steps.iter().find(|step| step.commit == commit);
+                RebaseStep {
+                    action,
+                    ..found.unwrap().clone()
+                }
+            })
+            .collect();
+        plan
+    }
+
+    fn author_time(repo: &Repository, id: Oid) -> i64 {
+        repo.find_commit(id).unwrap().author().when().seconds()
+    }
+
+    #[test]
+    fn plans_replay_heads_commits_the_target_lacks_merges_left_out() {
+        use RebaseAction::Pick;
+        let mut t = repo();
+        let [base, two, three, four] = branch(&mut t);
+        let steps = |plan: &RebasePlan| -> Vec<(RebaseAction, Oid)> {
+            plan.steps
+                .iter()
+                .map(|step| (step.action, step.commit))
+                .collect()
+        };
+        // Onto a commit of the branch: the commits after it.
+        let plan = RebasePlan::onto(&t.repo, two).unwrap();
+        assert_eq!(
+            (plan.onto, steps(&plan)),
+            (two, vec![(Pick, three), (Pick, four)])
+        );
+        // Onto a commit's parent: that commit first.
+        let plan = RebasePlan::onto_parent(&t.repo, two).unwrap();
+        assert_eq!(plan.onto, base);
+        assert_eq!(steps(&plan), [(Pick, two), (Pick, three), (Pick, four)]);
+        assert!(plan.merges.is_empty());
+        assert!(matches!(
+            RebasePlan::onto_parent(&t.repo, base),
+            Err(PlanError::Root)
+        ));
+        assert!(matches!(
+            RebasePlan::onto(&t.repo, four),
+            Err(PlanError::NothingToReplay)
+        ));
+        // Onto another branch: what HEAD has that it hasn't, merges left
+        // out.
+        t.branch("side", two);
+        t.checkout("side");
+        let side = t.commit(&[("s.txt", "s\n")], "Side", &[two]);
+        t.checkout("master");
+        sync(&t);
+        assert!(matches!(
+            RebasePlan::onto_parent(&t.repo, side),
+            Err(PlanError::NotOnBranch)
+        ));
+        let merge = t.commit(&[("m.txt", "m\n")], "Merge", &[four, side]);
+        sync(&t);
+        let plan = RebasePlan::onto(&t.repo, base).unwrap();
+        assert_eq!(plan.merges, [merge]);
+        let replayed: Vec<Oid> = plan.steps.iter().map(|step| step.commit).collect();
+        assert_eq!(replayed.len(), 4);
+        assert_eq!(replayed[0], two);
+        assert!(replayed.contains(&side));
+        assert!(matches!(
+            RebasePlan::onto_parent(&t.repo, merge),
+            Err(PlanError::Merge(id)) if id == merge
+        ));
+    }
+
+    #[test]
+    fn steps_are_reordered_and_dropped() {
+        use RebaseAction::{Drop, Pick};
+        let mut t = repo();
+        let [_, two, three, four] = branch(&mut t);
+        let plan = plan_of(&t, two, &[(four, Pick), (two, Pick), (three, Drop)]);
+        let outcome = run(&t.repo, &plan).unwrap();
+        assert!(
+            matches!(outcome, Outcome::Rebased { commits: 2, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(log(&t.repo), ["Two", "Four", "Base"]);
+        assert_eq!(read(&t, "b.txt"), "b\n");
+        assert_eq!(read(&t, "c.txt"), "c\n");
+        assert!(t.repo.statuses(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_fixup_folds_into_the_commit_before_it_keeping_its_message() {
+        use RebaseAction::{Fixup, Pick};
+        let mut t = repo();
+        let [_, two, three, four] = branch(&mut t);
+        let plan = plan_of(&t, two, &[(two, Pick), (four, Pick), (three, Fixup)]);
+        let outcome = run(&t.repo, &plan).unwrap();
+        assert!(
+            matches!(outcome, Outcome::Rebased { commits: 2, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(log(&t.repo), ["Four", "Two", "Base"]);
+        assert_eq!(read(&t, "b.txt"), "b3\n");
+        // Four's author, whose commit it is.
+        assert_eq!(
+            author_time(&t.repo, head(&t.repo)),
+            author_time(&t.repo, four)
+        );
+        // A run of fixups: no stop, the first commit's message.
+        let mut t = repo();
+        let [_, two, three, four] = branch(&mut t);
+        let plan = plan_of(&t, two, &[(two, Pick), (three, Fixup), (four, Fixup)]);
+        assert!(matches!(
+            run(&t.repo, &plan).unwrap(),
+            Outcome::Rebased { .. }
+        ));
+        assert_eq!(log(&t.repo), ["Two", "Base"]);
+        assert_eq!(
+            (read(&t, "a.txt"), read(&t, "b.txt"), read(&t, "c.txt")),
+            ("a2\n".to_owned(), "b3\n".to_owned(), "c\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_squash_stops_for_the_combined_message_at_the_end_of_its_run() {
+        use RebaseAction::{Fixup, Pick, Squash};
+        let mut t = repo();
+        let [base, two, three, four] = branch(&mut t);
+        let plan = plan_of(&t, two, &[(two, Pick), (three, Squash), (four, Pick)]);
+        let outcome = run(&t.repo, &plan).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Editing {
+                step: (2, 3),
+                commit: three,
+                action: Squash,
+            }
+        );
+        // Both commits' changes staged where two was made.
+        assert_eq!(head(&t.repo), base);
+        assert!(has_staged(&t.repo).unwrap());
+        let status = rebase_status(&t.repo).unwrap();
+        assert_eq!(status.message.as_deref(), Some("Two\n\nThree"));
+        assert_eq!(status.stop, Some((Squash, three)));
+        assert_eq!(
+            summary("master", &outcome),
+            format!(
+                "Stopped to squash {} (2 of 3): write the message of the commits folded together and commit them; the rebase goes on once nothing is left unstaged",
+                short_id(three)
+            )
+        );
+        let continued = proceed(&t.repo, "Two and three").unwrap();
+        assert!(
+            matches!(continued.outcome, Some(Outcome::Rebased { .. })),
+            "{continued:?}"
+        );
+        assert_eq!(log(&t.repo), ["Four", "Two and three", "Base"]);
+        let squashed = continued.committed.unwrap();
+        assert_eq!(author_time(&t.repo, squashed), author_time(&t.repo, two));
+        assert_eq!(read(&t, "b.txt"), "b3\n");
+
+        // A run of a fixup and a squash stops once, at its end, the
+        // fixup's message left out.
+        let mut t = repo();
+        let [_, two, three, four] = branch(&mut t);
+        let plan = plan_of(&t, two, &[(two, Pick), (three, Fixup), (four, Squash)]);
+        let outcome = run(&t.repo, &plan).unwrap();
+        assert!(
+            matches!(outcome, Outcome::Editing { step: (3, 3), commit, .. } if commit == four),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            rebase_status(&t.repo).unwrap().message.as_deref(),
+            Some("Two\n\nFour")
+        );
+        proceed(&t.repo, "All of it").unwrap();
+        assert_eq!(log(&t.repo), ["All of it", "Base"]);
+        assert!(t.repo.statuses(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_fold_that_conflicts_stops_to_replace_the_commit_folded_into() {
+        use RebaseAction::{Drop, Fixup, Pick};
+        let mut t = repo();
+        let [base, two, three, four] = branch(&mut t);
+        // Three changes b.txt, which two (dropped) added.
+        let plan = plan_of(&t, two, &[(two, Drop), (four, Pick), (three, Fixup)]);
+        let outcome = run(&t.repo, &plan).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Conflicts {
+                    step: Some((3, 3)),
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(head(&t.repo), base);
+        let status = rebase_status(&t.repo).unwrap();
+        assert_eq!(status.message.as_deref(), Some("Four"));
+        fs::write(t.path().join("b.txt"), "b3\n").unwrap();
+        stage(&t.repo, "b.txt");
+        let continued = proceed(&t.repo, "Four").unwrap();
+        assert!(
+            matches!(continued.outcome, Some(Outcome::Rebased { .. })),
+            "{continued:?}"
+        );
+        assert_eq!(log(&t.repo), ["Four", "Base"]);
+        assert_eq!(
+            author_time(&t.repo, head(&t.repo)),
+            author_time(&t.repo, four)
+        );
+        assert_eq!(read(&t, "b.txt"), "b3\n");
+        assert_eq!(read(&t, "c.txt"), "c\n");
+    }
+
+    #[test]
+    fn gits_stop_at_a_fold_that_conflicts_is_made_one_replacing_the_commit() {
+        use RebaseAction::{Drop, Fixup, Pick};
+        let mut t = repo();
+        let [base, two, three, four] = branch(&mut t);
+        let plan = plan_of(&t, two, &[(two, Drop), (four, Pick), (three, Fixup)]);
+        run(&t.repo, &plan).unwrap();
+        // As git stops there: HEAD on four as replayed, to be amended,
+        // with its note of the run, a message with comments, and
+        // three's author. (The editor stopped with HEAD moved off it.)
+        let four_now = t.repo.reflog("HEAD").unwrap().get(0).unwrap().id_old();
+        assert_eq!(
+            t.repo.find_commit(four_now).unwrap().parent_id(0).unwrap(),
+            base
+        );
+        t.repo.set_head_detached(four_now).unwrap();
+        let dir = state_dir(&t.repo);
+        fs::write(dir.join(AMEND), format!("{four_now}\n")).unwrap();
+        fs::write(dir.join(FIXUPS), format!("fixup {three}\n")).unwrap();
+        fs::write(dir.join("message-fixup"), "Four\n").unwrap();
+        fs::write(
+            dir.join("message"),
+            "# This is a combination of 2 commits.\n# This is the 1st commit message:\n\nFour\n\n# The commit message #2 will be skipped:\n\n# Three\n",
+        )
+        .unwrap();
+        let three_author = t.repo.find_commit(three).unwrap().author().to_owned();
+        fs::write(dir.join("author-script"), author_script(&three_author)).unwrap();
+
+        assert!(adopt_stop(&t.repo).unwrap());
+        assert_eq!(head(&t.repo), base);
+        assert!(!dir.join(FIXUPS).exists());
+        assert!(!dir.join("message-fixup").exists());
+        let status = rebase_status(&t.repo).unwrap();
+        assert_eq!(status.message.as_deref(), Some("Four"));
+        fs::write(t.path().join("b.txt"), "b3\n").unwrap();
+        stage(&t.repo, "b.txt");
+        proceed(&t.repo, "Four").unwrap();
+        assert_eq!(log(&t.repo), ["Four", "Base"]);
+        assert_eq!(
+            author_time(&t.repo, head(&t.repo)),
+            author_time(&t.repo, four)
+        );
+    }
+
+    #[test]
+    fn a_fold_with_nothing_kept_before_it_is_refused() {
+        use RebaseAction::{Drop, Pick, Squash};
+        let mut t = repo();
+        let [_, two, three, four] = branch(&mut t);
+        let plan = plan_of(&t, two, &[(two, Drop), (three, Squash), (four, Pick)]);
+        assert!(matches!(plan.check(), Err(PlanError::NothingToFold(id)) if id == three));
+        let err = run(&t.repo, &plan).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{} has no commit kept before it to fold into",
+                short_id(three)
+            )
+        );
+        assert_eq!(t.repo.state(), RepositoryState::Clean);
+    }
+
+    #[test]
+    fn an_author_script_reads_back() {
+        let author = Signature::new("O'Neil", "o@example.com", &git2::Time::new(100, -90)).unwrap();
+        let read = parse_author_script(&author_script(&author)).unwrap();
+        assert_eq!(read.name(), Ok("O'Neil"));
+        assert_eq!(read.email(), Ok("o@example.com"));
+        assert_eq!(
+            (read.when().seconds(), read.when().offset_minutes()),
+            (100, -90)
+        );
+        assert!(parse_author_script("GIT_AUTHOR_NAME=unquoted\n").is_none());
     }
 
     #[test]

@@ -168,6 +168,8 @@ pub enum OperationError {
     /// The operation stopped part way, left in progress, since the
     /// submodules couldn't follow it there.
     Stopped(CheckoutError),
+    /// An interactive rebase's plan can't be carried out as it stands.
+    Plan(interactive::PlanError),
     Git(git2::Error),
 }
 
@@ -230,6 +232,7 @@ impl fmt::Display for OperationError {
                 f,
                 "stopped part way, as the submodules couldn't follow: {err}; fix that, then continue or abort on the changes page"
             ),
+            OperationError::Plan(err) => err.fmt(f),
             OperationError::Git(err) => f.write_str(err.message()),
         }
     }
