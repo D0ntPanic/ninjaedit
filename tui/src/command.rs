@@ -98,6 +98,9 @@ pub enum Command {
     /// The git log page's resetting of HEAD's branch to the selected
     /// commit.
     ResetToCommit,
+    /// The git log page's editing of the selected commit of HEAD's
+    /// branch, by an interactive rebase.
+    EditCommit,
     /// The git log page's merging of the branch selected in the sidebar
     /// into HEAD's.
     MergeBranch,
@@ -283,6 +286,9 @@ pub struct Context {
     /// On the git log page, whether the selected commit is one HEAD
     /// isn't at with a branch at it other than HEAD's, to merge.
     pub can_merge_commit: bool,
+    /// On the git log page, whether the selected commit is one of
+    /// HEAD's branch that an interactive rebase can edit.
+    pub can_edit_commit: bool,
     /// On the git log page, with the keyboard in the sidebar, whether a
     /// branch (local or a remote's) HEAD isn't on is selected there, to
     /// merge, rebase onto, or reset to.
@@ -313,7 +319,7 @@ impl Command {
     /// Every command, in the order the palette lists them before
     /// anything is typed: files, searching, editing, building, the
     /// pages, views, and quitting last.
-    pub const ALL: [Command; 65] = [
+    pub const ALL: [Command; 66] = [
         Command::OpenFile,
         Command::SwitchTab,
         Command::Save,
@@ -351,6 +357,7 @@ impl Command {
         Command::DeleteBranch,
         Command::MergeCommit,
         Command::RebaseOntoCommit,
+        Command::EditCommit,
         Command::ResetToCommit,
         Command::MergeBranch,
         Command::RebaseOntoBranch,
@@ -428,6 +435,7 @@ impl Command {
             Command::CheckoutBranch => on(Page::GitLog) && context.can_checkout_branch,
             Command::DeleteBranch => on(Page::GitLog) && context.can_delete_branch,
             Command::MergeCommit => on(Page::GitLog) && context.can_merge_commit,
+            Command::EditCommit => on(Page::GitLog) && context.can_edit_commit,
             Command::RebaseOntoCommit | Command::ResetToCommit => {
                 on(Page::GitLog) && context.other_commit_selected
             }
@@ -504,6 +512,7 @@ impl Command {
             Command::MergeCommit => "Merge into current branch",
             Command::RebaseOntoCommit => "Rebase current branch onto commit",
             Command::ResetToCommit => "Reset current branch to commit",
+            Command::EditCommit => "Edit commit",
             Command::MergeBranch => "Merge branch into current branch",
             Command::RebaseOntoBranch => "Rebase current branch onto branch",
             Command::ResetToBranch => "Reset current branch to branch",
@@ -613,6 +622,9 @@ impl Command {
             Command::RebaseOntoCommit => {
                 "On the git log page, replay the commits of the branch HEAD is on onto the selected commit (git rebase); conflicts stop it on the changes page, to resolve and continue"
             }
+            Command::EditCommit => {
+                "On the git log page, rewrite the selected commit of the branch HEAD is on (git rebase -i, edit): the changes page opens with its changes staged, to reword, change, or split it into several commits; the commits after it are replayed once nothing is left unstaged"
+            }
             Command::ResetToCommit => {
                 "On the git log page, move the branch HEAD is on to the selected commit (git reset, mixed): the index follows, the working directory stays as it is, so what differs shows as unstaged changes; asks first if commits would be left on no branch"
             }
@@ -674,7 +686,7 @@ impl Command {
                 "On the changes page, make the commit replace the last one (git commit --amend), or follow it (m in a list)"
             }
             Command::ContinueRebase => {
-                "On the changes page, commit the commit the rebase stopped at, its conflicts resolved and staged, with the message in the box, and replay the rest (git rebase --continue)"
+                "On the changes page, commit the commit the rebase stopped at, its conflicts resolved and staged, with the message in the box, and replay the rest (git rebase --continue); in an interactive rebase, commit what is staged, and go on once nothing is left unstaged"
             }
             Command::AbortMerge => {
                 "On the changes page, give up the merge in progress after asking, putting the branch and its files back as they were before it (git merge --abort)"
@@ -738,6 +750,7 @@ impl Command {
             | Command::DeleteBranch
             | Command::MergeCommit
             | Command::RebaseOntoCommit
+            | Command::EditCommit
             | Command::ResetToCommit
             | Command::MergeBranch
             | Command::RebaseOntoBranch
@@ -1125,6 +1138,28 @@ mod tests {
             commit_commands.iter().all(|c| !listed.contains(c)),
             "{listed:?}"
         );
+    }
+
+    #[test]
+    fn the_git_log_offers_editing_a_commit_of_heads_branch() {
+        // HEAD's own commit can be edited, though nothing else is
+        // offered for it.
+        let log = Context {
+            page: Page::GitLog,
+            commit_selected: true,
+            ..Context::default()
+        };
+        assert!(!available(&log).contains(&Command::EditCommit));
+        let editable = Context {
+            can_edit_commit: true,
+            ..log
+        };
+        assert!(available(&editable).contains(&Command::EditCommit));
+        let elsewhere = Context {
+            page: Page::Changes,
+            ..editable
+        };
+        assert!(!available(&elsewhere).contains(&Command::EditCommit));
     }
 
     #[test]

@@ -17,16 +17,21 @@
 //! [`History::detail`] and [`History::file_diff`]; see the [`diff`]
 //! module. A commit is checked out, on the caller's thread too, by
 //! [`History::checkout_plan`] and [`History::checkout`]; see the
-//! [`checkout`] module. The history itself doesn't follow: open a fresh
-//! one to see HEAD where it now is.
+//! [`checkout`] module. Whether a commit can be edited, by an
+//! interactive rebase of HEAD's branch, is told from the commits walked
+//! by [`History::can_edit`], and the rebase planned by
+//! [`History::edit_plan`]; see the [`interactive`] module. The history
+//! itself doesn't follow: open a fresh one to see HEAD where it now is.
 //!
 //! [`graph`]: super::graph
 //! [`diff`]: super::diff
 //! [`checkout`]: super::checkout
+//! [`interactive`]: super::interactive
 
 use super::checkout::{Checkout, CheckoutError, CheckoutPlan};
 use super::diff::{self, CommitDetail, FileDiff};
 use super::graph::{GraphLayout, GraphRow};
+use super::interactive::{PlanError, RebasePlan, commits_to_edit};
 pub use git2::Oid;
 use git2::{BranchType, Repository, Sort};
 use jiff::Timestamp;
@@ -363,6 +368,29 @@ impl History {
         old_path: Option<&str>,
     ) -> Result<FileDiff, git2::Error> {
         diff::file_diff(&self.repo, id, path, old_path)
+    }
+
+    /// Whether a commit can be edited on HEAD's branch by an interactive
+    /// rebase, as far as the commits walked so far tell (see
+    /// [`RebasePlan::edit`]): HEAD's own, or one its first parents lead
+    /// back to through no merge, with a parent of its own.
+    pub fn can_edit(&self, id: Oid) -> bool {
+        let (Some(head), Some(at)) = (self.head, self.position(id)) else {
+            return false;
+        };
+        // The walk puts each commit before its parents, so a commit
+        // further down the log than this one can't lead back to it.
+        let parents = |of: Oid| {
+            let position = self.position(of).filter(|&position| position <= at)?;
+            Some(self.commits[position].parents.clone())
+        };
+        commits_to_edit(head, id, parents).is_ok()
+    }
+
+    /// The interactive rebase that edits a commit on HEAD's branch, as
+    /// the repository has it now; see [`RebasePlan::edit`].
+    pub fn edit_plan(&self, id: Oid) -> Result<RebasePlan, PlanError> {
+        RebasePlan::edit(&self.repo, id)
     }
 
     /// What checking out a commit calls for, or why it can't be done
@@ -781,6 +809,32 @@ pub(crate) mod tests {
         let now = time(1_700_000_000, 0);
         assert_eq!(now.to_string(), now.in_zone(&TimeZone::system()));
         assert_eq!(now.to_string().len(), "2023-11-14 22:13".len());
+    }
+
+    #[test]
+    fn commits_of_heads_branch_short_of_a_merge_can_be_edited() {
+        let mut t = TestRepo::new();
+        let base = t.commit(&[("a.txt", "a\n")], "Base", &[]);
+        let two = t.commit(&[("a.txt", "two\n")], "Two", &[base]);
+        t.branch("side", base);
+        t.checkout("side");
+        let side = t.commit(&[("s.txt", "s\n")], "Side", &[base]);
+        t.checkout("master");
+        let merge = t.commit(&[("m.txt", "m\n")], "Merge", &[two, side]);
+        let after = t.commit(&[("n.txt", "n\n")], "After", &[merge]);
+        let history = open(&t);
+        assert!(history.can_edit(after));
+        // A merge, and anything behind one.
+        assert!(!history.can_edit(merge));
+        assert!(!history.can_edit(two));
+        assert!(!history.can_edit(side));
+        // The first commit, with no parent to replay it onto.
+        assert!(!history.can_edit(base));
+        // A commit HEAD's branch doesn't have.
+        t.checkout("side");
+        let history = open(&t);
+        assert!(history.can_edit(side));
+        assert!(!history.can_edit(after));
     }
 
     #[test]

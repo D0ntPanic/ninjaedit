@@ -13,11 +13,14 @@
 //! resolved commit, with the message given or its own, and replays the
 //! rest, which may stop again; [`abort_rebase`] puts the branch back
 //! where it was. [`rebase_status`] says what a rebase in progress is
-//! doing, for the changes page's heading. See the
+//! doing, for the changes page's heading, and says it of an
+//! interactive rebase too (see the [`interactive`]
+//! module, which carries those on and aborts them). See the
 //! [`operation`](super::operation) module for what merging and
 //! rebasing share.
 
 use super::history::short_id;
+use super::interactive::{self, RebaseAction};
 use super::operation::{
     Integration, OperationError, Outcome, Target, checkout_options, conflicted_files, ensure_ready,
     fast_forward, follow_submodules, head_commit, settle_part_way,
@@ -33,21 +36,34 @@ pub struct RebaseStatus {
     /// The branch being rebased, or `None` for a detached HEAD.
     pub branch: Option<String>,
     /// What it is being rebased onto, as named when it started: a
-    /// branch, or a commit id.
+    /// branch, or a commit id (always, for an interactive rebase).
     pub onto: String,
     /// The commit being replayed, counting from 1, and how many there
     /// are.
     pub step: usize,
     pub total: usize,
     /// The message of the commit being replayed, which it keeps unless
-    /// the user writes another.
+    /// the user writes another. At an interactive rebase's stop it is
+    /// for the first commit made there, the commit's replacement; one
+    /// made after it, the next part of a split, wants a message of its
+    /// own.
     pub message: Option<String>,
+    /// Whether the rebase is interactive: carried on by committing what
+    /// is staged at a stop (see the [`interactive`]
+    /// module), rather than by continuing with the commit stopped at.
+    pub interactive: bool,
+    /// For an interactive rebase stopped at a step, what the step does
+    /// and with which commit: an edit, or a pick that conflicted.
+    pub stop: Option<(RebaseAction, Oid)>,
 }
 
 impl RebaseStatus {
     /// How continuing the rebase went, for the status bar (see
     /// [`Integration::summary`]).
     pub fn summary(&self, outcome: &Outcome) -> String {
+        if self.interactive {
+            return interactive::summary(self.branch.as_deref().unwrap_or("HEAD"), outcome);
+        }
         let onto = Target::Branch {
             name: self.onto.clone(),
             remote: false,
@@ -149,10 +165,12 @@ pub fn abort_rebase(repo: &Repository) -> Result<(), OperationError> {
 }
 
 /// What a rebase in progress is doing, if one is (and is one the
-/// editor can carry on with: not interactive).
+/// editor can carry on with).
 pub fn rebase_status(repo: &Repository) -> Option<RebaseStatus> {
-    if repo.state() != RepositoryState::RebaseMerge {
-        return None;
+    match repo.state() {
+        RepositoryState::RebaseMerge => {}
+        RepositoryState::RebaseInteractive => return interactive::status(repo),
+        _ => return None,
     }
     let mut rebase = repo.open_rebase(None).ok()?;
     let total = rebase.len();
@@ -182,6 +200,8 @@ pub fn rebase_status(repo: &Repository) -> Option<RebaseStatus> {
         step: current.map_or(0, |index| index + 1),
         total,
         message,
+        interactive: false,
+        stop: None,
     })
 }
 
@@ -362,6 +382,8 @@ mod tests {
                 step: 1,
                 total: 2,
                 message: Some("Main".to_owned()),
+                interactive: false,
+                stop: None,
             }
         );
 

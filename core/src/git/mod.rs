@@ -20,15 +20,17 @@
 //! one before it) has them, leaving the index alone. The [`merge`] and
 //! [`rebase`] modules bring another branch's commits into HEAD's, as
 //! `git merge` and `git rebase` do, stopping at conflicts for the
-//! changes page to resolve, with what the two share (and the job that
-//! runs either in the background) in the [`operation`] module; the
+//! changes page to resolve, and the [`interactive`] module rewrites
+//! HEAD's own commits by a plan, as `git rebase -i` does, stopping for
+//! the changes page to edit one, with what they share (and the job that
+//! runs any of them in the background) in the [`operation`] module; the
 //! [`reset`](mod@reset) module moves HEAD's branch to a commit as `git reset`
 //! does, keeping the working directory.
 //! Everything goes through libgit2, by way of the `git2` crate; nothing
 //! shells out to git.
 //!
 //! Only the [`changes`], [`fetch`], [`checkout`], [`branch`],
-//! [`restore`](mod@restore), [`merge`], [`rebase`], and [`reset`](mod@reset) modules change the
+//! [`restore`](mod@restore), [`merge`], [`rebase`], [`interactive`], and [`reset`](mod@reset) modules change the
 //! repository. The first two touch only its index,
 //! HEAD, and remote-tracking references, except that discarding a
 //! change puts a file of the working directory back to the index's
@@ -38,7 +40,7 @@
 //! only a reference (with its configuration) and HEAD, never the files;
 //! and restoring rewrites files
 //! of the working directory and nothing else. A merge or rebase
-//! rewrites the working directory and index as a checkout does, and
+//! (interactive or not) rewrites the working directory and index as a checkout does, and
 //! refuses to start while there are changes it could lose; a reset
 //! moves HEAD and the index, never the working directory.
 
@@ -51,6 +53,7 @@ pub mod fetch;
 pub mod graph;
 pub mod head;
 pub mod history;
+pub mod interactive;
 pub mod merge;
 pub mod operation;
 pub mod rebase;
@@ -72,6 +75,7 @@ pub use fetch::{Fetch, FetchReport};
 pub use graph::{GraphCell, GraphRow, NODE, cells_for};
 pub use head::{Head, head, head_of};
 pub use history::{Branch, Commit, CommitTime, History, Oid, RefKind, RefLabel, Remote, short_id};
+pub use interactive::{Continued, PlanError, RebaseAction, RebasePlan, RebaseStep};
 pub use merge::abort_merge;
 pub use operation::{
     InProgress, Integration, IntegrationJob, OperationError, Outcome, Target, in_progress,

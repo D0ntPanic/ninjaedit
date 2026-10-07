@@ -96,8 +96,14 @@
 //! A right click on a commit in the log selects it and opens a menu of
 //! what can be done with it, each in the command palette too: check it
 //! out (as Space does, below); merge the branch there into the branch
-//! HEAD is on, or rebase HEAD's branch onto the commit; and, set apart
-//! below, reset HEAD's branch to it. Only a commit HEAD isn't at offers
+//! HEAD is on, or rebase HEAD's branch onto the commit; edit it; and,
+//! set apart below, reset HEAD's branch to it. Editing is for one of
+//! HEAD's branch's own commits (HEAD's, or one its first parents lead
+//! back to through no merge, with a parent of its own): an interactive
+//! rebase, in the background as a rebase is, stops at it with its
+//! changes staged and brings up the changes page, where it is reworded,
+//! changed, or split, and the commits after it replayed once that is
+//! committed (see the core crate's `git::interactive` module). Only a commit HEAD isn't at offers
 //! more than checking out, and merging needs a branch there other than
 //! HEAD's: a local one, or failing that a remote's (see the core
 //! crate's `git::merge` and `git::rebase` modules). A merge or rebase
@@ -215,7 +221,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ninjaedit_core::git::{
     ChangeKind, Checkout, CheckoutError, CheckoutJob, CheckoutOutcome, CommitDetail,
     DeleteBranchError, DiffModel, Fetch, FileChange, FileTree, History, Integration,
-    IntegrationJob, Oid, OperationError, Outcome, RefKind, Restored, Target, TreeRow,
+    IntegrationJob, Oid, OperationError, Outcome, RebasePlan, RefKind, Restored, Target, TreeRow,
     delete_branch, left_behind, reset, restore, short_id, submodules, unstaged_among,
 };
 use ratatui::buffer::Buffer;
@@ -689,6 +695,12 @@ impl GitLogTabs {
     /// shown page's selected commit, in the background.
     pub fn rebase_onto_selected_commit(&mut self) {
         self.active().rebase_onto_selected_commit();
+    }
+
+    /// The command palette's "Edit commit": the shown page's selected
+    /// commit, by an interactive rebase in the background.
+    pub fn edit_selected_commit(&mut self) {
+        self.active().edit_selected_commit();
     }
 
     /// The command palette's "Reset current branch to commit": the
@@ -1406,6 +1418,7 @@ impl GitLogView {
             let doing = match what {
                 Integration::Merge(target) => format!("merging {}", target.name()),
                 Integration::Rebase(target) => format!("rebasing onto {}", target.name()),
+                Integration::Interactive(plan) => format!("rebasing to {}", plan_words(plan)),
             };
             return StatusLine::progress(match job.progress() {
                 Some((written, total)) => format!("{doing}… {written}/{total} files"),
@@ -2283,7 +2296,7 @@ impl GitLogView {
         } else if let Some(running) = &self.integration {
             match running.what {
                 Integration::Merge(_) => "A merge",
-                Integration::Rebase(_) => "A rebase",
+                Integration::Rebase(_) | Integration::Interactive(_) => "A rebase",
             }
         } else {
             return false;
@@ -2365,6 +2378,36 @@ impl GitLogView {
     pub fn rebase_onto_selected_commit(&mut self) {
         if let Some(id) = self.other_selected_id() {
             self.start_integration(Integration::Rebase(Target::Commit(id)));
+        }
+    }
+
+    /// Whether the selected commit is one of HEAD's branch's own that
+    /// an interactive rebase can edit, for "Edit commit" (see the core
+    /// crate's `git::interactive` module).
+    pub fn can_edit_commit(&self) -> bool {
+        self.selected_id()
+            .zip(self.history.as_ref())
+            .is_some_and(|(id, history)| history.can_edit(id))
+    }
+
+    /// "Edit commit": rebase HEAD's branch interactively to stop at the
+    /// selected commit with its changes staged, for the changes page,
+    /// which the page brings up once it stops there.
+    pub fn edit_selected_commit(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let (Some(id), Some(history)) = (self.selected_id(), &self.history) else {
+            return;
+        };
+        match history.edit_plan(id) {
+            Ok(plan) => self.start_integration(Integration::Interactive(plan)),
+            Err(err) => {
+                self.notice = Some(StatusLine::error(format!(
+                    "Could not edit {}: {err}",
+                    short_id(id)
+                )));
+            }
         }
     }
 
@@ -2452,7 +2495,8 @@ impl GitLogView {
         let moved = match job.outcome() {
             Some(Ok(outcome)) => {
                 self.notice = Some(StatusLine::info(what.summary(head.as_deref(), &outcome)));
-                if matches!(outcome, Outcome::Conflicts { .. }) {
+                // Conflicts are resolved, and a commit edited, there.
+                if matches!(outcome, Outcome::Conflicts { .. } | Outcome::Editing { .. }) {
                     self.show_changes = true;
                 }
                 outcome != Outcome::UpToDate
@@ -2463,6 +2507,7 @@ impl GitLogView {
                 let doing = match &what {
                     Integration::Merge(target) => format!("Merging {}", target.name()),
                     Integration::Rebase(target) => format!("Rebasing onto {}", target.name()),
+                    Integration::Interactive(plan) => format!("Rebasing to {}", plan_words(plan)),
                 };
                 self.notice = Some(StatusLine::error(format!("{doing} {err}")));
                 self.show_changes = true;
@@ -2472,6 +2517,7 @@ impl GitLogView {
                 let done = match &what {
                     Integration::Merge(target) => format!("Merged {}", target.name()),
                     Integration::Rebase(target) => format!("Rebased onto {}", target.name()),
+                    Integration::Interactive(_) => "Rebased".to_owned(),
                 };
                 self.notice = Some(StatusLine::error(format!("{done}: {err}")));
                 true
@@ -3739,6 +3785,29 @@ fn integration_words(what: &Integration) -> String {
     match what {
         Integration::Merge(target) => format!("merge {}", target.name()),
         Integration::Rebase(target) => format!("rebase onto {}", target.name()),
+        Integration::Interactive(plan) => format!("rebase to {}", plan_words(plan)),
+    }
+}
+
+/// What an interactive rebase is for, in words for the status bar:
+/// the steps it stops at (`edit 1a2b3c4d, reword 5e6f7a8b`), or how
+/// many it has.
+fn plan_words(plan: &RebasePlan) -> String {
+    let stops: Vec<String> = plan
+        .steps
+        .iter()
+        .filter(|step| step.action.stops())
+        .map(|step| format!("{} {}", step.action.word(), short_id(step.commit)))
+        .collect();
+    match stops.as_slice() {
+        [] => {
+            let count = plan.steps.len();
+            format!(
+                "replay {count} {}",
+                if count == 1 { "commit" } else { "commits" }
+            )
+        }
+        stops => stops.join(", "),
     }
 }
 
@@ -6748,6 +6817,46 @@ mod tests {
         view.reset_to_selected_commit();
         let notice = notice_of(&mut view).unwrap();
         assert!(notice.contains("a rebase is in progress"), "{notice}");
+    }
+
+    #[test]
+    fn editing_a_commit_of_heads_branch_asks_for_the_changes_page() {
+        let (dir, [base, main, side]) = diverged_repo(false);
+        let mut view = view(&dir);
+        wait(&mut view);
+        let select = |view: &mut GitLogView, id: Oid| {
+            let position = view.history.as_ref().unwrap().position(id).unwrap();
+            view.select_commit(position);
+        };
+        // Another branch's commit, and the first commit, can't be
+        // edited; HEAD's can.
+        select(&mut view, side);
+        assert!(!view.can_edit_commit());
+        select(&mut view, base);
+        assert!(!view.can_edit_commit());
+        select(&mut view, main);
+        assert!(view.can_edit_commit());
+
+        view.edit_selected_commit();
+        assert!(
+            view.hint()
+                .text()
+                .starts_with(&format!("rebasing to edit {}…", short_id(main))),
+            "{}",
+            view.hint()
+        );
+        wait(&mut view);
+        assert_eq!(
+            notice_of(&mut view),
+            Some(format!(
+                "Stopped to edit {} (1 of 1): change, stage, and commit it; the rebase goes on once nothing is left unstaged",
+                short_id(main)
+            ))
+        );
+        assert!(view.take_show_changes());
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(repo.state(), git2::RepositoryState::RebaseInteractive);
+        assert_eq!(repo.head().unwrap().target(), Some(base));
     }
 
     #[test]

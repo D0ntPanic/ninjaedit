@@ -119,6 +119,30 @@
 //! the branch and its files back as they were before it began; that
 //! loses whatever was resolved, so a box asks first.
 //!
+//! An interactive rebase (the git log's "Edit commit"; see the core
+//! crate's `git::interactive` module) stops here to edit a commit, with
+//! HEAD at what it is replayed onto and the commit's changes staged,
+//! the heading saying so (`Edit 1a2b3c4d on main: 1 of 3`) and the box
+//! starting with its message. Ctrl+S commits what is staged, keeping
+//! the commit's author, and the rebase goes on by itself once nothing
+//! is left unstaged: so the commit is reworded by changing the message,
+//! changed by staging more, and split by unstaging some of it, then
+//! committing what is left staged and the rest after. With nothing
+//! staged Ctrl+S commits nothing, never an empty commit, and goes on if
+//! nothing is unstaged either (the commit's changes all discarded,
+//! say), or says what is left to stage or discard. An untracked file
+//! holds it up only when the commit added it (unstaged from it, to
+//! split it off); others are left alone, as git leaves them. A step
+//! that conflicts stops as a plain rebase's does, and its resolution is
+//! committed the same way.
+//!
+//! On arriving at a merge or rebase's stop, and again after each commit
+//! made there, the keyboard goes where the next step is done: to the
+//! first file in conflict, if any; else, with everything staged, to the
+//! commit message; else to the first unstaged file. Staging and the
+//! like at the same stop, or coming back to the page, leave it where the
+//! user put it.
+//!
 //! Amending (the toggle beside the commit heading, `m` in a list, or
 //! the command palette's "Toggle amend") makes the commit replace the
 //! last one, as `git commit --amend` does: the staged list becomes
@@ -166,8 +190,8 @@ use crate::status::StatusLine;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
-    ChangeKind, Changes, ConflictSide, DiffLine, DiffModel, FileChange, FileDiff, FileTree,
-    InProgress, LinesChange, LinesTarget, TreeRow, short_id,
+    ChangeKind, Changes, ConflictSide, Continued, DiffLine, DiffModel, FileChange, FileDiff,
+    FileTree, InProgress, LinesChange, LinesTarget, Oid, RebaseAction, TreeRow, short_id,
 };
 use ninjaedit_core::{Editor, FileBuffer};
 use ratatui::buffer::Buffer;
@@ -506,6 +530,32 @@ impl FileList {
     fn select(&mut self, index: usize) {
         self.selected = index.min(self.rows.len().saturating_sub(1));
         self.reveal = true;
+    }
+
+    /// Select the first file, in the order the tree shows them, that
+    /// `wanted` accepts (by its index in the files the tree was built
+    /// from), unfolding the directories it is in. Returns whether there
+    /// was one.
+    fn select_first(&mut self, wanted: impl Fn(usize) -> bool) -> bool {
+        let found = self.tree.rows(&[]).into_iter().find_map(|row| match row {
+            TreeRow::File { file, parent, .. } if wanted(file) => Some((file, parent)),
+            _ => None,
+        });
+        let Some((file, mut dir)) = found else {
+            return false;
+        };
+        while let Some(at) = dir {
+            self.set_dir_collapsed(at, false);
+            dir = self.tree.dirs()[at].parent;
+        }
+        let row = self
+            .rows
+            .iter()
+            .position(|row| matches!(row, TreeRow::File { file: f, .. } if *f == file));
+        if let Some(row) = row {
+            self.select(row);
+        }
+        row.is_some()
     }
 
     /// Select the row of a directory of the tree.
@@ -965,6 +1015,10 @@ pub struct ChangesView {
     /// message, the amended commit's), which it may replace or clear
     /// again while the user hasn't changed it.
     auto_message: Option<String>,
+    /// The commit an interactive rebase stopped at that a commit has
+    /// been made at already, the first part of a split: the stopped
+    /// commit's message was for that one, and isn't offered again.
+    committed_at: Option<Oid>,
     /// Sizes set by dragging the rules between panes, or kept from
     /// last time, as shares of the space each divides.
     files_share: Option<f32>,
@@ -984,6 +1038,11 @@ pub struct ChangesView {
     /// The abort box, while it asks whether to give up the merge or
     /// rebase in progress.
     abort: Option<ConfirmBox>,
+    /// The stop of the merge or rebase in progress that the keyboard
+    /// was last put where it is next needed for (see
+    /// [`place_for_stop`](Self::place_for_stop)): HEAD's commit then,
+    /// and the rebase's step; `None` with neither in progress.
+    placed_for: Option<(Option<Oid>, usize)>,
     /// The page, its panes, and the rules between them from the last
     /// render.
     area: Rect,
@@ -1032,6 +1091,7 @@ impl ChangesView {
             content_pane: ContentPane::default(),
             message: message_editor(""),
             auto_message: None,
+            committed_at: None,
             files_share: None,
             unstaged_share: None,
             commit_share: None,
@@ -1040,6 +1100,7 @@ impl ChangesView {
             submodule_to_show: None,
             pending: None,
             abort: None,
+            placed_for: None,
             area: Rect::default(),
             unstaged_area: Rect::default(),
             staged_area: Rect::default(),
@@ -1069,7 +1130,53 @@ impl ChangesView {
             return false;
         }
         self.follow_lists();
+        self.place_for_stop();
         true
+    }
+
+    /// Put the keyboard where the next step of a merge or rebase in
+    /// progress is done, the first time a scan shows where it has
+    /// stopped: on arriving at the page with one stopped, and after
+    /// each commit made there (HEAD has moved, or the rebase has gone
+    /// on to another step). A file in conflict is the first thing to
+    /// do, so the first one is selected; with none, and everything
+    /// staged, the commit message is next; otherwise the first of the
+    /// unstaged files, to stage or discard. A scan of the same stop
+    /// (after staging a file, or coming back to the page) leaves the
+    /// keyboard where the user put it.
+    fn place_for_stop(&mut self) {
+        let Some(changes) = &self.changes else {
+            return;
+        };
+        let stop = (changes.is_merging() || changes.rebase().is_some()).then(|| {
+            (
+                changes.head_id(),
+                changes.rebase().map_or(0, |rebase| rebase.step),
+            )
+        });
+        if stop == self.placed_for {
+            return;
+        }
+        self.placed_for = stop;
+        if stop.is_none() {
+            return;
+        }
+        let conflicted: Vec<bool> = changes
+            .unstaged()
+            .iter()
+            .map(|change| change.kind == ChangeKind::Conflicted)
+            .collect();
+        let any_conflict = conflicted.contains(&true);
+        let selected = !conflicted.is_empty()
+            && self
+                .unstaged
+                .select_first(|file| !any_conflict || conflicted[file]);
+        if selected {
+            self.list = List::Unstaged;
+            self.pane = Pane::Unstaged;
+        } else {
+            self.pane = Pane::Commit;
+        }
     }
 
     /// The lists are new, from a scan or an action: rebuild the trees,
@@ -1082,9 +1189,15 @@ impl ChangesView {
         self.unstaged.rebuild(changes.unstaged());
         self.staged.rebuild(changes.staged());
         drop_content(&mut self.content, &mut self.stale);
-        // A rebase's commit keeps its message unless another is written.
+        // A rebase's commit keeps its message unless another is written,
+        // but a later commit at the same stop is another one.
         let rebase_message = changes
             .rebase()
+            .filter(|rebase| {
+                rebase
+                    .stop
+                    .is_none_or(|(_, at)| Some(at) != self.committed_at)
+            })
             .and_then(|rebase| rebase.message.as_deref());
         let merge_message = match changes.merge_message().or(rebase_message) {
             Some(message) if !changes.is_amending() => Some(message.to_owned()),
@@ -1729,8 +1842,11 @@ impl ChangesView {
     /// "Continue rebase", and Ctrl+S while a rebase is in progress:
     /// commit the commit it stopped at, its conflicts resolved and
     /// staged, with the message in the box, and replay the rest (see
-    /// the core crate's `git::rebase` module). The status bar says how
-    /// that went: finished, or stopped at conflicts again.
+    /// the core crate's `git::rebase` module). In an interactive rebase,
+    /// commit what is staged with the message, if anything is, and go
+    /// on once nothing is left unstaged (see the core crate's
+    /// `git::interactive` module). The status bar says how that went:
+    /// committed and waiting for the rest, finished, or stopped again.
     pub fn continue_rebase(&mut self) -> ChangesOutcome {
         let message = self.message_text();
         let Some(changes) = &mut self.changes else {
@@ -1743,10 +1859,27 @@ impl ChangesView {
         self.acted = true;
         drop_content(&mut self.content, &mut self.stale);
         match result {
-            Ok(outcome) => {
+            Ok(Continued { committed, outcome }) => {
                 self.message = message_editor("");
                 self.auto_message = None;
-                ChangesOutcome::Notice(StatusLine::info(status.summary(&outcome)))
+                let committed = committed.map(|id| {
+                    let summary = message.trim().lines().next().unwrap_or("");
+                    format!("Committed {} {summary}", short_id(id))
+                });
+                if committed.is_some() && outcome.is_none() {
+                    self.committed_at = status.stop.map(|(_, at)| at);
+                }
+                let text = match (committed, outcome) {
+                    (Some(committed), None) => format!(
+                        "{committed}; stage and commit, or discard, what is left unstaged to go on with the rebase"
+                    ),
+                    (Some(committed), Some(outcome)) => {
+                        format!("{committed}; {}", status.summary(&outcome))
+                    }
+                    (None, Some(outcome)) => status.summary(&outcome),
+                    (None, None) => String::new(),
+                };
+                ChangesOutcome::Notice(StatusLine::info(text))
             }
             Err(err) => ChangesOutcome::Notice(StatusLine::error(format!(
                 "Could not continue the rebase: {err}"
@@ -1763,8 +1896,13 @@ impl ChangesView {
         };
         let (title, body) = if let Some(rebase) = changes.rebase() {
             let branch = rebase.branch.as_deref().unwrap_or("HEAD");
+            let title = if rebase.interactive {
+                format!("Abort rebasing {branch}?")
+            } else {
+                format!("Abort rebasing {branch} onto {}?", rebase.onto)
+            };
             (
-                format!("Abort rebasing {branch} onto {}?", rebase.onto),
+                title,
                 format!(
                     "The commits replayed so far and any conflicts resolved are thrown away: {branch} and its files go back to how they were before the rebase. This can't be undone."
                 ),
@@ -2769,13 +2907,30 @@ impl ChangesView {
             return (String::new(), heading);
         };
         let rebasing = changes.rebase().map(|rebase| {
-            format!(
-                "Rebase {} onto {}: {} of {}",
-                rebase.branch.as_deref().unwrap_or("HEAD"),
-                rebase.onto,
-                rebase.step,
-                rebase.total
-            )
+            let branch = rebase.branch.as_deref().unwrap_or("HEAD");
+            match rebase.stop {
+                // What the step stopped at does, to which commit.
+                Some((action, commit)) => {
+                    let action = match action {
+                        RebaseAction::Pick => "Pick",
+                        RebaseAction::Edit => "Edit",
+                        RebaseAction::Reword => "Reword",
+                    };
+                    format!(
+                        "{action} {} on {branch}: {} of {}",
+                        short_id(commit),
+                        rebase.step,
+                        rebase.total
+                    )
+                }
+                None if rebase.interactive => {
+                    format!("Rebase {branch}: {} of {}", rebase.step, rebase.total)
+                }
+                None => format!(
+                    "Rebase {branch} onto {}: {} of {}",
+                    rebase.onto, rebase.step, rebase.total
+                ),
+            }
         });
         let conflicts = changes.conflict_count();
         if conflicts > 0 {
@@ -4088,6 +4243,220 @@ mod tests {
             right.iter().any(|r| r.starts_with(" Commit to ")),
             "{right:#?}"
         );
+    }
+
+    #[test]
+    fn a_conflict_is_selected_on_arriving_and_left_alone_at_the_same_stop() {
+        let (dir, main, _) = rebase_stopped_at_a_conflict();
+        // An untracked file listed before the one in conflict.
+        fs::write(dir.path().join("a_notes.txt"), "notes\n").unwrap();
+        let mut view = view(&dir);
+        assert_eq!(unstaged_paths(&view), ["a_notes.txt", "f.txt"]);
+        assert_eq!(view.pane, Pane::Unstaged);
+        assert_eq!(view.selected_change().unwrap().1.path, "f.txt");
+        // Resolving it is the same stop: the keyboard stays put.
+        fs::write(dir.path().join("f.txt"), "one\nboth\nthree\n").unwrap();
+        press(&mut view, KeyCode::Char(' '));
+        settle(&mut view);
+        press(&mut view, KeyCode::Up);
+        assert_eq!(view.selected_change().unwrap().1.path, "a_notes.txt");
+        view.refresh();
+        settle(&mut view);
+        assert_eq!(view.selected_change().unwrap().1.path, "a_notes.txt");
+        // Going on finishes the rebase; nothing more to place.
+        let outcome = ctrl(&mut view, 's');
+        assert!(
+            matches!(&outcome, ChangesOutcome::Notice(m)
+                if m.text() == format!("Rebased {main} onto side: 2 commits")),
+            "{outcome:?}"
+        );
+        settle(&mut view);
+        assert_eq!(view.placed_for, None);
+    }
+
+    /// A repository whose main branch has `Base`, then `Two` changing
+    /// `a.txt` and adding `dir/b.txt`, then `Three` adding `c.txt`, with
+    /// an interactive rebase stopped to edit Two. Returns the
+    /// repository's directory, main's branch, and Two.
+    fn editing_a_commit() -> (tempfile::TempDir, String, git2::Oid) {
+        use ninjaedit_core::git::{Integration, RebasePlan};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        configure_user(&repo);
+        commit_files(&repo, &[("a.txt", "a\n")], "Base");
+        let main = repo.head().unwrap().shorthand().unwrap().to_owned();
+        let two = commit_files(&repo, &[("a.txt", "a2\n"), ("dir/b.txt", "b\n")], "Two");
+        commit_files(&repo, &[("c.txt", "c\n")], "Three");
+        let edit = Integration::Interactive(RebasePlan::edit(&repo, two).unwrap());
+        edit.run_with(&repo, &mut |_, _| {}).unwrap();
+        assert_eq!(repo.state(), git2::RepositoryState::RebaseInteractive);
+        (dir, main, two)
+    }
+
+    #[test]
+    fn an_edited_commit_is_split_with_the_keyboard_where_it_is_next_needed() {
+        let (dir, main, two) = editing_a_commit();
+        let repo = Repository::open(dir.path()).unwrap();
+        let mut view = view(&dir);
+        assert!(view.is_rebasing());
+        // Everything is staged: the message is next, Two's to start.
+        assert_eq!(view.pane, Pane::Commit);
+        assert_eq!(view.message_text(), "Two");
+        let screen = draw(&mut view, 100, 30);
+        let right = right_column(&screen, view.files_rule.x as usize);
+        let heading = format!(" Edit {} on {main}: 1 of 2", short_id(two));
+        assert!(right.iter().any(|r| r.starts_with(&heading)), "{right:#?}");
+
+        // Split dir/b.txt off into a commit of its own, its directory
+        // folded to show it is unfolded to select it.
+        view.unstaged.folded.insert("dir".to_owned());
+        view.changes
+            .as_mut()
+            .unwrap()
+            .unstage(["dir/b.txt"])
+            .unwrap();
+        settle(&mut view);
+        view.message = message_editor("Two: a");
+        let outcome = ctrl(&mut view, 's');
+        let ChangesOutcome::Notice(notice) = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(
+            notice.text().ends_with(
+                " Two: a; stage and commit, or discard, what is left unstaged to go on with the rebase"
+            ),
+            "{outcome:?}"
+        );
+        settle(&mut view);
+        assert!(view.is_rebasing());
+        assert_eq!(view.pane, Pane::Unstaged);
+        assert_eq!(view.selected_change().unwrap().1.path, "dir/b.txt");
+        // Two's message was for the first commit only, even when the
+        // page scans again.
+        assert_eq!(view.message_text(), "");
+        view.refresh();
+        settle(&mut view);
+        assert_eq!(view.message_text(), "");
+
+        // Nothing staged: nothing to go on with yet.
+        let outcome = ctrl(&mut view, 's');
+        assert!(
+            matches!(&outcome, ChangesOutcome::Notice(m)
+                if m.text() == "Could not continue the rebase: untracked files are left unstaged; stage and commit them, or discard them, to go on"),
+            "{outcome:?}"
+        );
+        press(&mut view, KeyCode::Char(' '));
+        settle(&mut view);
+        view.message = message_editor("Two: b");
+        let outcome = ctrl(&mut view, 's');
+        let ChangesOutcome::Notice(notice) = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(
+            notice
+                .text()
+                .ends_with(&format!(" Two: b; Rebased {main}: 2 commits")),
+            "{outcome:?}"
+        );
+        settle(&mut view);
+        assert!(!view.is_rebasing());
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        let head = repo.head().unwrap();
+        assert_eq!(head.shorthand().unwrap(), main);
+        let messages: Vec<String> = {
+            let mut walk = repo.revwalk().unwrap();
+            walk.push_head().unwrap();
+            walk.map(|id| {
+                let commit = repo.find_commit(id.unwrap()).unwrap();
+                commit.message().unwrap().to_owned()
+            })
+            .collect()
+        };
+        assert_eq!(messages, ["Three", "Two: b", "Two: a", "Base"]);
+    }
+
+    #[test]
+    fn a_stop_git_made_to_edit_opens_with_the_commits_changes_staged() {
+        let (dir, main, two) = editing_a_commit();
+        // As git's command line stops: the commit made, HEAD on it,
+        // nothing staged, and `amend` naming it.
+        let repo = Repository::open(dir.path()).unwrap();
+        repo.set_head_detached(two).unwrap();
+        fs::write(
+            repo.path().join("rebase-merge").join("amend"),
+            format!("{two}\n"),
+        )
+        .unwrap();
+        let mut view = view(&dir);
+        assert!(view.is_rebasing());
+        assert_eq!(view.pane, Pane::Commit);
+        assert_eq!(view.message_text(), "Two");
+        let staged: Vec<&str> = view
+            .changes
+            .as_ref()
+            .unwrap()
+            .staged()
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+        assert_eq!(staged, ["a.txt", "dir/b.txt"]);
+        view.message = message_editor("Two, reworded");
+        let outcome = ctrl(&mut view, 's');
+        let ChangesOutcome::Notice(notice) = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(
+            notice
+                .text()
+                .ends_with(&format!(" Two, reworded; Rebased {main}: 2 commits")),
+            "{outcome:?}"
+        );
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.parent(0).unwrap().message().unwrap(), "Two, reworded");
+    }
+
+    #[test]
+    fn an_edited_commit_left_with_nothing_goes_on_without_a_commit() {
+        let (dir, main, two) = editing_a_commit();
+        let mut view = view(&dir);
+        let mut changes = Changes::open(dir.path()).unwrap();
+        changes.wait(Duration::from_secs(10));
+        changes.unstage(["a.txt", "dir/b.txt"]).unwrap();
+        changes.discard(["a.txt", "dir/b.txt"]).unwrap();
+        view.refresh();
+        settle(&mut view);
+        let outcome = ctrl(&mut view, 's');
+        assert!(
+            matches!(&outcome, ChangesOutcome::Notice(m)
+                if m.text() == format!("Rebased {main}: 1 commit")),
+            "{outcome:?}"
+        );
+        let repo = Repository::open(dir.path()).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.message().unwrap(), "Three");
+        assert_ne!(head.parent_id(0).unwrap(), two);
+        assert_eq!(head.parent(0).unwrap().message().unwrap(), "Base");
+    }
+
+    #[test]
+    fn an_interactive_rebase_is_aborted_once_the_box_says_yes() {
+        let (dir, main, _) = editing_a_commit();
+        let mut view = view(&dir);
+        view.abort();
+        let title = format!("Abort rebasing {main}?");
+        assert_eq!(view.abort_box().unwrap().title(), title);
+        let outcome = press(&mut view, KeyCode::Char('y'));
+        assert_eq!(
+            outcome,
+            ChangesOutcome::Notice(StatusLine::info("Rebase aborted"))
+        );
+        settle(&mut view);
+        assert!(!view.is_rebasing());
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(repo.state(), git2::RepositoryState::Clean);
+        let head = repo.head().unwrap();
+        assert_eq!(head.shorthand().unwrap(), main);
+        assert_eq!(head.peel_to_commit().unwrap().message().unwrap(), "Three");
     }
 
     #[test]

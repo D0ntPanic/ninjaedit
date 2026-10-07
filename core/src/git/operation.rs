@@ -1,8 +1,11 @@
 //! Merging and rebasing: bringing another branch's commits into the one
 //! HEAD is on, as `git merge` and `git rebase` do, either of which may
-//! stop part way at conflicts for the user to resolve. The work itself
-//! is in the [`merge`](super::merge) and [`rebase`](super::rebase)
-//! modules; this one has what they share: what to merge or rebase onto
+//! stop part way at conflicts for the user to resolve; and rebasing
+//! interactively, as `git rebase -i` does, rewriting HEAD's own
+//! commits by a plan, which may stop for the user too. The work itself
+//! is in the [`merge`](super::merge), [`rebase`](super::rebase), and
+//! [`interactive`] modules; this one has what they
+//! share: what to merge or rebase onto
 //! (a [`Target`]), how it went (an [`Outcome`]), why it couldn't be
 //! done (an [`OperationError`]), and the job that runs one in the
 //! background ([`IntegrationJob`]), since on a large repository either
@@ -42,6 +45,7 @@ use super::checkout::{
     CheckoutError, check_submodules, ensure_clean, follow_index, update_submodules,
 };
 use super::history::short_id;
+use super::interactive::{self, RebaseAction, RebasePlan};
 use super::submodule_conflicts::{SubmoduleConflict, resolve_submodule_conflicts};
 use git2::build::CheckoutBuilder;
 use git2::{AnnotatedCommit, BranchType, Index, Oid, Repository, RepositoryState};
@@ -100,11 +104,13 @@ pub enum InProgress {
     /// resolved.
     Merge,
     /// A rebase stopped at conflicts, to be continued once they are
-    /// resolved.
+    /// resolved; or an interactive one stopped there, or for the user
+    /// to edit a commit.
     Rebase,
     /// Something begun with git's command line that the editor doesn't
     /// carry on with: a cherry-pick, a revert, a bisect, an interactive
-    /// or `git am` style rebase. Named as git names it.
+    /// rebase with steps the editor doesn't know, or a `git am` style
+    /// rebase. Named as git names it.
     Other(&'static str),
 }
 
@@ -114,6 +120,9 @@ pub fn in_progress(repo: &Repository) -> Option<InProgress> {
         RepositoryState::Clean => None,
         RepositoryState::Merge => Some(InProgress::Merge),
         RepositoryState::RebaseMerge => Some(InProgress::Rebase),
+        RepositoryState::RebaseInteractive if interactive::is_supported(repo) => {
+            Some(InProgress::Rebase)
+        }
         RepositoryState::RebaseInteractive => Some(InProgress::Other("interactive rebase")),
         RepositoryState::Rebase | RepositoryState::ApplyMailboxOrRebase => {
             Some(InProgress::Other("rebase"))
@@ -144,6 +153,12 @@ pub enum OperationError {
     Unresolved {
         files: usize,
         submodules: Vec<SubmoduleConflict>,
+    },
+    /// An interactive rebase's stop has nothing staged to commit, but
+    /// changes left unstaged (only untracked files, if
+    /// `untracked_only`): stage and commit them, or discard them, first.
+    Unstaged {
+        untracked_only: bool,
     },
     /// The working tree, or a submodule, isn't fit to start: it has
     /// changes that could be lost, or a submodule lacks a commit.
@@ -196,6 +211,17 @@ impl fmt::Display for OperationError {
                 }
                 Ok(())
             }
+            OperationError::Unstaged { untracked_only } => {
+                let what = if *untracked_only {
+                    "untracked files are"
+                } else {
+                    "changes are"
+                };
+                write!(
+                    f,
+                    "{what} left unstaged; stage and commit them, or discard them, to go on"
+                )
+            }
             OperationError::Checkout(err) => err.fmt(f),
             OperationError::SubmodulesBehind(err) => {
                 write!(f, "done, but the submodules couldn't follow: {err}")
@@ -227,6 +253,14 @@ pub enum Outcome {
         submodules: usize,
         resolved: usize,
     },
+    /// An interactive rebase stopped at a step that edits or rewords
+    /// `commit` (counting from 1, of how many), as `action` says, with
+    /// its changes staged for the user to change and commit.
+    Editing {
+        step: (usize, usize),
+        commit: Oid,
+        action: RebaseAction,
+    },
     /// HEAD's commits were replayed on the target: `commits` of them,
     /// of which `skipped` were dropped as already there, with
     /// `resolved` submodule conflicts resolved on the way.
@@ -255,6 +289,8 @@ pub enum Integration {
     Merge(Target),
     /// Rebase HEAD's branch onto the target.
     Rebase(Target),
+    /// Rewrite HEAD's own commits as the plan says.
+    Interactive(RebasePlan),
 }
 
 impl Integration {
@@ -268,6 +304,7 @@ impl Integration {
         match self {
             Integration::Merge(target) => super::merge::merge(repo, target, progress),
             Integration::Rebase(target) => super::rebase::rebase(repo, target, progress),
+            Integration::Interactive(plan) => interactive::start(repo, plan, progress),
         }
     }
 
@@ -277,6 +314,7 @@ impl Integration {
         let head = head.unwrap_or("HEAD");
         let target = match self {
             Integration::Merge(target) | Integration::Rebase(target) => target.name(),
+            Integration::Interactive(_) => return interactive::summary(head, outcome),
         };
         let what = match outcome {
             Outcome::UpToDate => return format!("{head} is already up to date with {target}"),
@@ -296,6 +334,7 @@ impl Integration {
                 rebased_summary(head, &target, *commits, *skipped),
                 *resolved,
             ),
+            Outcome::Editing { .. } => return interactive::summary(head, outcome),
             Outcome::Conflicts {
                 files,
                 step,
@@ -308,7 +347,8 @@ impl Integration {
                 };
                 let (doing, then) = match self {
                     Integration::Merge(_) => (format!("Merging {target} into {head}"), "commit"),
-                    Integration::Rebase(_) => {
+                    // An interactive rebase is summarized above.
+                    Integration::Rebase(_) | Integration::Interactive(_) => {
                         (format!("Rebasing {head} onto {target}"), "continue")
                     }
                 };
@@ -335,7 +375,7 @@ impl Outcome {
             Outcome::FastForwarded { submodules }
             | Outcome::Merged { submodules, .. }
             | Outcome::Rebased { submodules, .. } => *submodules,
-            Outcome::UpToDate | Outcome::Conflicts { .. } => 0,
+            Outcome::UpToDate | Outcome::Editing { .. } | Outcome::Conflicts { .. } => 0,
         }
     }
 }
@@ -351,7 +391,7 @@ pub(super) fn rebased_summary(head: &str, onto: &str, commits: usize, skipped: u
 }
 
 /// A summary with how many submodule conflicts were resolved, if any.
-fn with_resolved(what: String, resolved: usize) -> String {
+pub(super) fn with_resolved(what: String, resolved: usize) -> String {
     match resolved {
         0 => what,
         1 => format!("{what}; 1 submodule conflict resolved"),
@@ -507,6 +547,7 @@ impl IntegrationJob {
         let name = match what {
             Integration::Merge(_) => "git-merge",
             Integration::Rebase(_) => "git-rebase",
+            Integration::Interactive(_) => "git-rebase-interactive",
         };
         thread::Builder::new()
             .name(name.to_owned())

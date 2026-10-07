@@ -31,10 +31,13 @@
 //! finished here once they are resolved and staged: a merge by
 //! [`commit`](Changes::commit), a rebase by
 //! [`continue_rebase`](Changes::continue_rebase), which commits the
-//! commit it stopped at and replays the rest. [`rebase`](Changes::rebase)
-//! says what a rebase in progress is doing. Either is given up with
-//! [`abort`](Changes::abort), which puts things back as they were
-//! before it started.
+//! commit it stopped at and replays the rest. An interactive rebase
+//! (see the [`interactive`] module) is carried on
+//! by [`continue_rebase`](Changes::continue_rebase) too, which there
+//! commits what is staged at the stop and goes on once nothing is left
+//! unstaged. [`rebase`](Changes::rebase) says what a rebase in progress
+//! is doing. Any of them is given up with [`abort`](Changes::abort),
+//! which puts things back as they were before it started.
 //!
 //! A conflict can also be settled wholesale by
 //! [`resolve`](Changes::resolve), which takes one side's version of the
@@ -82,7 +85,8 @@ use super::diff::{
     self, CONTEXT_LINES, ChangeKind, Contents, FileChange, FileDiff, LinesChange, LinesTarget,
     STATS_LIMIT, Unshown,
 };
-use super::operation::{InProgress, OperationError, Outcome};
+use super::interactive::{self, Continued};
+use super::operation::{InProgress, OperationError};
 use super::rebase::{RebaseStatus, rebase_status};
 use super::submodule_conflicts::resolve_submodule_conflicts;
 use super::submodules::{Submodule, changed_submodules, submodule_range, uncommitted_changes};
@@ -128,6 +132,7 @@ struct Snapshot {
     merging: bool,
     merge_message: Option<String>,
     rebase: Option<RebaseStatus>,
+    head_id: Option<Oid>,
     head_message: Option<String>,
     conflicts: usize,
 }
@@ -151,6 +156,7 @@ pub struct Changes {
     merging: bool,
     merge_message: Option<String>,
     rebase: Option<RebaseStatus>,
+    head_id: Option<Oid>,
     head_message: Option<String>,
     conflicts: usize,
     /// Whether the commit will replace HEAD.
@@ -195,6 +201,7 @@ impl Changes {
             merging: false,
             merge_message: None,
             rebase: None,
+            head_id: None,
             head_message: None,
             conflicts: 0,
             amend: false,
@@ -216,6 +223,11 @@ impl Changes {
     /// Scan the working tree again. A scan already running is
     /// superseded: its result is dropped when it arrives.
     pub fn refresh(&mut self) {
+        // A stop git's command line made to edit a commit is made the
+        // editor's kind first, so that the scan finds the commit's
+        // changes staged. One that can't be is shown as git left it,
+        // and continuing tries again, saying why if it fails.
+        let _ = interactive::adopt_stop(&self.repo);
         self.scan(false);
     }
 
@@ -302,6 +314,7 @@ impl Changes {
                 self.merging = snapshot.merging;
                 self.merge_message = snapshot.merge_message;
                 self.rebase = snapshot.rebase;
+                self.head_id = snapshot.head_id;
                 self.head_message = snapshot.head_message;
                 self.conflicts = snapshot.conflicts;
                 self.error = None;
@@ -382,7 +395,10 @@ impl Changes {
                     "a merge in progress can't amend: commit it first",
                 ));
             }
-            if self.repo.state() == RepositoryState::RebaseMerge {
+            if matches!(
+                self.repo.state(),
+                RepositoryState::RebaseMerge | RepositoryState::RebaseInteractive
+            ) {
                 return Err(git2::Error::from_str(
                     "a rebase in progress can't amend: continue it first",
                 ));
@@ -391,6 +407,11 @@ impl Changes {
         self.amend = amend;
         self.refresh();
         Ok(())
+    }
+
+    /// The commit HEAD is at, if any.
+    pub fn head_id(&self) -> Option<Oid> {
+        self.head_id
     }
 
     /// HEAD's message, as the amended commit starts from it.
@@ -433,7 +454,8 @@ impl Changes {
 
     /// What the rebase in progress is doing, if one is: its commit
     /// that stopped at conflicts is committed and the rest replayed by
-    /// [`continue_rebase`](Self::continue_rebase), not by a commit.
+    /// [`continue_rebase`](Self::continue_rebase), not by a commit; as
+    /// is what is staged at an interactive rebase's stop.
     pub fn rebase(&self) -> Option<&RebaseStatus> {
         self.rebase.as_ref()
     }
@@ -447,6 +469,17 @@ impl Changes {
     /// Whether nothing is changed anywhere: the tree is clean.
     pub fn is_clean(&self) -> bool {
         self.unstaged.is_empty() && self.staged.is_empty()
+    }
+
+    /// The repository's index as it is on disk now. libgit2 keeps the
+    /// one it last read, which something else may have written since
+    /// (a merge or rebase run in the background, a `git` command in a
+    /// shell), and an action on that one would write it back over what
+    /// is there.
+    fn index(&self) -> Result<Index, git2::Error> {
+        let mut index = self.repo.index()?;
+        index.read(false)?;
+        Ok(index)
     }
 
     // ----- Diffs -----------------------------------------------------------
@@ -541,7 +574,7 @@ impl Changes {
     /// two sides, from ours to theirs, which the submodule's own
     /// repository has.
     fn conflict_diff(&self, change: &FileChange) -> Result<FileDiff, git2::Error> {
-        let index = self.repo.index()?;
+        let index = self.index()?;
         let conflict = index.conflicts()?.filter_map(Result::ok).find(|conflict| {
             [&conflict.our, &conflict.their, &conflict.ancestor]
                 .into_iter()
@@ -600,7 +633,7 @@ impl Changes {
         paths: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), git2::Error> {
         let paths: Vec<&str> = paths.into_iter().collect();
-        let mut index = self.repo.index()?;
+        let mut index = self.index()?;
         for &path in &paths {
             if fs::symlink_metadata(self.workdir.join(path)).is_ok() {
                 index.add_path(Path::new(path))?;
@@ -629,6 +662,8 @@ impl Changes {
     ) -> Result<(), git2::Error> {
         let paths: Vec<&str> = paths.into_iter().collect();
         {
+            // Which libgit2 changes as it last read it.
+            self.index()?;
             let base = self.base_commit().map(|commit| commit.into_object());
             self.repo.reset_default(base.as_ref(), &paths)?;
         }
@@ -772,8 +807,7 @@ impl Changes {
             LinesTarget::Index => {
                 // As the index is on disk now, which the diff may be older
                 // than.
-                let mut index = self.repo.index()?;
-                index.read(false)?;
+                let mut index = self.index()?;
                 let entry = index.get_path(Path::new(path), 0);
                 let now = match &entry {
                     Some(entry) => self.repo.find_blob(entry.id)?.content().to_vec(),
@@ -905,8 +939,7 @@ impl Changes {
     /// that the index and the working directory agree.
     fn take_side(&self, paths: &[&str], side: ConflictSide) -> Result<(), git2::Error> {
         let gitlink = u32::from(FileMode::Commit);
-        let mut index = self.repo.index()?;
-        index.read(false)?;
+        let mut index = self.index()?;
         let mut write = Vec::new();
         let mut remove = Vec::new();
         let mut failure = None;
@@ -963,7 +996,10 @@ impl Changes {
         if message.is_empty() {
             return Err(git2::Error::from_str("a commit needs a message"));
         }
-        if self.repo.state() == RepositoryState::RebaseMerge {
+        if matches!(
+            self.repo.state(),
+            RepositoryState::RebaseMerge | RepositoryState::RebaseInteractive
+        ) {
             return Err(git2::Error::from_str(
                 "a rebase is in progress: continue it rather than commit",
             ));
@@ -977,7 +1013,7 @@ impl Changes {
             })?;
         }
         let id = {
-            let mut index = self.repo.index()?;
+            let mut index = self.index()?;
             if index.has_conflicts() && merging {
                 // A submodule conflict that has become resolvable since
                 // the merge stopped (its own branch rebased since, as the
@@ -1051,23 +1087,43 @@ impl Changes {
     /// commit it stopped at are resolved and staged: commit that commit
     /// with `message` (its own when empty), keeping its author, and
     /// replay the rest, which may stop at conflicts again (see the
-    /// [`rebase`](super::rebase) module). The lists scan again after.
-    pub fn continue_rebase(&mut self, message: &str) -> Result<Outcome, OperationError> {
-        let outcome = super::rebase::continue_rebase(&self.repo, Some(message));
+    /// [`rebase`](super::rebase) module). An interactive rebase commits
+    /// what is staged instead, if anything, as the stopped commit's
+    /// author, and goes on only once nothing is left unstaged (see
+    /// [`interactive::proceed`]). The lists scan again after.
+    pub fn continue_rebase(&mut self, message: &str) -> Result<Continued, OperationError> {
+        let continued = self.go_on(message);
         self.refresh();
-        outcome
+        continued
+    }
+
+    /// The work of [`continue_rebase`](Self::continue_rebase).
+    fn go_on(&self, message: &str) -> Result<Continued, OperationError> {
+        self.index()?;
+        if self.repo.state() == RepositoryState::RebaseInteractive {
+            return interactive::proceed(&self.repo, message);
+        }
+        let outcome = super::rebase::continue_rebase(&self.repo, Some(message))?;
+        Ok(Continued {
+            committed: None,
+            outcome: Some(outcome),
+        })
     }
 
     /// Give up the merge or rebase in progress, putting the branch, the
     /// index, and the working tree back as they were before it began.
     /// Returns which it was. The lists scan again after.
     pub fn abort(&mut self) -> Result<InProgress, OperationError> {
+        self.index()?;
         let aborted = match self.repo.state() {
             RepositoryState::Merge => {
                 super::merge::abort_merge(&self.repo).map(|()| InProgress::Merge)
             }
             RepositoryState::RebaseMerge => {
                 super::rebase::abort_rebase(&self.repo).map(|()| InProgress::Rebase)
+            }
+            RepositoryState::RebaseInteractive => {
+                interactive::abort(&self.repo).map(|()| InProgress::Rebase)
             }
             _ => Err(OperationError::NothingInProgress),
         };
@@ -1194,6 +1250,7 @@ fn snapshot(workdir: &Path, amend: bool) -> Result<Snapshot, git2::Error> {
         Err(err) => return Err(err),
     };
     let head_commit = head.and_then(|head| head.peel_to_commit().ok());
+    let head_id = head_commit.as_ref().map(git2::Commit::id);
     let head_message = head_commit.as_ref().and_then(|commit| {
         commit
             .message()
@@ -1236,6 +1293,7 @@ fn snapshot(workdir: &Path, amend: bool) -> Result<Snapshot, git2::Error> {
         merging,
         merge_message,
         rebase,
+        head_id,
         head_message,
         conflicts,
     })
@@ -1284,7 +1342,7 @@ fn list_changes(
 mod tests {
     use super::super::history::tests::TestRepo;
     use super::*;
-    use crate::git::{DiffLine, DiffRow, LineKind};
+    use crate::git::{DiffLine, DiffRow, Integration, LineKind, Outcome, RebasePlan};
 
     fn open(repo: &TestRepo) -> Changes {
         let mut changes = Changes::open(repo.path()).unwrap();
@@ -1671,14 +1729,102 @@ mod tests {
         fs::write(repo.path().join("f.txt"), "main and side\n").unwrap();
         changes.stage(["f.txt"]).unwrap();
         settle(&mut changes);
-        let outcome = changes.continue_rebase("Main, on side").unwrap();
-        assert!(matches!(outcome, Outcome::Rebased { commits: 1, .. }));
+        let continued = changes.continue_rebase("Main, on side").unwrap();
+        assert_eq!(continued.committed, None);
+        assert!(matches!(
+            continued.outcome,
+            Some(Outcome::Rebased { commits: 1, .. })
+        ));
         settle(&mut changes);
         assert!(changes.rebase().is_none());
         assert!(changes.is_clean());
         assert_eq!(changes.head_message(), Some("Main, on side"));
         let head = repo.repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.parent_ids().collect::<Vec<_>>(), [side]);
+        assert_eq!(repo.repo.head().unwrap().shorthand().unwrap(), "master");
+    }
+
+    #[test]
+    fn staging_keeps_what_something_else_staged_since() {
+        let mut repo = TestRepo::new();
+        repo.commit(&[("a.txt", "a\n"), ("b.txt", "b\n")], "Base", &[]);
+        let mut changes = open(&repo);
+        // Read the index once, as an action does.
+        changes.unstage(["a.txt"]).unwrap();
+        // Something else (a `git add` in a shell) stages b.txt.
+        fs::write(repo.path().join("a.txt"), "a2\n").unwrap();
+        fs::write(repo.path().join("b.txt"), "b2\n").unwrap();
+        let other = Repository::open(repo.path()).unwrap();
+        let mut index = other.index().unwrap();
+        index.add_path(Path::new("b.txt")).unwrap();
+        index.write().unwrap();
+        // Staging a.txt here mustn't write the index back as it was.
+        changes.stage(["a.txt"]).unwrap();
+        settle(&mut changes);
+        assert_eq!(
+            listed(changes.staged()),
+            [('M', "a.txt", 1, 1), ('M', "b.txt", 1, 1)]
+        );
+    }
+
+    #[test]
+    fn an_interactive_rebases_stop_is_committed_and_continued_or_aborted() {
+        let mut repo = TestRepo::new();
+        configure_user(&repo);
+        let base = repo.commit(&[("a.txt", "a\n")], "Base", &[]);
+        let two = repo.commit(&[("a.txt", "a2\n"), ("b.txt", "b\n")], "Two", &[base]);
+        let three = repo.commit(&[("c.txt", "c\n")], "Three", &[two]);
+        let edit = Integration::Interactive(RebasePlan::edit(&repo.repo, two).unwrap());
+        edit.run_with(&repo.repo, &mut |_, _| {}).unwrap();
+        let mut changes = open(&repo);
+        // Two's changes, staged on its parent.
+        assert_eq!(changes.head_id(), Some(base));
+        assert_eq!(
+            listed(changes.staged()),
+            [('M', "a.txt", 1, 1), ('A', "b.txt", 1, 0)]
+        );
+        assert!(changes.unstaged().is_empty());
+        let status = changes.rebase().unwrap();
+        assert!(status.interactive);
+        assert_eq!((status.step, status.total), (1, 2));
+        assert_eq!(status.message.as_deref(), Some("Two"));
+        assert!(changes.set_amend(true).is_err(), "no amending mid-rebase");
+        assert!(changes.commit("Two").is_err(), "a rebase continues");
+
+        // Split off b.txt: committing the rest waits for it.
+        changes.unstage(["b.txt"]).unwrap();
+        settle(&mut changes);
+        let continued = changes.continue_rebase("Two: a").unwrap();
+        assert_eq!(continued.outcome, None);
+        settle(&mut changes);
+        assert_eq!(changes.head_id(), continued.committed);
+        assert_eq!(listed(changes.unstaged()), [('?', "b.txt", 1, 0)]);
+        assert_eq!(changes.rebase().unwrap().message.as_deref(), Some("Two"));
+
+        // Abort: back where the branch was.
+        assert_eq!(changes.abort().unwrap(), InProgress::Rebase);
+        settle(&mut changes);
+        assert!(changes.rebase().is_none());
+        assert!(changes.is_clean());
+        assert_eq!(changes.head_id(), Some(three));
+
+        // Again, with b.txt committed too this time.
+        edit.run_with(&repo.repo, &mut |_, _| {}).unwrap();
+        changes.refresh();
+        settle(&mut changes);
+        changes.unstage(["b.txt"]).unwrap();
+        changes.continue_rebase("Two: a").unwrap();
+        settle(&mut changes);
+        changes.stage(["b.txt"]).unwrap();
+        let continued = changes.continue_rebase("Two: b").unwrap();
+        assert!(matches!(
+            continued.outcome,
+            Some(Outcome::Rebased { commits: 2, .. })
+        ));
+        settle(&mut changes);
+        assert!(changes.rebase().is_none());
+        assert!(changes.is_clean());
+        assert_eq!(changes.head_message(), Some("Three"));
         assert_eq!(repo.repo.head().unwrap().shorthand().unwrap(), "master");
     }
 
