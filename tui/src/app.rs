@@ -186,7 +186,10 @@
 //!
 //! Agent mode (Ctrl+I) runs the coding agent the settings name (`claude`
 //! unless they say otherwise) in the project's directory, in a terminal
-//! standing in for the editor as the other modes do. Ctrl+I there goes
+//! standing in for the editor as the other modes do. With auto update
+//! on, the same terminal runs the update command first, and the agent on
+//! a fresh screen once it ends, whether or not it worked, so the agent
+//! starts up to date rather than asking to be restarted. Ctrl+I there goes
 //! back to where the user was before: the mode, and the view the
 //! keyboard was in. So does the agent exiting, since an agent leaves
 //! nothing worth reading on its screen when it goes. Going back doesn't
@@ -710,6 +713,9 @@ pub struct App {
     /// The coding agent (Ctrl+I) while it runs, whether agent mode is
     /// showing it or it is working in the background.
     agent: Option<Tool>,
+    /// The agent's own command while its terminal runs the update that
+    /// comes first, to start when the update ends.
+    agent_after_update: Option<ninjaedit_core::terminal::Command>,
     /// The tool pane's own tab bar, one tab per tool.
     tool_tab_bar: TabBar,
     /// Which view the keyboard drives.
@@ -819,6 +825,7 @@ impl App {
             editor_area: Rect::default(),
             tool_pane: ToolPane::default(),
             agent: None,
+            agent_after_update: None,
             tool_tab_bar: TabBar::default(),
             focus: Focus::Editor,
             events,
@@ -2164,16 +2171,20 @@ impl App {
     }
 
     /// Start the coding agent with the command the settings name, unless
-    /// it is running already. Returns whether it is running; a failure
-    /// to start is reported in the status bar.
+    /// it is running already. With auto update on, its terminal runs the
+    /// update command first, and the agent once that ends. Returns
+    /// whether it is running; a failure to start is reported in the
+    /// status bar.
     fn start_agent(&mut self) -> bool {
         if self.agent.is_some() {
             return true;
         }
-        let Some(command) = ToolKind::Agent.command(self.project.root(), &self.settings) else {
+        let root = self.project.root();
+        let Some(command) = ToolKind::Agent.command(root, &self.settings) else {
             self.status = Some(StatusLine::error("No coding agent command is set"));
             return false;
         };
+        let update = ToolKind::Agent.update_command(root, &self.settings);
         // Sized to the editor's area, where it will show, until the
         // render fits it exactly.
         let (cols, rows) = if self.editor_area.width > 0 && self.editor_area.height > 0 {
@@ -2183,8 +2194,36 @@ impl App {
         };
         let scrollback = self.settings.terminal_scrollback();
         let mut agent = Tool::of_kind(ToolKind::Agent, cols, rows, scrollback);
+        if let Some(update) = update {
+            let events = self.events.clone();
+            match agent.start(|cols, rows| spawn_session(&update, cols, rows, events)) {
+                Ok(()) => {
+                    self.agent = Some(agent);
+                    self.agent_after_update = Some(command);
+                    return true;
+                }
+                // Not being able to update is no reason not to start.
+                Err(err) => {
+                    self.status = Some(StatusLine::error(format!(
+                        "Could not update the coding agent ({}): {err}",
+                        update.display()
+                    )));
+                }
+            }
+        }
+        self.launch_agent(agent, &command)
+    }
+
+    /// Start the coding agent's own command in its terminal, which may
+    /// have just run its update. Returns whether it is running; a
+    /// failure to start is reported in the status bar.
+    fn launch_agent(
+        &mut self,
+        mut agent: Tool,
+        command: &ninjaedit_core::terminal::Command,
+    ) -> bool {
         let events = self.events.clone();
-        match agent.start(|cols, rows| spawn_session(&command, cols, rows, events)) {
+        match agent.start(|cols, rows| spawn_session(command, cols, rows, events)) {
             Ok(()) => {
                 self.agent = Some(agent);
                 true
@@ -2196,6 +2235,26 @@ impl App {
                 )));
                 false
             }
+        }
+    }
+
+    /// The update run ahead of the coding agent ended: start the agent
+    /// in its place, on a fresh screen, whether or not the update
+    /// worked. One that failed says so; one that can't start goes back
+    /// from agent mode, as an agent ending does.
+    fn agent_updated(&mut self, command: ninjaedit_core::terminal::Command, status: ExitStatus) {
+        let Some(mut agent) = self.agent.take() else {
+            return;
+        };
+        agent.note_exit(status.clone());
+        if !status.success() {
+            self.status = Some(StatusLine::error(format!(
+                "The coding agent update failed ({}); started it anyway",
+                exit_reason(&status)
+            )));
+        }
+        if !self.launch_agent(agent, &command) {
+            self.leave_agent();
         }
     }
 
@@ -2235,11 +2294,10 @@ impl App {
         let showing = matches!(self.mode, Mode::Agent(..));
         self.leave_agent();
         if !status.success() {
-            let why = match &status.signal {
-                Some(signal) => format!("killed by {signal}"),
-                None => format!("exit code {}", status.code),
-            };
-            self.status = Some(StatusLine::error(format!("The coding agent ended: {why}")));
+            self.status = Some(StatusLine::error(format!(
+                "The coding agent ended: {}",
+                exit_reason(&status)
+            )));
         } else if !showing {
             self.status = Some(StatusLine::info("The coding agent exited"));
         }
@@ -3503,7 +3561,10 @@ impl App {
             }
             Output::Exited(status) => {
                 if self.agent.as_ref().and_then(Tool::session).map(Session::id) == Some(id) {
-                    self.agent_exited(status);
+                    match self.agent_after_update.take() {
+                        Some(command) => self.agent_updated(command, status),
+                        None => self.agent_exited(status),
+                    }
                     self.track_view();
                     return;
                 }
@@ -4588,6 +4649,14 @@ impl App {
 
 /// Run a command in a pty, routing its output to the application's event
 /// channel so the loop wakes when the program writes or exits.
+/// Why a program that failed ended, for a message about it.
+fn exit_reason(status: &ExitStatus) -> String {
+    match &status.signal {
+        Some(signal) => format!("killed by {signal}"),
+        None => format!("exit code {}", status.code),
+    }
+}
+
 fn spawn_session(
     command: &ninjaedit_core::terminal::Command,
     cols: u16,
@@ -5209,7 +5278,7 @@ mod tests {
         // Down to the scrollback field, a new value, Enter: applied and
         // saved to the storage, where nothing was before.
         assert_eq!(settings_file(&app), None);
-        for _ in 0..4 {
+        for _ in 0..6 {
             press(&mut app, KeyCode::Down);
         }
         ctrl(&mut app, 'a');
@@ -5999,10 +6068,10 @@ mod tests {
         assert!(screen[9].contains("search.max-results"), "{screen:#?}");
 
         // Down past the continuation indent, the wheel lines, the shell,
-        // the agent, the scrollback, and the terminal keys' rows to the
-        // results.
+        // the agent and its update, the scrollback, and the terminal
+        // keys' rows to the results.
         app.open_settings();
-        for _ in 0..8 {
+        for _ in 0..10 {
             press(&mut app, KeyCode::Down);
         }
         ctrl(&mut app, 'a');
@@ -6782,7 +6851,7 @@ mod tests {
         assert!(matches!(app.mode, Mode::Settings(_)));
         assert_eq!(app.focus, Focus::Editor);
         assert!(app.tool_pane.is_visible());
-        for _ in 0..4 {
+        for _ in 0..6 {
             press(&mut app, KeyCode::Down);
         }
         ctrl(&mut app, 'a');
@@ -7340,6 +7409,79 @@ mod tests {
         let status = status_text(&app).unwrap_or_default();
         assert!(
             status.starts_with("Could not start the coding agent (/nonexistent/agent)"),
+            "{status}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_update_runs_the_update_in_the_agents_terminal_before_the_agent() {
+        let (_dir, mut app, events) = app_with_agent("sh");
+        app.settings
+            .set_text(
+                SettingKey::AgentUpdateCommand,
+                "sh -c 'echo updating; sleep 0.2'",
+            )
+            .unwrap();
+        draw(&mut app, 80, 20);
+
+        // Off by default: the agent starts at once.
+        ctrl(&mut app, 'i');
+        assert!(app.agent_after_update.is_none());
+        pump(&mut app, &events, |app| agent_text(app).contains('$'));
+        assert!(!agent_text(&app).contains("updating"));
+        type_str(&mut app, "exit");
+        press(&mut app, KeyCode::Enter);
+        pump(&mut app, &events, |app| app.agent.is_none());
+
+        // On, the update runs first, in agent mode; the agent follows on
+        // a fresh screen, in the same mode.
+        app.settings
+            .set_text(SettingKey::AgentAutoUpdate, "true")
+            .unwrap();
+        ctrl(&mut app, 'i');
+        assert!(matches!(app.mode, Mode::Agent(..)));
+        let update = agent_session(&app).expect("updating");
+        assert!(app.agent_after_update.is_some());
+        pump(&mut app, &events, |app| {
+            agent_text(app).contains("updating")
+        });
+        pump(&mut app, &events, |app| agent_text(app).contains('$'));
+        assert!(agent_session(&app).is_some_and(|id| id != update));
+        assert!(app.agent_after_update.is_none());
+        assert!(matches!(app.mode, Mode::Agent(..)));
+        assert!(!agent_text(&app).contains("updating"), "a fresh screen");
+        assert_eq!(app.status, None);
+        type_str(&mut app, "exit");
+        press(&mut app, KeyCode::Enter);
+        pump(&mut app, &events, |app| app.agent.is_none());
+
+        // An update that fails says so, and the agent starts anyway.
+        app.settings
+            .set_text(SettingKey::AgentUpdateCommand, "sh -c 'exit 4'")
+            .unwrap();
+        ctrl(&mut app, 'i');
+        pump(&mut app, &events, |app| app.agent_after_update.is_none());
+        assert!(agent_session(&app).is_some());
+        assert_eq!(
+            status_text(&app).as_deref(),
+            Some("The coding agent update failed (exit code 4); started it anyway")
+        );
+        pump(&mut app, &events, |app| agent_text(app).contains('$'));
+        type_str(&mut app, "exit");
+        press(&mut app, KeyCode::Enter);
+        pump(&mut app, &events, |app| app.agent.is_none());
+
+        // So does one that can't start at all.
+        app.settings
+            .set_text(SettingKey::AgentUpdateCommand, "/nonexistent/update")
+            .unwrap();
+        ctrl(&mut app, 'i');
+        assert!(app.agent_after_update.is_none());
+        assert!(agent_session(&app).is_some());
+        let status = status_text(&app).unwrap_or_default();
+        assert!(
+            status.starts_with("Could not update the coding agent (/nonexistent/update)"),
             "{status}"
         );
     }

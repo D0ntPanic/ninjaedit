@@ -14,6 +14,8 @@
 //! [terminal]
 //! shell = "/opt/homebrew/bin/fish"
 //! agent = "claude --model opus"
+//! agent-auto-update = true
+//! agent-update = "claude update"
 //! scrollback = 50000
 //! shell-ctrl-o = true
 //! agent-ctrl-p = false
@@ -332,6 +334,13 @@ pub enum SettingKey {
     Shell,
     /// The command agent mode runs: the program and its arguments.
     AgentCommand,
+    /// Whether agent mode runs the update command before starting the
+    /// coding agent, so that it starts up to date rather than asking
+    /// to be restarted for an update soon after.
+    AgentAutoUpdate,
+    /// The command that updates the coding agent: the program and its
+    /// arguments.
+    AgentUpdateCommand,
     /// How many lines of output a terminal keeps to scroll back through.
     TerminalScrollback,
     /// Whether a kind of terminal leaves one of the editor's keys to the
@@ -364,25 +373,27 @@ impl SettingKey {
     /// Every setting, in the order a settings page lists them (grouped by
     /// category, in [`Category::ALL`]'s order). A table's toggles follow
     /// one another, row by row.
-    pub const ALL: [SettingKey; 28] = {
+    pub const ALL: [SettingKey; 30] = {
         const KEYS: usize = EditorKey::ALL.len();
         const TERMINAL_KEYS: usize = TerminalKind::ALL.len() * KEYS;
-        let mut all = [SettingKey::ContinuationIndent; 10 + TERMINAL_KEYS];
+        let mut all = [SettingKey::ContinuationIndent; 12 + TERMINAL_KEYS];
         all[1] = SettingKey::WheelLines;
         all[2] = SettingKey::Shell;
         all[3] = SettingKey::AgentCommand;
-        all[4] = SettingKey::TerminalScrollback;
+        all[4] = SettingKey::AgentAutoUpdate;
+        all[5] = SettingKey::AgentUpdateCommand;
+        all[6] = SettingKey::TerminalScrollback;
         let mut i = 0;
         while i < TERMINAL_KEYS {
-            all[5 + i] =
+            all[7 + i] =
                 SettingKey::TerminalKey(TerminalKind::ALL[i / KEYS], EditorKey::ALL[i % KEYS]);
             i += 1;
         }
-        all[5 + TERMINAL_KEYS] = SettingKey::SearchMaxResults;
-        all[6 + TERMINAL_KEYS] = SettingKey::CMakeGenerator;
-        all[7 + TERMINAL_KEYS] = SettingKey::CompletionModels;
-        all[8 + TERMINAL_KEYS] = SettingKey::CompletionLineConfidence;
-        all[9 + TERMINAL_KEYS] = SettingKey::CompletionTokenConfidence;
+        all[7 + TERMINAL_KEYS] = SettingKey::SearchMaxResults;
+        all[8 + TERMINAL_KEYS] = SettingKey::CMakeGenerator;
+        all[9 + TERMINAL_KEYS] = SettingKey::CompletionModels;
+        all[10 + TERMINAL_KEYS] = SettingKey::CompletionLineConfidence;
+        all[11 + TERMINAL_KEYS] = SettingKey::CompletionTokenConfidence;
         all
     };
 
@@ -391,6 +402,8 @@ impl SettingKey {
             SettingKey::ContinuationIndent | SettingKey::WheelLines => Category::Editor,
             SettingKey::Shell
             | SettingKey::AgentCommand
+            | SettingKey::AgentAutoUpdate
+            | SettingKey::AgentUpdateCommand
             | SettingKey::TerminalScrollback
             | SettingKey::TerminalKey(..) => Category::Terminal,
             SettingKey::SearchMaxResults => Category::Search,
@@ -406,10 +419,11 @@ impl SettingKey {
         match self {
             SettingKey::ContinuationIndent => SettingKind::Choice(&CONTINUATION_CHOICES),
             SettingKey::CompletionModels => SettingKind::List,
-            SettingKey::TerminalKey(..) => SettingKind::Toggle,
+            SettingKey::AgentAutoUpdate | SettingKey::TerminalKey(..) => SettingKind::Toggle,
             SettingKey::WheelLines
             | SettingKey::Shell
             | SettingKey::AgentCommand
+            | SettingKey::AgentUpdateCommand
             | SettingKey::TerminalScrollback
             | SettingKey::SearchMaxResults
             | SettingKey::CMakeGenerator
@@ -440,6 +454,8 @@ impl SettingKey {
             SettingKey::WheelLines => "Mouse wheel lines",
             SettingKey::Shell => "Shell executable",
             SettingKey::AgentCommand => "Coding agent",
+            SettingKey::AgentAutoUpdate => "Auto update coding agent before launching",
+            SettingKey::AgentUpdateCommand => "Coding agent update command",
             SettingKey::TerminalScrollback => "Scrollback lines",
             SettingKey::TerminalKey(_, key) => key.label(),
             SettingKey::SearchMaxResults => "Maximum search results",
@@ -460,6 +476,12 @@ impl SettingKey {
             SettingKey::Shell => "The program the shell tool runs; blank to use your login shell",
             SettingKey::AgentCommand => {
                 "The command agent mode (Ctrl+I) runs in the project's directory, with any arguments, quoted as in a shell"
+            }
+            SettingKey::AgentAutoUpdate => {
+                "Run the update command each time agent mode starts the coding agent, so it starts up to date instead of asking for a restart to update soon after"
+            }
+            SettingKey::AgentUpdateCommand => {
+                "The command run in agent mode's terminal before the coding agent when auto update is on, quoted as in a shell. The agent starts once it ends, even if it fails"
             }
             SettingKey::TerminalScrollback => {
                 "Lines of output each terminal keeps to scroll back through"
@@ -497,6 +519,8 @@ impl SettingKey {
             SettingKey::WheelLines => "wheel-lines",
             SettingKey::Shell => "shell",
             SettingKey::AgentCommand => "agent",
+            SettingKey::AgentAutoUpdate => "agent-auto-update",
+            SettingKey::AgentUpdateCommand => "agent-update",
             SettingKey::TerminalScrollback => "scrollback",
             SettingKey::TerminalKey(terminal, key) => {
                 return format!("{}-ctrl-{}", terminal.key(), key.letter());
@@ -526,6 +550,8 @@ impl SettingKey {
             SettingKey::WheelLines => DEFAULT_WHEEL_LINES.to_string(),
             SettingKey::Shell => String::new(),
             SettingKey::AgentCommand => DEFAULT_AGENT_COMMAND.to_owned(),
+            SettingKey::AgentAutoUpdate => false.to_string(),
+            SettingKey::AgentUpdateCommand => DEFAULT_AGENT_UPDATE_COMMAND.to_owned(),
             SettingKey::TerminalScrollback => DEFAULT_SCROLLBACK.to_string(),
             SettingKey::TerminalKey(terminal, _) => {
                 terminal.editor_takes_keys_by_default().to_string()
@@ -573,6 +599,10 @@ impl std::error::Error for SettingsError {}
 /// The command agent mode runs unless the settings name another.
 pub const DEFAULT_AGENT_COMMAND: &str = "claude";
 
+/// The command that updates the coding agent unless the settings name
+/// another.
+pub const DEFAULT_AGENT_UPDATE_COMMAND: &str = "claude update";
+
 /// Lines scrolled per mouse wheel event unless the settings say
 /// otherwise; see [`SettingKey::WheelLines`].
 pub const DEFAULT_WHEEL_LINES: usize = 1;
@@ -585,6 +615,8 @@ pub struct Settings {
     wheel_lines: Option<usize>,
     shell: Option<String>,
     agent_command: Option<String>,
+    agent_auto_update: Option<bool>,
+    agent_update_command: Option<String>,
     terminal_scrollback: Option<usize>,
     /// For each [`TerminalKind`], for each [`EditorKey`], whether the
     /// editor takes the key, in the order of their `ALL`s.
@@ -642,6 +674,26 @@ impl Settings {
     pub fn agent_args(&self) -> Vec<String> {
         // The command was checked when it was set.
         split_args(self.agent_command()).unwrap_or_default()
+    }
+
+    /// Whether agent mode updates the coding agent before starting it.
+    pub fn agent_auto_update(&self) -> bool {
+        self.agent_auto_update.unwrap_or(false)
+    }
+
+    /// The command that updates the coding agent, as typed: the program
+    /// and its arguments, quoted as in a shell.
+    pub fn agent_update_command(&self) -> &str {
+        self.agent_update_command
+            .as_deref()
+            .unwrap_or(DEFAULT_AGENT_UPDATE_COMMAND)
+    }
+
+    /// The command that updates the coding agent, as the program
+    /// followed by its arguments.
+    pub fn agent_update_args(&self) -> Vec<String> {
+        // The command was checked when it was set.
+        split_args(self.agent_update_command()).unwrap_or_default()
     }
 
     /// How many lines of output a terminal keeps to scroll back through.
@@ -751,6 +803,8 @@ impl Settings {
             SettingKey::WheelLines => self.wheel_lines().to_string(),
             SettingKey::Shell => self.shell().unwrap_or_default().to_owned(),
             SettingKey::AgentCommand => self.agent_command().to_owned(),
+            SettingKey::AgentAutoUpdate => self.agent_auto_update().to_string(),
+            SettingKey::AgentUpdateCommand => self.agent_update_command().to_owned(),
             SettingKey::TerminalScrollback => self.terminal_scrollback().to_string(),
             SettingKey::TerminalKey(terminal, key) => {
                 self.editor_takes_key(terminal, key).to_string()
@@ -788,6 +842,16 @@ impl Settings {
                 split_args(text)?;
                 self.agent_command =
                     (!text.is_empty() && text != DEFAULT_AGENT_COMMAND).then(|| text.to_owned());
+            }
+            SettingKey::AgentAutoUpdate => {
+                self.agent_auto_update = parse_toggle(text)?.then_some(true);
+            }
+            SettingKey::AgentUpdateCommand => {
+                // Blank is the default, as for the agent itself.
+                split_args(text)?;
+                self.agent_update_command = (!text.is_empty()
+                    && text != DEFAULT_AGENT_UPDATE_COMMAND)
+                    .then(|| text.to_owned());
             }
             SettingKey::TerminalScrollback => {
                 let lines = parse_count(text, 0)?;
@@ -830,6 +894,8 @@ impl Settings {
             SettingKey::WheelLines => self.wheel_lines() == DEFAULT_WHEEL_LINES,
             SettingKey::Shell => self.shell.is_none(),
             SettingKey::AgentCommand => self.agent_command.is_none(),
+            SettingKey::AgentAutoUpdate => self.agent_auto_update.is_none(),
+            SettingKey::AgentUpdateCommand => self.agent_update_command.is_none(),
             SettingKey::TerminalScrollback => self.terminal_scrollback() == DEFAULT_SCROLLBACK,
             SettingKey::TerminalKey(terminal, key) => self.terminal_key(terminal, key).is_none(),
             SettingKey::SearchMaxResults => self.search_max_results() == MAX_MATCHES,
@@ -853,6 +919,8 @@ impl Settings {
             SettingKey::WheelLines => self.wheel_lines = None,
             SettingKey::Shell => self.shell = None,
             SettingKey::AgentCommand => self.agent_command = None,
+            SettingKey::AgentAutoUpdate => self.agent_auto_update = None,
+            SettingKey::AgentUpdateCommand => self.agent_update_command = None,
             SettingKey::TerminalScrollback => self.terminal_scrollback = None,
             SettingKey::TerminalKey(terminal, key) => {
                 self.terminal_keys[terminal_index(terminal)][key_index(key)] = None;
@@ -938,12 +1006,18 @@ impl Settings {
                     .ok_or_else(|| SettingsError(format!("`{}` must be a string", key.path())))?;
                 self.shell = (!shell.trim().is_empty()).then(|| shell.trim().to_owned());
             }
-            SettingKey::AgentCommand => {
+            SettingKey::AgentCommand | SettingKey::AgentUpdateCommand => {
                 let command = value
                     .as_str()
                     .ok_or_else(|| SettingsError(format!("`{}` must be a string", key.path())))?;
                 self.set_text(key, command)
                     .map_err(|err| SettingsError(format!("`{}`: {err}", key.path())))?;
+            }
+            SettingKey::AgentAutoUpdate => {
+                let update = value.as_bool().ok_or_else(|| {
+                    SettingsError(format!("`{}` must be true or false", key.path()))
+                })?;
+                self.agent_auto_update = update.then_some(true);
             }
             SettingKey::TerminalScrollback => {
                 self.terminal_scrollback = Some(read_count(key, value, 0)?);
@@ -998,9 +1072,11 @@ impl Settings {
                 continue;
             }
             let value = match key {
-                SettingKey::ContinuationIndent | SettingKey::Shell | SettingKey::AgentCommand => {
-                    Value::String(self.text(key))
-                }
+                SettingKey::ContinuationIndent
+                | SettingKey::Shell
+                | SettingKey::AgentCommand
+                | SettingKey::AgentUpdateCommand => Value::String(self.text(key)),
+                SettingKey::AgentAutoUpdate => Value::Boolean(self.agent_auto_update()),
                 SettingKey::WheelLines => Value::Integer(self.wheel_lines() as i64),
                 SettingKey::TerminalScrollback => Value::Integer(self.terminal_scrollback() as i64),
                 SettingKey::TerminalKey(terminal, key) => {
@@ -1499,6 +1575,67 @@ mod tests {
         assert_eq!(settings.set_text(SettingKey::AgentCommand, "  "), Ok(true));
         assert!(settings.is_default(SettingKey::AgentCommand));
         assert_eq!(settings.text(SettingKey::AgentCommand), "claude");
+        assert!(!settings.to_toml().contains("agent"));
+    }
+
+    #[test]
+    fn the_agent_update_is_off_by_default_with_a_command_checked_like_the_agents() {
+        let mut settings = Settings::default();
+        assert!(!settings.agent_auto_update());
+        assert_eq!(SettingKey::AgentAutoUpdate.kind(), SettingKind::Toggle);
+        assert_eq!(SettingKey::AgentAutoUpdate.cell(), None, "on its own");
+        assert_eq!(settings.text(SettingKey::AgentAutoUpdate), "false");
+        assert_eq!(
+            settings.agent_update_command(),
+            DEFAULT_AGENT_UPDATE_COMMAND
+        );
+        assert_eq!(settings.agent_update_args(), ["claude", "update"]);
+        assert_eq!(
+            SettingKey::AgentUpdateCommand.placeholder(),
+            "claude update"
+        );
+
+        assert_eq!(
+            settings.set_text(SettingKey::AgentAutoUpdate, "true"),
+            Ok(true)
+        );
+        assert!(settings.agent_auto_update());
+        assert!(!settings.is_default(SettingKey::AgentAutoUpdate));
+        assert_eq!(
+            settings.set_text(SettingKey::AgentUpdateCommand, " npm i -g 'my agent' "),
+            Ok(true)
+        );
+        assert_eq!(settings.agent_update_args(), ["npm", "i", "-g", "my agent"]);
+        assert_eq!(
+            settings.set_text(SettingKey::AgentUpdateCommand, "x 'oops"),
+            Err("unclosed ' quote".to_owned())
+        );
+
+        let text = settings.to_toml();
+        assert!(text.contains("agent-auto-update = true"), "{text}");
+        assert!(
+            text.contains("agent-update = \"npm i -g 'my agent'\""),
+            "{text}"
+        );
+        assert_eq!(Settings::parse(&text).unwrap(), settings);
+        assert_eq!(
+            Settings::parse("[terminal]\nagent-auto-update = \"yes\"\n")
+                .unwrap_err()
+                .to_string(),
+            "`terminal.agent-auto-update` must be true or false"
+        );
+
+        // Off and blank are the defaults, and stay out of the file.
+        assert_eq!(
+            settings.set_text(SettingKey::AgentAutoUpdate, "false"),
+            Ok(true)
+        );
+        assert_eq!(
+            settings.set_text(SettingKey::AgentUpdateCommand, " "),
+            Ok(true)
+        );
+        assert!(settings.is_default(SettingKey::AgentAutoUpdate));
+        assert!(settings.is_default(SettingKey::AgentUpdateCommand));
         assert!(!settings.to_toml().contains("agent"));
     }
 

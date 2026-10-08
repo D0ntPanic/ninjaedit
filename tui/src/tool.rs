@@ -90,14 +90,23 @@ impl ToolKind {
                 Some(shell) => Command::new(shell),
                 None => Command::shell(),
             },
-            ToolKind::Agent => {
-                let mut args = settings.agent_args().into_iter();
-                args.next()
-                    .map(|program| args.fold(Command::new(program), Command::arg))?
-            }
+            ToolKind::Agent => command_of(settings.agent_args())?,
             ToolKind::Output => return None,
         };
         Some(command.current_dir(directory))
+    }
+
+    /// The command to run in `directory` before this tool's own, in its
+    /// terminal, when it is opened: for the agent with auto update on,
+    /// the command that updates it, so that it starts up to date. The
+    /// others have none.
+    pub fn update_command(self, directory: &Path, settings: &Settings) -> Option<Command> {
+        match self {
+            ToolKind::Agent if settings.agent_auto_update() => {
+                Some(command_of(settings.agent_update_args())?.current_dir(directory))
+            }
+            _ => None,
+        }
     }
 
     /// Whether the tool is worth showing with no program running in it:
@@ -109,6 +118,14 @@ impl ToolKind {
             ToolKind::Output => true,
         }
     }
+}
+
+/// A command from a program followed by its arguments, if there is a
+/// program.
+fn command_of(args: Vec<String>) -> Option<Command> {
+    let mut args = args.into_iter();
+    args.next()
+        .map(|program| args.fold(Command::new(program), Command::arg))
 }
 
 /// The starting fraction of the editor-plus-tool area given to the tool

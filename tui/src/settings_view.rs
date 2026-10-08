@@ -1079,10 +1079,10 @@ mod tests {
     fn enter_applies_a_value_and_moving_on_applies_the_field_left() {
         let mut settings = Settings::default();
         let mut view = SettingsView::new(&settings);
-        // Down past the continuation indent, wheel, shell, and agent
-        // fields to the scrollback field; the fields left as they were
-        // are applied without changing anything.
-        for _ in 0..4 {
+        // Down past the continuation indent, wheel, shell, agent, and
+        // agent update fields to the scrollback field; the fields left
+        // as they were are applied without changing anything.
+        for _ in 0..6 {
             assert_eq!(
                 press(&mut view, &mut settings, KeyCode::Down),
                 SettingsOutcome::Continue
@@ -1257,8 +1257,9 @@ mod tests {
         // still applies the others.
         ctrl(&mut view, &mut settings, 'a');
         type_str(&mut view, &mut settings, "x");
-        press(&mut view, &mut settings, KeyCode::Up);
-        press(&mut view, &mut settings, KeyCode::Up);
+        for _ in 0..4 {
+            press(&mut view, &mut settings, KeyCode::Up);
+        }
         type_str(&mut view, &mut settings, "/bin/dash");
         assert_eq!(view.commit_all(&mut settings), SettingsOutcome::Changed);
         assert_eq!(settings.shell(), Some("/bin/dash"));
@@ -1553,7 +1554,7 @@ mod tests {
         );
 
         // Too narrow for every column, the table keeps the ones that fit.
-        let screen = draw(&mut view, &settings, 30, 60);
+        let screen = draw(&mut view, &settings, 30, 80);
         let name = screen
             .iter()
             .position(|r| r.contains("Editor keys in"))
@@ -1677,7 +1678,7 @@ mod tests {
             .set_text(SettingKey::CompletionModels, "/nonexistent/model")
             .unwrap();
         let mut view = SettingsView::new(&settings);
-        let screen = draw(&mut view, &settings, 120, 60);
+        let screen = draw(&mut view, &settings, 120, 70);
         assert!(
             row_with(&screen, "Can't be used").contains("config.json"),
             "{screen:#?}"
