@@ -20,6 +20,7 @@
 //! rebasing share.
 
 use super::history::short_id;
+use super::hooks::{Hook, Hooks};
 use super::interactive::{self, RebaseAction};
 use super::operation::{
     Integration, OperationError, Outcome, Target, checkout_options, conflicted_files, ensure_ready,
@@ -73,10 +74,13 @@ impl RebaseStatus {
 }
 
 /// Rebase HEAD's branch (or a detached HEAD) onto `target`, telling
-/// `progress` how many files have been written of how many.
+/// `progress` how many files have been written of how many. The
+/// `pre-rebase` hook may stop it before anything is done, as it may
+/// stop git's.
 pub(super) fn rebase(
     repo: &Repository,
     target: &Target,
+    hooks: &Hooks,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<Outcome, OperationError> {
     let head = ensure_ready(repo)?;
@@ -86,6 +90,12 @@ pub(super) fn rebase(
     if head == onto || repo.graph_descendant_of(head, onto)? {
         return Ok(Outcome::UpToDate);
     }
+    // Named as it would be on git's command line.
+    let named = match target {
+        Target::Branch { name, .. } => name.clone(),
+        Target::Commit(id) => id.to_string(),
+    };
+    hooks.run(repo, Hook::PreRebase, &[&named], &[])?;
     if repo.graph_descendant_of(onto, head)? {
         let why = format!("rebase: fast-forward to {}", target.name());
         let submodules = fast_forward(repo, onto, &why, progress)?;
@@ -287,7 +297,12 @@ mod tests {
     use std::path::Path;
 
     fn run(repo: &Repository, target: &Target) -> Result<Outcome, OperationError> {
-        rebase(repo, target, &mut |_, _| {})
+        rebase(
+            repo,
+            target,
+            &crate::git::hooks::tests::hooks(),
+            &mut |_, _| {},
+        )
     }
 
     fn side() -> Target {
@@ -529,5 +544,37 @@ mod tests {
             continue_rebase(&t.repo, None),
             Err(OperationError::NothingInProgress)
         ));
+    }
+
+    #[test]
+    fn the_pre_rebase_hook_may_refuse_the_rebase_before_it_starts() {
+        use crate::git::hooks::tests::{hooks, install};
+        use crate::git::hooks::{Hook, HookError};
+        let mut t = repo();
+        let (_, main, side_id) = diverged(&mut t, false);
+        install(
+            &t.repo,
+            Hook::PreRebase,
+            "echo \"$# $1\" > .git/pre-rebase; exit 1",
+        );
+        let err = run(&t.repo, &side()).unwrap_err();
+        assert!(
+            matches!(err, OperationError::Hook(HookError::Failed(_))),
+            "{err:?}"
+        );
+        let args = std::fs::read_to_string(t.repo.path().join("pre-rebase")).unwrap();
+        assert_eq!(args, "1 side\n");
+        assert_eq!(t.repo.head().unwrap().target(), Some(main));
+        assert_eq!(t.repo.state(), RepositoryState::Clean);
+
+        // An up-to-date rebase runs no hook; one without verifying goes
+        // ahead.
+        let up_to_date = Target::Commit(t.repo.find_commit(main).unwrap().parent_id(0).unwrap());
+        assert_eq!(run(&t.repo, &up_to_date).unwrap(), Outcome::UpToDate);
+        let hooks = hooks().without_verify();
+        let outcome = rebase(&t.repo, &side(), &hooks, &mut |_, _| {}).unwrap();
+        assert!(matches!(outcome, Outcome::Rebased { commits: 1, .. }));
+        let head = t.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.parent_id(0).unwrap(), side_id);
     }
 }

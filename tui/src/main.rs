@@ -22,6 +22,7 @@ mod git_layout;
 mod git_view;
 mod goto_line;
 mod heads;
+mod hook_box;
 mod input;
 mod new_branch;
 mod palette;

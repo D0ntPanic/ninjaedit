@@ -3647,7 +3647,14 @@ impl App {
                 self.follow_git_log();
                 polled
             }
-            Mode::Changes(tabs) => tabs.poll(),
+            Mode::Changes(tabs) => {
+                let polled = tabs.poll();
+                // A commit whose hooks ran says how it went.
+                if let Some(notice) = tabs.take_notice() {
+                    self.status = Some(notice);
+                }
+                polled
+            }
             _ => false,
         };
         redraw |= polled;

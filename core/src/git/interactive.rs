@@ -68,6 +68,7 @@
 
 use super::checkout::check_submodules;
 use super::history::short_id;
+use super::hooks::{Hook, Hooks};
 use super::operation::{
     InProgress, OperationError, Outcome, checkout_options, conflicted_files, ensure_ready,
     follow_submodules, head_commit, settle_part_way, with_resolved, with_submodules,
@@ -704,6 +705,7 @@ pub(super) fn is_supported(repo: &Repository) -> bool {
 pub(super) fn start(
     repo: &Repository,
     plan: &RebasePlan,
+    hooks: &Hooks,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<Outcome, OperationError> {
     plan.check().map_err(OperationError::Plan)?;
@@ -715,6 +717,8 @@ pub(super) fn start(
     }
     let onto = repo.find_commit(plan.onto)?;
     check_submodules(repo, &onto)?;
+    // As `git rebase -i <onto>` runs it, before anything is done.
+    hooks.run(repo, Hook::PreRebase, &[&onto.id().to_string()], &[])?;
     {
         let mut options = checkout_options(progress);
         repo.checkout_tree(onto.as_object(), Some(&mut options))?;
@@ -1276,7 +1280,11 @@ mod tests {
     }
 
     fn run(repo: &Repository, plan: &RebasePlan) -> Result<Outcome, OperationError> {
-        Integration::Interactive(plan.clone()).run_with(repo, &mut |_, _| {})
+        Integration::Interactive(plan.clone()).run_with(
+            repo,
+            &crate::git::hooks::tests::hooks(),
+            &mut |_, _| {},
+        )
     }
 
     /// Begin editing `commit`, which must stop there.

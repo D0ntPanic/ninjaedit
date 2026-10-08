@@ -29,7 +29,9 @@
 //! compares an editor's buffer with HEAD's version of its file, line by
 //! line, to mark what has changed beside the text.
 //! Everything goes through libgit2, by way of the `git2` crate; nothing
-//! shells out to git.
+//! shells out to git. libgit2 runs no hooks, so the [`hooks`] module
+//! runs the repository's around a commit, a merge, a rebase, or a
+//! checkout, as git's command line would.
 //!
 //! Only the [`changes`], [`fetch`], [`checkout`], [`branch`],
 //! [`restore`](mod@restore), [`merge`], [`rebase`], [`interactive`], and [`reset`](mod@reset) modules change the
@@ -55,6 +57,7 @@ pub mod fetch;
 pub mod graph;
 pub mod head;
 pub mod history;
+pub mod hooks;
 pub mod interactive;
 pub mod line_status;
 pub mod merge;
@@ -67,7 +70,7 @@ pub mod submodules;
 pub mod tree;
 
 pub use branch::{BranchError, DeleteBranchError, create_branch, create_branch_in, delete_branch};
-pub use changes::{Changes, ConflictSide};
+pub use changes::{Changes, CommitError, Committed, ConflictSide};
 pub use checkout::{Checkout, CheckoutError, CheckoutJob, CheckoutOutcome, CheckoutPlan};
 pub use diff::{
     ChangeKind, CommitDetail, DiffLine, DiffRow, FileChange, FileDiff, LineKind, LinesChange,
@@ -78,6 +81,7 @@ pub use fetch::{Fetch, FetchReport};
 pub use graph::{GraphCell, GraphRow, NODE, cells_for};
 pub use head::{Head, head, head_of};
 pub use history::{Branch, Commit, CommitTime, History, Oid, RefKind, RefLabel, Remote, short_id};
+pub use hooks::{Hook, HookError, HookFailure, Hooks};
 pub use interactive::{Continued, PlanError, RebaseAction, RebasePlan, RebaseStep};
 pub use line_status::{LineStatus, LineStatuses, LinesEdit};
 pub use merge::abort_merge;

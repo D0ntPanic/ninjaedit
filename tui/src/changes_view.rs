@@ -180,6 +180,16 @@
 //! rather than opening it as a file; a submodule with no tab (its
 //! commit moved, but nothing is changed inside it) has nothing to go
 //! to, and the status bar says so.
+//!
+//! A commit runs the repository's hooks as `git commit` does (see the
+//! core crate's `git::hooks` module). With any to run, it is made in
+//! the background, the status bar naming the hook running, which
+//! Escape cancels; the page's other actions are refused until it is
+//! done. A hook is never seen unless it fails: then the hook box (see
+//! the `hook_box` module) shows what it wrote. One that stopped the
+//! commit leaves the message and what is staged as they were, and
+//! offers to commit anyway, as `git commit --no-verify` does; one run
+//! after the commit (`post-commit`) stopped nothing, and only says so.
 
 use crate::clipboard::Clipboard;
 use crate::confirm_box::{ConfirmBox, ConfirmOutcome};
@@ -189,13 +199,15 @@ use crate::diff_pane::{
 };
 use crate::editor_view::EditorView;
 use crate::git_layout::{ChangesSizes, GitChangesLayout, MAIN_REPOSITORY};
+use crate::hook_box::{HookBox, HookOutcome};
 use crate::palette::palette_background;
 use crate::status::StatusLine;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
-    ChangeKind, Changes, ConflictSide, Continued, DiffLine, DiffModel, FileChange, FileDiff,
-    FileTree, InProgress, LinesChange, LinesTarget, Oid, RebaseAction, TreeRow, short_id,
+    ChangeKind, Changes, CommitError, Committed, ConflictSide, Continued, DiffLine, DiffModel,
+    FileChange, FileDiff, FileTree, HookError, Hooks, InProgress, LinesChange, LinesTarget, Oid,
+    RebaseAction, TreeRow, short_id,
 };
 use ninjaedit_core::{Editor, FileBuffer};
 use ratatui::buffer::Buffer;
@@ -268,6 +280,9 @@ const DISCARD_HELP: &[(&str, &str)] = &[("y", "discard"), ("n/Esc", "cancel")];
 const RESOLVE_HELP: &[(&str, &str)] = &[("y", "resolve"), ("n/Esc", "cancel")];
 const ABORT_HELP: &[(&str, &str)] = &[("y", "abort"), ("n/Esc", "cancel")];
 const REVERT_HELP: &[(&str, &str)] = &[("y", "revert"), ("n/Esc", "cancel")];
+const HOOK_HELP: &[(&str, &str)] = &[("↑↓", "scroll"), ("Tab", "button"), ("Esc", "dismiss")];
+/// The hook box's button, for a hook that stopped a commit.
+const COMMIT_ANYWAY: &str = "Commit anyway";
 /// The diff of an unstaged file, and of a staged one.
 const CONTENT_HELP: &[(&str, &str)] = &[
     ("Space", "stage lines"),
@@ -445,6 +460,15 @@ pub struct ChangesMouseOutcome {
     /// Something to say in the status bar: a discard confirmed with a
     /// click, an action that failed.
     pub notice: Option<StatusLine>,
+}
+
+/// A commit being made on its own thread while its hooks run (see the
+/// core crate's `git::hooks` module): the hooks, to say which is
+/// running and to cancel it, and the message it was given, to clear
+/// from the box once made unless the user has changed it meanwhile.
+struct Committing {
+    hooks: Hooks,
+    message: String,
 }
 
 /// What a box asking about files of the unstaged list will do to them
@@ -735,18 +759,41 @@ impl ChangesTabs {
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
         let mut main_changed = false;
+        let mut acted = None;
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             if let Some(view) = &mut tab.view
                 && view.poll()
             {
                 changed = true;
                 main_changed |= index == 0;
+                // A commit whose hooks ran has been made.
+                if view.take_acted() {
+                    acted = Some(index);
+                }
+            }
+        }
+        if let Some(acted) = acted {
+            for (index, tab) in self.tabs.iter_mut().enumerate() {
+                if index != acted
+                    && let Some(view) = &mut tab.view
+                {
+                    view.refresh();
+                }
             }
         }
         if main_changed {
             self.sync_tabs();
         }
         changed
+    }
+
+    /// What the status bar is to say about something a page finished
+    /// between events (a commit whose hooks ran), once.
+    pub fn take_notice(&mut self) -> Option<StatusLine> {
+        self.tabs
+            .iter_mut()
+            .filter_map(|tab| tab.view.as_mut())
+            .find_map(ChangesView::take_notice)
     }
 
     /// Make the tabs the main repository's changed submodules, keeping
@@ -1042,6 +1089,13 @@ pub struct ChangesView {
     /// The abort box, while it asks whether to give up the merge or
     /// rebase in progress.
     abort: Option<ConfirmBox>,
+    /// The commit being made while its hooks run, if any.
+    committing: Option<Committing>,
+    /// The hook box, while it shows a hook that failed.
+    hook_box: Option<HookBox>,
+    /// What the status bar is to say about something that finished
+    /// between events (a commit whose hooks ran), until taken.
+    notice: Option<StatusLine>,
     /// The stop of the merge or rebase in progress that the keyboard
     /// was last put where it is next needed for (see
     /// [`place_for_stop`](Self::place_for_stop)): HEAD's commit then,
@@ -1104,6 +1158,9 @@ impl ChangesView {
             submodule_to_show: None,
             pending: None,
             abort: None,
+            committing: None,
+            hook_box: None,
+            notice: None,
             placed_for: None,
             area: Rect::default(),
             unstaged_area: Rect::default(),
@@ -1133,9 +1190,26 @@ impl ChangesView {
         if !changes.poll() {
             return false;
         }
+        if let Some(result) = changes.take_commit()
+            && let Some(Committing { hooks, message }) = self.committing.take()
+        {
+            let outcome = match result {
+                Ok(committed) => self.committed(committed, &message, &hooks),
+                Err(err) => self.commit_failed(err),
+            };
+            if let ChangesOutcome::Notice(notice) = outcome {
+                self.notice = Some(notice);
+            }
+        }
         self.follow_lists();
         self.place_for_stop();
         true
+    }
+
+    /// What the status bar is to say about something that finished
+    /// between events, once.
+    pub fn take_notice(&mut self) -> Option<StatusLine> {
+        self.notice.take()
     }
 
     /// Put the keyboard where the next step of a merge or rebase in
@@ -1262,6 +1336,15 @@ impl ChangesView {
     /// What the status bar shows for the page: the scan while one is
     /// under way, otherwise the pane's key bindings.
     pub fn hint(&self) -> StatusLine {
+        if let Some(committing) = &self.committing {
+            return StatusLine::progress(match committing.hooks.running() {
+                Some(hook) => format!("committing: running the {hook} hook… (Esc cancels)"),
+                None => "committing…".to_owned(),
+            });
+        }
+        if self.hook_box.is_some() {
+            return StatusLine::help(HOOK_HELP);
+        }
         if self.scanning() {
             return StatusLine::progress(SCANNING);
         }
@@ -1801,8 +1884,17 @@ impl ChangesView {
     }
 
     /// Commit what is staged with the message in the box; while a
-    /// rebase is in progress, continue it instead.
+    /// rebase is in progress, continue it instead. With hooks to run,
+    /// the commit is made in the background, the status bar saying
+    /// which hook is running (Escape cancels it), and how it went comes
+    /// with a later [`poll`](Self::poll). A hook that stops the commit
+    /// is shown in the hook box, which can make it anyway.
     pub fn commit(&mut self) -> ChangesOutcome {
+        let (cols, rows) = HookBox::terminal_size(self.area);
+        self.commit_with(Hooks::new(cols, rows))
+    }
+
+    fn commit_with(&mut self, hooks: Hooks) -> ChangesOutcome {
         if self.is_rebasing() {
             return self.continue_rebase();
         }
@@ -1810,25 +1902,81 @@ impl ChangesView {
         let Some(changes) = &mut self.changes else {
             return ChangesOutcome::Continue;
         };
-        let amended = changes.is_amending();
-        match changes.commit(&message) {
-            Ok(id) => {
-                self.acted = true;
-                self.message = message_editor("");
-                self.auto_message = None;
-                self.follow_lists();
-                let summary = message.trim().lines().next().unwrap_or("").to_owned();
-                let verb = if amended { "Amended" } else { "Committed" };
-                ChangesOutcome::Notice(StatusLine::info(format!(
-                    "{verb} {} {summary}",
-                    short_id(id)
-                )))
+        match changes.commit(&message, &hooks) {
+            Ok(Some(committed)) => self.committed(committed, &message, &hooks),
+            Ok(None) => {
+                self.committing = Some(Committing { hooks, message });
+                ChangesOutcome::Continue
             }
-            Err(err) => ChangesOutcome::Notice(StatusLine::error(format!(
+            Err(err) => self.commit_failed(err),
+        }
+    }
+
+    /// A commit was made with `message` from the box: clear the box,
+    /// unless the user has written in it since, follow the lists, and
+    /// say so; and show a hook run after it that failed.
+    fn committed(&mut self, committed: Committed, message: &str, hooks: &Hooks) -> ChangesOutcome {
+        self.acted = true;
+        if self.message_text() == message {
+            self.message = message_editor("");
+            self.auto_message = None;
+        }
+        self.follow_lists();
+        let summary = committed.message.lines().next().unwrap_or("");
+        let verb = if committed.amended {
+            "Amended"
+        } else {
+            "Committed"
+        };
+        let id = short_id(committed.id);
+        if let Some(failure) = hooks.take_failures().into_iter().next() {
+            let body = format!("{verb} {id} all the same: the hook runs after the commit is made.");
+            self.hook_box = Some(HookBox::new(failure, body, None));
+        }
+        ChangesOutcome::Notice(StatusLine::info(format!("{verb} {id} {summary}")))
+    }
+
+    /// A commit wasn't made: say why, showing a hook that stopped it in
+    /// the hook box.
+    fn commit_failed(&mut self, err: CommitError) -> ChangesOutcome {
+        match err {
+            CommitError::Hook(HookError::Failed(failure)) => {
+                let text = format!("Could not commit: {failure}");
+                let body = "Nothing was committed. What is staged stays staged.";
+                self.hook_box = Some(HookBox::new(failure, body, Some(COMMIT_ANYWAY.to_owned())));
+                ChangesOutcome::Notice(StatusLine::error(text))
+            }
+            CommitError::Hook(err @ HookError::Cancelled(_)) => {
+                ChangesOutcome::Notice(StatusLine::info(format!("Commit cancelled: {err}")))
+            }
+            CommitError::Git(err) => ChangesOutcome::Notice(StatusLine::error(format!(
                 "Could not commit: {}",
                 err.message()
             ))),
         }
+    }
+
+    /// Act on the hook box's answer: close it, or commit again without
+    /// the hooks git's `--no-verify` skips.
+    fn finish_hook_box(&mut self, outcome: HookOutcome) -> ChangesOutcome {
+        match outcome {
+            HookOutcome::Continue => ChangesOutcome::Continue,
+            HookOutcome::Dismiss => {
+                self.hook_box = None;
+                ChangesOutcome::Continue
+            }
+            HookOutcome::Override => {
+                self.hook_box = None;
+                let (cols, rows) = HookBox::terminal_size(self.area);
+                self.commit_with(Hooks::new(cols, rows).without_verify())
+            }
+        }
+    }
+
+    /// The hook box, while it shows a failed hook.
+    #[cfg(test)]
+    fn hook_box(&self) -> Option<&HookBox> {
+        self.hook_box.as_ref()
     }
 
     /// Whether a merge is in progress, to commit or abort.
@@ -2002,6 +2150,18 @@ impl ChangesView {
     // ----- Input ----------------------------------------------------------
 
     pub fn handle_key(&mut self, key: KeyEvent, clipboard: &mut Clipboard) -> ChangesOutcome {
+        // The hook box, while it shows, has every key.
+        if let Some(dialog) = &mut self.hook_box {
+            let outcome = dialog.handle_key(key);
+            return self.finish_hook_box(outcome);
+        }
+        // Escape stops the hook a commit is waiting on.
+        if key.code == KeyCode::Esc
+            && let Some(committing) = &self.committing
+        {
+            committing.hooks.cancel();
+            return ChangesOutcome::Continue;
+        }
         // The discard or resolve box, while it asks, has every key.
         if let Some(pending) = &mut self.pending {
             return match pending.dialog.handle_key(key) {
@@ -2465,6 +2625,15 @@ impl ChangesView {
     /// sideways) a wheel event scrolls.
     pub fn handle_mouse(&mut self, mouse: MouseEvent, wheel: usize) -> ChangesMouseOutcome {
         let mut outcome = ChangesMouseOutcome::default();
+        // The hook box, while it shows, has the mouse; a press outside
+        // it dismisses it.
+        if let Some(dialog) = &mut self.hook_box {
+            let answer = dialog.handle_mouse(mouse, wheel);
+            if let ChangesOutcome::Notice(notice) = self.finish_hook_box(answer) {
+                outcome.notice = Some(notice);
+            }
+            return outcome;
+        }
         // The discard or resolve box, while it asks, has the mouse; a
         // press outside it is no.
         if let Some(pending) = &mut self.pending {
@@ -2742,6 +2911,10 @@ impl ChangesView {
             return None;
         }
         if let Some(dialog) = &mut self.abort {
+            dialog.render(area, buf, theme);
+            return None;
+        }
+        if let Some(dialog) = &mut self.hook_box {
             dialog.render(area, buf, theme);
             return None;
         }
@@ -4188,7 +4361,9 @@ mod tests {
             name: "side".to_owned(),
             remote: false,
         });
-        rebase.run_with(&repo, &mut |_, _| {}).unwrap();
+        rebase
+            .run_with(&repo, &Hooks::new(80, 24), &mut |_, _| {})
+            .unwrap();
         assert_eq!(repo.state(), git2::RepositoryState::RebaseMerge);
         (dir, main, side)
     }
@@ -4295,7 +4470,8 @@ mod tests {
         let two = commit_files(&repo, &[("a.txt", "a2\n"), ("dir/b.txt", "b\n")], "Two");
         commit_files(&repo, &[("c.txt", "c\n")], "Three");
         let edit = Integration::Interactive(RebasePlan::edit(&repo, two).unwrap());
-        edit.run_with(&repo, &mut |_, _| {}).unwrap();
+        edit.run_with(&repo, &Hooks::new(80, 24), &mut |_, _| {})
+            .unwrap();
         assert_eq!(repo.state(), git2::RepositoryState::RebaseInteractive);
         (dir, main, two)
     }
@@ -5191,5 +5367,145 @@ mod tests {
             body(&[deleted, untracked], &[submodule]),
             "1 file goes back to what is staged, or else what was last committed; 1 untracked file is deleted. 1 submodule is left alone. This can't be undone."
         );
+    }
+
+    /// Install `script` as the repository's hook `name`.
+    fn install_hook(dir: &tempfile::TempDir, name: &str, script: &str) {
+        let hooks = dir.path().join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let path = hooks.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// Wait for the commit whose hooks are running, and the scan after.
+    fn finish_commit(view: &mut ChangesView) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while view.committing.is_some() && std::time::Instant::now() < deadline {
+            view.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(view.committing.is_none());
+        settle(view);
+    }
+
+    /// The changes of [`repo_with_changes`] staged, with a message to
+    /// commit them with.
+    fn ready_to_commit(dir: &tempfile::TempDir) -> ChangesView {
+        let mut view = view(dir);
+        view.stage_all();
+        settle(&mut view);
+        view.message = message_editor("Add two");
+        view
+    }
+
+    #[test]
+    fn a_hook_that_stops_the_commit_is_shown_and_can_be_overridden() {
+        let dir = repo_with_changes();
+        install_hook(
+            &dir,
+            "pre-commit",
+            "echo 'lint: a.rs is not formatted'; exit 1",
+        );
+        let mut view = ready_to_commit(&dir);
+        assert_eq!(ctrl(&mut view, 's'), ChangesOutcome::Continue);
+        assert!(matches!(view.hint(), StatusLine::Progress(_)));
+        finish_commit(&mut view);
+        assert_eq!(
+            view.take_notice(),
+            Some(StatusLine::error(
+                "Could not commit: the pre-commit hook failed (exit code 1)"
+            ))
+        );
+        let dialog = view.hook_box().expect("the hook box shows");
+        assert_eq!(dialog.title(), "The pre-commit hook failed (exit code 1)");
+        assert_eq!(dialog.action(), Some(COMMIT_ANYWAY));
+        assert_eq!(view.hint(), StatusLine::help(HOOK_HELP));
+        let screen = draw(&mut view, 100, 30);
+        assert!(
+            screen
+                .iter()
+                .any(|r| r.contains("lint: a.rs is not formatted")),
+            "{screen:#?}"
+        );
+        assert_eq!(head_message(&dir), "Base");
+
+        // Enter dismisses, as Dismiss has the keyboard; the message and
+        // what is staged stay for another go.
+        assert_eq!(press(&mut view, KeyCode::Enter), ChangesOutcome::Continue);
+        assert!(view.hook_box().is_none());
+        assert_eq!(view.message_text(), "Add two");
+        assert_eq!(view.changes.as_ref().unwrap().staged().len(), 3);
+
+        // Again, and this time commit anyway: no hook stands in the way,
+        // so the commit is made at once.
+        ctrl(&mut view, 's');
+        finish_commit(&mut view);
+        assert!(view.hook_box().is_some());
+        press(&mut view, KeyCode::Tab);
+        let ChangesOutcome::Notice(notice) = press(&mut view, KeyCode::Enter) else {
+            panic!("the commit says so");
+        };
+        assert!(notice.text().starts_with("Committed "), "{notice}");
+        assert!(view.hook_box().is_none());
+        assert_eq!(head_message(&dir), "Add two");
+        assert_eq!(view.message_text(), "");
+    }
+
+    #[test]
+    fn escape_cancels_the_hook_a_commit_waits_on() {
+        let dir = repo_with_changes();
+        install_hook(&dir, "pre-commit", "sleep 30");
+        let mut view = ready_to_commit(&dir);
+        ctrl(&mut view, 's');
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while view.committing.as_ref().unwrap().hooks.running().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            view.hint(),
+            StatusLine::progress("committing: running the pre-commit hook… (Esc cancels)")
+        );
+        // Meanwhile nothing else changes the repository.
+        let ChangesOutcome::Notice(notice) = view.unstage_all() else {
+            panic!("refused");
+        };
+        assert!(notice.text().contains("wait for its hooks"), "{notice}");
+        press(&mut view, KeyCode::Esc);
+        finish_commit(&mut view);
+        assert_eq!(
+            view.take_notice(),
+            Some(StatusLine::info(
+                "Commit cancelled: the pre-commit hook was cancelled"
+            ))
+        );
+        assert!(view.hook_box().is_none());
+        assert_eq!(head_message(&dir), "Base");
+        assert_eq!(view.message_text(), "Add two");
+    }
+
+    #[test]
+    fn a_failing_post_commit_hook_is_shown_after_the_commit() {
+        let dir = repo_with_changes();
+        install_hook(&dir, "post-commit", "echo 'could not notify'; exit 1");
+        let mut view = ready_to_commit(&dir);
+        ctrl(&mut view, 's');
+        finish_commit(&mut view);
+        let notice = view.take_notice().unwrap();
+        assert!(notice.text().starts_with("Committed "), "{notice}");
+        assert!(notice.text().ends_with(" Add two"), "{notice}");
+        assert_eq!(head_message(&dir), "Add two");
+        assert_eq!(view.message_text(), "");
+        let dialog = view.hook_box().expect("the hook box shows");
+        assert_eq!(dialog.title(), "The post-commit hook failed (exit code 1)");
+        assert_eq!(dialog.action(), None);
+        assert_eq!(dialog.failure().output_text(), "could not notify");
+        press(&mut view, KeyCode::Esc);
+        assert!(view.hook_box().is_none());
     }
 }

@@ -53,6 +53,7 @@
 //! done.
 
 use super::history::short_id;
+use super::hooks::{Hook, Hooks};
 use git2::build::CheckoutBuilder;
 use git2::{
     Branch, BranchType, ErrorCode, ObjectType, Oid, Repository, Status, StatusOptions,
@@ -592,8 +593,8 @@ impl CheckoutJob {
     /// `git_dir` (see [`Repository::path`]), however [`Checkout::plan`]
     /// says to; a plan wanting a name ends the job with
     /// [`CheckoutOutcome::NeedsName`].
-    pub fn start(git_dir: &Path, id: Oid) -> Result<CheckoutJob, CheckoutError> {
-        CheckoutJob::spawn(git_dir.to_path_buf(), Start::Commit(id, None))
+    pub fn start(git_dir: &Path, id: Oid, hooks: Hooks) -> Result<CheckoutJob, CheckoutError> {
+        CheckoutJob::spawn(git_dir.to_path_buf(), Start::Commit(id, None), hooks)
     }
 
     /// Start checking out `id` a given way: the plan, or a
@@ -602,8 +603,9 @@ impl CheckoutJob {
         git_dir: &Path,
         id: Oid,
         how: Checkout,
+        hooks: Hooks,
     ) -> Result<CheckoutJob, CheckoutError> {
-        CheckoutJob::spawn(git_dir.to_path_buf(), Start::Commit(id, Some(how)))
+        CheckoutJob::spawn(git_dir.to_path_buf(), Start::Commit(id, Some(how)), hooks)
     }
 
     /// Start checking out a branch, as [`Checkout::plan_branch`] says
@@ -616,6 +618,7 @@ impl CheckoutJob {
         git_dir: &Path,
         name: &str,
         remote: bool,
+        hooks: Hooks,
     ) -> Result<CheckoutJob, CheckoutError> {
         CheckoutJob::spawn(
             git_dir.to_path_buf(),
@@ -623,10 +626,14 @@ impl CheckoutJob {
                 name: name.to_owned(),
                 remote,
             },
+            hooks,
         )
     }
 
-    fn spawn(git_dir: PathBuf, start: Start) -> Result<CheckoutJob, CheckoutError> {
+    /// Run the checkout on a thread of its own, and then the
+    /// repository's `post-checkout` hook, as git's checkout runs it
+    /// (its failure stops nothing; see [`Hooks::take_failures`]).
+    fn spawn(git_dir: PathBuf, start: Start, hooks: Hooks) -> Result<CheckoutJob, CheckoutError> {
         let (sender, receiver) = mpsc::channel();
         thread::Builder::new()
             .name("git-checkout".to_owned())
@@ -657,8 +664,18 @@ impl CheckoutJob {
                     let mut progress = |completed, total| {
                         let _ = sender.send(Message::Progress(completed, total));
                     };
+                    let before = repo
+                        .head()
+                        .ok()
+                        .and_then(|head| head.target())
+                        .unwrap_or(Oid::ZERO_SHA1);
                     match how.run_with(&repo, id, &mut progress) {
-                        Ok(submodules) => CheckoutOutcome::Done { how, submodules },
+                        Ok(submodules) => {
+                            let (before, after) = (before.to_string(), id.to_string());
+                            let _ =
+                                hooks.run(&repo, Hook::PostCheckout, &[&before, &after, "1"], &[]);
+                            CheckoutOutcome::Done { how, submodules }
+                        }
                         Err(err) => CheckoutOutcome::Failed(err),
                     }
                 })();
@@ -1138,7 +1155,13 @@ mod tests {
         fs::write(t.path().join("f.txt"), "three\n").unwrap();
 
         // In the background, the commit comes back with the outcome.
-        let mut job = CheckoutJob::start_branch(t.repo.path(), "origin/feature", true).unwrap();
+        let mut job = CheckoutJob::start_branch(
+            t.repo.path(),
+            "origin/feature",
+            true,
+            crate::git::hooks::tests::hooks(),
+        )
+        .unwrap();
         finish(&mut job);
         assert_eq!(job.commit(), Some(b));
         assert!(matches!(
@@ -1150,7 +1173,13 @@ mod tests {
         ));
         assert_eq!(head_of(&t.repo), (Some("feature".to_owned()), b, false));
         assert_eq!(fs::read_to_string(t.path().join("f.txt")).unwrap(), "two\n");
-        let mut job = CheckoutJob::start_branch(t.repo.path(), &main, false).unwrap();
+        let mut job = CheckoutJob::start_branch(
+            t.repo.path(),
+            &main,
+            false,
+            crate::git::hooks::tests::hooks(),
+        )
+        .unwrap();
         finish(&mut job);
         assert_eq!(job.commit(), Some(c));
         assert_eq!(head_of(&t.repo), (Some(main), c, false));
@@ -1586,7 +1615,8 @@ mod tests {
         t.branch("feature", b);
 
         // The plan wants a name: nothing is done.
-        let mut job = CheckoutJob::start(t.repo.path(), a).unwrap();
+        let mut job =
+            CheckoutJob::start(t.repo.path(), a, crate::git::hooks::tests::hooks()).unwrap();
         finish(&mut job);
         assert!(matches!(
             job.outcome(),
@@ -1601,7 +1631,13 @@ mod tests {
             name: "mine".to_owned(),
             upstream: "origin/feature".to_owned(),
         };
-        let mut job = CheckoutJob::start_with(t.repo.path(), a, how.clone()).unwrap();
+        let mut job = CheckoutJob::start_with(
+            t.repo.path(),
+            a,
+            how.clone(),
+            crate::git::hooks::tests::hooks(),
+        )
+        .unwrap();
         finish(&mut job);
         let (completed, total) = job.progress().expect("progress was reported");
         assert_eq!(completed, total);
@@ -1617,14 +1653,17 @@ mod tests {
             name: "feature".to_owned(),
             upstream: "origin/feature".to_owned(),
         };
-        let mut job = CheckoutJob::start_with(t.repo.path(), b, taken).unwrap();
+        let mut job =
+            CheckoutJob::start_with(t.repo.path(), b, taken, crate::git::hooks::tests::hooks())
+                .unwrap();
         finish(&mut job);
         assert!(matches!(
             job.outcome(),
             Some(CheckoutOutcome::Failed(CheckoutError::NameTaken(name))) if name == "feature"
         ));
         // A plain plan runs through to the end.
-        let mut job = CheckoutJob::start(t.repo.path(), b).unwrap();
+        let mut job =
+            CheckoutJob::start(t.repo.path(), b, crate::git::hooks::tests::hooks()).unwrap();
         finish(&mut job);
         assert!(matches!(
             job.outcome(),
@@ -1685,5 +1724,30 @@ mod tests {
             "new\n"
         );
         assert!(!t.path().join("g.txt").exists());
+    }
+
+    #[test]
+    fn post_checkout_runs_after_a_checkout_job_and_its_failure_is_kept() {
+        use crate::git::hooks::Hook;
+        use crate::git::hooks::tests::{hooks, install};
+        let mut t = TestRepo::new();
+        let a = t.commit(&[("f.txt", "one\n")], "One", &[]);
+        let b = t.commit(&[("f.txt", "two\n")], "Two", &[a]);
+        install(
+            &t.repo,
+            Hook::PostCheckout,
+            "echo \"$1 $2 $3\" > .git/post-checkout; echo nope; exit 1",
+        );
+        let hooks = hooks();
+        let mut job =
+            CheckoutJob::start_with(t.repo.path(), a, Checkout::Detached, hooks.clone()).unwrap();
+        finish(&mut job);
+        assert!(matches!(job.outcome(), Some(CheckoutOutcome::Done { .. })));
+        assert_eq!(head_of(&t.repo).1, a);
+        let args = fs::read_to_string(t.repo.path().join("post-checkout")).unwrap();
+        assert_eq!(args, format!("{b} {a} 1\n"));
+        let failures = hooks.take_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].output_text(), "nope");
     }
 }

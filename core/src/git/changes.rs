@@ -59,9 +59,15 @@
 //! writes over what the working directory has for a conflicted file,
 //! are the actions here that lose work.
 //!
+//! A commit runs the repository's hooks as `git commit` does (see the
+//! [`hooks`](super::hooks) module). Since they may take a while, a
+//! commit with any to run is made on a thread of its own, which
+//! [`Changes::poll`] takes the outcome of, and every other action is
+//! refused meanwhile.
+//!
 //! Every action ([`stage`](Changes::stage), [`unstage`](Changes::unstage),
 //! [`discard`](Changes::discard), [`resolve`](Changes::resolve), and
-//! [`commit`](Changes::commit))
+//! [`commit`](Changes::commit), when it has no hooks to run)
 //! changes the repository on the caller's thread and updates the lists
 //! right away with what it did: staging, unstaging, discarding, and
 //! resolving compare just the files they touched again, which is quick however
@@ -85,6 +91,7 @@ use super::diff::{
     self, CONTEXT_LINES, ChangeKind, Contents, FileChange, FileDiff, LinesChange, LinesTarget,
     STATS_LIMIT, Unshown,
 };
+use super::hooks::{Hook, HookError, Hooks, commit_env};
 use super::interactive::{self, Continued};
 use super::operation::{InProgress, OperationError};
 use super::rebase::{RebaseStatus, rebase_status};
@@ -95,6 +102,7 @@ use git2::{
     Repository, RepositoryState, Tree,
 };
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -161,6 +169,10 @@ pub struct Changes {
     conflicts: usize,
     /// Whether the commit will replace HEAD.
     amend: bool,
+    /// The commit being made on its thread, while its hooks run, and
+    /// how it went, until taken.
+    committing: Option<Receiver<Result<Committed, CommitError>>>,
+    commit_result: Option<Result<Committed, CommitError>>,
     receiver: Option<Receiver<Scanned>>,
     generation: u64,
     loading: bool,
@@ -205,6 +217,8 @@ impl Changes {
             head_message: None,
             conflicts: 0,
             amend: false,
+            committing: None,
+            commit_result: None,
             receiver: None,
             generation: 0,
             loading: false,
@@ -267,10 +281,10 @@ impl Changes {
     /// Take in the result of a scan if one has finished. Returns whether
     /// anything changed.
     pub fn poll(&mut self) -> bool {
+        let mut changed = self.poll_commit();
         let Some(receiver) = &self.receiver else {
-            return false;
+            return changed;
         };
-        let mut changed = false;
         let mut disconnected = false;
         let mut latest = None;
         loop {
@@ -323,13 +337,13 @@ impl Changes {
         }
     }
 
-    /// Poll until the scan is done or `timeout` passes. Returns whether
-    /// it finished.
+    /// Poll until the scan is done, and any commit being made, or
+    /// `timeout` passes. Returns whether they finished.
     pub fn wait(&mut self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
             self.poll();
-            if !self.loading {
+            if !self.loading && self.committing.is_none() {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -381,6 +395,7 @@ impl Changes {
         if amend == self.amend {
             return Ok(());
         }
+        self.ensure_idle()?;
         if amend {
             if self
                 .repo
@@ -632,6 +647,7 @@ impl Changes {
         &mut self,
         paths: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), git2::Error> {
+        self.ensure_idle()?;
         let paths: Vec<&str> = paths.into_iter().collect();
         let mut index = self.index()?;
         for &path in &paths {
@@ -660,6 +676,7 @@ impl Changes {
         &mut self,
         paths: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), git2::Error> {
+        self.ensure_idle()?;
         let paths: Vec<&str> = paths.into_iter().collect();
         {
             // Which libgit2 changes as it last read it.
@@ -748,6 +765,7 @@ impl Changes {
         &mut self,
         paths: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), git2::Error> {
+        self.ensure_idle()?;
         let paths: Vec<&str> = paths.into_iter().collect();
         if paths.is_empty() {
             return Ok(());
@@ -797,6 +815,7 @@ impl Changes {
     /// directory's file is, or as HEAD has it. Reverting can't be
     /// undone: a frontend should confirm it.
     pub fn apply_lines(&mut self, change: &LinesChange) -> Result<(), git2::Error> {
+        self.ensure_idle()?;
         let path = change.path.as_str();
         let stale = || {
             git2::Error::from_str(&format!(
@@ -922,6 +941,7 @@ impl Changes {
         paths: impl IntoIterator<Item = &'a str>,
         side: ConflictSide,
     ) -> Result<(), git2::Error> {
+        self.ensure_idle()?;
         let paths: Vec<&str> = paths.into_iter().collect();
         if paths.is_empty() {
             return Ok(());
@@ -991,96 +1011,109 @@ impl Changes {
     /// the staged tree, and the message. Refuses an empty message,
     /// unresolved conflicts, and a commit that would change nothing
     /// (unless it finishes a merge or amends).
-    pub fn commit(&mut self, message: &str) -> Result<Oid, git2::Error> {
-        let message = message.trim();
-        if message.is_empty() {
-            return Err(git2::Error::from_str("a commit needs a message"));
+    ///
+    /// The repository's hooks run around it as around `git commit`
+    /// (`pre-commit`, `prepare-commit-msg`, `commit-msg`, then
+    /// `post-commit`), with `hooks`. With none to run, the commit
+    /// is made at once and returned. Otherwise it is made on a thread
+    /// of its own, since hooks may take a while, and `None` returned:
+    /// [`poll`](Self::poll) takes in how it went, for
+    /// [`take_commit`](Self::take_commit); until then
+    /// [`is_committing`](Self::is_committing) says so, and the other
+    /// actions are refused. Either way the lists follow as a commit made
+    /// here does.
+    pub fn commit(
+        &mut self,
+        message: &str,
+        hooks: &Hooks,
+    ) -> Result<Option<Committed>, CommitError> {
+        self.ensure_idle()?;
+        if !COMMIT_HOOKS
+            .iter()
+            .any(|&hook| hooks.will_run(&self.repo, hook))
+        {
+            let committed = make_commit(&self.repo, message, self.amend, hooks)?;
+            self.follow_commit(&committed);
+            return Ok(Some(committed));
         }
-        if matches!(
-            self.repo.state(),
-            RepositoryState::RebaseMerge | RepositoryState::RebaseInteractive
-        ) {
-            return Err(git2::Error::from_str(
-                "a rebase is in progress: continue it rather than commit",
-            ));
-        }
-        let merging = self.repo.state() == RepositoryState::Merge;
-        let mut merged = Vec::new();
-        if merging {
-            self.repo.mergehead_foreach(|id| {
-                merged.push(*id);
-                true
-            })?;
-        }
-        let id = {
-            let mut index = self.index()?;
-            if index.has_conflicts() && merging {
-                // A submodule conflict that has become resolvable since
-                // the merge stopped (its own branch rebased since, as the
-                // stop said to) is resolved now.
-                resolve_submodule_conflicts(&self.repo, &mut |_, _| {})?;
-            }
-            if index.has_conflicts() {
-                return Err(git2::Error::from_str(
-                    "resolve the conflicts and stage the files first",
-                ));
-            }
-            let head = self
-                .repo
-                .head()
-                .ok()
-                .and_then(|head| head.peel_to_commit().ok());
-            let tree_id = index.write_tree()?;
-            let unchanged = match &head {
-                Some(head) => head.tree_id() == tree_id,
-                None => index.is_empty(),
-            };
-            if unchanged && !merging && !self.amend {
-                return Err(git2::Error::from_str("nothing is staged to commit"));
-            }
-            let tree = self.repo.find_tree(tree_id)?;
-            let signature = self.repo.signature()?;
-            if self.amend {
-                let head =
-                    head.ok_or_else(|| git2::Error::from_str("there is no commit to amend"))?;
-                head.amend(
-                    Some("HEAD"),
-                    None,
-                    Some(&signature),
-                    None,
-                    Some(message),
-                    Some(&tree),
-                )?
-            } else {
-                let mut parents: Vec<git2::Commit<'_>> = head.into_iter().collect();
-                for id in merged {
-                    parents.push(self.repo.find_commit(id)?);
-                }
-                let parent_refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
-                self.repo.commit(
-                    Some("HEAD"),
-                    &signature,
-                    &signature,
-                    message,
-                    &tree,
-                    &parent_refs,
-                )?
+        // Whatever would refuse the commit does so now, rather than
+        // after a hook has run for nothing.
+        check_commit(&self.repo, message, self.amend)?;
+        let git_dir = self.repo.path().to_path_buf();
+        let message = message.to_owned();
+        let amend = self.amend;
+        let hooks = hooks.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("git-commit".to_owned())
+            .spawn(move || {
+                let result = Repository::open(&git_dir)
+                    .map_err(CommitError::from)
+                    .and_then(|repo| make_commit(&repo, &message, amend, &hooks));
+                let _ = sender.send(result);
+            })
+            .map_err(|err| git2::Error::from_str(&err.to_string()))?;
+        self.committing = Some(receiver);
+        Ok(None)
+    }
+
+    /// Whether a commit is being made on its thread (see
+    /// [`commit`](Self::commit)), as of the last poll.
+    pub fn is_committing(&self) -> bool {
+        self.committing.is_some()
+    }
+
+    /// How the commit made on its thread went, once
+    /// [`poll`](Self::poll) has taken it in. Taking it clears it.
+    pub fn take_commit(&mut self) -> Option<Result<Committed, CommitError>> {
+        self.commit_result.take()
+    }
+
+    /// Take in how the commit on its thread went, if it is done.
+    /// Returns whether it is.
+    fn poll_commit(&mut self) -> bool {
+        let Some(receiver) = &self.committing else {
+            return false;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => {
+                Err(git2::Error::from_str("the commit stopped").into())
             }
         };
-        if merging {
-            self.repo.cleanup_state()?;
+        self.committing = None;
+        match &result {
+            Ok(committed) => self.follow_commit(committed),
+            // The hooks may have changed files or staged them before
+            // one failed.
+            Err(_) => self.refresh(),
         }
+        self.commit_result = Some(result);
+        true
+    }
+
+    /// Refuse an action while a commit is being made on its thread.
+    fn ensure_idle(&self) -> Result<(), git2::Error> {
+        if self.committing.is_some() {
+            return Err(git2::Error::from_str(
+                "a commit is being made; wait for its hooks to finish",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Show what a commit made: the commit holds what was staged, and
+    /// is now what a commit would replace.
+    fn follow_commit(&mut self, committed: &Committed) {
         // An amended commit is made; the next one follows it.
         self.amend = false;
-        // The commit holds what was staged, and is now what a commit
-        // would replace.
         self.staged.clear();
         self.unborn = false;
         self.merging = false;
         self.merge_message = None;
-        self.head_message = Some(message.to_owned());
+        self.head_message = Some(committed.message.clone());
         self.confirm();
-        Ok(id)
     }
 
     /// Go on with the rebase in progress, now that the conflicts of the
@@ -1092,6 +1125,7 @@ impl Changes {
     /// author, and goes on only once nothing is left unstaged (see
     /// [`interactive::proceed`]). The lists scan again after.
     pub fn continue_rebase(&mut self, message: &str) -> Result<Continued, OperationError> {
+        self.ensure_idle()?;
         let continued = self.go_on(message);
         self.refresh();
         continued
@@ -1114,6 +1148,7 @@ impl Changes {
     /// index, and the working tree back as they were before it began.
     /// Returns which it was. The lists scan again after.
     pub fn abort(&mut self) -> Result<InProgress, OperationError> {
+        self.ensure_idle()?;
         self.index()?;
         let aborted = match self.repo.state() {
             RepositoryState::Merge => {
@@ -1131,6 +1166,193 @@ impl Changes {
         self.refresh();
         aborted
     }
+}
+
+/// A commit made by [`Changes::commit`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Committed {
+    pub id: Oid,
+    /// The message it was made with, which the hooks may have changed.
+    pub message: String,
+    /// Whether it replaced HEAD.
+    pub amended: bool,
+}
+
+/// Why a commit wasn't made.
+#[derive(Debug)]
+pub enum CommitError {
+    /// A hook stopped it.
+    Hook(HookError),
+    Git(git2::Error),
+}
+
+impl From<git2::Error> for CommitError {
+    fn from(err: git2::Error) -> CommitError {
+        CommitError::Git(err)
+    }
+}
+
+impl From<HookError> for CommitError {
+    fn from(err: HookError) -> CommitError {
+        CommitError::Hook(err)
+    }
+}
+
+impl fmt::Display for CommitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CommitError::Hook(err) => err.fmt(f),
+            CommitError::Git(err) => f.write_str(err.message()),
+        }
+    }
+}
+
+impl std::error::Error for CommitError {}
+
+/// The hooks a commit runs, any of which sends it to its thread.
+const COMMIT_HOOKS: [Hook; 4] = [
+    Hook::PreCommit,
+    Hook::PrepareCommitMsg,
+    Hook::CommitMsg,
+    Hook::PostCommit,
+];
+
+/// What a commit's checks found to commit.
+struct CommitPlan {
+    /// Whether it finishes a merge in progress, and the commits merged,
+    /// the parents after HEAD.
+    merging: bool,
+    merged: Vec<Oid>,
+}
+
+/// Whether a commit of what is staged, with `message`, can be made (see
+/// [`Changes::commit`]), before any hook runs. A merge's submodule
+/// conflicts that have become resolvable are resolved.
+fn check_commit(repo: &Repository, message: &str, amend: bool) -> Result<CommitPlan, git2::Error> {
+    if message.trim().is_empty() {
+        return Err(git2::Error::from_str("a commit needs a message"));
+    }
+    if matches!(
+        repo.state(),
+        RepositoryState::RebaseMerge | RepositoryState::RebaseInteractive
+    ) {
+        return Err(git2::Error::from_str(
+            "a rebase is in progress: continue it rather than commit",
+        ));
+    }
+    let merging = repo.state() == RepositoryState::Merge;
+    let mut merged = Vec::new();
+    if merging {
+        // As `mergehead_foreach` would list them, which wants the
+        // repository to itself.
+        let heads = fs::read_to_string(repo.path().join("MERGE_HEAD"))
+            .map_err(|err| git2::Error::from_str(&format!("MERGE_HEAD: {err}")))?;
+        for line in heads.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            merged.push(Oid::from_str(line)?);
+        }
+    }
+    let mut index = repo.index()?;
+    index.read(false)?;
+    if index.has_conflicts() && merging {
+        // A submodule conflict that has become resolvable since the
+        // merge stopped (its own branch rebased since, as the stop said
+        // to) is resolved now.
+        resolve_submodule_conflicts(repo, &mut |_, _| {})?;
+        index.read(true)?;
+    }
+    if index.has_conflicts() {
+        return Err(git2::Error::from_str(
+            "resolve the conflicts and stage the files first",
+        ));
+    }
+    let tree_id = index.write_tree()?;
+    let unchanged = match head_commit(repo) {
+        Some(head) => head.tree_id() == tree_id,
+        None => index.is_empty(),
+    };
+    if unchanged && !merging && !amend {
+        return Err(git2::Error::from_str("nothing is staged to commit"));
+    }
+    Ok(CommitPlan { merging, merged })
+}
+
+fn head_commit(repo: &Repository) -> Option<git2::Commit<'_>> {
+    repo.head().ok().and_then(|head| head.peel_to_commit().ok())
+}
+
+/// Make the commit [`Changes::commit`] describes, with the hooks `git
+/// commit -m` runs: `pre-commit`, which may stage more; then
+/// `prepare-commit-msg` and `commit-msg` on the message, in
+/// `COMMIT_EDITMSG`, which may change it; any of which may stop the
+/// commit; and `post-commit` once it is made.
+fn make_commit(
+    repo: &Repository,
+    message: &str,
+    amend: bool,
+    hooks: &Hooks,
+) -> Result<Committed, CommitError> {
+    let CommitPlan { merging, merged } = check_commit(repo, message, amend)?;
+    let mut message = message.trim().to_owned();
+    let env = commit_env(repo);
+    hooks.run(repo, Hook::PreCommit, &[], &env)?;
+    let mut index = repo.index()?;
+    index.read(true)?;
+    if index.has_conflicts() {
+        return Err(
+            git2::Error::from_str("resolve the conflicts and stage the files first").into(),
+        );
+    }
+    // The message as git keeps it, for the hooks and after.
+    let path = repo.path().join("COMMIT_EDITMSG");
+    let io = |err: std::io::Error| git2::Error::from_str(&format!("COMMIT_EDITMSG: {err}"));
+    fs::write(&path, format!("{message}\n")).map_err(io)?;
+    if hooks.will_run(repo, Hook::PrepareCommitMsg) || hooks.will_run(repo, Hook::CommitMsg) {
+        let file = path.to_string_lossy();
+        hooks.run(repo, Hook::PrepareCommitMsg, &[&file, "message"], &env)?;
+        hooks.run(repo, Hook::CommitMsg, &[&file], &env)?;
+        let text = fs::read_to_string(&path).map_err(io)?;
+        message = git2::message_prettify(text, None)?.trim().to_owned();
+        if message.is_empty() {
+            return Err(git2::Error::from_str("the hooks left the commit's message empty").into());
+        }
+    }
+    let tree = repo.find_tree(index.write_tree()?)?;
+    let signature = repo.signature()?;
+    let head = head_commit(repo);
+    let id = if amend {
+        let head = head.ok_or_else(|| git2::Error::from_str("there is no commit to amend"))?;
+        head.amend(
+            Some("HEAD"),
+            None,
+            Some(&signature),
+            None,
+            Some(&message),
+            Some(&tree),
+        )?
+    } else {
+        let mut parents: Vec<git2::Commit<'_>> = head.into_iter().collect();
+        for id in &merged {
+            parents.push(repo.find_commit(*id)?);
+        }
+        let parent_refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            &message,
+            &tree,
+            &parent_refs,
+        )?
+    };
+    if merging {
+        repo.cleanup_state()?;
+    }
+    hooks.run(repo, Hook::PostCommit, &[], &env)?;
+    Ok(Committed {
+        id,
+        message,
+        amended: amend,
+    })
 }
 
 /// The options for comparing the working directory with the index:
@@ -1342,12 +1564,19 @@ fn list_changes(
 mod tests {
     use super::super::history::tests::TestRepo;
     use super::*;
+    use crate::git::hooks::{self, Hook, HookFailure};
     use crate::git::{DiffLine, DiffRow, Integration, LineKind, Outcome, RebasePlan};
 
     fn open(repo: &TestRepo) -> Changes {
         let mut changes = Changes::open(repo.path()).unwrap();
         assert!(changes.wait(Duration::from_secs(10)), "the scan finished");
         changes
+    }
+
+    /// Commit as the changes page does, without hooks to run.
+    fn make(changes: &mut Changes, message: &str) -> Result<Oid, CommitError> {
+        let committed = changes.commit(message, &hooks::tests::hooks())?;
+        Ok(committed.expect("made at once, with no hooks").id)
     }
 
     fn settle(changes: &mut Changes) {
@@ -1509,8 +1738,8 @@ mod tests {
         confirmed(&mut changes);
 
         // Commit: the tree is clean, and HEAD moved on from the base.
-        assert!(changes.commit("   ").is_err());
-        let id = changes.commit("Change things\n").unwrap();
+        assert!(make(&mut changes, "   ").is_err());
+        let id = make(&mut changes, "Change things\n").unwrap();
         confirmed(&mut changes);
         assert!(changes.is_clean());
         let commit = repo.repo.find_commit(id).unwrap();
@@ -1518,7 +1747,7 @@ mod tests {
         assert_eq!(commit.parent_id(0).unwrap(), base);
         assert_eq!(repo.repo.head().unwrap().target(), Some(id));
         assert!(
-            changes.commit("Nothing").is_err(),
+            make(&mut changes, "Nothing").is_err(),
             "nothing staged to commit"
         );
     }
@@ -1582,7 +1811,7 @@ mod tests {
         assert!(shown.contains(&"+<<<<<<< HEAD".to_owned()), "{shown:?}");
         assert!(shown.contains(&" ours".to_owned()), "{shown:?}");
         assert!(shown.contains(&"+theirs".to_owned()), "{shown:?}");
-        assert!(changes.commit("Merge").is_err(), "conflicts remain");
+        assert!(make(&mut changes, "Merge").is_err(), "conflicts remain");
 
         // Resolve it, stage it, and commit the merge.
         fs::write(repo.path().join("f.txt"), "one\nours and theirs\nthree\n").unwrap();
@@ -1594,7 +1823,7 @@ mod tests {
         assert_eq!(changes.conflict_count(), 0);
         assert_eq!(listed(changes.staged()), [('M', "f.txt", 1, 1)]);
         assert!(changes.unstaged().is_empty());
-        let id = changes.commit("Merge branch 'side'").unwrap();
+        let id = make(&mut changes, "Merge branch 'side'").unwrap();
         confirmed(&mut changes);
         let commit = repo.repo.find_commit(id).unwrap();
         let parents: Vec<Oid> = commit.parent_ids().collect();
@@ -1679,7 +1908,7 @@ mod tests {
             listed(changes.staged()),
             [('M', "a/g.txt", 1, 1), ('D', "d/gone.txt", 0, 1)]
         );
-        let id = changes.commit("Merge branch 'side'").unwrap();
+        let id = make(&mut changes, "Merge branch 'side'").unwrap();
         confirmed(&mut changes);
         let commit = repo.repo.find_commit(id).unwrap();
         assert_eq!(commit.parent_ids().collect::<Vec<_>>(), [ours, theirs]);
@@ -1697,7 +1926,9 @@ mod tests {
             name: "side".to_owned(),
             remote: false,
         });
-        let stopped = rebase.run_with(&repo.repo, &mut |_, _| {}).unwrap();
+        let stopped = rebase
+            .run_with(&repo.repo, &hooks::tests::hooks(), &mut |_, _| {})
+            .unwrap();
         assert!(matches!(stopped, Outcome::Conflicts { files: 1, .. }));
 
         let mut changes = open(&repo);
@@ -1708,7 +1939,7 @@ mod tests {
         assert!(!changes.is_merging());
         assert_eq!(changes.conflict_count(), 1);
         assert!(changes.set_amend(true).is_err(), "no amending mid-rebase");
-        assert!(changes.commit("Main").is_err(), "a rebase continues");
+        assert!(make(&mut changes, "Main").is_err(), "a rebase continues");
         assert!(matches!(
             changes.continue_rebase(""),
             Err(OperationError::Unresolved { files: 1, .. })
@@ -1723,7 +1954,9 @@ mod tests {
         assert_eq!(repo.repo.head().unwrap().target(), Some(main));
 
         // Again, resolved and continued this time, with a new message.
-        rebase.run_with(&repo.repo, &mut |_, _| {}).unwrap();
+        rebase
+            .run_with(&repo.repo, &hooks::tests::hooks(), &mut |_, _| {})
+            .unwrap();
         changes.refresh();
         settle(&mut changes);
         fs::write(repo.path().join("f.txt"), "main and side\n").unwrap();
@@ -1775,7 +2008,8 @@ mod tests {
         let two = repo.commit(&[("a.txt", "a2\n"), ("b.txt", "b\n")], "Two", &[base]);
         let three = repo.commit(&[("c.txt", "c\n")], "Three", &[two]);
         let edit = Integration::Interactive(RebasePlan::edit(&repo.repo, two).unwrap());
-        edit.run_with(&repo.repo, &mut |_, _| {}).unwrap();
+        edit.run_with(&repo.repo, &hooks::tests::hooks(), &mut |_, _| {})
+            .unwrap();
         let mut changes = open(&repo);
         // Two's changes, staged on its parent.
         assert_eq!(changes.head_id(), Some(base));
@@ -1789,7 +2023,7 @@ mod tests {
         assert_eq!((status.step, status.total), (1, 2));
         assert_eq!(status.message.as_deref(), Some("Two"));
         assert!(changes.set_amend(true).is_err(), "no amending mid-rebase");
-        assert!(changes.commit("Two").is_err(), "a rebase continues");
+        assert!(make(&mut changes, "Two").is_err(), "a rebase continues");
 
         // Split off b.txt: committing the rest waits for it.
         changes.unstage(["b.txt"]).unwrap();
@@ -1809,7 +2043,8 @@ mod tests {
         assert_eq!(changes.head_id(), Some(three));
 
         // Again, with b.txt committed too this time.
-        edit.run_with(&repo.repo, &mut |_, _| {}).unwrap();
+        edit.run_with(&repo.repo, &hooks::tests::hooks(), &mut |_, _| {})
+            .unwrap();
         changes.refresh();
         settle(&mut changes);
         changes.unstage(["b.txt"]).unwrap();
@@ -1883,7 +2118,7 @@ mod tests {
             config.set_str("user.name", "Sub Author").unwrap();
             config.set_str("user.email", "sub@example.com").unwrap();
         }
-        let inner_commit = inner.commit("Inner change").unwrap();
+        let inner_commit = make(&mut inner, "Inner change").unwrap();
         settle(&mut inner);
         assert!(inner.is_clean());
 
@@ -1930,7 +2165,7 @@ mod tests {
             (Some(first_inner), Some(inner_commit))
         );
         assert_eq!(range.commits.len(), 2);
-        let id = changes.commit("Update submodule").unwrap();
+        let id = make(&mut changes, "Update submodule").unwrap();
         confirmed(&mut changes);
         assert!(changes.is_clean());
         let tree = repo.repo.find_commit(id).unwrap().tree().unwrap();
@@ -1985,7 +2220,7 @@ mod tests {
         assert_eq!(listed(changes.unstaged()), [('?', "c.txt", 1, 0)]);
         // The commit replaces HEAD: same parent, new tree and message,
         // and amending is off again.
-        let id = changes.commit("Add two and bee").unwrap();
+        let id = make(&mut changes, "Add two and bee").unwrap();
         confirmed(&mut changes);
         assert_ne!(id, head);
         assert!(!changes.is_amending());
@@ -2355,7 +2590,7 @@ mod tests {
         changes.refresh();
         settle(&mut changes);
         assert_eq!(listed(changes.unstaged()), [('?', "first.txt", 1, 0)]);
-        assert!(changes.commit("Nothing staged").is_err());
+        assert!(make(&mut changes, "Nothing staged").is_err());
         changes.stage_all().unwrap();
         confirmed(&mut changes);
         assert_eq!(listed(changes.staged()), [('A', "first.txt", 1, 0)]);
@@ -2369,5 +2604,166 @@ mod tests {
         // Nothing to amend on an unborn branch.
         assert!(changes.set_amend(true).is_err());
         assert!(!changes.is_amending());
+    }
+
+    /// Commit with hooks to run, waiting for the commit's thread.
+    fn make_with(
+        changes: &mut Changes,
+        message: &str,
+        hooks: &Hooks,
+    ) -> Result<Committed, CommitError> {
+        assert!(
+            changes.commit(message, hooks)?.is_none(),
+            "made on its thread"
+        );
+        assert!(changes.is_committing());
+        assert!(changes.wait(Duration::from_secs(10)), "the commit finished");
+        changes.take_commit().expect("the commit's outcome")
+    }
+
+    /// A repository with a commit, and a change staged on top of it.
+    fn staged_change() -> (TestRepo, Changes, Oid) {
+        let mut repo = TestRepo::new();
+        let base = repo.commit(&[("a.txt", "one\n")], "Base", &[]);
+        fs::write(repo.path().join("a.txt"), "two\n").unwrap();
+        let mut changes = open(&repo);
+        changes.stage(["a.txt"]).unwrap();
+        settle(&mut changes);
+        (repo, changes, base)
+    }
+
+    #[test]
+    fn a_failing_pre_commit_hook_stops_the_commit_until_skipped() {
+        let (repo, mut changes, base) = staged_change();
+        hooks::tests::install(&repo.repo, Hook::PreCommit, "echo \"lint: bad\"; exit 1");
+        let Err(CommitError::Hook(HookError::Failed(failure))) =
+            make_with(&mut changes, "Change", &hooks::tests::hooks())
+        else {
+            panic!("the hook should stop the commit");
+        };
+        assert_eq!(failure.hook, Hook::PreCommit);
+        assert_eq!(failure.output_text(), "lint: bad");
+        settle(&mut changes);
+        assert_eq!(repo.repo.head().unwrap().target(), Some(base));
+        assert_eq!(listed(changes.staged()), [('M', "a.txt", 1, 1)]);
+
+        // --no-verify: done anyway.
+        let hooks = hooks::tests::hooks().without_verify();
+        let committed = changes.commit("Change", &hooks).unwrap().unwrap();
+        assert_eq!(committed.message, "Change");
+        assert_eq!(repo.repo.head().unwrap().target(), Some(committed.id));
+        assert!(changes.staged().is_empty());
+    }
+
+    #[test]
+    fn message_hooks_change_the_message_and_post_commit_failing_stops_nothing() {
+        let (repo, mut changes, base) = staged_change();
+        hooks::tests::install(
+            &repo.repo,
+            Hook::PrepareCommitMsg,
+            "[ \"$2\" = message ] || exit 1; printf '[%s] ' \"$(basename \"$1\")\" | cat - \"$1\" > \"$1.new\" && mv \"$1.new\" \"$1\"",
+        );
+        hooks::tests::install(
+            &repo.repo,
+            Hook::CommitMsg,
+            "[ \"$GIT_EDITOR\" = : ] || exit 1; printf '\\nSigned-off-by: Test\\n\\n\\n' >> \"$1\"",
+        );
+        hooks::tests::install(&repo.repo, Hook::PostCommit, "echo done; exit 2");
+        let hooks = hooks::tests::hooks();
+        let committed = make_with(&mut changes, "Change\n", &hooks).unwrap();
+        let message = "[COMMIT_EDITMSG] Change\n\nSigned-off-by: Test";
+        assert_eq!(committed.message, message);
+        let commit = repo.repo.find_commit(committed.id).unwrap();
+        assert_eq!(commit.message().unwrap(), message);
+        assert_eq!(commit.parent_id(0).unwrap(), base);
+        assert_eq!(changes.head_message(), Some(message));
+        let failures = hooks.take_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].hook, Hook::PostCommit);
+        assert_eq!(failures[0].output_text(), "done");
+
+        // A commit-msg hook that rejects a message stops the amend.
+        hooks::tests::install(
+            &repo.repo,
+            Hook::CommitMsg,
+            "grep -q WIP \"$1\" && exit 1; exit 0",
+        );
+        changes.set_amend(true).unwrap();
+        settle(&mut changes);
+        let result = make_with(&mut changes, "WIP", &hooks::tests::hooks());
+        assert!(matches!(
+            result,
+            Err(CommitError::Hook(HookError::Failed(HookFailure {
+                hook: Hook::CommitMsg,
+                ..
+            })))
+        ));
+        assert_eq!(repo.repo.head().unwrap().target(), Some(committed.id));
+    }
+
+    #[test]
+    fn what_the_pre_commit_hook_stages_is_committed() {
+        let (repo, mut changes, _) = staged_change();
+        // As a formatter run by the hook would.
+        hooks::tests::install(
+            &repo.repo,
+            Hook::PreCommit,
+            "echo three > a.txt && git add a.txt",
+        );
+        let committed = make_with(&mut changes, "Change", &hooks::tests::hooks()).unwrap();
+        let commit = repo.repo.find_commit(committed.id).unwrap();
+        let entry = commit.tree().unwrap().get_name("a.txt").unwrap().id();
+        let blob = repo.repo.find_blob(entry).unwrap();
+        assert_eq!(blob.content(), b"three\n");
+    }
+
+    #[test]
+    fn nothing_else_is_done_while_the_hooks_of_a_commit_run() {
+        let (repo, mut changes, _) = staged_change();
+        let go = repo.path().join("go");
+        hooks::tests::install(
+            &repo.repo,
+            Hook::PreCommit,
+            "while [ ! -f go ]; do sleep 0.02; done; rm go",
+        );
+        let hooks = hooks::tests::hooks();
+        assert!(changes.commit("Change", &hooks).unwrap().is_none());
+        assert!(changes.is_committing());
+        assert!(changes.stage(["a.txt"]).is_err());
+        assert!(changes.set_amend(true).is_err());
+        assert!(changes.commit("Again", &hooks).is_err());
+        assert!(changes.abort().is_err());
+        fs::write(&go, "").unwrap();
+        assert!(changes.wait(Duration::from_secs(10)));
+        assert!(!changes.is_committing());
+        let committed = changes.take_commit().unwrap().unwrap();
+        assert_eq!(repo.repo.head().unwrap().target(), Some(committed.id));
+        assert!(changes.take_commit().is_none());
+
+        // A refusal that needs no hook comes at once, before any runs.
+        assert!(changes.commit("Nothing staged", &hooks).is_err());
+        assert!(!changes.is_committing());
+    }
+
+    #[test]
+    fn cancelling_a_commit_s_hook_makes_no_commit() {
+        let (repo, mut changes, base) = staged_change();
+        hooks::tests::install(&repo.repo, Hook::PreCommit, "sleep 30");
+        let hooks = hooks::tests::hooks();
+        assert!(changes.commit("Change", &hooks).unwrap().is_none());
+        let start = Instant::now();
+        while hooks.running().is_none() {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            thread::sleep(Duration::from_millis(5));
+        }
+        hooks.cancel();
+        assert!(changes.wait(Duration::from_secs(10)));
+        assert!(matches!(
+            changes.take_commit(),
+            Some(Err(CommitError::Hook(HookError::Cancelled(
+                Hook::PreCommit
+            ))))
+        ));
+        assert_eq!(repo.repo.head().unwrap().target(), Some(base));
     }
 }

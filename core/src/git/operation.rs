@@ -45,6 +45,7 @@ use super::checkout::{
     CheckoutError, check_submodules, ensure_clean, follow_index, update_submodules,
 };
 use super::history::short_id;
+use super::hooks::{HookError, Hooks};
 use super::interactive::{self, RebaseAction, RebasePlan};
 use super::submodule_conflicts::{SubmoduleConflict, resolve_submodule_conflicts};
 use git2::build::CheckoutBuilder;
@@ -170,12 +171,22 @@ pub enum OperationError {
     Stopped(CheckoutError),
     /// An interactive rebase's plan can't be carried out as it stands.
     Plan(interactive::PlanError),
+    /// A hook stopped it (see the [`hooks`](super::hooks) module),
+    /// leaving the repository as it was before, for it to be done again
+    /// without the hook if the hook can be skipped.
+    Hook(HookError),
     Git(git2::Error),
 }
 
 impl From<git2::Error> for OperationError {
     fn from(err: git2::Error) -> OperationError {
         OperationError::Git(err)
+    }
+}
+
+impl From<HookError> for OperationError {
+    fn from(err: HookError) -> OperationError {
+        OperationError::Hook(err)
     }
 }
 
@@ -233,6 +244,7 @@ impl fmt::Display for OperationError {
                 "stopped part way, as the submodules couldn't follow: {err}; fix that, then continue or abort on the changes page"
             ),
             OperationError::Plan(err) => err.fmt(f),
+            OperationError::Hook(err) => err.fmt(f),
             OperationError::Git(err) => f.write_str(err.message()),
         }
     }
@@ -299,15 +311,18 @@ pub enum Integration {
 impl Integration {
     /// Merge or rebase, telling `progress` how many files of the
     /// working tree have been written and how many there are to write.
+    /// The repository's hooks run as git's would (see the
+    /// [`hooks`](super::hooks) module).
     pub fn run_with(
         &self,
         repo: &Repository,
+        hooks: &Hooks,
         progress: &mut dyn FnMut(usize, usize),
     ) -> Result<Outcome, OperationError> {
         match self {
-            Integration::Merge(target) => super::merge::merge(repo, target, progress),
-            Integration::Rebase(target) => super::rebase::rebase(repo, target, progress),
-            Integration::Interactive(plan) => interactive::start(repo, plan, progress),
+            Integration::Merge(target) => super::merge::merge(repo, target, hooks, progress),
+            Integration::Rebase(target) => super::rebase::rebase(repo, target, hooks, progress),
+            Integration::Interactive(plan) => interactive::start(repo, plan, hooks, progress),
         }
     }
 
@@ -543,8 +558,13 @@ pub struct IntegrationJob {
 
 impl IntegrationJob {
     /// Start merging or rebasing in the repository whose git directory
-    /// is `git_dir` (see [`Repository::path`]).
-    pub fn start(git_dir: &Path, what: Integration) -> Result<IntegrationJob, OperationError> {
+    /// is `git_dir` (see [`Repository::path`]), running its hooks with
+    /// `hooks`.
+    pub fn start(
+        git_dir: &Path,
+        what: Integration,
+        hooks: Hooks,
+    ) -> Result<IntegrationJob, OperationError> {
         let git_dir: PathBuf = git_dir.to_path_buf();
         let (sender, receiver) = mpsc::channel();
         let name = match what {
@@ -561,7 +581,7 @@ impl IntegrationJob {
                         let mut progress = |completed, total| {
                             let _ = sender.send(Message::Progress(completed, total));
                         };
-                        what.run_with(&repo, &mut progress)
+                        what.run_with(&repo, &hooks, &mut progress)
                     });
                 let _ = sender.send(Message::Outcome(outcome));
             })
@@ -729,7 +749,12 @@ pub(super) mod tests {
         let mut t = repo();
         let (_, main, side_id) = diverged(&mut t, false);
         let what = Integration::Merge(side());
-        let mut job = IntegrationJob::start(t.repo.path(), what.clone()).unwrap();
+        let mut job = IntegrationJob::start(
+            t.repo.path(),
+            what.clone(),
+            crate::git::hooks::tests::hooks(),
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !job.is_done() && Instant::now() < deadline {
             job.poll();
@@ -804,7 +829,13 @@ pub(super) mod tests {
         let mut t = repo();
         diverged(&mut t, false);
         fs::write(t.path().join("f.txt"), "edited\n").unwrap();
-        let err = super::super::merge::merge(&t.repo, &side(), &mut |_, _| {}).unwrap_err();
+        let err = super::super::merge::merge(
+            &t.repo,
+            &side(),
+            &crate::git::hooks::tests::hooks(),
+            &mut |_, _| {},
+        )
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -817,7 +848,13 @@ pub(super) mod tests {
         );
         sync(&t);
         fs::write(t.repo.path().join("CHERRY_PICK_HEAD"), "x\n").unwrap();
-        let err = super::super::rebase::rebase(&t.repo, &side(), &mut |_, _| {}).unwrap_err();
+        let err = super::super::rebase::rebase(
+            &t.repo,
+            &side(),
+            &crate::git::hooks::tests::hooks(),
+            &mut |_, _| {},
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "a cherry-pick is in progress; finish it with git first"

@@ -9,6 +9,7 @@
 //! [`operation`](super::operation) module for what merging and
 //! rebasing share.
 
+use super::hooks::{Hook, Hooks, commit_env};
 use super::operation::{
     OperationError, Outcome, Target, checkout_options, conflicted_files, ensure_ready,
     fast_forward, follow_submodules, settle_part_way,
@@ -19,10 +20,16 @@ use std::collections::BTreeSet;
 use std::fs;
 
 /// Merge `target` into HEAD's branch (or a detached HEAD), telling
-/// `progress` how many files have been written of how many.
+/// `progress` how many files have been written of how many, with the
+/// hooks git's merge runs: `pre-merge-commit`, `prepare-commit-msg`,
+/// and `commit-msg` before a merge commit, any of which may stop it,
+/// and `post-merge` after it or a fast-forward. A merge a hook stops
+/// is aborted, leaving things as they were for it to be done again
+/// (unlike git, which leaves it in progress).
 pub(super) fn merge(
     repo: &Repository,
     target: &Target,
+    hooks: &Hooks,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<Outcome, OperationError> {
     let head = ensure_ready(repo)?;
@@ -38,6 +45,7 @@ pub(super) fn merge(
     if analysis.is_fast_forward() {
         let why = format!("merge {}: Fast-forward", target.name());
         let submodules = fast_forward(repo, their_id, &why, progress)?;
+        hooks.run(repo, Hook::PostMerge, &["0"], &[])?;
         return Ok(Outcome::FastForwarded { submodules });
     }
 
@@ -71,6 +79,15 @@ pub(super) fn merge(
         .map(|text| text.trim_end().to_owned())
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| format!("Merge {}", target.name()));
+    let message = match merge_hooks(repo, hooks, message) {
+        Ok(message) => message,
+        Err(err) => {
+            abort_merge(repo)?;
+            return Err(err);
+        }
+    };
+    // The hooks may have staged changes of their own.
+    index.read(true)?;
     let tree = repo.find_tree(index.write_tree()?)?;
     let signature = repo.signature()?;
     let ours = repo.find_commit(head)?;
@@ -84,11 +101,41 @@ pub(super) fn merge(
     )?;
     repo.cleanup_state()?;
     let submodules = moved.len() + follow_submodules(repo, commit, progress)?;
+    hooks.run(repo, Hook::PostMerge, &["0"], &[])?;
     Ok(Outcome::Merged {
         commit,
         submodules,
         resolved,
     })
+}
+
+/// Run the hooks git's merge runs before committing: `pre-merge-commit`,
+/// then `prepare-commit-msg` and `commit-msg` on `message`, put in
+/// `MERGE_MSG` for them. Returns the message as they leave it.
+fn merge_hooks(
+    repo: &Repository,
+    hooks: &Hooks,
+    message: String,
+) -> Result<String, OperationError> {
+    let env = commit_env(repo);
+    hooks.run(repo, Hook::PreMergeCommit, &[], &env)?;
+    if !hooks.will_run(repo, Hook::PrepareCommitMsg) && !hooks.will_run(repo, Hook::CommitMsg) {
+        return Ok(message);
+    }
+    let path = repo.path().join("MERGE_MSG");
+    let file = path.to_string_lossy();
+    let io = |err: std::io::Error| git2::Error::from_str(&format!("MERGE_MSG: {err}"));
+    fs::write(&path, format!("{message}\n")).map_err(io)?;
+    hooks.run(repo, Hook::PrepareCommitMsg, &[&file, "merge"], &env)?;
+    hooks.run(repo, Hook::CommitMsg, &[&file], &env)?;
+    let text = fs::read_to_string(&path).map_err(io)?;
+    let message = git2::message_prettify(text, Some(b'#'))?
+        .trim_end()
+        .to_owned();
+    if message.is_empty() {
+        return Err(git2::Error::from_str("the hooks left the merge's message empty").into());
+    }
+    Ok(message)
 }
 
 /// Name a remote's branch in the message libgit2 prepared as git's
@@ -137,7 +184,12 @@ mod tests {
     use std::fs;
 
     fn run(repo: &Repository, target: &Target) -> Result<Outcome, OperationError> {
-        merge(repo, target, &mut |_, _| {})
+        merge(
+            repo,
+            target,
+            &crate::git::hooks::tests::hooks(),
+            &mut |_, _| {},
+        )
     }
 
     fn branch(name: &str) -> Target {
@@ -310,5 +362,67 @@ mod tests {
             .to_owned();
         assert_eq!(message, "Merge remote-tracking branch 'origin/side'");
         assert_ne!(short_id(commit), short_id(side));
+    }
+
+    #[test]
+    fn hooks_run_around_the_merge_commit_and_a_failing_one_leaves_no_merge() {
+        use crate::git::hooks::tests::{hooks, install};
+        use crate::git::hooks::{Hook, HookError};
+        let mut t = repo();
+        let (_, main, side) = diverged(&mut t, false);
+        install(&t.repo, Hook::PreMergeCommit, "echo \"not today\"; exit 1");
+        let err = run(&t.repo, &branch("side")).unwrap_err();
+        let OperationError::Hook(HookError::Failed(failure)) = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(failure.hook, Hook::PreMergeCommit);
+        assert_eq!(failure.output_text(), "not today");
+        // As if never begun.
+        assert_eq!(head(&t.repo), main);
+        assert_eq!(t.repo.state(), RepositoryState::Clean);
+        assert!(!t.path().join("g.txt").exists());
+
+        // Without verifying: merged, the message as the other hooks
+        // leave it, and post-merge told it wasn't a squash.
+        install(
+            &t.repo,
+            Hook::PrepareCommitMsg,
+            "[ \"$2\" = merge ] && printf 'Merge it\n' > \"$1\"",
+        );
+        install(&t.repo, Hook::CommitMsg, "exit 1");
+        install(&t.repo, Hook::PostMerge, "echo \"$1\" > .git/post-merge");
+        let hooks = hooks().without_verify();
+        let outcome = merge(&t.repo, &branch("side"), &hooks, &mut |_, _| {}).unwrap();
+        let Outcome::Merged { commit, .. } = outcome else {
+            panic!("{outcome:?}");
+        };
+        let merged = t.repo.find_commit(commit).unwrap();
+        assert_eq!(merged.parent_ids().collect::<Vec<_>>(), [main, side]);
+        assert_eq!(merged.message().unwrap(), "Merge it");
+        assert_eq!(
+            fs::read_to_string(t.repo.path().join("post-merge")).unwrap(),
+            "0\n"
+        );
+        assert!(hooks.take_failures().is_empty());
+    }
+
+    #[test]
+    fn a_fast_forward_runs_only_post_merge() {
+        use crate::git::hooks::Hook;
+        use crate::git::hooks::tests::{hooks, install};
+        let mut t = repo();
+        let base = t.commit(&[("f.txt", "base\n")], "Base", &[]);
+        let ahead = t.commit(&[("f.txt", "ahead\n")], "Ahead", &[base]);
+        t.repo.set_head_detached(base).unwrap();
+        sync(&t);
+        install(&t.repo, Hook::PreMergeCommit, "exit 1");
+        install(&t.repo, Hook::PostMerge, "echo failed; exit 1");
+        let hooks = hooks();
+        let outcome = merge(&t.repo, &Target::Commit(ahead), &hooks, &mut |_, _| {}).unwrap();
+        assert_eq!(outcome, Outcome::FastForwarded { submodules: 0 });
+        assert_eq!(head(&t.repo), ahead);
+        let failures = hooks.take_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].hook, Hook::PostMerge);
     }
 }

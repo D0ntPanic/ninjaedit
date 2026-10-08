@@ -212,6 +212,15 @@
 //! so far; Space or a double-click meanwhile says one is under way. The
 //! page then refreshes, as it does when coming back, so the HEAD marker
 //! moves to the commit; the submodules' tabs refresh when next shown.
+//!
+//! Checking out, merging, and rebasing run the repository's hooks as
+//! git does (see the core crate's `git::hooks` module): a merge's
+//! `pre-merge-commit` and the message hooks, a rebase's `pre-rebase`,
+//! and `post-merge` and `post-checkout` after. The status bar names a
+//! hook while it runs, and Escape cancels it. A hook is never seen
+//! unless it fails: then the hook box (see the `hook_box` module) shows
+//! what it wrote, and for one that stopped a merge or rebase, offers to
+//! do it anyway, as git's `--no-verify` does.
 
 use crate::branch_prompt::{BranchPrompt, BranchPromptOutcome};
 use crate::clicks::ClickTracker;
@@ -223,6 +232,7 @@ use crate::diff_pane::{
     clamp_between, display_width, fit_end, share_for, share_of,
 };
 use crate::git_layout::{GitLogLayout, MAIN_REPOSITORY, PaneSizes};
+use crate::hook_box::{HookBox, HookOutcome};
 use crate::palette::palette_background;
 use crate::rebase_dialog::{PlanCommit, RebaseDialog, RebaseDialogOutcome};
 use crate::status::StatusLine;
@@ -230,9 +240,10 @@ use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ninjaedit_core::git::{
     ChangeKind, Checkout, CheckoutError, CheckoutJob, CheckoutOutcome, CommitDetail,
-    DeleteBranchError, DiffModel, Fetch, FileChange, FileTree, History, Integration,
-    IntegrationJob, Oid, OperationError, Outcome, RebasePlan, RefKind, Restored, Target, TreeRow,
-    delete_branch, left_behind, reset, restore, short_id, submodules, unstaged_among,
+    DeleteBranchError, DiffModel, Fetch, FileChange, FileTree, History, HookError, Hooks,
+    Integration, IntegrationJob, Oid, OperationError, Outcome, RebasePlan, RefKind, Restored,
+    Target, TreeRow, delete_branch, left_behind, reset, restore, short_id, submodules,
+    unstaged_among,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position as ScreenPosition, Rect};
@@ -283,6 +294,7 @@ const PROMPT_HELP: &[(&str, &str)] = &[("Enter", "create branch and check out"),
 const CONFIRM_HELP: &[(&str, &str)] = &[("y", "restore"), ("n/Esc", "cancel")];
 const DELETE_HELP: &[(&str, &str)] = &[("y", "delete"), ("n/Esc", "cancel")];
 const RESET_HELP: &[(&str, &str)] = &[("y", "reset"), ("n/Esc", "cancel")];
+const HOOK_HELP: &[(&str, &str)] = &[("↑↓", "scroll"), ("Tab", "button"), ("Esc", "dismiss")];
 /// What the status bar shows while the interactive rebase dialog plans.
 const REBASE_HELP: &[(&str, &str)] = &[
     ("↑↓", "select"),
@@ -480,10 +492,19 @@ struct PendingReset {
     what: String,
 }
 
-/// A merge or rebase under way, and what of.
+/// A merge or rebase under way, what of, and the hooks it runs, to say
+/// which is running and to cancel it.
 struct RunningIntegration {
     what: Integration,
     job: IntegrationJob,
+    hooks: Hooks,
+}
+
+/// A hook that failed, shown in the hook box, and the merge or rebase
+/// it stopped, to do again without it.
+struct PendingHook {
+    dialog: HookBox,
+    retry: Option<Integration>,
 }
 
 /// A checkout under way, and what of.
@@ -495,6 +516,7 @@ struct RunningCheckout {
     /// branch was at when picked until the job has looked it up again.
     id: Oid,
     job: CheckoutJob,
+    hooks: Hooks,
 }
 
 /// A branch selected in the sidebar.
@@ -1036,6 +1058,8 @@ pub struct GitLogView {
     branch_delete: Option<PendingDelete>,
     /// The reset box, while it asks whether to go ahead.
     reset_box: Option<PendingReset>,
+    /// The hook box, while it shows a hook that failed.
+    hook_box: Option<PendingHook>,
     /// The interactive rebase dialog, while it plans one.
     rebase_dialog: Option<RebaseDialog>,
     /// Whether a merge or rebase stopped at conflicts and the changes
@@ -1120,6 +1144,7 @@ impl GitLogView {
             restore: None,
             branch_delete: None,
             reset_box: None,
+            hook_box: None,
             rebase_dialog: None,
             show_changes: false,
         };
@@ -1440,6 +1465,16 @@ impl GitLogView {
     pub fn hint(&self) -> StatusLine {
         // Something under way has the bar to itself: it is what the
         // user is waiting on, and the bindings have been seen.
+        if let Some(hook) = [
+            self.integration.as_ref().map(|running| &running.hooks),
+            self.checkout.as_ref().map(|running| &running.hooks),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(Hooks::running)
+        {
+            return StatusLine::progress(format!("running the {hook} hook… (Esc cancels)"));
+        }
         if let Some(RunningCheckout { what, job, .. }) = &self.checkout {
             return StatusLine::progress(match job.progress() {
                 Some((written, total)) => {
@@ -1448,7 +1483,7 @@ impl GitLogView {
                 None => format!("checking out {what}…"),
             });
         }
-        if let Some(RunningIntegration { what, job }) = &self.integration {
+        if let Some(RunningIntegration { what, job, .. }) = &self.integration {
             let doing = match what {
                 Integration::Merge(target) => format!("merging {}", target.name()),
                 Integration::Rebase(target) => format!("rebasing onto {}", target.name()),
@@ -1484,6 +1519,9 @@ impl GitLogView {
         }
         if self.reset_box.is_some() {
             return StatusLine::help(RESET_HELP);
+        }
+        if self.hook_box.is_some() {
+            return StatusLine::help(HOOK_HELP);
         }
         if self.rebase_dialog.is_some() {
             return StatusLine::help(REBASE_HELP);
@@ -2576,14 +2614,26 @@ impl GitLogView {
     /// crate's `git::operation` module), unless something else is under
     /// way. The status bar says how it is going, and then how it went.
     fn start_integration(&mut self, what: Integration) {
+        let hooks = self.hooks();
+        self.start_integration_with(what, hooks);
+    }
+
+    /// The hooks for an operation to run, their output kept at the size
+    /// the hook box would show it.
+    fn hooks(&self) -> Hooks {
+        let (cols, rows) = HookBox::terminal_size(self.area);
+        Hooks::new(cols, rows)
+    }
+
+    fn start_integration_with(&mut self, what: Integration, hooks: Hooks) {
         if self.busy() {
             return;
         }
         let Some(history) = &self.history else {
             return;
         };
-        match IntegrationJob::start(history.git_dir(), what.clone()) {
-            Ok(job) => self.integration = Some(RunningIntegration { what, job }),
+        match IntegrationJob::start(history.git_dir(), what.clone(), hooks.clone()) {
+            Ok(job) => self.integration = Some(RunningIntegration { what, job, hooks }),
             Err(err) => {
                 self.notice = Some(StatusLine::error(format!(
                     "Could not {}: {err}",
@@ -2607,7 +2657,7 @@ impl GitLogView {
         if !running.job.is_done() {
             return changed;
         }
-        let Some(RunningIntegration { what, job }) = self.integration.take() else {
+        let Some(RunningIntegration { what, job, hooks }) = self.integration.take() else {
             return changed;
         };
         let head = self
@@ -2618,6 +2668,7 @@ impl GitLogView {
         let moved = match job.outcome() {
             Some(Ok(outcome)) => {
                 self.notice = Some(StatusLine::info(what.summary(head.as_deref(), &outcome)));
+                self.show_failed_hooks(&hooks);
                 // Conflicts are resolved, and a commit edited, there.
                 if matches!(outcome, Outcome::Conflicts { .. } | Outcome::Editing { .. }) {
                     self.show_changes = true;
@@ -2644,6 +2695,30 @@ impl GitLogView {
                 };
                 self.notice = Some(StatusLine::error(format!("{done}: {err}")));
                 true
+            }
+            Some(Err(OperationError::Hook(HookError::Failed(failure)))) => {
+                self.notice = Some(StatusLine::error(format!(
+                    "Could not {}: {failure}",
+                    integration_words(&what)
+                )));
+                let (body, action) = match &what {
+                    Integration::Merge(_) => ("Nothing was merged.", "Merge anyway"),
+                    Integration::Rebase(_) | Integration::Interactive(_) => {
+                        ("The rebase didn't start.", "Rebase anyway")
+                    }
+                };
+                self.hook_box = Some(PendingHook {
+                    dialog: HookBox::new(failure, body, Some(action.to_owned())),
+                    retry: Some(what),
+                });
+                false
+            }
+            Some(Err(OperationError::Hook(err @ HookError::Cancelled(_)))) => {
+                self.notice = Some(StatusLine::info(format!(
+                    "Did not {}: {err}",
+                    integration_words(&what)
+                )));
+                false
             }
             Some(Err(err)) => {
                 self.notice = Some(StatusLine::error(format!(
@@ -2672,6 +2747,64 @@ impl GitLogView {
     /// they are resolved.
     fn take_show_changes(&mut self) -> bool {
         std::mem::take(&mut self.show_changes)
+    }
+
+    /// Show a hook that failed after what it ran for was done (a
+    /// `post-merge`, a `post-checkout`), which stopped nothing.
+    fn show_failed_hooks(&mut self, hooks: &Hooks) {
+        if let Some(failure) = hooks.take_failures().into_iter().next() {
+            let body = format!(
+                "It ran after the {} was done, so that stands.",
+                match failure.hook {
+                    ninjaedit_core::git::Hook::PostCheckout => "checkout",
+                    _ => "merge",
+                }
+            );
+            self.hook_box = Some(PendingHook {
+                dialog: HookBox::new(failure, body, None),
+                retry: None,
+            });
+        }
+    }
+
+    /// Act on the hook box's answer: close it, or do the merge or
+    /// rebase it stopped again, without the hooks git's `--no-verify`
+    /// skips.
+    fn handle_hook_outcome(&mut self, outcome: HookOutcome) {
+        match outcome {
+            HookOutcome::Continue => {}
+            HookOutcome::Dismiss => self.hook_box = None,
+            HookOutcome::Override => {
+                if let Some(PendingHook {
+                    retry: Some(what), ..
+                }) = self.hook_box.take()
+                {
+                    let hooks = self.hooks().without_verify();
+                    self.start_integration_with(what, hooks);
+                }
+            }
+        }
+    }
+
+    /// Escape while an operation waits on a hook: stop the hook. Returns
+    /// whether there was one to stop.
+    fn cancel_hook(&mut self) -> bool {
+        let hooks = match (&self.integration, &self.checkout) {
+            (Some(running), _) => &running.hooks,
+            (None, Some(running)) => &running.hooks,
+            (None, None) => return false,
+        };
+        if hooks.running().is_none() {
+            return false;
+        }
+        hooks.cancel();
+        true
+    }
+
+    /// The hook box, while it shows a failed hook.
+    #[cfg(test)]
+    fn hook_box(&self) -> Option<&HookBox> {
+        self.hook_box.as_ref().map(|pending| &pending.dialog)
     }
 
     /// Reset HEAD's branch to `id` (called `what` in the status bar),
@@ -2759,8 +2892,9 @@ impl GitLogView {
         let Some(history) = &self.history else {
             return;
         };
-        let job = CheckoutJob::start(history.git_dir(), id);
-        self.start_checkout(short_id(id), id, job);
+        let hooks = self.hooks();
+        let job = CheckoutJob::start(history.git_dir(), id, hooks.clone());
+        self.start_checkout(short_id(id), id, job, hooks);
     }
 
     /// "Check out branch": check out the branch selected in the
@@ -2776,15 +2910,34 @@ impl GitLogView {
         let (Some(branch), Some(history)) = (self.selected_branch(), &self.history) else {
             return;
         };
-        let job = CheckoutJob::start_branch(history.git_dir(), &branch.name, branch.remote);
-        self.start_checkout(branch.name, branch.target, job);
+        let hooks = self.hooks();
+        let job = CheckoutJob::start_branch(
+            history.git_dir(),
+            &branch.name,
+            branch.remote,
+            hooks.clone(),
+        );
+        self.start_checkout(branch.name, branch.target, job, hooks);
     }
 
     /// Keep a checkout job just started, of `what` (for the status
     /// bar) at `id`, or say why it couldn't be.
-    fn start_checkout(&mut self, what: String, id: Oid, job: Result<CheckoutJob, CheckoutError>) {
+    fn start_checkout(
+        &mut self,
+        what: String,
+        id: Oid,
+        job: Result<CheckoutJob, CheckoutError>,
+        hooks: Hooks,
+    ) {
         match job {
-            Ok(job) => self.checkout = Some(RunningCheckout { what, id, job }),
+            Ok(job) => {
+                self.checkout = Some(RunningCheckout {
+                    what,
+                    id,
+                    job,
+                    hooks,
+                })
+            }
             Err(err) => {
                 self.notice = Some(StatusLine::error(format!("Could not check out: {err}")))
             }
@@ -2804,7 +2957,7 @@ impl GitLogView {
         if !job.is_done() {
             return changed;
         }
-        let Some(RunningCheckout { id, job, .. }) = self.checkout.take() else {
+        let Some(RunningCheckout { id, job, hooks, .. }) = self.checkout.take() else {
             return changed;
         };
         // A branch's commit as the job found it, which may have moved
@@ -2824,6 +2977,7 @@ impl GitLogView {
                 }));
                 self.branch_prompt = None;
                 self.checked_out = true;
+                self.show_failed_hooks(&hooks);
                 self.refresh();
             }
             Some(CheckoutOutcome::NeedsName { upstream, taken }) => {
@@ -2874,11 +3028,13 @@ impl GitLogView {
                 let (id, upstream) = (prompt.id, prompt.upstream.clone());
                 let what = name.clone();
                 let how = Checkout::NewBranch { name, upstream };
-                let job = CheckoutJob::start_with(history.git_dir(), id, how);
+                let (cols, rows) = HookBox::terminal_size(self.area);
+                let hooks = Hooks::new(cols, rows);
+                let job = CheckoutJob::start_with(history.git_dir(), id, how, hooks.clone());
                 if job.is_err() {
                     self.branch_prompt = None;
                 }
-                self.start_checkout(what, id, job);
+                self.start_checkout(what, id, job, hooks);
             }
         }
     }
@@ -2892,6 +3048,16 @@ impl GitLogView {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, clipboard: &mut Clipboard) {
+        // The hook box, while it shows, has every key.
+        if let Some(pending) = &mut self.hook_box {
+            let outcome = pending.dialog.handle_key(key);
+            self.handle_hook_outcome(outcome);
+            return;
+        }
+        // Escape stops a hook an operation is waiting on.
+        if key.code == KeyCode::Esc && self.cancel_hook() {
+            return;
+        }
         if let Some(prompt) = &mut self.branch_prompt {
             let outcome = prompt.handle_key(key, clipboard);
             self.handle_prompt_outcome(outcome);
@@ -3248,6 +3414,13 @@ impl GitLogView {
             }
             return outcome;
         }
+        // The hook box, while it shows, has the mouse; a press outside
+        // it dismisses it.
+        if let Some(pending) = &mut self.hook_box {
+            let answer = pending.dialog.handle_mouse(mouse, wheel);
+            self.handle_hook_outcome(answer);
+            return outcome;
+        }
         // The restore box, while it asks, has the mouse; a press outside
         // it is no.
         if let Some(pending) = &mut self.restore {
@@ -3491,6 +3664,10 @@ impl GitLogView {
         if let Some(dialog) = &mut self.rebase_dialog {
             dialog.render(area, buf, theme);
             cursor = None;
+        }
+        if let Some(pending) = &mut self.hook_box {
+            pending.dialog.render(area, buf, theme);
+            return None;
         }
         match &mut self.branch_prompt {
             Some(prompt) => prompt.render(area, buf, theme),
@@ -7196,5 +7373,50 @@ mod tests {
             restored_summary(&request, done),
             "Restored src/ as of 00000000: 2 files deleted, as that version hasn't it; 2 submodules left alone"
         );
+    }
+
+    #[test]
+    fn a_hook_that_stops_a_merge_is_shown_and_can_be_overridden() {
+        let (dir, [_, main, side]) = diverged_repo(false);
+        let hook = dir.path().join(".git/hooks/pre-merge-commit");
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        fs::write(&hook, "#!/bin/sh\necho 'tests failed'\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut view = view(&dir);
+        draw(&mut view, 110, 24);
+        let at = view.history.as_ref().unwrap().position(side).unwrap();
+        view.select_commit(at);
+        view.merge_selected_commit();
+        wait(&mut view);
+        assert_eq!(
+            notice_of(&mut view),
+            Some("Could not merge side: the pre-merge-commit hook failed (exit code 1)".to_owned())
+        );
+        let dialog = view.hook_box().expect("the hook box shows");
+        assert_eq!(dialog.action(), Some("Merge anyway"));
+        assert_eq!(dialog.failure().output_text(), "tests failed");
+        assert_eq!(view.hint(), StatusLine::help(HOOK_HELP));
+        let screen = draw(&mut view, 110, 24);
+        assert!(
+            screen.iter().any(|r| r.contains("tests failed")),
+            "{screen:#?}"
+        );
+        // Nothing was merged, nor left in progress.
+        assert_eq!(head_of(&dir).1, main);
+        assert!(!dir.path().join("g.txt").exists());
+
+        // Merge anyway: past the hook.
+        view.handle_key(key(KeyCode::Right), &mut Clipboard::new());
+        view.handle_key(key(KeyCode::Enter), &mut Clipboard::new());
+        assert!(view.hook_box().is_none());
+        wait(&mut view);
+        let merged = head_of(&dir).1;
+        let repo = Repository::open(dir.path()).unwrap();
+        let parents: Vec<Oid> = repo.find_commit(merged).unwrap().parent_ids().collect();
+        assert_eq!(parents, [main, side]);
     }
 }

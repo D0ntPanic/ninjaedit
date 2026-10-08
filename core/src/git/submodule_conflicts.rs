@@ -596,7 +596,11 @@ mod tests {
 
         fn rebase(&self) -> Outcome {
             Integration::Rebase(Target::Commit(self.side))
-                .run_with(&self.t.repo, &mut |_, _| {})
+                .run_with(
+                    &self.t.repo,
+                    &crate::git::hooks::tests::hooks(),
+                    &mut |_, _| {},
+                )
                 .unwrap()
         }
 
@@ -874,7 +878,11 @@ mod tests {
             .checkout_head(Some(CheckoutBuilder::new().force()))
             .unwrap();
         let outcome = Integration::Merge(Target::Commit(feature))
-            .run_with(&w.t.repo, &mut |_, _| {})
+            .run_with(
+                &w.t.repo,
+                &crate::git::hooks::tests::hooks(),
+                &mut |_, _| {},
+            )
             .unwrap();
         let Outcome::Merged {
             commit,

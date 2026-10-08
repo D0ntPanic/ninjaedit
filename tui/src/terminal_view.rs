@@ -676,7 +676,7 @@ fn translate_key(key: KeyEvent) -> Option<(Key, Modifiers)> {
 
 /// The ratatui style for a terminal cell, mapping its colors through the
 /// theme and applying inverse, hidden, and the text attributes.
-fn term_style(style: &TermStyle, theme: &Theme) -> Style {
+pub(crate) fn term_style(style: &TermStyle, theme: &Theme) -> Style {
     let default_fg = theme.terminal_text;
     let default_bg = theme.terminal_background;
     let mut fg = color(style.fg, theme).unwrap_or(default_fg);
