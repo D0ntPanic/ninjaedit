@@ -6,6 +6,11 @@ highlighted-find-result-background = "dark-blue"
 inactive-line-number = "dimmed"
 active-line-number = "alt"
 gutter-guide = "dark-dimmed"
+# Marks on the guide for lines changed since the last commit. A deletion
+# is marked on the line after it.
+gutter-added = "green"
+gutter-modified = "blue"
+gutter-deleted = "red"
 # A code completion proposed after the cursor, before it is accepted.
 pending-completion-text = "dimmed"
 inactive-tab-background = "black"

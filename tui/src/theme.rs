@@ -59,6 +59,7 @@
 //! is a type; see [`TokenKind::parent`]), and at the root falls back to
 //! `view-text`.
 
+use ninjaedit_core::git::LineStatus;
 use ninjaedit_core::{ConflictSide, TokenKind};
 use ratatui::style::{Color, Modifier, Style};
 use std::collections::HashMap;
@@ -224,6 +225,13 @@ required {
     active_line_number => "active-line-number",
     /// The vertical guide between the gutter and the text.
     gutter_guide => "gutter-guide",
+    /// The mark on the guide beside a line added since the last commit.
+    gutter_added => "gutter-added",
+    /// The mark beside a line modified since the last commit.
+    gutter_modified => "gutter-modified",
+    /// The mark beside the line just after some that were deleted since
+    /// the last commit.
+    gutter_deleted => "gutter-deleted",
     /// A code completion shown after the cursor, not yet in the file.
     pending_completion_text => "pending-completion-text",
     inactive_tab_background => "inactive-tab-background",
@@ -368,6 +376,18 @@ optional {
 }
 
 impl Theme {
+    /// The color of the mark on the gutter's guide for a line's status
+    /// since the last commit, or `None` for an unchanged line, which
+    /// keeps the plain guide.
+    pub fn line_status(&self, status: LineStatus) -> Option<Color> {
+        match status {
+            LineStatus::Unchanged => None,
+            LineStatus::Added => Some(self.gutter_added),
+            LineStatus::Modified => Some(self.gutter_modified),
+            LineStatus::DeletedAbove => Some(self.gutter_deleted),
+        }
+    }
+
     /// The background for the lines on one side of a merge conflict, if
     /// the theme tints that side.
     pub fn conflict_background(&self, side: ConflictSide) -> Option<Color> {

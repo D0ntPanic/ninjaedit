@@ -25,7 +25,9 @@
 //! the changes page to edit one, with what they share (and the job that
 //! runs any of them in the background) in the [`operation`] module; the
 //! [`reset`](mod@reset) module moves HEAD's branch to a commit as `git reset`
-//! does, keeping the working directory.
+//! does, keeping the working directory. The [`line_status`] module
+//! compares an editor's buffer with HEAD's version of its file, line by
+//! line, to mark what has changed beside the text.
 //! Everything goes through libgit2, by way of the `git2` crate; nothing
 //! shells out to git.
 //!
@@ -54,6 +56,7 @@ pub mod graph;
 pub mod head;
 pub mod history;
 pub mod interactive;
+pub mod line_status;
 pub mod merge;
 pub mod operation;
 pub mod rebase;
@@ -76,6 +79,7 @@ pub use graph::{GraphCell, GraphRow, NODE, cells_for};
 pub use head::{Head, head, head_of};
 pub use history::{Branch, Commit, CommitTime, History, Oid, RefKind, RefLabel, Remote, short_id};
 pub use interactive::{Continued, PlanError, RebaseAction, RebasePlan, RebaseStep};
+pub use line_status::{LineStatus, LineStatuses, LinesEdit};
 pub use merge::abort_merge;
 pub use operation::{
     InProgress, Integration, IntegrationJob, OperationError, Outcome, Target, in_progress,

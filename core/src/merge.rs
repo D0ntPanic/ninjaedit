@@ -85,38 +85,23 @@ pub struct LineMap {
 
 /// One changed region of a diff, as zero-based line ranges: `old_lines` of
 /// the old contents starting at `old_start` became `new_lines` of the new
-/// starting at `new_start`. Either count may be zero.
+/// starting at `new_start`. Either count may be zero; a side with none
+/// names the line just after the change on that side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Hunk {
-    old_start: usize,
-    old_lines: usize,
-    new_start: usize,
-    new_lines: usize,
+pub(crate) struct Hunk {
+    pub old_start: usize,
+    pub old_lines: usize,
+    pub new_start: usize,
+    pub new_lines: usize,
 }
 
 impl LineMap {
     /// Diff `old` against `new`. Binary contents, or a failed diff, give an
     /// identity map.
     pub fn new(old: &[u8], new: &[u8]) -> LineMap {
-        if is_binary(old) || is_binary(new) {
-            return LineMap::default();
+        LineMap {
+            hunks: line_hunks(old, new).unwrap_or_default(),
         }
-        init_libgit2();
-        let mut opts = DiffOptions::new();
-        opts.context_lines(0);
-        let Ok(patch) = Patch::from_buffers(old, None, new, None, Some(&mut opts)) else {
-            return LineMap::default();
-        };
-        let hunks = (0..patch.num_hunks())
-            .filter_map(|i| patch.hunk(i).ok())
-            .map(|(hunk, _)| Hunk {
-                old_start: zero_based(hunk.old_start(), hunk.old_lines()),
-                old_lines: hunk.old_lines() as usize,
-                new_start: zero_based(hunk.new_start(), hunk.new_lines()),
-                new_lines: hunk.new_lines() as usize,
-            })
-            .collect();
-        LineMap { hunks }
     }
 
     /// The line of the new contents holding what was on `line` of the old.
@@ -137,6 +122,28 @@ impl LineMap {
         }
         (line as isize + delta).max(0) as usize
     }
+}
+
+/// The changed regions between `old` and `new`, line by line, in order
+/// and without context. `None` when either is binary or the diff fails.
+pub(crate) fn line_hunks(old: &[u8], new: &[u8]) -> Option<Vec<Hunk>> {
+    if is_binary(old) || is_binary(new) {
+        return None;
+    }
+    init_libgit2();
+    let mut opts = DiffOptions::new();
+    opts.context_lines(0);
+    let patch = Patch::from_buffers(old, None, new, None, Some(&mut opts)).ok()?;
+    let hunks = (0..patch.num_hunks())
+        .filter_map(|i| patch.hunk(i).ok())
+        .map(|(hunk, _)| Hunk {
+            old_start: zero_based(hunk.old_start(), hunk.old_lines()),
+            old_lines: hunk.old_lines() as usize,
+            new_start: zero_based(hunk.new_start(), hunk.new_lines()),
+            new_lines: hunk.new_lines() as usize,
+        })
+        .collect();
+    Some(hunks)
 }
 
 /// A hunk's one-based start line as a zero-based one. A hunk with no lines

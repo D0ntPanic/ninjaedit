@@ -41,8 +41,10 @@
 //! `[breakpoint][line number][space][guide]`. The breakpoint column is
 //! blank for now; a debugger can later mark it with a red circle. The
 //! guide is a vertical line right against the text, showing where the
-//! text's left edge is; git line status can later replace the guide glyph
-//! on a line with a thin colored block. A view embedded in a page (the
+//! text's left edge is. Beside a line changed since the last commit it
+//! is a heavier line instead, colored by what happened to the line
+//! (`gutter-added`, `gutter-modified`, or `gutter-deleted` on the line
+//! after a deletion); see [`Editor::line_statuses`]. A view embedded in a page (the
 //! changes page's commit message) can do without the gutter altogether
 //! (see [`EditorView::set_gutter`]): the text then starts at the left
 //! edge, and only the scrollbars remain around it.
@@ -159,6 +161,9 @@ pub struct EditorView {
 
 /// The guide glyph drawn between the gutter and the text.
 const GUIDE: &str = "│";
+/// The guide glyph beside a line changed since the last commit, heavier
+/// than [`GUIDE`] so it shows without drawing the eye while typing.
+const CHANGE_MARK: &str = "┃";
 /// Gutter columns besides the line number: the breakpoint column before
 /// it, and the space and guide after it.
 const GUTTER_EXTRA: u16 = 3;
@@ -463,6 +468,7 @@ impl EditorView {
         let selected = Style::default().bg(theme.selection_background);
         // Search matches on the visible lines, ascending. Cells are walked
         // in the same order, so one index keeps up with them.
+        let first_line = rows.iter().find_map(|row| row.line);
         let last_line = rows.iter().filter_map(|row| row.line).next_back();
         let matches = match (self.editor.search(), last_line) {
             (Some(search), Some(last_line)) => {
@@ -476,12 +482,17 @@ impl EditorView {
         let found = Style::default().bg(theme.find_result_background);
         let found_current = Style::default().bg(theme.highlighted_find_result_background);
         let ghost_style = text_style.fg(theme.pending_completion_text);
+        let statuses = match (self.show_gutter, first_line, last_line) {
+            (true, Some(first), Some(last)) => self.editor.line_statuses(first..last + 1),
+            _ => Vec::new(),
+        };
         for (row, Row { line, segments }) in rows.iter().enumerate() {
             let y = area.y + row as u16;
 
-            // Line number, right-aligned after the breakpoint column. A
-            // row of a suggestion's later lines isn't a line of the file
-            // and gets none.
+            // Line number, right-aligned after the breakpoint column, and
+            // the guide marked if the line changed since the last commit.
+            // A row of a suggestion's later lines isn't a line of the file
+            // and gets neither.
             if self.show_gutter
                 && let Some(line) = line
             {
@@ -492,6 +503,12 @@ impl EditorView {
                     theme.inactive_line_number
                 };
                 buf.set_string(area.x + 1, y, &number, text_style.fg(color));
+                if let Some(color) = first_line
+                    .and_then(|first| statuses.get(line - first).copied().flatten())
+                    .and_then(|status| theme.line_status(status))
+                {
+                    buf.set_string(self.text.x - 1, y, CHANGE_MARK, text_style.fg(color));
+                }
             }
 
             // The lines of a merge conflict are tinted by side, across
@@ -1067,6 +1084,7 @@ fn digits(n: usize) -> usize {
 mod tests {
     use super::*;
     use ninjaedit_core::FileBuffer;
+    use std::time::Duration;
 
     /// Rows a wheel event scrolls in these tests.
     const WHEEL: usize = 3;
@@ -1323,5 +1341,45 @@ mod tests {
         assert_eq!(text_of(&rows[0]), " 1 │f(a, b,");
         assert_eq!(text_of(&rows[1]), "   │  d, c)");
         assert_eq!(text_of(&rows[2]), " 2 │");
+    }
+
+    #[test]
+    fn lines_changed_since_the_last_commit_are_marked_on_the_guide() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.txt")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Ann", "ann@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "first", &tree, &[])
+            .unwrap();
+
+        // Unsaved edits: "two" modified, a line added before "four", and
+        // "five" deleted, which marks the empty line after it.
+        let mut editor = Editor::new(FileBuffer::open(&path).unwrap());
+        editor.go_to_line(1);
+        editor.move_cursor(Movement::LineEnd);
+        editor.insert_text("!");
+        editor.go_to_line(3);
+        editor.insert_text("new\n");
+        editor.go_to_line(5);
+        editor.extend_selection(Movement::Down);
+        editor.delete_selection();
+        assert_eq!(editor.buffer().to_text(), "one\ntwo!\nthree\nnew\nfour\n");
+        assert!(editor.wait_for_line_statuses(Duration::from_secs(10)));
+        let mut view = EditorView::new(editor);
+        let buf = render_to(&mut view, 20, 7);
+        let theme = Theme::default();
+        let guide = |y: u16| (buf[(3, y)].symbol(), buf[(3, y)].fg);
+        assert_eq!(guide(0), (GUIDE, theme.gutter_guide));
+        assert_eq!(guide(1), (CHANGE_MARK, theme.gutter_modified));
+        assert_eq!(guide(2), (GUIDE, theme.gutter_guide));
+        assert_eq!(guide(3), (CHANGE_MARK, theme.gutter_added));
+        assert_eq!(guide(4), (GUIDE, theme.gutter_guide));
+        assert_eq!(guide(5), (CHANGE_MARK, theme.gutter_deleted));
+        // Past the end of the file the guide carries on unmarked.
+        assert_eq!(guide(6), (GUIDE, theme.gutter_guide));
     }
 }

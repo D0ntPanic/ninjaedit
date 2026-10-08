@@ -589,6 +589,9 @@ struct Tab {
     /// Likewise for the editor's search, which finds matches in the
     /// background.
     search_generation: u64,
+    /// Likewise for the editor's git line statuses, which are diffed in
+    /// the background.
+    line_status_generation: u64,
 }
 
 impl Tab {
@@ -970,6 +973,7 @@ impl App {
                     id: self.last_tab_id,
                     highlight_generation: editor.highlight_generation(),
                     search_generation: 0,
+                    line_status_generation: editor.line_status_generation(),
                     view: EditorView::new(editor),
                     last_viewed: 0,
                 });
@@ -990,6 +994,17 @@ impl App {
             self.active = index;
             self.view_clock += 1;
             tab.last_viewed = self.view_clock;
+            // HEAD may have moved while the tab was out of sight.
+            tab.view.editor().refresh_line_statuses();
+        }
+    }
+
+    /// Have the active tab compare its lines with HEAD again, in case a
+    /// commit or checkout has moved it. Only the active tab, since only
+    /// it is drawn; another catches up when activated.
+    fn refresh_line_statuses(&self) {
+        if let Some(tab) = self.tabs.get(self.active) {
+            tab.view.editor().refresh_line_statuses();
         }
     }
 
@@ -1096,10 +1111,14 @@ impl App {
     /// bar and returns whether anything did. Done when the index reports
     /// filesystem activity, when the terminal regains focus, and every
     /// [`FILE_CHECK_INTERVAL`] regardless; see
-    /// [`check_open_files_if_due`](Self::check_open_files_if_due).
+    /// [`check_open_files_if_due`](Self::check_open_files_if_due). The
+    /// active tab's line statuses are brought up to date with HEAD at
+    /// the same times, since a commit or checkout made elsewhere is as
+    /// likely then.
     fn check_open_files(&mut self) -> bool {
         self.file_activity = self.project.index().activity();
         self.last_file_check = Some(Instant::now());
+        self.refresh_line_statuses();
         let mut changed = false;
         for tab in &mut self.tabs {
             let title = tab.title();
@@ -1968,8 +1987,16 @@ impl App {
                 let outcome = view.commit_all(&mut self.build);
                 self.handle_build_outcome(outcome);
             }
-            Mode::GitLog(tabs) => self.git_log = Some(tabs),
-            Mode::Changes(tabs) => self.changes = Some(tabs),
+            // A commit, checkout, or rebase made there shows in the
+            // editor's line statuses straight away.
+            Mode::GitLog(tabs) => {
+                self.git_log = Some(tabs);
+                self.refresh_line_statuses();
+            }
+            Mode::Changes(tabs) => {
+                self.changes = Some(tabs);
+                self.refresh_line_statuses();
+            }
             Mode::Agent(previous, _) => {
                 self.mode = *previous;
                 self.leave_mode();
@@ -3640,6 +3667,11 @@ impl App {
             let generation = tab.view.editor().search().map_or(0, |s| s.generation());
             if generation != tab.search_generation {
                 tab.search_generation = generation;
+                redraw = true;
+            }
+            let generation = tab.view.editor().line_status_generation();
+            if generation != tab.line_status_generation {
+                tab.line_status_generation = generation;
                 redraw = true;
             }
         }

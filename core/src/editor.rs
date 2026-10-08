@@ -47,6 +47,14 @@
 //! module. [`Editor::next_conflict`] and [`Editor::previous_conflict`]
 //! move the cursor from conflict to conflict, wrapping around the buffer.
 //!
+//! Git line status: the editor keeps [`LineStatuses`] in step with
+//! every edit too, comparing the buffer, unsaved edits and all, with the
+//! file as HEAD has it, and [`Editor::line_statuses`] says which lines
+//! were added or modified, or follow lines that were deleted, for the
+//! frontend to mark. The comparison runs in the background, and each
+//! edit gets a guess in the meantime; see the
+//! [`line_status`](crate::git::line_status) module.
+//!
 //! Indentation: the editor guesses the buffer's [`Indentation`] style when
 //! it is created (see the [`indent`] module) and uses it for
 //! [`Editor::indent`] and [`Editor::outdent`], which the frontend binds to
@@ -145,6 +153,7 @@ use crate::auto_indent::{self, CodeLine, CodeStyle, Indenter, Rules};
 use crate::buffer::{BufferSnapshot, DiskChange, FileBuffer};
 use crate::caret::{Caret, Movement, TextPos};
 use crate::completion::CompletionRequest;
+use crate::git::line_status::{LineStatus, LineStatuses, LinesEdit};
 use crate::indent::{self, Indentation};
 use crate::merge;
 use crate::search::{Search, SearchStep};
@@ -153,6 +162,7 @@ use crate::text::{self, LineLayout};
 use std::io;
 use std::ops::Range;
 use std::path::Path;
+use std::time::Duration;
 
 /// The default number of cells between tab stops.
 pub const DEFAULT_TAB_WIDTH: usize = 4;
@@ -336,6 +346,8 @@ pub struct Editor {
     pending: Option<String>,
     /// Syntax highlighting.
     highlighter: Highlighter,
+    /// What has changed since the last commit, line by line.
+    line_status: LineStatuses,
     /// The search in progress or accepted, if any. Its offsets are only
     /// valid for the buffer as it was when it began, so every edit drops
     /// it.
@@ -366,6 +378,7 @@ impl Editor {
             .and_then(Language::from_path)
             .unwrap_or(Language::Plain);
         let highlighter = Highlighter::new(language, buffer.line_count());
+        let line_status = LineStatuses::new(buffer.line_count());
         let indentation = indent::detect(&buffer.snapshot()).unwrap_or_default();
         Editor {
             buffer,
@@ -381,6 +394,7 @@ impl Editor {
             code_style: CodeStyle::default(),
             pending: None,
             highlighter,
+            line_status,
             search: None,
             external: None,
             suggestion: None,
@@ -497,6 +511,36 @@ impl Editor {
     /// [`Highlighter::generation`].
     pub fn highlight_generation(&self) -> u64 {
         self.highlighter.generation()
+    }
+
+    // ----- Git line status -------------------------------------------------
+
+    /// What has happened to each of `lines` since the last commit, `None`
+    /// where that isn't known (yet, or at all: the file is in no
+    /// repository, or git ignores it). See
+    /// [`LineStatuses::statuses`].
+    pub fn line_statuses(&self, lines: Range<usize>) -> Vec<Option<LineStatus>> {
+        self.line_status.statuses(&self.buffer, lines)
+    }
+
+    /// A counter that changes when the line statuses have been updated in
+    /// the background, so a frontend knows to redraw. See
+    /// [`LineStatuses::generation`].
+    pub fn line_status_generation(&self) -> u64 {
+        self.line_status.generation()
+    }
+
+    /// Compare with HEAD again even if the buffer hasn't changed, for
+    /// when a commit or checkout may have moved it. Meant to be called
+    /// periodically; cheap when nothing has moved.
+    pub fn refresh_line_statuses(&self) {
+        self.line_status.refresh(&self.buffer);
+    }
+
+    /// Wait up to `timeout` for the line statuses to catch up with the
+    /// buffer. Returns whether they did. For tests.
+    pub fn wait_for_line_statuses(&self, timeout: Duration) -> bool {
+        self.line_status.wait(&self.buffer, timeout)
     }
 
     /// The number of cells between tab stops, used for display columns.
@@ -1460,10 +1504,25 @@ impl Editor {
     }
 
     /// Replace `len` bytes at `offset` with `bytes`, keeping the
-    /// highlighter in step. Every change to the buffer comes through here.
+    /// highlighter and the line statuses in step. Every change to the
+    /// buffer comes through here.
     fn replace_bytes(&mut self, offset: usize, len: usize, bytes: &[u8]) {
         let start = self.buffer.line_of_offset(offset);
         let old_end = self.buffer.line_of_offset(offset + len);
+        // The line statuses guess better knowing which of the touched
+        // lines really changed, which takes their text from before and
+        // after. Not for an edit within one line (other than the last,
+        // which may be the empty one after a final line break that git
+        // doesn't count), which certainly changed it, nor while there are
+        // no statuses to guess at.
+        let within_line = old_end == start
+            && start + 1 < self.buffer.line_count()
+            && !bytes.iter().any(|&b| b == b'\n' || b == b'\r');
+        let lines_text = |buffer: &FileBuffer, end: usize| {
+            buffer.bytes_in_range(buffer.offset_of_line(start)..buffer.line_range(end).end)
+        };
+        let old_text = (!within_line && self.line_status.wants_edit_text())
+            .then(|| lines_text(&self.buffer, old_end));
         self.buffer.delete(offset..offset + len);
         self.buffer.insert_bytes(offset, bytes);
         let new_end = self.buffer.line_of_offset(offset + bytes.len());
@@ -1473,6 +1532,16 @@ impl Editor {
             new_end - start + 1,
             self.buffer.line_count(),
         );
+        let edit = match old_text {
+            Some(old) => LinesEdit::between(start, &old, &lines_text(&self.buffer, new_end)),
+            None => LinesEdit {
+                start,
+                old_count: old_end - start + 1,
+                new_count: new_end - start + 1,
+            },
+        };
+        self.line_status
+            .lines_changed(edit, self.buffer.line_count());
     }
 
     fn state(&self) -> CursorState {
@@ -2287,6 +2356,7 @@ impl Editor {
                 .and_then(Language::from_path)
                 .unwrap_or(Language::Plain),
         );
+        self.refresh_line_statuses();
         Ok(())
     }
 
