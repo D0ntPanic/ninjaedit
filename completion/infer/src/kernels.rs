@@ -286,6 +286,42 @@ pub fn attend(
     }
 }
 
+/// Whether products and batched attention run on a matrix unit, which the cores share rather
+/// than each having their own FMA pipes.
+pub fn matrix_unit() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    return arm::matrix_unit();
+    #[cfg(not(target_arch = "aarch64"))]
+    false
+}
+
+/// Causal attention for `n` consecutive tokens in every head at once. Token `t`'s query for
+/// head `h` is `q[t * q_stride + h * hd..][..hd]` and its output goes to the same place in
+/// `out` with `out_stride`; `keys[h]` and `values[h]` are head `h`'s cache for every position
+/// through the last token's, and token `t` sees the first `keys[h].len() / hd - n + t + 1`.
+/// Returns false, leaving `out` alone, where there is no batched kernel for this CPU, and the
+/// caller runs [`attend`] query by query instead.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_batch(
+    q: &[f32],
+    q_stride: usize,
+    keys: &[&[f16]],
+    values: &[&[f16]],
+    hd: usize,
+    n: usize,
+    scale: f32,
+    out: &mut [f32],
+    out_stride: usize,
+) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    return arm::attend_batch(q, q_stride, keys, values, hd, n, scale, out, out_stride);
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (q, q_stride, keys, values, hd, n, scale, out, out_stride);
+        false
+    }
+}
+
 /// Matrices smaller than this are handled on the calling thread; the work is too small to
 /// pay for a parallel dispatch.
 const PARALLEL_MIN_ELEMENTS: usize = 128 * 1024;
@@ -473,6 +509,64 @@ mod tests {
             attend(&q, &keys, &values, scale, &mut scores, &mut out);
             for (a, b) in out.iter().zip(&expected) {
                 assert!((a - b).abs() < 1e-5, "hd {hd} len {len}: {a} vs {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn attend_batch_matches_attend() {
+        // Ragged query and key panels, a cache that already holds tokens, and two head sizes.
+        for (heads, hd, start, n) in [
+            (3, 64, 0, 70),
+            (2, 32, 37, 33),
+            (10, 64, 5, 16),
+            (1, 64, 0, 1),
+        ] {
+            let len = start + n;
+            let (q_stride, out_stride) = (heads * hd * 3 + 5, heads * hd + 3);
+            let q: Vec<f32> = (0..n * q_stride)
+                .map(|i| ((i * 37) % 101) as f32 / 101.0 - 0.5)
+                .collect();
+            let cache = |seed: usize| -> Vec<Vec<f16>> {
+                (0..heads)
+                    .map(|h| {
+                        (0..len * hd)
+                            .map(|i| f16::from_f32((((i + h * 7) * seed) % 97) as f32 / 30.0 - 1.6))
+                            .collect()
+                    })
+                    .collect()
+            };
+            let (keys, values) = (cache(13), cache(29));
+            let keys: Vec<&[f16]> = keys.iter().map(|k| k.as_slice()).collect();
+            let values: Vec<&[f16]> = values.iter().map(|v| v.as_slice()).collect();
+            let scale = 1.0 / (hd as f32).sqrt();
+            let mut out = vec![f32::NAN; n * out_stride];
+            if !attend_batch(
+                &q, q_stride, &keys, &values, hd, n, scale, &mut out, out_stride,
+            ) {
+                return;
+            }
+            for t in 0..n {
+                for h in 0..heads {
+                    let pos = start + t;
+                    let mut scores = vec![0f32; pos + 1];
+                    let mut expected = vec![0f32; hd];
+                    attend(
+                        &q[t * q_stride + h * hd..][..hd],
+                        &keys[h][..(pos + 1) * hd],
+                        &values[h][..(pos + 1) * hd],
+                        scale,
+                        &mut scores,
+                        &mut expected,
+                    );
+                    let got = &out[t * out_stride + h * hd..][..hd];
+                    for (a, b) in got.iter().zip(&expected) {
+                        assert!(
+                            (a - b).abs() < 1e-5,
+                            "{heads}/{hd}/{start}/{n} t {t} h {h}: {a} vs {b}"
+                        );
+                    }
+                }
             }
         }
     }

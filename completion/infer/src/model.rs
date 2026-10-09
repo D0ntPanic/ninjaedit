@@ -1,7 +1,9 @@
 //! The model: weight loading, the forward pass over a key/value cache, and the session that
 //! keeps the cache aligned with an editor's token sequence.
 
-use crate::kernels::{Matrix, Q8, Weights, attend, matmul, matvec, rms_norm, rope, silu};
+use crate::kernels::{
+    Matrix, Q8, Weights, attend, attend_batch, matmul, matvec, rms_norm, rope, silu,
+};
 use anyhow::{Context, Result, bail};
 use half::f16;
 use half::slice::HalfFloatSliceExt;
@@ -369,19 +371,31 @@ impl Model {
                         .convert_from_f32_slice(&row[2 * d + head * hd..2 * d + (head + 1) * hd]);
                 }
             }
-            // Attention: every (token, head) pair is independent.
             let k_cache: &[f16] = k_cache;
             let v_cache: &[f16] = v_cache;
-            let qkv_ref = &qkv;
-            attn.par_chunks_mut(hd).enumerate().for_each(|(idx, out)| {
-                let (t, head) = (idx / heads, idx % heads);
-                let pos = start + t;
-                let q = &qkv_ref[t * 3 * d + head * hd..t * 3 * d + (head + 1) * hd];
-                let keys = &k_cache[slot(head, 0)..slot(head, pos + 1)];
-                let values = &v_cache[slot(head, 0)..slot(head, pos + 1)];
-                let mut scores = vec![0f32; pos + 1];
-                attend(q, keys, values, scale, &mut scores, out);
-            });
+            // A long enough batch of tokens goes to the batched kernel where there is one;
+            // otherwise every (token, head) pair is independent.
+            let batched = n >= BATCH_ATTENTION_MIN && {
+                let keys: Vec<&[f16]> = (0..heads)
+                    .map(|head| &k_cache[slot(head, 0)..slot(head, start + n)])
+                    .collect();
+                let values: Vec<&[f16]> = (0..heads)
+                    .map(|head| &v_cache[slot(head, 0)..slot(head, start + n)])
+                    .collect();
+                attend_batch(&qkv, 3 * d, &keys, &values, hd, n, scale, &mut attn, d)
+            };
+            if !batched {
+                let qkv_ref = &qkv;
+                attn.par_chunks_mut(hd).enumerate().for_each(|(idx, out)| {
+                    let (t, head) = (idx / heads, idx % heads);
+                    let pos = start + t;
+                    let q = &qkv_ref[t * 3 * d + head * hd..t * 3 * d + (head + 1) * hd];
+                    let keys = &k_cache[slot(head, 0)..slot(head, pos + 1)];
+                    let values = &v_cache[slot(head, 0)..slot(head, pos + 1)];
+                    let mut scores = vec![0f32; pos + 1];
+                    attend(q, keys, values, scale, &mut scores, out);
+                });
+            }
             project(&layer.wo, &attn, &mut o, n);
             add_rows(&mut x, &o, d);
             norm_rows(&x, &layer.ffn_norm, &mut h, d);
@@ -414,6 +428,10 @@ impl Model {
     }
 }
 
+/// Tokens in a forward pass from which attention runs as a batch, where the CPU has a kernel
+/// for it, rather than query by query.
+const BATCH_ATTENTION_MIN: usize = 16;
+
 /// Threads for decode, beyond which memory bandwidth is already saturated and dispatch
 /// overhead grows: four on Apple silicon, while x86 cores each pull less bandwidth and need
 /// about eight (measured on Zen 2). Overridable with `INFER_DECODE_THREADS`.
@@ -430,11 +448,19 @@ fn thread_pools() -> (rayon::ThreadPool, rayon::ThreadPool) {
         .unwrap_or(DECODE_THREADS.min(cores))
         .clamp(1, available);
     // Prefill saturates the FMA units, so SMT siblings only contend for them and add
-    // synchronization; one thread per physical core is markedly faster.
+    // synchronization; one thread per physical core is markedly faster. A matrix unit is
+    // shared by a cluster of cores instead, and half the cores keep the units busy with less
+    // contention: on the M5 Max, 9 threads beat 18 by 10-25% up to 1024 tokens and trail by
+    // 5% at 2000.
+    let default_prefill = if crate::kernels::matrix_unit() {
+        cores.div_ceil(2)
+    } else {
+        cores
+    };
     let prefill = std::env::var("INFER_PREFILL_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(cores)
+        .unwrap_or(default_prefill)
         .clamp(1, available);
     let build = |n: usize| {
         rayon::ThreadPoolBuilder::new()

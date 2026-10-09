@@ -6,12 +6,19 @@
 //! is two vectors, and a register-blocked kernel accumulates eight rows against eight tokens
 //! as outer products, broadcasting each input value from a lane. Each accumulator then holds
 //! four adjacent outputs of one token, which store directly with no horizontal sums.
+//!
+//! On cores with SME2 (Apple M4 and later), prefill's products and attention run on the
+//! matrix unit instead; see the `sme` module. Decode stays here: a single vector keeps only
+//! a sixteenth of an outer product busy, and four threads of NEON already reach the bandwidth
+//! the matrix unit's dot products would.
 
 use super::{Matrix, Weights};
 use half::f16;
 use rayon::prelude::*;
 use std::arch::aarch64::*;
 use std::cell::RefCell;
+
+mod sme;
 
 /// Dot product of an f32 vector with an f16 row.
 pub fn dot_f16(x: &[f32], w: &[f16]) -> f32 {
@@ -190,6 +197,32 @@ fn exp(x: float32x4_t) -> float32x4_t {
     }
 }
 
+/// Whether the SME kernels are in use, as [`super::matrix_unit`].
+pub fn matrix_unit() -> bool {
+    sme::available()
+}
+
+/// Causal attention for a batch of queries, as [`super::attend_batch`]: on the matrix unit
+/// where there is one.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_batch(
+    q: &[f32],
+    q_stride: usize,
+    keys: &[&[f16]],
+    values: &[&[f16]],
+    hd: usize,
+    n: usize,
+    scale: f32,
+    out: &mut [f32],
+    out_stride: usize,
+) -> bool {
+    if !sme::available() || !hd.is_multiple_of(32) {
+        return false;
+    }
+    sme::attend(q, q_stride, keys, values, hd, n, scale, out, out_stride);
+    true
+}
+
 /// Softmax in place, as [`super::softmax`].
 pub fn softmax(x: &mut [f32]) {
     let n = x.len();
@@ -323,27 +356,27 @@ const TILE_ROWS: usize = 8;
 /// the rest of the 32 NEON registers for the eight input vectors and the weights.
 const TILE_TOKENS: usize = 8;
 
-/// Converts `rows <= TILE_ROWS` rows of `cols` values to f32, packed column by column into
-/// `dst` (`cols * TILE_ROWS` values). Missing rows are zero. `load(r, k)` gives row `r`'s
-/// values at columns `k..k + 4`, and `scalar(r, k)` its value at column `k`.
+/// Converts `rows <= R` rows of `cols` values to f32, packed column by column into `dst`
+/// (`cols * R` values). Missing rows are zero. `load(r, k)` gives row `r`'s values at
+/// columns `k..k + 4`, and `scalar(r, k)` its value at column `k`.
 ///
 /// # Safety
 /// `load` must be safe to call for every `r < rows` and `k + 4 <= cols`.
-unsafe fn pack(
+unsafe fn pack<const R: usize>(
     rows: usize,
     cols: usize,
     dst: &mut [f32],
     load: impl Fn(usize, usize) -> float32x4_t,
     scalar: impl Fn(usize, usize) -> f32,
 ) {
-    debug_assert_eq!(dst.len(), cols * TILE_ROWS);
+    debug_assert!(R.is_multiple_of(4) && dst.len() == cols * R);
     let dp = dst.as_mut_ptr();
     let mut k = 0;
-    if rows == TILE_ROWS {
-        // Four columns at a time: convert a 4x4 block per half of the rows and transpose it
-        // so each column's four rows are one vector.
+    if rows == R {
+        // Four columns at a time: convert a 4x4 block per quarter of the rows and transpose
+        // it so each column's four rows are one vector.
         while k + 4 <= cols {
-            for half in 0..2 {
+            for half in 0..R / 4 {
                 let (r0, r1, r2, r3) = (
                     load(4 * half, k),
                     load(4 * half + 1, k),
@@ -362,10 +395,7 @@ unsafe fn pack(
                         vtrn2q_f64(t1, t3),
                     ];
                     for (j, &c) in cols4.iter().enumerate() {
-                        vst1q_f32(
-                            dp.add((k + j) * TILE_ROWS + 4 * half),
-                            vreinterpretq_f32_f64(c),
-                        );
+                        vst1q_f32(dp.add((k + j) * R + 4 * half), vreinterpretq_f32_f64(c));
                     }
                 }
             }
@@ -373,28 +403,20 @@ unsafe fn pack(
         }
     }
     for k in k..cols {
-        for r in 0..TILE_ROWS {
-            dst[k * TILE_ROWS + r] = if r < rows { scalar(r, k) } else { 0.0 };
+        for r in 0..R {
+            dst[k * R + r] = if r < rows { scalar(r, k) } else { 0.0 };
         }
     }
 }
 
-/// Packs rows `r..r + rows` of `w` into `dst`, as [`pack`].
+/// Packs rows `r..r + rows` of `w` into `dst`, `R` rows to a column, as [`pack`].
 ///
 /// # Safety
 /// The rows must be in the matrix.
-unsafe fn pack_rows(w: &Matrix, r: usize, rows: usize, dst: &mut [f32]) {
+pub(super) unsafe fn pack_rows<const R: usize>(w: &Matrix, r: usize, rows: usize, dst: &mut [f32]) {
     let cols = w.cols;
     match &w.data {
-        Weights::F16(data) => {
-            let src = unsafe { data.as_ptr().add(r * cols) } as *const u16;
-            let load = |r: usize, k: usize| unsafe {
-                vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(src.add(r * cols + k))))
-            };
-            // Safety: r < rows and k < cols.
-            let scalar = |r: usize, k: usize| f16::from_bits(unsafe { *src.add(r * cols + k) });
-            unsafe { pack(rows, cols, dst, load, |r, k| scalar(r, k).to_f32()) }
-        }
+        Weights::F16(data) => pack_f16::<R>(&data[r * cols..(r + rows) * cols], rows, cols, dst),
         Weights::Q8(q) => {
             let groups = cols / q.group;
             let src = unsafe { q.values.as_ptr().add(r * cols) };
@@ -409,9 +431,36 @@ unsafe fn pack_rows(w: &Matrix, r: usize, rows: usize, dst: &mut [f32]) {
             // Safety: r < rows and k < cols.
             let scalar =
                 |r: usize, k: usize| unsafe { *src.add(r * cols + k) } as f32 * scale(r, k);
-            unsafe { pack(rows, cols, dst, load, scalar) }
+            unsafe { pack::<R>(rows, cols, dst, load, scalar) }
         }
     }
+}
+
+/// Packs `rows <= R` rows of f16 values, each `cols` wide, `R` rows to a column, as [`pack`].
+pub(super) fn pack_f16<const R: usize>(x: &[f16], rows: usize, cols: usize, dst: &mut [f32]) {
+    assert!(x.len() >= rows * cols);
+    let p = x.as_ptr() as *const u16;
+    // Safety: the rows are in `x`, as asserted.
+    let load = |r: usize, k: usize| unsafe {
+        vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(p.add(r * cols + k))))
+    };
+    unsafe { pack::<R>(rows, cols, dst, load, |r, k| x[r * cols + k].to_f32()) }
+}
+
+/// Packs `rows <= R` rows of `x`, each `cols` wide and `stride` after the last, `R` rows to
+/// a column, as [`pack`].
+pub(super) fn pack_f32<const R: usize>(
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    stride: usize,
+    dst: &mut [f32],
+) {
+    assert!(rows == 0 || x.len() >= (rows - 1) * stride + cols);
+    let p = x.as_ptr();
+    // Safety: the rows are in `x`, as asserted.
+    let load = |r: usize, k: usize| unsafe { vld1q_f32(p.add(r * stride + k)) };
+    unsafe { pack::<R>(rows, cols, dst, load, |r, k| x[r * stride + k]) }
 }
 
 /// `ys[tok + t][row + r] = w[r] · x[t]` for the `rows_here <= TILE_ROWS` rows packed at `w`
@@ -537,6 +586,9 @@ const TOKEN_BLOCK_BYTES: usize = 192 * 1024;
 pub fn matmul(w: &Matrix, xs: &[f32], ys: &mut [f32], n: usize) {
     assert_eq!(xs.len(), n * w.cols);
     assert_eq!(ys.len(), n * w.rows);
+    if sme::available() {
+        return sme::matmul(w, xs, ys, n);
+    }
     let (rows, cols) = (w.rows, w.cols);
     let row_block = (ROW_BLOCK_BYTES / (cols * 4 * TILE_ROWS)).max(1) * TILE_ROWS;
     let tok_block = (TOKEN_BLOCK_BYTES / (cols * 4 * TILE_TOKENS)).max(1) * TILE_TOKENS;
@@ -561,7 +613,7 @@ pub fn matmul(w: &Matrix, xs: &[f32], ys: &mut [f32], n: usize) {
                 {
                     let r = r0 + g * TILE_ROWS;
                     // Safety: the rows packed, at most r1 - r, are in the matrix.
-                    unsafe { pack_rows(w, r, TILE_ROWS.min(r1 - r), packed) };
+                    unsafe { pack_rows::<TILE_ROWS>(w, r, TILE_ROWS.min(r1 - r), packed) };
                 }
                 for t in (t0..t1).step_by(TILE_TOKENS) {
                     let tn = TILE_TOKENS.min(t1 - t);
