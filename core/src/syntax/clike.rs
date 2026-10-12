@@ -135,6 +135,9 @@ pub(super) struct Spec {
     /// Whether raw strings take the Rust `r#"..."#` form, and `r#name` is
     /// a raw identifier.
     raw_hashes: bool,
+    /// Whether a prefix containing `f` or `t` makes a string embed
+    /// expressions in braces, as Python's f-strings and t-strings do.
+    format_strings: bool,
     backticks: Backticks,
     rich_strings: RichStrings,
     regex_literals: bool,
@@ -283,6 +286,7 @@ pub(super) static RUST: Spec = Spec {
     string_prefixes: &["b", "r", "br", "c", "cr"],
     raw_strings: true,
     raw_hashes: true,
+    format_strings: false,
     backticks: Backticks::None,
     rich_strings: RichStrings::None,
     regex_literals: false,
@@ -398,6 +402,7 @@ pub(super) static C: Spec = Spec {
     string_prefixes: &["L", "u", "U", "u8"],
     raw_strings: false,
     raw_hashes: false,
+    format_strings: false,
     backticks: Backticks::None,
     rich_strings: RichStrings::None,
     regex_literals: false,
@@ -520,6 +525,7 @@ pub(super) static CPP: Spec = Spec {
     string_prefixes: &["L", "u", "U", "u8", "R", "LR", "uR", "UR", "u8R"],
     raw_strings: false,
     raw_hashes: false,
+    format_strings: false,
     backticks: Backticks::None,
     rich_strings: RichStrings::None,
     regex_literals: false,
@@ -607,6 +613,7 @@ pub(super) static JAVASCRIPT: Spec = Spec {
     string_prefixes: &[],
     raw_strings: false,
     raw_hashes: false,
+    format_strings: false,
     backticks: Backticks::Template,
     rich_strings: RichStrings::None,
     regex_literals: true,
@@ -711,6 +718,7 @@ pub(super) static TYPESCRIPT: Spec = Spec {
     string_prefixes: &[],
     raw_strings: false,
     raw_hashes: false,
+    format_strings: false,
     backticks: Backticks::Template,
     rich_strings: RichStrings::None,
     regex_literals: true,
@@ -844,6 +852,7 @@ pub(super) static WGSL: Spec = Spec {
     string_prefixes: &[],
     raw_strings: false,
     raw_hashes: false,
+    format_strings: false,
     backticks: Backticks::None,
     rich_strings: RichStrings::None,
     regex_literals: false,
@@ -913,10 +922,12 @@ pub(super) static PYTHON: Spec = Spec {
     multiline_strings: false,
     string_prefixes: &[
         "r", "u", "b", "f", "t", "rb", "br", "rf", "fr", "rt", "tr", "R", "U", "B", "F", "T", "Rb",
-        "rB", "RB", "bR", "Br", "BR", "Rf", "rF", "RF", "fR", "Fr", "FR",
+        "rB", "RB", "bR", "Br", "BR", "Rf", "rF", "RF", "fR", "Fr", "FR", "Rt", "rT", "RT", "tR",
+        "Tr", "TR",
     ],
     raw_strings: true,
     raw_hashes: false,
+    format_strings: true,
     backticks: Backticks::None,
     rich_strings: RichStrings::None,
     regex_literals: false,
@@ -1047,6 +1058,7 @@ pub(super) static CSHARP: Spec = Spec {
     string_prefixes: &[],
     raw_strings: false,
     raw_hashes: false,
+    format_strings: false,
     backticks: Backticks::None,
     rich_strings: RichStrings::CSharp,
     regex_literals: false,
@@ -1142,6 +1154,7 @@ pub(super) static JAVA: Spec = Spec {
     string_prefixes: &[],
     raw_strings: false,
     raw_hashes: false,
+    format_strings: false,
     backticks: Backticks::None,
     rich_strings: RichStrings::None,
     regex_literals: false,
@@ -1254,6 +1267,7 @@ pub(super) static KOTLIN: Spec = Spec {
     string_prefixes: &[],
     raw_strings: false,
     raw_hashes: false,
+    format_strings: false,
     backticks: Backticks::Identifier,
     rich_strings: RichStrings::Kotlin,
     regex_literals: false,
@@ -1354,6 +1368,7 @@ pub(super) static GO: Spec = Spec {
     string_prefixes: &[],
     raw_strings: false,
     raw_hashes: false,
+    format_strings: false,
     backticks: Backticks::RawString,
     rich_strings: RichStrings::None,
     regex_literals: false,
@@ -1448,6 +1463,7 @@ pub(super) static RUBY: Spec = Spec {
     string_prefixes: &[],
     raw_strings: false,
     raw_hashes: false,
+    format_strings: false,
     backticks: Backticks::None,
     rich_strings: RichStrings::Ruby,
     regex_literals: true,
@@ -1522,6 +1538,11 @@ struct Line<'a> {
     /// Whether the current token is directly inside a C# interpolation
     /// hole, where a `:` starts a format string.
     format_hole: bool,
+    /// How many parentheses and square brackets deep the current token
+    /// is in the embedded expression it is in, as far as this line goes,
+    /// to tell the `:` that starts a Python format spec from one in a
+    /// slice or a lambda.
+    hole_brackets: u8,
     /// The first Ruby heredoc opened on this line, whose body starts on
     /// the next.
     heredoc: Option<Context>,
@@ -1546,6 +1567,7 @@ impl Lexer for Spec {
             keep_pending: false,
             receiver_depth: 0,
             format_hole: false,
+            hole_brackets: 0,
             heredoc: None,
             block_params: false,
         };
@@ -1563,8 +1585,10 @@ impl Lexer for Spec {
                     triple,
                     escapes,
                     hashes,
-                }) => lx.continue_string(&mut state, quote, triple, escapes, hashes),
+                    interpolates,
+                }) => lx.continue_string(&mut state, quote, triple, escapes, hashes, interpolates),
                 Some(Context::Template) => lx.continue_template(&mut state),
+                Some(Context::FormatSpec) => lx.continue_format_spec(&mut state),
                 Some(Context::RichString {
                     quotes,
                     escapes,
@@ -1751,6 +1775,7 @@ impl<'a> Line<'a> {
         triple: bool,
         escapes: bool,
         hashes: u8,
+        interpolates: bool,
     ) -> bool {
         let mut segment = self.pos;
         let mut i = self.pos;
@@ -1778,6 +1803,20 @@ impl<'a> Line<'a> {
                     self.prev = Prev::Value;
                     self.pending = None;
                     return true;
+                }
+            }
+            if interpolates && (b == b'{' || b == b'}') {
+                if self.at(i + 1) == b {
+                    // `{{` and `}}` stand for a brace.
+                    self.emit(segment, i, TokenKind::String);
+                    self.emit(i, i + 2, TokenKind::StringEscape);
+                    i += 2;
+                    segment = i;
+                    continue;
+                }
+                if b == b'{' {
+                    self.emit(segment, i, TokenKind::String);
+                    return self.open_embedded(state, i, i + 1);
                 }
             }
             if self.spec.backticks == Backticks::Template
@@ -1812,7 +1851,34 @@ impl<'a> Line<'a> {
     /// Lex the body of a template literal. Returns whether the line goes
     /// on after it.
     fn continue_template(&mut self, state: &mut LexState) -> bool {
-        self.continue_string(state, b'`', false, true, 0)
+        self.continue_string(state, b'`', false, true, 0, false)
+    }
+
+    /// Lex the rest of a Python format spec; see [`Context::FormatSpec`].
+    /// Returns whether the line goes on after it.
+    fn continue_format_spec(&mut self, state: &mut LexState) -> bool {
+        let line = self.line;
+        let start = self.pos;
+        for (i, &b) in line.iter().enumerate().skip(start) {
+            match b {
+                b'{' => {
+                    self.emit(start, i, TokenKind::String);
+                    return self.open_embedded(state, i, i + 1);
+                }
+                b'}' => {
+                    // The end of the expression the spec belongs to.
+                    self.emit(start, i, TokenKind::String);
+                    self.emit(i, i + 1, TokenKind::Punctuation);
+                    self.pos = i + 1;
+                    state.pop();
+                    return self.continue_embedding(state);
+                }
+                _ => {}
+            }
+        }
+        self.emit(start, line.len(), TokenKind::String);
+        self.pos = line.len();
+        false
     }
 
     /// Lex the rest of a C# or Kotlin string; see
@@ -1921,6 +1987,7 @@ impl<'a> Line<'a> {
         state.push(Context::TemplateExpression { braces: 0 });
         self.prev = Prev::Start;
         self.pending = None;
+        self.hole_brackets = 0;
         true
     }
 
@@ -1943,6 +2010,14 @@ impl<'a> Line<'a> {
             Some(Context::Heredoc { tag, interpolates }) => {
                 self.continue_heredoc(state, tag, interpolates)
             }
+            Some(Context::String {
+                quote,
+                triple,
+                escapes,
+                hashes,
+                interpolates,
+            }) => self.continue_string(state, quote, triple, escapes, hashes, interpolates),
+            Some(Context::FormatSpec) => self.continue_format_spec(state),
             _ => self.continue_template(state),
         }
     }
@@ -2720,6 +2795,7 @@ impl<'a> Line<'a> {
                     };
                     self.emit(start, start + close, TokenKind::Punctuation);
                     self.pos = start + close;
+                    self.hole_brackets = 0;
                     return self.continue_embedding(state);
                 }
                 self.emit(start, start + 1, TokenKind::Punctuation);
@@ -2727,6 +2803,17 @@ impl<'a> Line<'a> {
                 state.replace(Context::TemplateExpression { braces: braces - 1 });
                 self.prev = Prev::Value;
                 return true;
+            } else if matches!(b, b'(' | b'[') {
+                self.hole_brackets = self.hole_brackets.saturating_add(1);
+            } else if matches!(b, b')' | b']') {
+                self.hole_brackets = self.hole_brackets.saturating_sub(1);
+            } else if spec.format_strings && braces == 0 && self.hole_brackets == 0 && b == b':' {
+                // A Python format spec, as in `{value:>{width}.2f}`, runs
+                // to the closing brace.
+                self.emit(start, start + 1, TokenKind::Punctuation);
+                self.pos = start + 1;
+                state.replace(Context::FormatSpec);
+                return self.continue_format_spec(state);
             } else if self.format_hole && b == b':' && self.at(start + 1) != b':' {
                 // A format string, as in `{value:N2}`, runs to the brace.
                 let end = line[start..]
@@ -2782,6 +2869,10 @@ impl<'a> Line<'a> {
         escapes: bool,
         hashes: u8,
     ) -> bool {
+        let interpolates = self.spec.format_strings
+            && self.line[start..quote_pos]
+                .iter()
+                .any(|c| matches!(c, b'f' | b'F' | b't' | b'T'));
         let triple = self.spec.triple_quotes
             && self.at(quote_pos + 1) == quote
             && self.at(quote_pos + 2) == quote;
@@ -2793,8 +2884,9 @@ impl<'a> Line<'a> {
             triple,
             escapes,
             hashes,
+            interpolates,
         });
-        let more = self.continue_string(state, quote, triple, escapes, hashes);
+        let more = self.continue_string(state, quote, triple, escapes, hashes, interpolates);
         self.merge_string_start(start);
         more
     }
@@ -3376,10 +3468,29 @@ kkkkk DDDpttttpo
         string\"\"\"
 sssssssssssssssss
         return f\"{self.x!r}\" + rb'\\d+' + 'it\\'s' + self.go()
-        KKKKKK sssssssssssss o sssssss o ssseess o kkkkpffpp
+        KKKKKK sspkkkkpdoips o sssssss o ssseess o kkkkpffpp
     for i in range(10): print(i)
     KKK v kk fffffpnnpo fffffpip
 
+",
+        );
+    }
+
+    #[test]
+    fn python_format_strings() {
+        check(
+            Language::Python,
+            "\
+x = f\"a {b:>{w}.2f} {{c}} {d[\"k\"]!r} {e[1:2]}\"
+i o sssspipspipssspseeseespipssspoipspipnonpps
+s = rf'\\d{n}' + t\"{x=}\" + b\"{y}\" + f\"{ {'a': 1}['a'] }\"
+i o ssssspips o sspiops o ssssss o ssp pssso nppsssp ps
+m = f\"\"\"
+i o ssss
+{call(
+pffffp
+    a)} end\"\"\"
+    ippsssssss
 ",
         );
     }
@@ -3514,7 +3625,7 @@ ttttpptttttpffffpiipopffffffpdddddo np sss oo ssseesssssp
         );
         assert_eq!(lines[0][4].kind, TokenKind::Field);
         assert_eq!(lines[0][6].kind, TokenKind::String);
-        assert_eq!(lines[1][1].kind, TokenKind::Punctuation);
+        assert_eq!(lines[1][1].kind, TokenKind::Bracket1);
         assert_eq!(lines[1][2].kind, TokenKind::Identifier);
         assert_eq!(lines[2][0].kind, TokenKind::String);
         // The string opened on the heredoc's line resumes after it.
@@ -3601,7 +3712,7 @@ ttttpptttttpffffpiipopffffffpdddddo np sss oo ssseesssssp
         assert_eq!(lines[0][0].kind, TokenKind::String);
         assert_eq!(lines[1][0].kind, TokenKind::Identifier);
         assert_eq!(lines[1][2].kind, TokenKind::String);
-        assert_eq!(lines[2][0].kind, TokenKind::Punctuation);
+        assert_eq!(lines[2][0].kind, TokenKind::Bracket1);
         assert_eq!(lines[2][1].kind, TokenKind::String);
         assert_eq!(lines[2][2].kind, TokenKind::Identifier);
     }
@@ -3618,13 +3729,13 @@ ttttpptttttpffffpiipopffffffpdddddo np sss oo ssseesssssp
         // An expression in a raw string spans lines, and closes with as
         // many braces as the string has dollars.
         let lines = lex_text(Language::CSharp, "$$\"\"\"\n{{a +\nb}} c\n\"\"\" d\n");
-        assert_eq!(lines[1][0].kind, TokenKind::Punctuation);
+        assert_eq!(lines[1][0].kind, TokenKind::Bracket1);
         assert_eq!(lines[2][0].kind, TokenKind::Identifier);
         assert_eq!(
             lines[2][1],
             Token {
                 range: 1..3,
-                kind: TokenKind::Punctuation
+                kind: TokenKind::Bracket1
             }
         );
         assert_eq!(lines[2][2].kind, TokenKind::String);
@@ -3635,7 +3746,7 @@ ttttpptttttpffffpiipopffffffpdddddo np sss oo ssseesssssp
         let lines = lex_text(Language::Kotlin, "\"\"\"a\n$b ${\nc\n}\"\"\"\n");
         assert_eq!(lines[1][0].kind, TokenKind::Variable);
         assert_eq!(lines[2][0].kind, TokenKind::Identifier);
-        assert_eq!(lines[3][0].kind, TokenKind::Punctuation);
+        assert_eq!(lines[3][0].kind, TokenKind::Bracket1);
         assert_eq!(lines[3][1].kind, TokenKind::String);
 
         // A Go raw string spans lines without escapes.
@@ -3668,24 +3779,24 @@ ttttpptttttpffffpiipopffffffpdddddo np sss oo ssseesssssp
             kinds(Language::Kotlin, "f(data, data.x)"),
             [
                 Function,
-                Punctuation,
+                Bracket1,
                 Identifier,
                 Punctuation,
                 Identifier,
                 Punctuation,
                 Field,
-                Punctuation
+                Bracket1
             ]
         );
         assert_eq!(
             kinds(Language::Kotlin, "if (value in xs) return data"),
             [
                 ControlKeyword,
-                Punctuation,
+                Bracket1,
                 Identifier,
                 Keyword,
                 Identifier,
-                Punctuation,
+                Bracket1,
                 ControlKeyword,
                 Identifier
             ]

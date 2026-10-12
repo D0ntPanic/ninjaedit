@@ -28,8 +28,11 @@
 //!
 //! Merge conflict markers belong to no language, so a file's lexer (see
 //! [`Language::file_lexer`]) is its language's lexer wrapped in one that
-//! recognizes them in any file; see the `conflicts` module.
+//! recognizes them in any file; see the `conflicts` module. The same
+//! wrapper tells brackets apart by how deeply they nest, for rainbow
+//! brackets; see the `brackets` module.
 
+mod brackets;
 mod clike;
 mod cmake;
 mod conflicts;
@@ -121,6 +124,16 @@ pub enum TokenKind {
     /// A merge conflict marker line: `<<<<<<<`, `|||||||`, `=======`, or
     /// `>>>>>>>` with its label. See the `conflicts` module.
     ConflictMarker,
+    /// A bracket that opens or closes a pair: `(`, `[`, `{`, the `${` that
+    /// opens an expression embedded in a string, and their closers. The
+    /// four kinds are nesting depths, outermost first, cycling for deeper
+    /// pairs, so a frontend can show rainbow brackets; one that doesn't
+    /// styles them all as their parent, [`Punctuation`](Self::Punctuation).
+    /// See the `brackets` module.
+    Bracket1,
+    Bracket2,
+    Bracket3,
+    Bracket4,
 }
 
 impl TokenKind {
@@ -163,10 +176,33 @@ impl TokenKind {
         TokenKind::Quote,
         TokenKind::Variable,
         TokenKind::ConflictMarker,
+        TokenKind::Bracket1,
+        TokenKind::Bracket2,
+        TokenKind::Bracket3,
+        TokenKind::Bracket4,
     ];
 
     /// The number of kinds; `index` is always below it.
-    pub const COUNT: usize = 37;
+    pub const COUNT: usize = 41;
+
+    /// The bracket kinds, by nesting depth; see [`bracket`](Self::bracket).
+    pub const BRACKETS: [TokenKind; 4] = [
+        TokenKind::Bracket1,
+        TokenKind::Bracket2,
+        TokenKind::Bracket3,
+        TokenKind::Bracket4,
+    ];
+
+    /// The kind of a bracket `depth` pairs deep, 0 being outermost. Past
+    /// the last kind they cycle back to the first.
+    pub fn bracket(depth: u8) -> TokenKind {
+        TokenKind::BRACKETS[depth as usize % TokenKind::BRACKETS.len()]
+    }
+
+    /// Whether this is one of the [`BRACKETS`](Self::BRACKETS).
+    pub fn is_bracket(self) -> bool {
+        TokenKind::BRACKETS.contains(&self)
+    }
 
     /// A stable index for tables, `0..COUNT`.
     pub fn index(self) -> usize {
@@ -213,6 +249,10 @@ impl TokenKind {
             TokenKind::Quote => "quote",
             TokenKind::Variable => "variable",
             TokenKind::ConflictMarker => "conflict-marker",
+            TokenKind::Bracket1 => "bracket-1",
+            TokenKind::Bracket2 => "bracket-2",
+            TokenKind::Bracket3 => "bracket-3",
+            TokenKind::Bracket4 => "bracket-4",
         }
     }
 
@@ -237,6 +277,10 @@ impl TokenKind {
             TokenKind::Link => TokenKind::String,
             TokenKind::Quote => TokenKind::Comment,
             TokenKind::ConflictMarker => TokenKind::Invalid,
+            TokenKind::Bracket1
+            | TokenKind::Bracket2
+            | TokenKind::Bracket3
+            | TokenKind::Bracket4 => TokenKind::Punctuation,
             TokenKind::Strong | TokenKind::Emphasis => return None,
             TokenKind::Keyword
             | TokenKind::Operator
@@ -502,14 +546,22 @@ pub enum Context {
         escapes: bool,
         /// For Rust raw strings, the number of `#` after the closing quote.
         hashes: u8,
+        /// Whether `{ }` embeds an expression, as in a Python f-string,
+        /// with `{{` and `}}` standing for braces.
+        interpolates: bool,
     },
     /// Inside a JavaScript template literal, outside any `${ }`.
     Template,
     /// Inside an embedded expression: a `${ }` in a template literal or
-    /// a Kotlin string, or a `{ }` in a C# interpolated string, `braces`
-    /// levels of plain braces deep. The string it is embedded in is
-    /// below it on the stack.
+    /// a Kotlin string, or a `{ }` in a C# interpolated string or a
+    /// Python f-string, `braces` levels of plain braces deep. The string
+    /// it is embedded in is below it on the stack.
     TemplateExpression { braces: u8 },
+    /// Inside the format spec of a Python f-string's embedded expression,
+    /// after its `:`, as in `{value:>{width}.2f}`: text to the closing
+    /// brace, with expressions of its own in braces. The string the
+    /// expression is embedded in is below it on the stack.
+    FormatSpec,
     /// Inside a C# or Kotlin string literal of a kind that has no
     /// [`String`](Self::String) equivalent: raw, verbatim, or with
     /// embedded expressions.
@@ -565,18 +617,24 @@ pub enum Context {
     /// `equals` equals signs.
     Bracket { equals: u8, comment: bool },
     /// Inside one side of a merge conflict. Always the outermost context;
-    /// see the `conflicts` module.
-    Conflict { side: ConflictSide },
+    /// see the `conflicts` module. `brackets` is the bracket depth the
+    /// conflict started at, which each side starts from.
+    Conflict { side: ConflictSide, brackets: u8 },
 }
 
 /// The lexer state at a line boundary: a small stack of the
-/// [`Context`]s the line starts inside. Fixed-size, so a highlighter can
-/// keep one per line of a large file, and comparable, so re-lexing knows
-/// when it has caught up with the previous results.
+/// [`Context`]s the line starts inside, and how many brackets deep it
+/// is. Fixed-size, so a highlighter can keep one per line of a large
+/// file, and comparable, so re-lexing knows when it has caught up with
+/// the previous results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LexState {
     stack: [Option<Context>; MAX_DEPTH],
     depth: u8,
+    /// The number of brackets open at the line boundary. Kept by a file's
+    /// lexer alone (see the `brackets` module): a language's lexer is
+    /// always handed 0, and what it returns is ignored.
+    brackets: u8,
 }
 
 impl Default for LexState {
@@ -585,6 +643,7 @@ impl Default for LexState {
         LexState {
             stack: [None; MAX_DEPTH],
             depth: 0,
+            brackets: 0,
         }
     }
 }
@@ -595,6 +654,7 @@ impl LexState {
     pub(super) const UNKNOWN: LexState = LexState {
         stack: [None; MAX_DEPTH],
         depth: u8::MAX,
+        brackets: 0,
     };
 
     pub(super) fn is_unknown(&self) -> bool {
@@ -641,6 +701,17 @@ impl LexState {
 
     pub fn is_default(&self) -> bool {
         self.depth == 0
+    }
+
+    /// The number of brackets open at the line boundary.
+    pub fn bracket_depth(&self) -> u8 {
+        self.brackets
+    }
+
+    /// The state with `brackets` open.
+    pub(super) fn with_bracket_depth(mut self, brackets: u8) -> LexState {
+        self.brackets = brackets;
+        self
     }
 
     /// The outermost context, if any.
@@ -818,12 +889,38 @@ pub(super) mod test_support {
     /// each byte of a token is replaced by a letter for its kind, for
     /// compact golden tests.
     pub fn annotate(language: Language, text: &str) -> String {
+        annotate_with(language, text, |kind| Some(letter(kind)))
+    }
+
+    /// Like [`annotate`], but marking only brackets: a digit for the kind
+    /// of each colored by depth (`1` for [`TokenKind::Bracket1`] and so
+    /// on), and `p` for other punctuation, including a closing bracket
+    /// that closes nothing.
+    pub fn annotate_brackets(language: Language, text: &str) -> String {
+        annotate_with(language, text, |kind| match kind {
+            TokenKind::Punctuation => Some(b'p'),
+            _ => {
+                let depth = TokenKind::BRACKETS.iter().position(|&b| b == kind)?;
+                Some(b'1' + depth as u8)
+            }
+        })
+    }
+
+    /// Render lexed lines with a parallel annotation line, each byte of a
+    /// token replaced by what `mark` gives for its kind, if anything.
+    fn annotate_with(
+        language: Language,
+        text: &str,
+        mark: impl Fn(TokenKind) -> Option<u8>,
+    ) -> String {
         let lines = lex_text(language, text);
         let mut out = String::new();
         for (line, tokens) in text.lines().zip(lines) {
             let mut marks = vec![b' '; line.len()];
             for token in tokens {
-                let c = letter(token.kind);
+                let Some(c) = mark(token.kind) else {
+                    continue;
+                };
                 for m in &mut marks[token.range.clone()] {
                     *m = c;
                 }
@@ -875,19 +972,35 @@ pub(super) mod test_support {
             TokenKind::Quote => b'Q',
             TokenKind::Variable => b'$',
             TokenKind::ConflictMarker => b'X',
+            // Bracket depths have their own tests; see `annotate_brackets`.
+            TokenKind::Bracket1
+            | TokenKind::Bracket2
+            | TokenKind::Bracket3
+            | TokenKind::Bracket4 => b'p',
         }
     }
 
     /// Check a golden: alternating source and annotation lines.
     #[track_caller]
     pub fn check(language: Language, golden: &str) {
+        check_with(golden, |source| annotate(language, source));
+    }
+
+    /// Check a golden of [`annotate_brackets`].
+    #[track_caller]
+    pub fn check_brackets(language: Language, golden: &str) {
+        check_with(golden, |source| annotate_brackets(language, source));
+    }
+
+    #[track_caller]
+    fn check_with(golden: &str, annotate: impl Fn(&str) -> String) {
         let lines: Vec<&str> = golden.lines().collect();
         let source: String = lines.iter().step_by(2).map(|l| format!("{l}\n")).collect();
         let expected: String = lines
             .chunks(2)
             .map(|pair| format!("{}\n{}\n", pair[0], pair.get(1).unwrap_or(&"").trim_end()))
             .collect();
-        let actual = annotate(language, &source);
+        let actual = annotate(&source);
         assert_eq!(
             actual, expected,
             "\n--- actual ---\n{actual}\n--- expected ---\n{expected}"

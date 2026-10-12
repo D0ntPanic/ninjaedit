@@ -777,6 +777,8 @@ impl App {
         completer.set_waker(move || {
             let _ = wake.send(AppEvent::CompletionReady);
         });
+        let mut theme = Theme::default();
+        theme.set_rainbow_brackets(settings.rainbow_brackets());
         let mut app = App {
             index_generation: project.index().generation(),
             file_activity: 0,
@@ -800,7 +802,7 @@ impl App {
             heads: Heads::new(),
             discoveries: discovery_rx,
             discovery_tx,
-            theme: Theme::default(),
+            theme,
             mode: Mode::Editor,
             git_log: None,
             changes: None,
@@ -953,6 +955,8 @@ impl App {
 
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+        self.theme
+            .set_rainbow_brackets(self.settings.rainbow_brackets());
     }
 
     /// Open a file in a new tab, or switch to its tab if it is already
@@ -2026,10 +2030,13 @@ impl App {
     }
 
     /// Apply the settings to what is running: every open editor's code
-    /// style, every terminal's scrollback, the project search's limit,
-    /// and the completion models. The shell and agent settings apply to
-    /// the next shell or agent started, and the keys to the next key.
+    /// style, rainbow brackets, every terminal's scrollback, the project
+    /// search's limit, and the completion models. The shell and agent
+    /// settings apply to the next shell or agent started, and the keys
+    /// to the next key.
     fn apply_settings(&mut self) {
+        self.theme
+            .set_rainbow_brackets(self.settings.rainbow_brackets());
         let style = self.settings.code_style();
         for tab in &mut self.tabs {
             tab.view.editor_mut_in_place().set_code_style(style);
@@ -5308,7 +5315,7 @@ mod tests {
             "the mode's tab replaces the editor's"
         );
         assert!(
-            screen.iter().any(|r| r.contains("Shell executable")),
+            screen.iter().any(|r| r.contains("Mouse wheel lines")),
             "{screen:#?}"
         );
         assert!(screen[19].contains("Ctrl+D default"), "{screen:#?}");
@@ -5317,7 +5324,7 @@ mod tests {
         // Down to the scrollback field, a new value, Enter: applied and
         // saved to the storage, where nothing was before.
         assert_eq!(settings_file(&app), None);
-        for _ in 0..6 {
+        for _ in 0..7 {
             press(&mut app, KeyCode::Down);
         }
         ctrl(&mut app, 'a');
@@ -5363,6 +5370,29 @@ mod tests {
     }
 
     #[test]
+    fn rainbow_brackets_setting_applies_to_the_theme() {
+        use ninjaedit_core::TokenKind;
+        let (dir, mut app) = app_with_files(&[("a.txt", "hi\n")]);
+        let punctuation = app.theme.syntax(TokenKind::Punctuation);
+        assert_ne!(app.theme.syntax(TokenKind::Bracket1), punctuation);
+
+        app.settings
+            .set_text(SettingKey::RainbowBrackets, "false")
+            .unwrap();
+        app.settings_changed();
+        assert_eq!(app.theme.syntax(TokenKind::Bracket1), punctuation);
+        // A theme loaded later keeps to the setting.
+        app.set_theme(Theme::default());
+        assert_eq!(app.theme.syntax(TokenKind::Bracket1), punctuation);
+
+        // As does an app started with it saved.
+        let (events, _events_rx) = std::sync::mpsc::channel();
+        let storage = Storage::new(dir.path().join(".storage"));
+        let again = App::new(Project::open(dir.path()).unwrap(), storage, events);
+        assert_eq!(again.theme.syntax(TokenKind::Bracket1), punctuation);
+    }
+
+    #[test]
     fn code_style_setting_applies_to_open_and_new_editors() {
         let (_dir, mut app) = app_with_files(&[("a.rs", "\n"), ("b.rs", "\n")]);
         app.open_file(app.project.root().join("a.rs"));
@@ -5390,7 +5420,8 @@ mod tests {
     fn ctrl_d_resets_and_ctrl_o_or_ctrl_t_leave_the_settings_page() {
         let (dir, mut app) = app_with_files(&[("a.txt", "hi\n"), ("b.txt", "yo\n")]);
         app.open_settings();
-        // Down past the wheel lines to the shell.
+        // Down past the wheel lines and rainbow brackets to the shell.
+        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         type_str(&mut app, "/bin/dash");
@@ -6106,11 +6137,11 @@ mod tests {
         let screen = draw(&mut app, 200, 10);
         assert!(screen[9].contains("search.max-results"), "{screen:#?}");
 
-        // Down past the continuation indent, the wheel lines, the shell,
-        // the agent and its update, the scrollback, and the terminal
-        // keys' rows to the results.
+        // Down past the continuation indent, the wheel lines, rainbow
+        // brackets, the shell, the agent and its update, the scrollback,
+        // and the terminal keys' rows to the results.
         app.open_settings();
-        for _ in 0..10 {
+        for _ in 0..11 {
             press(&mut app, KeyCode::Down);
         }
         ctrl(&mut app, 'a');
@@ -6890,7 +6921,7 @@ mod tests {
         assert!(matches!(app.mode, Mode::Settings(_)));
         assert_eq!(app.focus, Focus::Editor);
         assert!(app.tool_pane.is_visible());
-        for _ in 0..6 {
+        for _ in 0..7 {
             press(&mut app, KeyCode::Down);
         }
         ctrl(&mut app, 'a');
@@ -7360,7 +7391,8 @@ mod tests {
 
         // From a page, back to the page as it was.
         app.open_settings();
-        // Down past the wheel lines to the shell.
+        // Down past the wheel lines and rainbow brackets to the shell.
+        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         type_str(&mut app, "fish");

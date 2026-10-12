@@ -1079,10 +1079,11 @@ mod tests {
     fn enter_applies_a_value_and_moving_on_applies_the_field_left() {
         let mut settings = Settings::default();
         let mut view = SettingsView::new(&settings);
-        // Down past the continuation indent, wheel, shell, agent, and
-        // agent update fields to the scrollback field; the fields left
-        // as they were are applied without changing anything.
-        for _ in 0..6 {
+        // Down past the continuation indent, wheel, rainbow brackets,
+        // shell, agent, and agent update fields to the scrollback field;
+        // the fields left as they were are applied without changing
+        // anything.
+        for _ in 0..7 {
             assert_eq!(
                 press(&mut view, &mut settings, KeyCode::Down),
                 SettingsOutcome::Continue
@@ -1335,7 +1336,7 @@ mod tests {
         let mut settings = Settings::default();
         let mut view = SettingsView::new(&settings);
         // Wide enough for the note in one row, then not.
-        let screen = draw(&mut view, &settings, 80, 60);
+        let screen = draw(&mut view, &settings, 80, 70);
         let name = screen
             .iter()
             .position(|r| r.contains("Maximum search results"))

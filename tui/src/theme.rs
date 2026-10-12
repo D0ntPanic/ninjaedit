@@ -58,6 +58,13 @@
 //! style of its parent kind (a doc comment is a comment, a primitive type
 //! is a type; see [`TokenKind::parent`]), and at the root falls back to
 //! `view-text`.
+//!
+//! Brackets are styled by how deeply they nest, `syntax-bracket-1` for
+//! the outermost pairs through `syntax-bracket-4`, cycling back to the
+//! first for deeper ones, when the editor's rainbow brackets setting is
+//! on (see [`Theme::set_rainbow_brackets`]). With it off they are all
+//! `syntax-punctuation`, as are brackets of a depth the theme leaves
+//! unstyled.
 
 use ninjaedit_core::git::LineStatus;
 use ninjaedit_core::{ConflictSide, TokenKind};
@@ -114,6 +121,9 @@ macro_rules! theme_colors {
             /// Syntax styles by [`TokenKind::index`]; `None` where the
             /// theme leaves a kind to its parent.
             syntax: [Option<TextStyle>; TokenKind::COUNT],
+            /// Whether brackets take their colors by depth; a setting
+            /// rather than part of the theme file.
+            rainbow_brackets: bool,
         }
 
         impl Theme {
@@ -128,6 +138,7 @@ macro_rules! theme_colors {
                     $($field: color,)*
                     $($ofield: None,)*
                     syntax: [None; TokenKind::COUNT],
+                    rainbow_brackets: false,
                 }
             }
 
@@ -194,9 +205,20 @@ impl Theme {
         }
     }
 
+    /// Color brackets by depth (with their `syntax-bracket-` styles),
+    /// or not (with `syntax-punctuation`), as the settings say.
+    pub fn set_rainbow_brackets(&mut self, rainbow: bool) {
+        self.rainbow_brackets = rainbow;
+    }
+
     /// The style for a kind of token, following parents for kinds the
     /// theme doesn't style and ending at `view-text`.
     pub fn syntax(&self, kind: TokenKind) -> TextStyle {
+        let kind = if kind.is_bracket() && !self.rainbow_brackets {
+            TokenKind::Punctuation
+        } else {
+            kind
+        };
         let mut current = Some(kind);
         while let Some(kind) = current {
             if let Some(style) = self.syntax[kind.index()] {
@@ -664,6 +686,28 @@ mod tests {
         assert!(error("view-text = \"*#000000\"").contains("can't be bold or italic"));
         assert!(error("syntax-nope = \"#000000\"").contains("not a theme color"));
         assert!(error("syntax-comment = \"*\"").contains("nor a named color"));
+    }
+
+    #[test]
+    fn brackets_take_their_depth_colors_only_with_rainbow_brackets_on() {
+        let mut theme = Theme::default();
+        let punctuation = theme.syntax(TokenKind::Punctuation);
+        for kind in TokenKind::BRACKETS {
+            assert_eq!(theme.syntax(kind), punctuation, "{kind:?}");
+        }
+        theme.set_rainbow_brackets(true);
+        let colors: Vec<_> = TokenKind::BRACKETS
+            .iter()
+            .map(|&kind| theme.syntax(kind).color)
+            .collect();
+        for (i, color) in colors.iter().enumerate() {
+            assert_ne!(*color, punctuation.color);
+            assert!(!colors[..i].contains(color), "{colors:?}");
+        }
+        // A depth the theme leaves unstyled is punctuation.
+        let mut theme = Theme::parse("syntax-bracket-3 = \"\"\n").unwrap();
+        theme.set_rainbow_brackets(true);
+        assert_eq!(theme.syntax(TokenKind::Bracket3), punctuation);
     }
 
     #[test]

@@ -17,7 +17,8 @@
 //! guesses were right, and the sweep stops (or jumps to the next place an
 //! edit happened while it was busy). Typing inside a comment converges on
 //! the next line; opening a block comment at the top of a file sweeps to
-//! the end.
+//! the end, as does adding or removing a lone bracket, which changes the
+//! bracket depth of every line after it (brackets typed as a pair don't).
 //!
 //! Sweeps run on a worker thread over a [`BufferSnapshot`], which is cheap
 //! to take and never blocks editing. The worker merges its results in
@@ -234,7 +235,7 @@ impl Highlighter {
         let shared = self.shared.lock().unwrap();
         let side_at = |line: usize| match shared.states.get(line) {
             Some(state) if !state.is_unknown() => match state.bottom() {
-                Some(Context::Conflict { side }) => Some(side),
+                Some(Context::Conflict { side, .. }) => Some(side),
                 _ => None,
             },
             _ => None,
@@ -657,6 +658,10 @@ mod tests {
             "-->",
             "# ",
             "    ",
+            "(",
+            ")",
+            "[]",
+            "f\"{",
         ];
         for language in [
             Language::Rust,

@@ -10,6 +10,7 @@
 //! [editor]
 //! continuation-indent = "indent"
 //! wheel-lines = 3
+//! rainbow-brackets = false
 //!
 //! [terminal]
 //! shell = "/opt/homebrew/bin/fish"
@@ -330,6 +331,10 @@ pub enum SettingKey {
     /// touchpad, so one line an event follows both; a terminal that
     /// sends one event a notch wants more.
     WheelLines,
+    /// Whether brackets are colored by how deeply they nest, so that the
+    /// two ends of a pair can be matched at a glance; see
+    /// [`TokenKind::Bracket1`](crate::syntax::TokenKind::Bracket1).
+    RainbowBrackets,
     /// The program the shell tool runs; blank to detect the user's shell.
     Shell,
     /// The command agent mode runs: the program and its arguments.
@@ -373,33 +378,36 @@ impl SettingKey {
     /// Every setting, in the order a settings page lists them (grouped by
     /// category, in [`Category::ALL`]'s order). A table's toggles follow
     /// one another, row by row.
-    pub const ALL: [SettingKey; 30] = {
+    pub const ALL: [SettingKey; 31] = {
         const KEYS: usize = EditorKey::ALL.len();
         const TERMINAL_KEYS: usize = TerminalKind::ALL.len() * KEYS;
-        let mut all = [SettingKey::ContinuationIndent; 12 + TERMINAL_KEYS];
+        let mut all = [SettingKey::ContinuationIndent; 13 + TERMINAL_KEYS];
         all[1] = SettingKey::WheelLines;
-        all[2] = SettingKey::Shell;
-        all[3] = SettingKey::AgentCommand;
-        all[4] = SettingKey::AgentAutoUpdate;
-        all[5] = SettingKey::AgentUpdateCommand;
-        all[6] = SettingKey::TerminalScrollback;
+        all[2] = SettingKey::RainbowBrackets;
+        all[3] = SettingKey::Shell;
+        all[4] = SettingKey::AgentCommand;
+        all[5] = SettingKey::AgentAutoUpdate;
+        all[6] = SettingKey::AgentUpdateCommand;
+        all[7] = SettingKey::TerminalScrollback;
         let mut i = 0;
         while i < TERMINAL_KEYS {
-            all[7 + i] =
+            all[8 + i] =
                 SettingKey::TerminalKey(TerminalKind::ALL[i / KEYS], EditorKey::ALL[i % KEYS]);
             i += 1;
         }
-        all[7 + TERMINAL_KEYS] = SettingKey::SearchMaxResults;
-        all[8 + TERMINAL_KEYS] = SettingKey::CMakeGenerator;
-        all[9 + TERMINAL_KEYS] = SettingKey::CompletionModels;
-        all[10 + TERMINAL_KEYS] = SettingKey::CompletionLineConfidence;
-        all[11 + TERMINAL_KEYS] = SettingKey::CompletionTokenConfidence;
+        all[8 + TERMINAL_KEYS] = SettingKey::SearchMaxResults;
+        all[9 + TERMINAL_KEYS] = SettingKey::CMakeGenerator;
+        all[10 + TERMINAL_KEYS] = SettingKey::CompletionModels;
+        all[11 + TERMINAL_KEYS] = SettingKey::CompletionLineConfidence;
+        all[12 + TERMINAL_KEYS] = SettingKey::CompletionTokenConfidence;
         all
     };
 
     pub fn category(self) -> Category {
         match self {
-            SettingKey::ContinuationIndent | SettingKey::WheelLines => Category::Editor,
+            SettingKey::ContinuationIndent
+            | SettingKey::WheelLines
+            | SettingKey::RainbowBrackets => Category::Editor,
             SettingKey::Shell
             | SettingKey::AgentCommand
             | SettingKey::AgentAutoUpdate
@@ -419,7 +427,9 @@ impl SettingKey {
         match self {
             SettingKey::ContinuationIndent => SettingKind::Choice(&CONTINUATION_CHOICES),
             SettingKey::CompletionModels => SettingKind::List,
-            SettingKey::AgentAutoUpdate | SettingKey::TerminalKey(..) => SettingKind::Toggle,
+            SettingKey::RainbowBrackets
+            | SettingKey::AgentAutoUpdate
+            | SettingKey::TerminalKey(..) => SettingKind::Toggle,
             SettingKey::WheelLines
             | SettingKey::Shell
             | SettingKey::AgentCommand
@@ -452,6 +462,7 @@ impl SettingKey {
         match self {
             SettingKey::ContinuationIndent => "Continuation indent",
             SettingKey::WheelLines => "Mouse wheel lines",
+            SettingKey::RainbowBrackets => "Rainbow brackets",
             SettingKey::Shell => "Shell executable",
             SettingKey::AgentCommand => "Coding agent",
             SettingKey::AgentAutoUpdate => "Auto update coding agent before launching",
@@ -472,6 +483,9 @@ impl SettingKey {
             SettingKey::ContinuationIndent => "How a line continuing inside brackets is indented",
             SettingKey::WheelLines => {
                 "Lines scrolled for each mouse wheel event, or columns sideways: 1 for a terminal that sends several events for a notch of the wheel (most terminals), more for one that sends just one"
+            }
+            SettingKey::RainbowBrackets => {
+                "Color brackets by how deeply they nest, cycling through the theme's four bracket colors, so the two ends of a pair can be matched at a glance"
             }
             SettingKey::Shell => "The program the shell tool runs; blank to use your login shell",
             SettingKey::AgentCommand => {
@@ -517,6 +531,7 @@ impl SettingKey {
         let key = match self {
             SettingKey::ContinuationIndent => "continuation-indent",
             SettingKey::WheelLines => "wheel-lines",
+            SettingKey::RainbowBrackets => "rainbow-brackets",
             SettingKey::Shell => "shell",
             SettingKey::AgentCommand => "agent",
             SettingKey::AgentAutoUpdate => "agent-auto-update",
@@ -548,6 +563,7 @@ impl SettingKey {
                 continuation_name(ContinuationIndent::default()).to_owned()
             }
             SettingKey::WheelLines => DEFAULT_WHEEL_LINES.to_string(),
+            SettingKey::RainbowBrackets => true.to_string(),
             SettingKey::Shell => String::new(),
             SettingKey::AgentCommand => DEFAULT_AGENT_COMMAND.to_owned(),
             SettingKey::AgentAutoUpdate => false.to_string(),
@@ -613,6 +629,7 @@ pub const DEFAULT_WHEEL_LINES: usize = 1;
 pub struct Settings {
     continuation_indent: Option<ContinuationIndent>,
     wheel_lines: Option<usize>,
+    rainbow_brackets: Option<bool>,
     shell: Option<String>,
     agent_command: Option<String>,
     agent_auto_update: Option<bool>,
@@ -653,6 +670,11 @@ impl Settings {
     /// how many columns for each sideways one.
     pub fn wheel_lines(&self) -> usize {
         self.wheel_lines.unwrap_or(DEFAULT_WHEEL_LINES)
+    }
+
+    /// Whether brackets are colored by how deeply they nest.
+    pub fn rainbow_brackets(&self) -> bool {
+        self.rainbow_brackets.unwrap_or(true)
     }
 
     /// The program the shell tool runs, or `None` to detect the user's
@@ -801,6 +823,7 @@ impl Settings {
                 continuation_name(self.continuation_indent()).to_owned()
             }
             SettingKey::WheelLines => self.wheel_lines().to_string(),
+            SettingKey::RainbowBrackets => self.rainbow_brackets().to_string(),
             SettingKey::Shell => self.shell().unwrap_or_default().to_owned(),
             SettingKey::AgentCommand => self.agent_command().to_owned(),
             SettingKey::AgentAutoUpdate => self.agent_auto_update().to_string(),
@@ -833,6 +856,9 @@ impl Settings {
             SettingKey::WheelLines => {
                 let lines = parse_count(text, 1)?;
                 self.wheel_lines = (lines != DEFAULT_WHEEL_LINES).then_some(lines);
+            }
+            SettingKey::RainbowBrackets => {
+                self.rainbow_brackets = (!parse_toggle(text)?).then_some(false);
             }
             SettingKey::Shell => {
                 self.shell = (!text.is_empty()).then(|| text.to_owned());
@@ -892,6 +918,7 @@ impl Settings {
                 self.continuation_indent() == ContinuationIndent::default()
             }
             SettingKey::WheelLines => self.wheel_lines() == DEFAULT_WHEEL_LINES,
+            SettingKey::RainbowBrackets => self.rainbow_brackets.is_none(),
             SettingKey::Shell => self.shell.is_none(),
             SettingKey::AgentCommand => self.agent_command.is_none(),
             SettingKey::AgentAutoUpdate => self.agent_auto_update.is_none(),
@@ -917,6 +944,7 @@ impl Settings {
         match key {
             SettingKey::ContinuationIndent => self.continuation_indent = None,
             SettingKey::WheelLines => self.wheel_lines = None,
+            SettingKey::RainbowBrackets => self.rainbow_brackets = None,
             SettingKey::Shell => self.shell = None,
             SettingKey::AgentCommand => self.agent_command = None,
             SettingKey::AgentAutoUpdate => self.agent_auto_update = None,
@@ -1000,6 +1028,12 @@ impl Settings {
                 let lines = read_count(key, value, 1)?;
                 self.wheel_lines = (lines != DEFAULT_WHEEL_LINES).then_some(lines);
             }
+            SettingKey::RainbowBrackets => {
+                let rainbow = value.as_bool().ok_or_else(|| {
+                    SettingsError(format!("`{}` must be true or false", key.path()))
+                })?;
+                self.rainbow_brackets = (!rainbow).then_some(false);
+            }
             SettingKey::Shell => {
                 let shell = value
                     .as_str()
@@ -1076,6 +1110,7 @@ impl Settings {
                 | SettingKey::Shell
                 | SettingKey::AgentCommand
                 | SettingKey::AgentUpdateCommand => Value::String(self.text(key)),
+                SettingKey::RainbowBrackets => Value::Boolean(self.rainbow_brackets()),
                 SettingKey::AgentAutoUpdate => Value::Boolean(self.agent_auto_update()),
                 SettingKey::WheelLines => Value::Integer(self.wheel_lines() as i64),
                 SettingKey::TerminalScrollback => Value::Integer(self.terminal_scrollback() as i64),
@@ -1518,6 +1553,36 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "`editor.wheel-lines` must be a whole number of at least 1"
+        );
+    }
+
+    #[test]
+    fn rainbow_brackets_are_an_editor_toggle_on_by_default() {
+        let mut settings = Settings::default();
+        assert!(settings.rainbow_brackets());
+        assert_eq!(SettingKey::RainbowBrackets.category(), Category::Editor);
+        assert_eq!(SettingKey::RainbowBrackets.kind(), SettingKind::Toggle);
+        assert_eq!(settings.text(SettingKey::RainbowBrackets), "true");
+
+        assert_eq!(
+            settings.set_text(SettingKey::RainbowBrackets, "false"),
+            Ok(true)
+        );
+        assert!(!settings.rainbow_brackets());
+        let text = settings.to_toml();
+        assert!(text.contains("rainbow-brackets = false"), "{text}");
+        assert_eq!(Settings::parse(&text).unwrap(), settings);
+
+        assert!(settings.reset(SettingKey::RainbowBrackets));
+        assert!(settings.rainbow_brackets());
+        assert!(!settings.to_toml().contains("rainbow-brackets"));
+        let settings = Settings::parse("[editor]\nrainbow-brackets = true\n").unwrap();
+        assert!(settings.is_default(SettingKey::RainbowBrackets));
+        assert_eq!(
+            Settings::parse("[editor]\nrainbow-brackets = 1\n")
+                .unwrap_err()
+                .to_string(),
+            "`editor.rainbow-brackets` must be true or false"
         );
     }
 

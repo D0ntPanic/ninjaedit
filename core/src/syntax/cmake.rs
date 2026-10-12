@@ -284,6 +284,7 @@ impl Line<'_> {
                     triple: false,
                     escapes: true,
                     hashes: 0,
+                    interpolates: false,
                 });
                 let more = self.continue_string(state);
                 // Join the opening quote onto the first body token, or put
@@ -520,7 +521,7 @@ cccccccccc fffpv ssssssssssssssp
             lines[6],
             vec![Token {
                 range: 0..1,
-                kind: TokenKind::Punctuation
+                kind: TokenKind::Bracket1
             }]
         );
         assert_eq!(lines[7][0].kind, TokenKind::Function);

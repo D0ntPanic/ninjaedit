@@ -33,6 +33,15 @@
 //! a fixed-size state can't hold two continuations, and a conflict is
 //! about to be resolved by hand anyway.
 //!
+//! The wrapper also keeps the bracket depth of rainbow brackets (see the
+//! `brackets` module), since it is the one lexer that sees every line of
+//! a file. Unlike the language's state, the depth doesn't flow straight
+//! through a conflict: each side starts from the depth the conflict
+//! started at, so that brackets left open on one side don't shift the
+//! colors of the next, and the text after the conflict continues from
+//! the depth the last side left. A Markdown file starts each code fence
+//! at depth 0, so that an unbalanced snippet doesn't color the next.
+//!
 //! A marker is exactly seven of its character at the start of a line,
 //! followed by a space (then a label) or the end of the line. The
 //! separator and the base marker only count inside a conflict, and only
@@ -40,7 +49,7 @@
 //! heading or `>>>>>>>` on a deeply quoted line is left to the language
 //! unless the file is actually in the middle of a conflict.
 
-use super::{ConflictSide, Context, Language, LexState, Lexer, Token, TokenKind};
+use super::{ConflictSide, Context, Language, LexState, Lexer, Token, TokenKind, brackets};
 
 /// A language's lexer with conflict markers recognized across it.
 #[derive(Clone, Copy)]
@@ -93,10 +102,11 @@ pub(crate) fn is_conflict_start(line: &[u8]) -> bool {
 
 impl Lexer for Conflicts {
     fn lex_line(&self, state: LexState, line: &[u8], out: &mut Vec<Token>) -> LexState {
-        let side = match state.bottom() {
-            Some(Context::Conflict { side }) => Some(side),
-            _ => None,
+        let (side, conflict_brackets) = match state.bottom() {
+            Some(Context::Conflict { side, brackets }) => (Some(side), brackets),
+            _ => (None, 0),
         };
+        let depth = state.bracket_depth();
         // Which marker, if any, moves the state on from this side. A
         // stray opening marker inside a conflict starts it over rather
         // than nesting, since nesting is never what a merge writes.
@@ -113,24 +123,39 @@ impl Lexer for Conflicts {
             state.without_bottom()
         } else {
             state
-        };
+        }
+        .with_bracket_depth(0);
         if let Some(next) = next {
             out.push(Token {
                 range: 0..line.len(),
                 kind: TokenKind::ConflictMarker,
             });
-            return wrap(inner_state, next);
+            // A new conflict notes the depth it starts at, the later
+            // sides go back to it, and the end keeps the last side's.
+            let (depth, conflict_brackets) = match next {
+                Some(ConflictSide::Ours) => (depth, depth),
+                Some(_) => (conflict_brackets, conflict_brackets),
+                None => (depth, 0),
+            };
+            return wrap(inner_state, next, conflict_brackets).with_bracket_depth(depth);
         }
+        let first = out.len();
         let inner_state = self.inner.lexer().lex_line(inner_state, line, out);
-        wrap(inner_state, side)
+        let mut depth = brackets::color(&mut out[first..], line, depth);
+        if self.inner == Language::Markdown
+            && !matches!(inner_state.bottom(), Some(Context::Fence { .. }))
+        {
+            depth = 0;
+        }
+        wrap(inner_state, side, conflict_brackets).with_bracket_depth(depth)
     }
 }
 
 /// A wrapped lexer's state as seen from outside: inside `side` of a
-/// conflict, or as it is when not in one.
-fn wrap(inner: LexState, side: Option<ConflictSide>) -> LexState {
+/// conflict that started `brackets` deep, or as it is when not in one.
+fn wrap(inner: LexState, side: Option<ConflictSide>, brackets: u8) -> LexState {
     match side {
-        Some(side) => inner.with_bottom(Context::Conflict { side }),
+        Some(side) => inner.with_bottom(Context::Conflict { side, brackets }),
         None => inner,
     }
 }
@@ -173,7 +198,7 @@ mod tests {
         let mut out = Vec::new();
         let mut lex = |state, line: &str| lexer.lex_line(state, line.as_bytes(), &mut out);
         let side = |state: LexState| match state.bottom() {
-            Some(Context::Conflict { side }) => Some(side),
+            Some(Context::Conflict { side, .. }) => Some(side),
             _ => None,
         };
         let start = LexState::default();

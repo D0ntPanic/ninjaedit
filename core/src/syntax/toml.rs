@@ -173,6 +173,7 @@ fn lex_line(mut state: LexState, line: &[u8], out: &mut Vec<Token>) -> LexState 
                         triple,
                         escapes,
                         hashes: 0,
+                        interpolates: false,
                     });
                     // The string branch at the top of the loop lexes the
                     // body.
@@ -313,11 +314,11 @@ mod tests {
         assert_eq!(
             lines[0],
             vec![
-                (TokenKind::Punctuation, "["),
+                (TokenKind::Bracket1, "["),
                 (TokenKind::Namespace, "package"),
                 (TokenKind::Punctuation, "."),
                 (TokenKind::Namespace, "\"sub\""),
-                (TokenKind::Punctuation, "]"),
+                (TokenKind::Bracket1, "]"),
                 (TokenKind::Comment, "# c"),
             ]
         );
@@ -332,9 +333,9 @@ mod tests {
                 (TokenKind::Comment, "# done"),
             ]
         );
-        assert_eq!(lines[2][0], (TokenKind::Punctuation, "[["));
+        assert_eq!(lines[2][0], (TokenKind::Bracket1, "[["));
         assert_eq!(lines[2][1], (TokenKind::Namespace, "bin"));
-        assert_eq!(lines[2][2], (TokenKind::Punctuation, "]]"));
+        assert_eq!(lines[2][2], (TokenKind::Bracket1, "]]"));
         assert_eq!(lines[3][0], (TokenKind::Key, "a"));
         assert_eq!(lines[3][2], (TokenKind::Key, "b"));
         assert_eq!(lines[3][5], (TokenKind::Number, "1"));
@@ -357,7 +358,7 @@ mod tests {
         assert_eq!(lines[1][1], (TokenKind::Comment, "# c"));
         assert_eq!(lines[3][0], (TokenKind::Number, "1"));
         assert_eq!(lines[4][0], (TokenKind::String, "\"x\""));
-        assert_eq!(lines[5][0], (TokenKind::Punctuation, "]"));
+        assert_eq!(lines[5][0], (TokenKind::Bracket1, "]"));
         assert_eq!(lines[6][0], (TokenKind::Key, "b"));
 
         // An unterminated single-line string doesn't leak into the next

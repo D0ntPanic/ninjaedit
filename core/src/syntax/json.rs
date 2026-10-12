@@ -192,7 +192,7 @@ mod tests {
         );
         assert_eq!(
             lines[0],
-            vec![(TokenKind::Punctuation, "{"), (TokenKind::Comment, "// hi")]
+            vec![(TokenKind::Bracket1, "{"), (TokenKind::Comment, "// hi")]
         );
         assert_eq!(lines[1][0], (TokenKind::Key, "\"a"));
         assert_eq!(lines[1][1], (TokenKind::StringEscape, "\\n"));
