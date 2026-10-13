@@ -135,10 +135,10 @@ syntax-quote = "/alt"
 syntax-variable = "lavender"
 syntax-conflict-marker = "*red"
 # Brackets by depth, outermost first, with rainbow brackets on.
-syntax-bracket-1 = "gold"
-syntax-bracket-2 = "orchid"
-syntax-bracket-3 = "coral"
-syntax-bracket-4 = "saturated-blue"
+syntax-bracket-1 = "saturated-blue"
+syntax-bracket-2 = "coral"
+syntax-bracket-3 = "orchid"
+syntax-bracket-4 = "gold"
 
 [names]
 black = "#000000"
