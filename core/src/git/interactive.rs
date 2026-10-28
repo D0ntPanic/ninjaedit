@@ -71,7 +71,8 @@ use super::history::short_id;
 use super::hooks::{Hook, Hooks};
 use super::operation::{
     InProgress, OperationError, Outcome, checkout_options, conflicted_files, ensure_ready,
-    follow_submodules, head_commit, settle_part_way, with_resolved, with_submodules,
+    follow_submodules, head_commit, restage_gitlinks, settle_part_way, with_resolved,
+    with_submodules,
 };
 use super::rebase::RebaseStatus;
 use git2::{Commit, Oid, Repository, RepositoryState, ResetType, Signature, Status, StatusOptions};
@@ -1129,7 +1130,8 @@ fn merge_in(
 ) -> Result<(), git2::Error> {
     let mut index = repo.cherrypick_commit(commit, head, 0, None)?;
     let mut options = checkout_options(progress);
-    repo.checkout_index(Some(&mut index), Some(&mut options))
+    repo.checkout_index(Some(&mut index), Some(&mut options))?;
+    restage_gitlinks(repo, &index)
 }
 
 /// Commit the index on HEAD as `author`, with `message`, unless it
@@ -1234,7 +1236,9 @@ fn unstaged(repo: &Repository, stopped: &Commit<'_>) -> Result<Option<bool>, Ope
 mod tests {
     use super::*;
     use crate::git::history::tests::TestRepo;
-    use crate::git::operation::tests::{read, repo, sync};
+    use crate::git::operation::tests::{
+        CAPITALS, read, repo, repo_ignoring_case, submodule_moved_on_side, sync,
+    };
     use crate::git::operation::{Integration, in_progress};
     use crate::git::rebase::rebase_status;
 
@@ -1817,6 +1821,41 @@ mod tests {
             })
             .collect();
         plan
+    }
+
+    #[test]
+    fn a_picked_submodule_move_stays_moved_beside_upper_case_paths() {
+        use RebaseAction::Pick;
+        // The move, swapped with a commit adding upper-case paths, is
+        // picked onto it: libgit2 alone loses the move, and with it the
+        // commit, which changes nothing else.
+        let mut t = repo_ignoring_case();
+        let (sub, [_, _, side, _, s2]) = submodule_moved_on_side(&mut t, false);
+        t.repo.set_head("refs/heads/side").unwrap();
+        sync(&t);
+        sub.set_head_detached(s2).unwrap();
+        sub.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let capitals = t.commit(CAPITALS, "Capitals", &[side]);
+        sync(&t);
+        let plan = plan_of(&t, side, &[(capitals, Pick), (side, Pick)]);
+        let outcome = run(&t.repo, &plan).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Rebased {
+                    commits: 2,
+                    skipped: 0,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(log(&t.repo)[..2], ["Bump sub", "Capitals"]);
+        let tree = t.repo.head().unwrap().peel_to_tree().unwrap();
+        assert_eq!(tree.get_path(Path::new("sub")).unwrap().id(), s2);
+        assert_eq!(sub.head().unwrap().target(), Some(s2));
+        assert!(t.repo.statuses(None).unwrap().is_empty());
     }
 
     fn author_time(repo: &Repository, id: Oid) -> i64 {

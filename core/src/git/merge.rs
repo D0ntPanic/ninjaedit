@@ -12,7 +12,7 @@
 use super::hooks::{Hook, Hooks, commit_env};
 use super::operation::{
     OperationError, Outcome, Target, checkout_options, conflicted_files, ensure_ready,
-    fast_forward, follow_submodules, settle_part_way,
+    fast_forward, follow_submodules, restage_gitlinks, settle_part_way,
 };
 use git2::build::CheckoutBuilder;
 use git2::{Repository, RepositoryState, ResetType};
@@ -53,6 +53,8 @@ pub(super) fn merge(
         let mut options = checkout_options(progress);
         repo.merge(&[&theirs], None, Some(&mut options))?;
     }
+    let ours = repo.find_commit(head)?;
+    restage_gitlinks(repo, &repo.merge_commits(&ours, &their_commit, None)?)?;
     name_remote_branch(repo, target);
     let mut index = repo.index()?;
     // Submodule conflicts that can be resolved are; with nothing else in
@@ -90,7 +92,6 @@ pub(super) fn merge(
     index.read(true)?;
     let tree = repo.find_tree(index.write_tree()?)?;
     let signature = repo.signature()?;
-    let ours = repo.find_commit(head)?;
     let commit = repo.commit(
         Some("HEAD"),
         &signature,
@@ -178,7 +179,9 @@ pub fn abort_merge(repo: &Repository) -> Result<(), OperationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::operation::tests::{diverged, read, repo, submodule_moved_on_side, sync};
+    use crate::git::operation::tests::{
+        CAPITALS, diverged, read, repo, repo_ignoring_case, submodule_moved_on_side, sync,
+    };
     use crate::git::short_id;
     use git2::Oid;
     use std::fs;
@@ -338,6 +341,29 @@ mod tests {
         // Aborting takes it back.
         abort_merge(&t.repo).unwrap();
         assert_ne!(sub.head().unwrap().target(), Some(s2));
+        assert!(t.repo.statuses(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_submodule_merged_in_stays_moved_beside_upper_case_paths() {
+        // libgit2 alone leaves the move out of the merge commit.
+        let mut t = repo_ignoring_case();
+        let (sub, [_, main, side, _, s2]) = submodule_moved_on_side(&mut t, false);
+        t.commit(CAPITALS, "Capitals", &[main]);
+        sync(&t);
+        let outcome = run(&t.repo, &Target::Commit(side)).unwrap();
+        let Outcome::Merged {
+            commit,
+            submodules: 1,
+            ..
+        } = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        let tree = t.repo.find_commit(commit).unwrap().tree().unwrap();
+        let recorded = tree.get_path(std::path::Path::new("sub")).unwrap();
+        assert_eq!(recorded.id(), s2);
+        assert_eq!(sub.head().unwrap().target(), Some(s2));
         assert!(t.repo.statuses(None).unwrap().is_empty());
     }
 

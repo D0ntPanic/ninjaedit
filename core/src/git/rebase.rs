@@ -24,7 +24,7 @@ use super::hooks::{Hook, Hooks};
 use super::interactive::{self, RebaseAction};
 use super::operation::{
     Integration, OperationError, Outcome, Target, checkout_options, conflicted_files, ensure_ready,
-    fast_forward, follow_submodules, head_commit, settle_part_way,
+    fast_forward, follow_submodules, head_commit, restage_gitlinks, settle_part_way,
 };
 use git2::{ErrorCode, Oid, Rebase, RebaseOptions, Repository, RepositoryState, Signature};
 use std::cell::RefCell;
@@ -244,7 +244,7 @@ fn replay(
 ) -> Result<Outcome, OperationError> {
     let total = rebase.len();
     while let Some(operation) = rebase.next() {
-        operation?;
+        restage_step(repo, operation?.id())?;
         let settled = settle_part_way(repo, progress)?;
         tally.moved.extend(settled.moved);
         tally.resolved += settled.resolved;
@@ -273,6 +273,21 @@ fn replay(
     })
 }
 
+/// Stage a submodule that libgit2 may have left out of the step it has
+/// just merged (see [`restage_gitlinks`]), merging the step's commit,
+/// `id`, onto HEAD again as libgit2 merged it.
+fn restage_step(repo: &Repository, id: Oid) -> Result<(), git2::Error> {
+    let commit = repo.find_commit(id)?;
+    let base = match commit.parent(0) {
+        Ok(parent) => parent.tree()?,
+        // A root commit is merged as if from an empty tree.
+        Err(_) => repo.find_tree(repo.treebuilder(None)?.write()?)?,
+    };
+    let head = repo.head()?.peel_to_tree()?;
+    let merged = repo.merge_trees(&base, &head, &commit.tree()?, None)?;
+    restage_gitlinks(repo, &merged)
+}
+
 /// Commit the rebase's current commit as replayed, keeping its author,
 /// or drop it when it changes nothing any more.
 fn commit_step(
@@ -292,7 +307,9 @@ fn commit_step(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::operation::tests::{diverged, read, repo, submodule_moved_on_side, sync};
+    use crate::git::operation::tests::{
+        CAPITALS, diverged, read, repo, repo_ignoring_case, submodule_moved_on_side, sync,
+    };
     use git2::Oid;
     use std::path::Path;
 
@@ -508,6 +525,36 @@ mod tests {
             matches!(outcome, Outcome::Rebased { commits: 1, .. }),
             "{outcome:?}"
         );
+        assert_eq!(sub.head().unwrap().target(), Some(s2));
+        assert!(t.repo.statuses(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_submodule_the_branch_moves_stays_moved_beside_upper_case_paths() {
+        // libgit2 alone loses the move, and with it the commit, which
+        // changes nothing else.
+        let mut t = repo_ignoring_case();
+        let (sub, [_, main, _, _, s2]) = submodule_moved_on_side(&mut t, false);
+        let onto = t.commit(CAPITALS, "Capitals", &[main]);
+        t.repo.set_head("refs/heads/side").unwrap();
+        sync(&t);
+        sub.set_head_detached(s2).unwrap();
+        sub.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let outcome = run(&t.repo, &Target::Commit(onto)).unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Rebased {
+                commits: 1,
+                skipped: 0,
+                submodules: 0,
+                resolved: 0,
+            }
+        );
+        let replayed = t.repo.find_commit(head(&t.repo)).unwrap();
+        assert_eq!(replayed.parent_ids().collect::<Vec<_>>(), [onto]);
+        let recorded = replayed.tree().unwrap().get_path(Path::new("sub")).unwrap();
+        assert_eq!(recorded.id(), s2);
         assert_eq!(sub.head().unwrap().target(), Some(s2));
         assert!(t.repo.statuses(None).unwrap().is_empty());
     }

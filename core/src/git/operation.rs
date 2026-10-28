@@ -533,6 +533,39 @@ pub(super) fn settle_part_way(
     })
 }
 
+/// Stage the submodules where `merged`, the merge result libgit2 has
+/// just checked out, has them, as libgit2 may leave one where it was:
+/// with `core.ignorecase` set (as it is by default on macOS and
+/// Windows), its checkout looks a merge result's submodules up ignoring
+/// case though the result is sorted by case, so one that sorts after an
+/// upper-case path (`api` after `README.md`) isn't found, its directory
+/// is taken for an untracked one, and its move is left out of the
+/// index, and so out of the commit. Those in conflict in `merged` are
+/// left alone.
+pub(super) fn restage_gitlinks(repo: &Repository, merged: &Index) -> Result<(), git2::Error> {
+    // An index entry's stage, in its flags: 0 for one not in conflict.
+    const STAGE_MASK: u16 = 0x3000;
+    const GITLINK: u32 = 0o160000;
+    let mut index = repo.index()?;
+    let mut changed = false;
+    for entry in merged.iter() {
+        if entry.mode != GITLINK || entry.flags & STAGE_MASK != 0 {
+            continue;
+        }
+        let path = String::from_utf8_lossy(&entry.path).into_owned();
+        let staged = index.get_path(Path::new(&path), 0);
+        if staged.is_some_and(|staged| staged.mode == GITLINK && staged.id == entry.id) {
+            continue;
+        }
+        index.add(&entry)?;
+        changed = true;
+    }
+    if changed {
+        index.write()?;
+    }
+    Ok(())
+}
+
 /// How many files of an index are in conflict.
 pub(super) fn conflicted_files(index: &Index) -> Result<usize, git2::Error> {
     let mut files = 0;
@@ -732,6 +765,25 @@ pub(super) mod tests {
         assert!(t.repo.statuses(None).unwrap().is_empty(), "clean to start");
         (sub, [base, main, side, s1, s2])
     }
+
+    /// A test repository ignoring case, as git sets one up on macOS.
+    pub fn repo_ignoring_case() -> TestRepo {
+        let t = repo();
+        let mut config = t.repo.config().unwrap();
+        config.set_bool("core.ignorecase", true).unwrap();
+        t
+    }
+
+    /// Files whose upper-case names sort before `sub` by case, as a merge
+    /// result is sorted, and after it ignoring case: beside them, libgit2
+    /// alone loses a submodule's move (see [`restage_gitlinks`]).
+    pub const CAPITALS: &[(&str, &str)] = &[
+        ("V.txt", "v\n"),
+        ("W.txt", "w\n"),
+        ("X.txt", "x\n"),
+        ("Y.txt", "y\n"),
+        ("Z.txt", "z\n"),
+    ];
 
     pub fn read(t: &TestRepo, path: &str) -> String {
         fs::read_to_string(t.path().join(path)).unwrap()
